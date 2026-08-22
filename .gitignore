@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.pytest_tmp_*/
+.venv/
+artifacts/
+build/
+dist/
+*.egg-info/
+
+# Runtime race data and local configuration
+RaceData/
+race/
+logs/
+config.json
+finish_review_config.json

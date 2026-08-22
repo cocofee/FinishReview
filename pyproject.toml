@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finish-review"
+version = "0.1.0"
+description = "Standalone multi-source finish review console"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy>=1.26,<3",
+    "opencv-python>=4.10,<5",
+    "PyQt5>=5.15,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6,<7",
+    "pytest>=8,<9",
+]
+
+[project.scripts]
+finish-review = "realtime.review_main:main"
+
+[tool.setuptools.packages.find]
+include = ["realtime*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
