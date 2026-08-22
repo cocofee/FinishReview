@@ -20,10 +20,13 @@ CycleRace / RaceTiger 过线事件接入、奥亚特高速相机文件读取和�
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python -m pip install -e ".[dev]"
+.\.venv\Scripts\python -m pip install -e ".[dev]" -c constraints-dev.txt
 .\.venv\Scripts\python -m pytest -q --basetemp .pytest_tmp_finish_review
 .\.venv\Scripts\python -m realtime.review_main
 ```
+
+`constraints-dev.txt` 固定了已验证的 Windows 开发与打包依赖版本。CI 在 Python 3.10
+和 Python 3.12 上执行同一套安装、编译和测试命令，并在 Python 3.12 上构建发布包。
 
 系统需要可用的 FFmpeg。可以把 `ffmpeg.exe` 放在程序目录，加入 `PATH`，或设置：
 

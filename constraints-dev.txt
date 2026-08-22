@@ -1,0 +1,6 @@
+# Direct dependency versions validated on Windows and used by CI.
+numpy==1.26.4
+opencv-python==4.11.0.86
+PyQt5==5.15.11
+pyinstaller==6.20.0
+pytest==9.0.2

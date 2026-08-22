@@ -9,6 +9,7 @@ $ForbiddenRelativePaths = @(
     "RaceData",
     "logs",
     "config.json",
+    "finish_review_config.json",
     "global_config.json"
 )
 

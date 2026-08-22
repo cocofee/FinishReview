@@ -1,8 +1,15 @@
 import json
+import os
+import socket
 from pathlib import Path
 
-import pytest
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QApplication
+
+from realtime import review_main
 from realtime.review_main import (
     build_argument_parser,
     load_review_settings,
@@ -11,6 +18,54 @@ from realtime.review_main import (
 )
 from realtime.review_recorder import parse_directshow_source
 from realtime.review_window import FinishReviewSettings
+
+
+def test_main_shows_real_window_before_entering_event_loop(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    captured_windows = []
+
+    class _CapturingFinishReviewWindow(review_main.FinishReviewWindow):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured_windows.append(self)
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        passage_port = probe.getsockname()[1]
+
+    monkeypatch.setattr(
+        review_main,
+        "FinishReviewWindow",
+        _CapturingFinishReviewWindow,
+    )
+    monkeypatch.setattr(
+        review_main,
+        "default_config_path",
+        lambda: tmp_path / "config.json",
+    )
+    monkeypatch.setattr(review_main, "discover_auyat_root", lambda: None)
+    QTimer.singleShot(0, app.quit)
+
+    result = review_main.main(
+        [
+            "--output",
+            str(tmp_path / "race"),
+            "--passage-host",
+            "127.0.0.1",
+            "--passage-port",
+            str(passage_port),
+        ]
+    )
+
+    assert result == 0
+    assert len(captured_windows) == 1
+    window = captured_windows[0]
+    assert window.isVisible()
+    assert int(window.winId()) != 0
+    assert window.receiver is not None
+    assert window.receiver.is_running
+    window.close()
+    app.processEvents()
 
 
 def test_installer_arguments_build_usb_camera_source():

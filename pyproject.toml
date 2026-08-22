@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pyinstaller>=6,<7",
-    "pytest>=8,<9",
+    "pytest>=8,<10",
 ]
 
 [project.scripts]
