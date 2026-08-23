@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -533,10 +534,12 @@ class PassageDiscoveryResponder:
         *,
         discovery_port: int = DEFAULT_DISCOVERY_PORT,
         host_name: str | None = None,
+        auth_required: bool = False,
     ) -> None:
         self.http_port = int(http_port)
         self.discovery_port = int(discovery_port)
         self.host_name = str(host_name or socket.gethostname()).strip() or "FinishReview"
+        self.auth_required = bool(auth_required)
         if not 1 <= self.http_port <= 65535:
             raise ValueError("passage receiver port is out of range")
         if self.discovery_port < 0 or self.discovery_port > 65535:
@@ -577,6 +580,7 @@ class PassageDiscoveryResponder:
                 "service": DISCOVERY_SERVICE,
                 "host_name": self.host_name,
                 "port": self.http_port,
+                "auth_required": self.auth_required,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -623,6 +627,7 @@ def _handler_type(
     on_focus_accepted: Optional[Callable[[RaceFocus], None]],
     request_path: str,
     max_body_bytes: int,
+    shared_token: str,
 ):
     class PassageRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -630,6 +635,14 @@ def _handler_type(
         def do_POST(self) -> None:
             if urlsplit(self.path).path != request_path:
                 self._send_json(404, "rejected", "endpoint not found")
+                return
+            if shared_token and not self._is_authorized(shared_token):
+                self._send_json(
+                    401,
+                    "rejected",
+                    "valid Bearer token is required",
+                    authenticate=True,
+                )
                 return
             length_header = self.headers.get("Content-Length")
             try:
@@ -700,6 +713,7 @@ def _handler_type(
             error: str = "",
             *,
             message_type: str = ACK_MESSAGE_TYPE,
+            authenticate: bool = False,
         ) -> None:
             body: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
@@ -717,9 +731,23 @@ def _handler_type(
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Connection", "close")
+            if authenticate:
+                self.send_header("WWW-Authenticate", "Bearer")
             self.end_headers()
             self.wfile.write(encoded)
             self.close_connection = True
+
+        def _is_authorized(self, shared_token: str) -> bool:
+            authorization = str(self.headers.get("Authorization") or "")
+            scheme, separator, supplied_token = authorization.partition(" ")
+            return (
+                bool(separator)
+                and scheme.lower() == "bearer"
+                and hmac.compare_digest(
+                    supplied_token.encode("utf-8"),
+                    shared_token.encode("utf-8"),
+                )
+            )
 
         def log_message(self, format: str, *args: Any) -> None:
             logger.debug("CycleRace HTTP: " + format, *args)
@@ -739,6 +767,7 @@ class PassageEventReceiver:
         request_path: str = DEFAULT_PATH,
         max_body_bytes: int = MAX_BODY_BYTES,
         discovery_port: int | None = DEFAULT_DISCOVERY_PORT,
+        shared_token: str = "",
         on_accepted: Optional[Callable[[PassageEvent], None]] = None,
         metadata_store: RaceMetadataStore | None = None,
         on_metadata_accepted: Optional[Callable[[RaceMetadata], None]] = None,
@@ -764,6 +793,7 @@ class PassageEventReceiver:
         self.discovery_port = (
             None if discovery_port is None else int(discovery_port)
         )
+        self.shared_token = str(shared_token or "").strip()
         self.store = store
         self.ingestor = PassageEventIngestor(store, on_accepted=on_accepted)
         self.metadata_store = metadata_store or RaceMetadataStore(
@@ -788,6 +818,7 @@ class PassageEventReceiver:
                 self._on_focus_accepted,
                 self.request_path,
                 self.max_body_bytes,
+                self.shared_token,
             )
             server = _PassageHTTPServer((self.host, self.port), handler)
             thread = threading.Thread(
@@ -803,6 +834,7 @@ class PassageEventReceiver:
                 discovery = PassageDiscoveryResponder(
                     self.listen_port,
                     discovery_port=self.discovery_port,
+                    auth_required=bool(self.shared_token),
                 )
                 try:
                     discovery.start()

@@ -165,7 +165,63 @@ def test_catalog_reports_pending_file_even_when_older_capture_is_ready(tmp_path)
     assert result.status == "ready"
     assert len(result.captures) == 1
     assert result.waiting_file_count == 1
-    assert "等待 1 个高速文件封口" in result.message
+    assert "等待高速摄像软件完成判读并释放 1 个文件" in result.message
+
+
+def test_catalog_reads_vendor_live_header_and_payload_pair(tmp_path):
+    root = tmp_path / "vendor"
+    (root / "Photo").mkdir(parents=True)
+    combined_path = root / "combined.RGB"
+    _write_rgb(
+        combined_path,
+        capture_date=date(2026, 8, 23),
+        ticks=(100, 120, 140),
+    )
+    payload = combined_path.read_bytes()
+    (root / "BRSY_Head.RGB").write_bytes(payload[:HEADER_SIZE])
+    live_path = root / "BRSY_Photo.RGB"
+    live_path.write_bytes(payload[HEADER_SIZE:])
+    combined_path.unlink()
+
+    result = AuyatRgbCatalog(
+        root,
+        target_dates=(date(2026, 8, 23),),
+    ).scan()
+
+    assert result.status == "ready"
+    assert len(result.captures) == 1
+    capture = result.captures[0]
+    assert capture.file_path == live_path.absolute()
+    assert capture.data_offset == 0
+    assert read_capture(capture).width == 3
+
+
+def test_catalog_reports_vendor_live_payload_as_waiting_while_busy(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "vendor"
+    (root / "Photo").mkdir(parents=True)
+    combined_path = root / "combined.RGB"
+    _write_rgb(
+        combined_path,
+        capture_date=date(2026, 8, 23),
+        ticks=(100, 120),
+    )
+    payload = combined_path.read_bytes()
+    (root / "BRSY_Head.RGB").write_bytes(payload[:HEADER_SIZE])
+    (root / "BRSY_Photo.RGB").write_bytes(payload[HEADER_SIZE:])
+    combined_path.unlink()
+
+    def busy_scan(path, **kwargs):
+        raise auyat_rgb.AuyatRgbBusyError(f"busy: {path}")
+
+    monkeypatch.setattr(auyat_rgb, "_scan_rgb_file", busy_scan)
+    result = AuyatRgbCatalog(root).scan()
+
+    assert result.status == "waiting"
+    assert result.waiting_file_count == 1
+    assert "等待高速摄像软件完成判读并释放 1 个文件" in result.message
 
 
 def test_catalog_publishes_completed_segments_while_vendor_file_keeps_growing(

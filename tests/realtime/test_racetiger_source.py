@@ -1,3 +1,9 @@
+from urllib.error import HTTPError
+from urllib.request import Request
+
+import pytest
+
+from realtime import racetiger_source as racetiger_source_module
 from realtime.passage_receiver import PassageEventStore
 from realtime.racetiger_source import (
     RaceTigerClient,
@@ -192,7 +198,7 @@ def test_poll_once_increments_revision_when_identity_details_change(tmp_path):
     assert second[0].team_name == "Team B"
 
 
-def test_racetiger_client_uses_query_parameters_for_post(monkeypatch):
+def test_racetiger_client_uses_query_parameters_for_post():
     captured = {}
 
     class Response:
@@ -213,13 +219,13 @@ def test_racetiger_client_uses_query_parameters_for_post(monkeypatch):
         captured["timeout"] = timeout
         return Response()
 
-    monkeypatch.setattr("realtime.racetiger_source.urlopen", fake_urlopen)
     test_token = "placeholder"
     client = RaceTigerClient(
         "https://rqs.racetigertiming.com",
         test_token,
         pc="pc-1",
         rid="rid-2",
+        opener=fake_urlopen,
     )
 
     assert client.post("Dif/info") == {"data": []}
@@ -230,3 +236,80 @@ def test_racetiger_client_uses_query_parameters_for_post(monkeypatch):
     assert f"token={test_token}" in captured["url"]
     assert "page=1" in captured["url"]
     assert "Authorization" not in captured["headers"]
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://racetiger.example.test",
+        "ftp://127.0.0.1/feed",
+        "rqs.racetigertiming.com",
+        "https://user:password@racetiger.example.test",
+        "https://racetiger.example.test?token=unexpected",
+        "https://racetiger.example.test:invalid",
+    ],
+)
+def test_racetiger_client_rejects_insecure_or_invalid_base_url(base_url):
+    with pytest.raises(ValueError):
+        RaceTigerClient(base_url, "placeholder")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://127.0.0.1:8080",
+        "http://localhost:8080/api",
+        "http://[::1]:8080",
+        "https://rqs.racetigertiming.com",
+    ],
+)
+def test_racetiger_client_allows_https_and_local_http(base_url):
+    client = RaceTigerClient(base_url, "placeholder")
+
+    assert client.base_url == base_url
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "http://rqs.racetigertiming.com/Dif/info?token=placeholder",
+        "https://other.example.test/Dif/info?token=placeholder",
+        "ftp://rqs.racetigertiming.com/Dif/info?token=placeholder",
+    ],
+)
+def test_racetiger_redirect_handler_rejects_origin_changes(target_url):
+    handler = racetiger_source_module._SameOriginRedirectHandler(
+        "https://rqs.racetigertiming.com"
+    )
+    request = Request(
+        "https://rqs.racetigertiming.com/Dif/info?token=placeholder",
+        data=b"",
+        method="POST",
+    )
+
+    with pytest.raises(HTTPError):
+        handler.redirect_request(request, None, 302, "Found", {}, target_url)
+
+
+def test_racetiger_redirect_handler_allows_same_origin():
+    handler = racetiger_source_module._SameOriginRedirectHandler(
+        "https://rqs.racetigertiming.com"
+    )
+    request = Request(
+        "https://rqs.racetigertiming.com/Dif/info?token=placeholder",
+        data=b"",
+        method="POST",
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://rqs.racetigertiming.com/Dif/info2?token=placeholder",
+    )
+
+    assert redirected.full_url.startswith(
+        "https://rqs.racetigertiming.com/Dif/info2"
+    )

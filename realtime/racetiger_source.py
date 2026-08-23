@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import math
@@ -11,8 +12,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
     from .passage_receiver import PassageEvent, PassageEventStore
@@ -27,6 +28,33 @@ DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 
 class RaceTigerError(RuntimeError):
     """Raised when RaceTiger cannot provide a valid finish snapshot."""
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urlsplit(url)
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
+    return parsed.scheme.lower(), str(parsed.hostname or "").lower(), port
+
+
+class _SameOriginRedirectHandler(HTTPRedirectHandler):
+    """Allow RaceTiger redirects only within the configured transport origin."""
+
+    def __init__(self, base_url: str):
+        super().__init__()
+        self._allowed_origin = _url_origin(base_url)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _url_origin(newurl) != self._allowed_origin:
+            raise HTTPError(
+                req.full_url,
+                code,
+                "RaceTiger redirect outside configured origin is not allowed",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,8 +323,9 @@ class RaceTigerClient:
         pc: str = "",
         rid: str = "",
         timeout_seconds: float = 5.0,
+        opener: Optional[Callable[..., Any]] = None,
     ):
-        self.base_url = str(base_url).rstrip("/")
+        self.base_url = self._validated_base_url(base_url)
         self.token = str(token).strip()
         self.pc = str(pc).strip()
         self.rid = str(rid).strip()
@@ -305,6 +334,40 @@ class RaceTigerClient:
             raise ValueError("RaceTiger base_url is required")
         if not self.token:
             raise ValueError("RaceTiger token is required")
+        self._opener = opener or build_opener(
+            _SameOriginRedirectHandler(self.base_url)
+        ).open
+
+    @staticmethod
+    def _validated_base_url(base_url: str) -> str:
+        value = str(base_url or "").strip().rstrip("/")
+        if not value:
+            raise ValueError("RaceTiger base_url is required")
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("RaceTiger base_url must be an HTTP(S) URL")
+        try:
+            parsed.port
+        except ValueError as error:
+            raise ValueError("RaceTiger base_url contains an invalid port") from error
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("RaceTiger base_url must not contain credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("RaceTiger base_url must not contain query or fragment data")
+        if parsed.scheme == "http" and not RaceTigerClient._is_loopback_host(
+            parsed.hostname
+        ):
+            raise ValueError("RaceTiger base_url must use HTTPS outside this computer")
+        return value
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        if host.lower() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
 
     def post(
         self,
@@ -332,7 +395,7 @@ class RaceTigerClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with self._opener(request, timeout=self.timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise RaceTigerError(f"RaceTiger request failed: {type(error).__name__}") from error

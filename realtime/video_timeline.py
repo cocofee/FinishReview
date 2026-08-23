@@ -22,6 +22,35 @@ class VideoTimelineError(RuntimeError):
     """Raised when the recording timeline cannot be read or updated."""
 
 
+def _video_path_is_playable(video_path: Path) -> bool:
+    try:
+        if not video_path.is_file() or video_path.stat().st_size <= 0:
+            return False
+        if video_path.suffix.lower() != ".m3u8":
+            return True
+        lines = video_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    media_paths = [
+        line.strip()
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not media_paths:
+        return False
+    for value in media_paths:
+        segment_path = Path(value)
+        if not segment_path.is_absolute():
+            segment_path = video_path.parent / segment_path
+        try:
+            if not segment_path.is_file() or segment_path.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class RecordingSegment:
     segment_id: str
@@ -532,7 +561,10 @@ class VideoTimelineStore:
         if not segments:
             return PassageVideoLookup("race_mismatch", target_time_ms)
 
-        candidates: dict[str, tuple[tuple[int, int, int], RecordingSegment]] = {}
+        candidates: dict[
+            str,
+            tuple[tuple[int, int, int, int], RecordingSegment],
+        ] = {}
         for segment in segments:
             process_end = (
                 segment.ended_at_ms if segment.ended_at_ms is not None else now_ms
@@ -571,9 +603,13 @@ class VideoTimelineStore:
                 candidate_key = (2, 0, -segment.started_at_ms)
             if candidate_key is None:
                 continue
+            playable_rank = int(
+                not _video_path_is_playable(self.resolve_video_path(segment))
+            )
+            ranked_candidate_key = (playable_rank, *candidate_key)
             current = candidates.get(segment.source_id)
-            if current is None or candidate_key < current[0]:
-                candidates[segment.source_id] = (candidate_key, segment)
+            if current is None or ranked_candidate_key < current[0]:
+                candidates[segment.source_id] = (ranked_candidate_key, segment)
 
         locations = []
         selected_segments = [item[1] for item in candidates.values()]
@@ -581,7 +617,7 @@ class VideoTimelineStore:
             video_path = self.resolve_video_path(segment)
             if segment.ended_at_ms is None:
                 status = "recording"
-            elif not video_path.is_file() or video_path.stat().st_size <= 0:
+            elif not _video_path_is_playable(video_path):
                 status = "missing_file"
             elif (
                 segment.media_started_at_ms is None

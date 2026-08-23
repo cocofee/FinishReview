@@ -26,7 +26,8 @@ python -m venv .venv
 ```
 
 `constraints-dev.txt` 固定了已验证的 Windows 开发与打包依赖版本。CI 在 Python 3.10
-和 Python 3.12 上执行同一套安装、编译和测试命令，并在 Python 3.12 上构建发布包。
+和 Python 3.12 上执行同一套安装、编译和测试命令，并在 Python 3.12 上构建发布包及
+执行打包后 EXE 冒烟检查。
 
 系统需要可用的 FFmpeg。可以把 `ffmpeg.exe` 放在程序目录，加入 `PATH`，或设置：
 
@@ -42,6 +43,16 @@ $env:FINISH_REVIEW_FFMPEG = "C:\path\to\ffmpeg.exe"
 
 输出位于 `artifacts\dist\FinishReviewConsole`。打包脚本显式排除检测、OCR 和模型框架，
 并检查发布目录没有混入比赛数据、日志或本机配置。
+
+## Runtime security and diagnostics
+
+- 运行日志保存在 `%LOCALAPPDATA%\FinishReview\logs\finish_review.log`，自动轮转并保留
+  最多 5 个历史文件。
+- RaceTiger 令牌使用当前 Windows 用户的 DPAPI 加密后写入配置；旧版明文令牌会在
+  下次保存设置时迁移。
+- DPAPI 密文不能跨 Windows 用户或电脑直接复用；复制配置后需要重新输入令牌。
+- RaceTiger 远程地址必须使用 HTTPS，仅 `localhost` 和回环 IP 允许 HTTP。
+- 当前 CycleRace 兼容链路尚未启用身份认证，只能部署在受信任的赛事局域网中。
 
 ## Compatibility boundary
 

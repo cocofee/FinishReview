@@ -8,7 +8,18 @@ import time
 from typing import Callable, Iterable, Optional
 
 from PyQt5.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform
+from PyQt5.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPalette,
+    QPen,
+    QPixmap,
+    QTransform,
+)
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -29,6 +40,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStyledItemDelegate,
     QShortcut,
     QTableWidget,
     QTableWidgetItem,
@@ -104,6 +116,8 @@ _STATUS_PRIORITY = {
     "outside_media": 5,
 }
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+UI_FONT_FAMILY = "Microsoft YaHei UI"
+UI_BASE_FONT_POINT_SIZE = 10
 
 
 def format_passage_time(timestamp_ms: int) -> str:
@@ -218,6 +232,17 @@ def combined_review_status(
     high_speed: Optional[PassageVideoLocation],
 ) -> str:
     return "芯片记录"
+
+
+class _StatusColorDelegate(QStyledItemDelegate):
+    """Preserve status colors when a table row is selected."""
+
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        foreground = index.data(Qt.ForegroundRole)
+        if isinstance(foreground, QBrush):
+            option.palette.setBrush(QPalette.Text, foreground)
+            option.palette.setBrush(QPalette.HighlightedText, foreground)
 
 
 def review_status_text(
@@ -366,16 +391,19 @@ class EvidenceImageView(QGraphicsView):
             self.clear_identity_cue()
             return
         status = str(status).strip()
-        self._identity_badge.setText(f"{status}  {identity}" if status else identity)
-        border_color = "#1bbf83" if status == "已确认" else "#ffb020"
+        confirmed = status == "已确认"
+        background_color = "#1bbf83" if confirmed else "#ffb020"
+        text_color = "#07120e" if confirmed else "#231703"
+        border_color = "#4dd6a5" if confirmed else "#ffcc66"
+        self._identity_badge.setText(identity)
         self._identity_badge.setStyleSheet(
             "QLabel#evidenceIdentityBadge {"
-            " background: rgba(15, 23, 32, 225);"
-            " color: #ffffff;"
+            f" background: {background_color};"
+            f" color: {text_color};"
             f" border: 2px solid {border_color};"
             " border-radius: 3px;"
-            " padding: 7px 13px;"
-            " font-size: 24px;"
+            " padding: 8px 18px;"
+            " font-size: 34px;"
             " font-weight: 700;"
             "}"
         )
@@ -620,7 +648,7 @@ class EvidenceImageView(QGraphicsView):
         x = x_normalized * self._source_width
         y = y_normalized * self._source_height
         scale = max(0.001, abs(self.transform().m11()))
-        color = QColor("#ffb020" if simple else "#1bbf83" if confirmed else "#ffb020")
+        color = QColor("#1bbf83" if confirmed else "#ffb020")
         pen = QPen(color, 3)
         pen.setCosmetic(True)
         if not confirmed and not simple:
@@ -634,10 +662,10 @@ class EvidenceImageView(QGraphicsView):
             painter.drawLine(int(x - cross_extent), int(y), int(x + cross_extent), int(y))
             painter.drawLine(int(x), int(y - cross_extent), int(x), int(y + cross_extent))
 
-        tag_text = label if confirmed or simple else f"{label} 待确认"
+        tag_text = label
         margin = 8.0 / scale
-        tag_width = max(76.0, 20.0 + len(tag_text) * 22.0) / scale
-        tag_height = 40.0 / scale
+        tag_width = max(76.0, 28.0 + len(tag_text) * 26.0) / scale
+        tag_height = 52.0 / scale
         visible_left = max(0.0, rect.left())
         visible_top = max(0.0, rect.top())
         visible_right = min(float(self._source_width), rect.right())
@@ -659,7 +687,7 @@ class EvidenceImageView(QGraphicsView):
         painter.drawRoundedRect(tag_rect, 3.0 / scale, 3.0 / scale)
         painter.setPen(QColor("#07120e" if confirmed else "#231703"))
         font = QFont(self.font())
-        font.setPixelSize(max(1, int(round(22.0 / scale))))
+        font.setPixelSize(max(1, int(round(30.0 / scale))))
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(tag_rect, Qt.AlignCenter, tag_text)
@@ -708,6 +736,7 @@ class PassageEvidencePane(QFrame):
         self._location: Optional[PassageVideoLocation] = None
         self._association: Optional[PassageEvidenceAssociation] = None
         self._pending_marker: Optional[tuple[float, float, int, int]] = None
+        self._marking_enabled = False
         self._identity = ""
         self._worker: Optional[object] = None
         self._retired_workers: set[object] = set()
@@ -863,6 +892,7 @@ class PassageEvidencePane(QFrame):
     def begin_marking(self) -> None:
         if self._worker is None or not self.video_view.has_frame:
             return
+        self._marking_enabled = True
         self._playing = False
         self.play_btn.setText("▶")
         self._worker.pause()
@@ -872,10 +902,13 @@ class PassageEvidencePane(QFrame):
 
     def cancel_marker_edit(self) -> None:
         self._pending_marker = None
+        self._marking_enabled = self._association is None
         self.mark_btn.setText(
             f"重标 {self._identity}" if self._association is not None else f"标线 {self._identity}"
         )
-        self.video_view.set_marker_mode(self.video_view.has_frame)
+        self.video_view.set_marker_mode(
+            self.video_view.has_frame and self._marking_enabled
+        )
         self._render_marker()
 
     def set_association(
@@ -884,7 +917,10 @@ class PassageEvidencePane(QFrame):
     ) -> None:
         self._association = association
         self._pending_marker = None
-        self.video_view.set_marker_mode(self.video_view.has_frame)
+        self._marking_enabled = association is None
+        self.video_view.set_marker_mode(
+            self.video_view.has_frame and self._marking_enabled
+        )
         self.mark_btn.setText(
             f"重标 {self._identity}" if association is not None else f"标线 {self._identity}"
         )
@@ -970,7 +1006,7 @@ class PassageEvidencePane(QFrame):
         association = self._association
         if (
             association is not None
-            and self._current_frame_index == association.frame_index
+            and self._association_is_visible(association)
         ):
             self.video_view.set_marker(
                 association.marker_x_normalized,
@@ -998,6 +1034,19 @@ class PassageEvidencePane(QFrame):
                 return
         self.video_view.clear_marker()
 
+    def _association_is_visible(
+        self,
+        association: PassageEvidenceAssociation,
+    ) -> bool:
+        if self._current_frame_index < 0:
+            return False
+        if self._current_frame_index == association.frame_index:
+            return True
+        return (
+            abs(self._current_position_ms - association.position_ms)
+            <= self.frame_duration_ms()
+        )
+
     def set_passage(
         self,
         event: PassageEvent,
@@ -1020,6 +1069,7 @@ class PassageEvidencePane(QFrame):
             association = None
         self._association = association
         self._pending_marker = None
+        self._marking_enabled = association is None
         self._playing = False
         self._current_frame_index = -1
         self._current_position_ms = 0
@@ -1114,6 +1164,7 @@ class PassageEvidencePane(QFrame):
         self._location = None
         self._association = None
         self._pending_marker = None
+        self._marking_enabled = False
         self._identity = ""
         self._target_position_ms = 0
         self._playing = False
@@ -1178,7 +1229,7 @@ class PassageEvidencePane(QFrame):
             source_height=self._source_height,
         )
         self.mark_btn.setEnabled(True)
-        self.video_view.set_marker_mode(True)
+        self.video_view.set_marker_mode(self._marking_enabled)
         self._render_marker()
         if not self._timeline_dragging:
             self.timeline.setValue(max(0, min(int(position_ms), self._duration_ms)))
@@ -1472,20 +1523,26 @@ class PassageReviewDialog(QDialog):
 
     def _init_ui(self) -> None:
         self.setStyleSheet(
-            "QDialog { background: #e9eef3; color: #17212b; }"
+            f'QDialog {{ background: #e9eef3; color: #17212b; '
+            f'font-family: "{UI_FONT_FAMILY}"; '
+            f'font-size: {UI_BASE_FONT_POINT_SIZE}pt; }}'
             "QFrame#reviewPanel, QFrame#passageEvidencePane { background: #ffffff; "
             "border: 1px solid #cfd7df; border-radius: 4px; }"
-            "QLabel#panelTitle, QLabel#evidencePaneTitle { font-size: 14px; font-weight: 700; }"
-            "QLabel#evidencePaneStatus { color: #667085; font-size: 11px; }"
-            "QLabel#evidencePaneTime { font-family: Consolas; font-size: 13px; font-weight: 700; }"
-            "QPushButton { min-height: 30px; padding: 0 10px; border: 1px solid #aeb8c2; "
+            "QLabel#panelTitle, QLabel#evidencePaneTitle { font-size: 11pt; font-weight: 700; }"
+            "QLabel#evidencePaneStatus { color: #667085; font-size: 9pt; }"
+            "QLabel#evidencePaneTime { font-family: Consolas; font-size: 10pt; font-weight: 700; }"
+            "QPushButton { min-height: 30px; padding: 0 10px; font-size: 10pt; "
+            "border: 1px solid #aeb8c2; "
             "border-radius: 4px; background: #ffffff; }"
             "QPushButton:hover { background: #eef5fa; border-color: #5d91b5; }"
             "QPushButton:disabled { color: #9ba5ae; background: #f4f6f8; }"
-            "QTableWidget { background: #ffffff; gridline-color: #d8dee5; alternate-background-color: #f8fafb; }"
-            "QHeaderView::section { background: #eef2f5; color: #526170; padding: 6px; "
+            "QCheckBox, QComboBox, QLineEdit, QSpinBox { font-size: 10pt; }"
+            "QTableWidget { background: #ffffff; gridline-color: #d8dee5; "
+            "alternate-background-color: #f8fafb; font-size: 10pt; }"
+            "QHeaderView::section { background: #eef2f5; color: #526170; "
+            "font-size: 10pt; font-weight: 600; padding: 5px; "
             "border: none; border-right: 1px solid #d5dce3; border-bottom: 1px solid #c8d1da; }"
-            "QTableWidget::item:selected { background: #dcecf8; color: #17212b; }"
+            "QTableWidget::item:selected { background: #dcecf8; }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -1595,6 +1652,12 @@ class PassageReviewDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        for column in (6, 7, 8):
+            self.table.setItemDelegateForColumn(
+                column,
+                _StatusColorDelegate(self.table),
+            )
         self.table.verticalHeader().setVisible(False)
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.table.cellDoubleClicked.connect(self._open_preferred_source)
@@ -1617,11 +1680,11 @@ class PassageReviewDialog(QDialog):
         transport_layout.setSpacing(7)
         self.current_passage_label = QLabel("未选择通过记录")
         self.current_passage_label.setStyleSheet(
-            "font-size: 18px; font-weight: 700; color: #17212b;"
+            "font-size: 12pt; font-weight: 700; color: #17212b;"
         )
         self.current_time_label = QLabel("--:--:--.---")
         self.current_time_label.setStyleSheet(
-            "font-family: Consolas; font-size: 14px; font-weight: 700;"
+            "font-family: Consolas; font-size: 10pt; font-weight: 700;"
         )
         self.previous_passage_btn = QPushButton("上一条")
         self.previous_frame_btn = QPushButton("|◀")
@@ -1680,7 +1743,7 @@ class PassageReviewDialog(QDialog):
 
         footer = QHBoxLayout()
         self.summary_label = QLabel()
-        self.summary_label.setStyleSheet("color: #667085; font-size: 12px;")
+        self.summary_label.setStyleSheet("color: #667085; font-size: 9pt;")
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.close)
         footer.addWidget(self.summary_label)
@@ -1948,7 +2011,7 @@ class PassageReviewDialog(QDialog):
             if column == 0:
                 item.setData(Qt.UserRole, event.event_id)
             if column in {6, 7, 8}:
-                item.setForeground(self._status_color(value))
+                self._apply_status_style(item, value)
             self.table.setItem(row, column, item)
 
     def refresh(self) -> None:
@@ -2124,7 +2187,21 @@ class PassageReviewDialog(QDialog):
             return QColor("#16845b")
         if value == "可查看":
             return QColor("#276d9b")
+        if value == "无画面":
+            return QColor("#c0372b")
         return QColor("#526170")
+
+    @classmethod
+    def _apply_status_style(cls, item: QTableWidgetItem, value: str) -> None:
+        item.setForeground(cls._status_color(value))
+        font = item.font()
+        font.setBold(value == "无画面" or value in {
+            "已标记",
+            "录像标记",
+            "高速标记",
+            "双源标记",
+        })
+        item.setFont(font)
 
     def _on_table_selection_changed(self) -> None:
         row = self.table.currentRow()
@@ -2484,7 +2561,7 @@ class PassageReviewDialog(QDialog):
                 item = self.table.item(row, column)
                 if item is not None:
                     item.setText(value)
-                    item.setForeground(self._status_color(value))
+                    self._apply_status_style(item, value)
             break
         if event_id == self._selected_event_id:
             self.source_value.setText(status)
@@ -2832,6 +2909,8 @@ class PassageReviewDialog(QDialog):
 __all__ = [
     "PassageEvidencePane",
     "PassageReviewDialog",
+    "UI_BASE_FONT_POINT_SIZE",
+    "UI_FONT_FAMILY",
     "compact_source_status",
     "combined_review_status",
     "format_passage_time",

@@ -198,6 +198,7 @@ def test_review_uses_one_row_per_passage_and_opens_regular_video(
     assert dialog.table.rowCount() == 1
     assert dialog.table.item(0, 6).text() == "可查看"
     assert dialog.table.item(0, 7).text() == "无画面"
+    assert dialog.table.item(0, 7).foreground().color().name() == "#c0372b"
     assert dialog.table.item(0, 8).text() == "芯片记录"
     assert dialog.regular_pane.location.video_path == video_path.absolute()
     assert dialog.high_speed_pane.location is None
@@ -207,6 +208,23 @@ def test_review_uses_one_row_per_passage_and_opens_regular_video(
     assert opened[0][0].event_id == "passage-1"
     assert opened[0][1].passage_position_ms == 5_500
     assert opened[0][1].playback_position_ms == 2_500
+    dialog.close()
+
+
+def test_review_uses_consistent_laptop_typography(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event())
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+
+    style = dialog.styleSheet()
+    assert f'font-family: "{passage_review.UI_FONT_FAMILY}"' in style
+    assert f"font-size: {passage_review.UI_BASE_FONT_POINT_SIZE}pt" in style
+    assert dialog.table.verticalHeader().defaultSectionSize() == 34
+    assert "font-size: 12pt" in dialog.current_passage_label.styleSheet()
+    assert "font-size: 9pt" in dialog.summary_label.styleSheet()
     dialog.close()
 
 
@@ -941,7 +959,8 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
 
     regular_view = dialog.regular_pane.video_view
     assert regular_view._identity_badge.isVisible()
-    assert regular_view._identity_badge.text() == "待判读  15"
+    assert regular_view._identity_badge.text() == "15"
+    assert "background: #ffb020" in regular_view._identity_badge.styleSheet()
     assert regular_view._marker is None
     QTest.mouseClick(
         regular_view.viewport(),
@@ -949,7 +968,8 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
         pos=regular_view.viewport().rect().center(),
     )
     assert dialog.regular_pane.has_pending_marker
-    assert regular_view._identity_badge.text() == "待确认  15"
+    assert regular_view._identity_badge.text() == "15"
+    assert "background: #ffb020" in regular_view._identity_badge.styleSheet()
     pending_marker = regular_view._marker
     assert pending_marker is not None
     assert pending_marker[2:] == ("15", False)
@@ -963,7 +983,9 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     assert regular_association.position_ms == 10_050
     assert regular_association.marker_x_normalized == pytest.approx(pending_marker[0])
     assert regular_association.marker_y_normalized == pytest.approx(pending_marker[1])
-    assert regular_view._identity_badge.text() == "已确认  15"
+    assert regular_view._identity_badge.text() == "15"
+    assert "background: #1bbf83" in regular_view._identity_badge.styleSheet()
+    assert not regular_view._marker_mode
     assert dialog.table.item(0, 6).text() == "已标记"
     assert dialog.table.item(0, 8).text() == "录像标记"
 
@@ -1115,6 +1137,17 @@ def test_manual_marker_restores_and_upgrades_to_dual_source_confirmation(
     qapp.processEvents()
     assert dialog.regular_pane.video_view._marker == (0.25, 0.5, "15", True)
 
+    regular_worker.frame_ready.emit(frame, 10_069, 503)
+    qapp.processEvents()
+    assert dialog.regular_pane.video_view._marker == (0.25, 0.5, "15", True)
+
+    regular_worker.frame_ready.emit(frame, 10_091, 505)
+    qapp.processEvents()
+    assert dialog.regular_pane.video_view._marker is None
+
+    regular_worker.frame_ready.emit(frame, 10_050, 502)
+    qapp.processEvents()
+
     high_speed_view = dialog.high_speed_pane.video_view
     high_speed_view.set_actual_size()
     high_speed_view.zoom_by(1.2)
@@ -1135,6 +1168,8 @@ def test_manual_marker_restores_and_upgrades_to_dual_source_confirmation(
     assert high_speed_view.zoom_percent == zoom_before_confirmation
     assert dialog.table.item(0, 8).text() == "双源标记"
     assert dialog.source_value.text() == "双源标记"
+    assert dialog.table.item(0, 6).foreground().color().name() == "#16845b"
+    assert dialog.table.item(0, 7).foreground().color().name() == "#16845b"
     dialog.close()
 
 
@@ -1182,14 +1217,27 @@ def test_escape_cancels_pending_marker_and_delete_clears_confirmed_marker(
     qapp.processEvents()
 
     regular_view = dialog.regular_pane.video_view
+    assert not regular_view._marker_mode
     QTest.mouseClick(
         regular_view.viewport(),
         Qt.LeftButton,
         pos=regular_view.viewport().rect().center(),
     )
+    assert not dialog.regular_pane.has_pending_marker
+    assert dialog.regular_pane.video_view._marker == (0.4, 0.6, "15", True)
+
+    QTest.mouseClick(dialog.regular_pane.mark_btn, Qt.LeftButton)
+    assert regular_view._marker_mode
+    QTest.mouseClick(
+        regular_view.viewport(),
+        Qt.LeftButton,
+        pos=regular_view.viewport().rect().center(),
+    )
+    assert dialog.regular_pane.has_pending_marker
     QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Escape)
     assert not dialog.regular_pane.has_pending_marker
     assert dialog.regular_pane.video_view._marker == (0.4, 0.6, "15", True)
+    assert not regular_view._marker_mode
 
     monkeypatch.setattr(
         passage_review.QMessageBox,
@@ -1259,6 +1307,7 @@ def test_enter_stays_by_default_and_opt_in_auto_advance_moves_to_next_passage(
     worker.frame_ready.emit(frame, 5_000, 250)
     qapp.processEvents()
     dialog.auto_advance_checkbox.setChecked(True)
+    QTest.mouseClick(dialog.regular_pane.mark_btn, Qt.LeftButton)
     QTest.mouseClick(
         view.viewport(),
         Qt.LeftButton,

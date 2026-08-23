@@ -41,10 +41,16 @@ TICK_COUNTER_SIZE = 1 << 32
 CAPTURE_START_FLAG = 0x01000000
 CAPTURE_END_FLAG = 0x02000000
 SNAPSHOT_SUFFIX = re.compile(r"_\d{4}-\d{2}-\d{2} \d{6}\.RGB$", re.IGNORECASE)
+LIVE_HEADER_NAME = "BRSY_Head.RGB"
+LIVE_DATA_NAME = "BRSY_Photo.RGB"
 
 
 class AuyatRgbError(RuntimeError):
     """Raised when an AYT/Auyat RGB source is invalid or unavailable."""
+
+
+class AuyatRgbBusyError(AuyatRgbError):
+    """Raised while the vendor application still owns an RGB file."""
 
 
 class AuyatScanCancelled(RuntimeError):
@@ -61,6 +67,7 @@ class AuyatRgbCapture:
     end_tick: int
     height: int = DEFAULT_HEIGHT
     channel_order: str = "rgb"
+    data_offset: int = HEADER_SIZE
 
     def __post_init__(self) -> None:
         if self.start_record < 0 or self.end_record < self.start_record:
@@ -73,6 +80,8 @@ class AuyatRgbCapture:
             raise AuyatRgbError("unsupported RGB line height")
         if self.channel_order not in {"rgb", "bgr"}:
             raise AuyatRgbError("unsupported RGB channel order")
+        if self.data_offset < 0:
+            raise AuyatRgbError("invalid RGB data offset")
 
     @property
     def column_count(self) -> int:
@@ -111,6 +120,7 @@ class AuyatRgbCapture:
                 str(self.end_record),
                 str(self.start_tick),
                 str(self.end_tick),
+                str(self.data_offset),
             )
         )
         return "auyat-" + hashlib.sha1(identity.encode("utf-8")).hexdigest()
@@ -125,6 +135,7 @@ class AuyatRgbCapture:
                 self.start_tick,
                 self.end_tick,
                 self.height,
+                self.data_offset,
             )
         ) + f":{self.channel_order}"
 
@@ -176,12 +187,13 @@ class AuyatRgbCapture:
     @classmethod
     def from_location(cls, location: PassageVideoLocation) -> "AuyatRgbCapture":
         values = str(location.media_locator).split(":")
-        if len(values) != 6:
+        if len(values) not in {6, 7}:
             raise AuyatRgbError("invalid RGB media locator")
         try:
             start_record, end_record, start_tick, end_tick, height = (
                 int(value) for value in values[:5]
             )
+            data_offset = int(values[5]) if len(values) == 7 else HEADER_SIZE
         except ValueError as error:
             raise AuyatRgbError("invalid RGB media locator") from error
         capture_datetime = datetime.fromtimestamp(
@@ -196,7 +208,8 @@ class AuyatRgbCapture:
             start_tick=start_tick,
             end_tick=end_tick,
             height=height,
-            channel_order=values[5],
+            channel_order=values[-1],
+            data_offset=data_offset,
         )
 
 
@@ -255,7 +268,7 @@ class AuyatScanResult:
 
 @dataclass(frozen=True, slots=True)
 class _CachedRgbFile:
-    signature: tuple[int, int]
+    signature: tuple[int, int, int, int]
     capture_date: Optional[date]
     captures: Optional[tuple[AuyatRgbCapture, ...]]
     channel_order: str
@@ -640,9 +653,20 @@ class AuyatRgbCatalog:
             )
 
         try:
-            paths = tuple(
-                sorted(photo_dir.glob("*.RGB"), key=lambda item: item.name)
-            )
+            sources = {
+                path.absolute(): (path.absolute(), HEADER_SIZE)
+                for path in photo_dir.glob("*.RGB")
+                if path.name.casefold()
+                not in {LIVE_HEADER_NAME.casefold(), LIVE_DATA_NAME.casefold()}
+            }
+            live_roots = (root, photo_dir.parent)
+            for live_root in live_roots:
+                live_header = (live_root / LIVE_HEADER_NAME).absolute()
+                live_data = (live_root / LIVE_DATA_NAME).absolute()
+                if live_header.is_file() and live_data.is_file():
+                    sources[live_data] = (live_header, 0)
+                    break
+            paths = tuple(sorted(sources, key=lambda item: str(item).casefold()))
         except OSError as error:
             return self._publish(
                 generation,
@@ -671,8 +695,21 @@ class AuyatRgbCatalog:
             if not self._is_current_generation(generation):
                 return self.snapshot()
             try:
+                header_path, data_offset = sources[path]
                 stat = path.stat()
-                signature = (int(stat.st_size), int(stat.st_mtime_ns))
+                if data_offset:
+                    header_signature = (0, 0)
+                else:
+                    header_stat = header_path.stat()
+                    header_signature = (
+                        int(header_stat.st_size),
+                        int(header_stat.st_mtime_ns),
+                    )
+                signature = (
+                    int(stat.st_size),
+                    int(stat.st_mtime_ns),
+                    *header_signature,
+                )
                 with self._lock:
                     cached = self._file_cache.get(path)
                 matching_cache = bool(
@@ -688,7 +725,10 @@ class AuyatRgbCatalog:
                     capture_date = cached.capture_date
                 else:
                     try:
-                        capture_date, _height = read_rgb_header(path)
+                        capture_date, _height = read_rgb_header(header_path)
+                    except AuyatRgbBusyError:
+                        waiting_file_count += 1
+                        continue
                     except AuyatRgbError as error:
                         cached = _CachedRgbFile(
                             signature=signature,
@@ -734,6 +774,8 @@ class AuyatRgbCatalog:
                     )
                     parsed, scanned_records, open_capture = _scan_rgb_file(
                         path,
+                        header_path=header_path,
+                        data_offset=data_offset,
                         channel_order=channel_order,
                         cancel_requested=cancel_requested,
                         start_record=(cached.scanned_records if can_resume else 0),
@@ -752,10 +794,12 @@ class AuyatRgbCatalog:
                             open_capture=open_capture,
                         )
                     cache_changed = True
-                payload_bytes = max(0, signature[0] - HEADER_SIZE)
+                payload_bytes = max(0, signature[0] - data_offset)
                 if open_capture is not None or payload_bytes % RECORD_SIZE:
                     waiting_file_count += 1
                 captures.extend(parsed)
+            except AuyatRgbBusyError:
+                waiting_file_count += 1
             except (AuyatRgbError, OSError) as error:
                 errors.append(str(error))
 
@@ -789,13 +833,16 @@ class AuyatRgbCatalog:
         )
         status = "ready" if captures else "waiting"
         if waiting_file_count:
-            message = f"已连接，等待 {waiting_file_count} 个高速文件封口"
+            message = (
+                "目录可访问，等待高速摄像软件完成判读并释放 "
+                f"{waiting_file_count} 个文件"
+            )
             if errors:
                 message += f"；另跳过 {len(errors)} 个不可读文件"
         elif errors:
             message = f"已跳过 {len(errors)} 个不可读文件；{errors[0]}"
         else:
-            message = "" if captures else "等待原厂软件生成并封口高速图像"
+            message = "" if captures else "等待高速摄像软件完成判读并保存高速图像"
         if cache_changed:
             self._save_cache(generation)
         return self._publish(
@@ -877,7 +924,8 @@ class AuyatRgbCatalog:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
         except (OSError, TypeError, ValueError):
             return
-        if payload.get("schema_version") != 1:
+        schema_version = int(payload.get("schema_version", 0))
+        if schema_version not in {1, 2}:
             return
         if _path_identity(payload.get("root")) != _path_identity(root):
             return
@@ -888,7 +936,12 @@ class AuyatRgbCatalog:
         for item in entries:
             try:
                 path = Path(str(item["path"])).absolute()
-                signature = (int(item["size"]), int(item["mtime_ns"]))
+                signature = (
+                    int(item["size"]),
+                    int(item["mtime_ns"]),
+                    int(item.get("header_size", 0)),
+                    int(item.get("header_mtime_ns", 0)),
+                )
                 date_value = str(item.get("capture_date") or "")
                 capture_date = date.fromisoformat(date_value) if date_value else None
                 channel_order = str(item.get("channel_order") or "rgb")
@@ -930,13 +983,15 @@ class AuyatRgbCatalog:
         if cache_path is None or root is None:
             return
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "root": str(root),
             "files": [
                 {
                     "path": str(path),
                     "size": cached.signature[0],
                     "mtime_ns": cached.signature[1],
+                    "header_size": cached.signature[2],
+                    "header_mtime_ns": cached.signature[3],
                     "capture_date": (
                         cached.capture_date.isoformat()
                         if cached.capture_date is not None
@@ -1033,6 +1088,8 @@ def scan_rgb_file(
 def _scan_rgb_file(
     path: str | Path,
     *,
+    header_path: str | Path | None = None,
+    data_offset: int = HEADER_SIZE,
     channel_order: str = "rgb",
     cancel_requested: Callable[[], bool] | None = None,
     start_record: int = 0,
@@ -1044,20 +1101,30 @@ def _scan_rgb_file(
     Optional[tuple[int, int]],
 ]:
     file_path = Path(path).expanduser().absolute()
+    resolved_header_path = (
+        Path(header_path).expanduser().absolute()
+        if header_path is not None
+        else file_path
+    )
+    data_offset = max(0, int(data_offset))
     try:
+        with resolved_header_path.open("rb") as header_source:
+            header = header_source.read(HEADER_SIZE)
+        if len(header) != HEADER_SIZE:
+            raise AuyatRgbError(f"RGB文件头不完整: {resolved_header_path}")
+        capture_date, height = _parse_header(header, resolved_header_path)
         with file_path.open("rb") as source:
-            header = source.read(HEADER_SIZE)
-            if len(header) != HEADER_SIZE:
-                raise AuyatRgbError(f"RGB文件头不完整: {file_path}")
-            capture_date, height = _parse_header(header, file_path)
-            complete_records = max(0, (file_path.stat().st_size - HEADER_SIZE) // RECORD_SIZE)
+            complete_records = max(
+                0,
+                (file_path.stat().st_size - data_offset) // RECORD_SIZE,
+            )
             record_index = max(0, int(start_record))
             if record_index > complete_records:
                 record_index = 0
                 open_capture = None
                 existing_captures = ()
             captures = list(existing_captures)
-            source.seek(HEADER_SIZE + record_index * RECORD_SIZE)
+            source.seek(data_offset + record_index * RECORD_SIZE)
             records_per_chunk = 64
             while record_index < complete_records:
                 _raise_if_cancelled(cancel_requested)
@@ -1084,6 +1151,7 @@ def _scan_rgb_file(
                                 end_tick=tick,
                                 height=height,
                                 channel_order=channel_order,
+                                data_offset=data_offset,
                             )
                         )
                         open_capture = None
@@ -1091,7 +1159,9 @@ def _scan_rgb_file(
                 if complete_chunk_records < count:
                     break
     except PermissionError as error:
-        raise AuyatRgbError(f"高速图像仍被原厂软件占用: {file_path}") from error
+        raise AuyatRgbBusyError(
+            f"高速图像仍被原厂软件占用，请先完成判读: {file_path}"
+        ) from error
     except OSError as error:
         raise AuyatRgbError(f"无法读取高速图像: {file_path}") from error
     return tuple(captures), record_index, open_capture
@@ -1103,7 +1173,9 @@ def read_rgb_header(path: str | Path) -> tuple[date, int]:
         with file_path.open("rb") as source:
             header = source.read(HEADER_SIZE)
     except PermissionError as error:
-        raise AuyatRgbError(f"高速图像仍被原厂软件占用: {file_path}") from error
+        raise AuyatRgbBusyError(
+            f"高速图像仍被原厂软件占用，请先完成判读: {file_path}"
+        ) from error
     except OSError as error:
         raise AuyatRgbError(f"无法读取高速图像: {file_path}") from error
     if len(header) != HEADER_SIZE:
@@ -1113,15 +1185,15 @@ def read_rgb_header(path: str | Path) -> tuple[date, int]:
 
 def read_capture(capture: AuyatRgbCapture) -> AuyatRgbFrame:
     count = capture.column_count
-    start_offset = HEADER_SIZE + capture.start_record * RECORD_SIZE
+    start_offset = capture.data_offset + capture.start_record * RECORD_SIZE
     byte_count = count * RECORD_SIZE
     try:
         with capture.file_path.open("rb") as source:
             source.seek(start_offset)
             raw = source.read(byte_count)
     except PermissionError as error:
-        raise AuyatRgbError(
-            f"高速图像仍被原厂软件占用: {capture.file_path}"
+        raise AuyatRgbBusyError(
+            f"高速图像仍被原厂软件占用，请先完成判读: {capture.file_path}"
         ) from error
     except OSError as error:
         raise AuyatRgbError(f"无法读取高速图像: {capture.file_path}") from error
@@ -1209,6 +1281,7 @@ def _capture_to_cache(capture: AuyatRgbCapture) -> dict[str, object]:
         "start_tick": capture.start_tick,
         "end_tick": capture.end_tick,
         "height": capture.height,
+        "data_offset": capture.data_offset,
     }
 
 
@@ -1229,6 +1302,7 @@ def _capture_from_cache(
         end_tick=int(value["end_tick"]),
         height=int(value.get("height", DEFAULT_HEIGHT)),
         channel_order=channel_order,
+        data_offset=int(value.get("data_offset", HEADER_SIZE)),
     )
 
 

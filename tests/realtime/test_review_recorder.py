@@ -545,6 +545,17 @@ def test_ready_window_publishes_one_idempotent_playable_timeline(
     assert "#EXT-X-ENDLIST" in content
     assert "2026-08-21T20:00:00.000+08:00" in content
     assert "finish.ts" in content
+    coordinator = PassageReviewCoordinator(ring_buffer)
+    coordinator.register(
+        window.event_id,
+        passage_timestamp_ms=window.passage_timestamp_ms,
+    )
+    coordinator.discard(window.event_id)
+    assert ring_buffer.cleanup(current_time_ms=1_787_313_700_000) == ()
+    assert all(
+        any(pin_id.startswith("published:") for pin_id in ring_buffer.pinned_event_ids(name))
+        for name in ("before.ts", "finish.ts", "after.ts")
+    )
     located = timeline.locate_passage(
         1_787_313_601_000,
         race_id="race-1",

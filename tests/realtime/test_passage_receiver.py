@@ -1,5 +1,6 @@
 import json
 import socket
+from http.client import HTTPConnection
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -88,12 +89,20 @@ def focus_payload(**overrides):
     return payload
 
 
-def post_json(receiver, payload, path="/api/v1/passage-events"):
+def post_json(
+    receiver,
+    payload,
+    path="/api/v1/passage-events",
+    *,
+    headers=None,
+):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request_headers = {"Content-Type": "application/json"}
+    request_headers.update(headers or {})
     request = Request(
         f"http://127.0.0.1:{receiver.listen_port}{path}",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=request_headers,
         method="POST",
     )
     try:
@@ -147,7 +156,112 @@ def test_discovery_responder_reports_receiver_without_shared_path():
         "service": DISCOVERY_SERVICE,
         "host_name": "finish-laptop",
         "port": 18765,
+        "auth_required": False,
     }
+
+
+def test_discovery_responder_reports_required_authentication():
+    responder = PassageDiscoveryResponder(
+        18765,
+        discovery_port=0,
+        host_name="secure-finish-laptop",
+        auth_required=True,
+    )
+    responder.start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.settimeout(1.0)
+    try:
+        client.sendto(DISCOVERY_REQUEST, ("127.0.0.1", responder.listen_port))
+        raw, _sender = client.recvfrom(4096)
+    finally:
+        client.close()
+        responder.stop()
+
+    payload = json.loads(raw.decode("utf-8"))
+    assert payload["auth_required"] is True
+
+
+def test_optional_shared_token_rejects_unauthorized_requests(tmp_path):
+    accepted = []
+    store = PassageEventStore(tmp_path / "passage-events.jsonl")
+    receiver = PassageEventReceiver(
+        "127.0.0.1",
+        0,
+        store,
+        discovery_port=None,
+        shared_token="shared-secret",
+        on_accepted=accepted.append,
+    )
+    receiver.start()
+    try:
+        missing_status, missing_ack = post_json(receiver, passage_payload())
+        wrong_status, wrong_ack = post_json(
+            receiver,
+            passage_payload(),
+            headers={"Authorization": "Bearer wrong-secret"},
+        )
+    finally:
+        receiver.stop()
+
+    assert missing_status == 401
+    assert missing_ack["status"] == "rejected"
+    assert wrong_status == 401
+    assert wrong_ack["status"] == "rejected"
+    assert len(store) == 0
+    assert accepted == []
+
+
+def test_shared_token_is_checked_before_request_body_headers(tmp_path):
+    receiver = PassageEventReceiver(
+        "127.0.0.1",
+        0,
+        PassageEventStore(tmp_path / "passage-events.jsonl"),
+        discovery_port=None,
+        shared_token="shared-secret",
+    )
+    receiver.start()
+    connection = HTTPConnection("127.0.0.1", receiver.listen_port, timeout=2.0)
+    try:
+        connection.putrequest("POST", "/api/v1/passage-events")
+        connection.endheaders()
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        receiver.stop()
+
+    assert response.status == 401
+    assert response.getheader("WWW-Authenticate") == "Bearer"
+    assert body["status"] == "rejected"
+
+
+def test_optional_shared_token_accepts_matching_bearer_token(tmp_path):
+    accepted = []
+    store = PassageEventStore(tmp_path / "passage-events.jsonl")
+    receiver = PassageEventReceiver(
+        "127.0.0.1",
+        0,
+        store,
+        discovery_port=None,
+        shared_token="shared-secret",
+        on_accepted=accepted.append,
+    )
+    receiver.start()
+    try:
+        status, ack = post_json(
+            receiver,
+            passage_payload(),
+            headers={"Authorization": "Bearer shared-secret"},
+        )
+    finally:
+        receiver.stop()
+
+    assert status == 201
+    assert ack["status"] == "accepted"
+    assert len(store) == 1
+    assert [event.event_id for event in accepted] == [
+        "race-1-stage-1-passage-7"
+    ]
 
 
 def test_accepts_and_deduplicates_one_revision(running_receiver):

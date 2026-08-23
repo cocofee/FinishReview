@@ -125,6 +125,68 @@ def test_reports_before_after_and_restart_gap(tmp_path):
     assert lookup.locations[0].video_path.name == "second.mkv"
 
 
+def test_reports_hls_playlist_with_missing_media_segment_as_missing(tmp_path):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    playlist = tmp_path / "review_buffer" / "evidence.m3u8"
+    playlist.parent.mkdir(parents=True)
+    playlist.write_text(
+        "#EXTM3U\n#EXTINF:2.000,\nmissing.ts\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+    store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=playlist,
+        media_started_at_ms=10_000,
+        media_duration_ms=2_000,
+        clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="passage_review_window",
+    )
+
+    lookup = store.locate_passage(11_000)
+
+    assert lookup.locations[0].status == "missing_file"
+
+
+def test_prefers_playable_archive_over_broken_hls_for_same_source(tmp_path):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    archive = tmp_path / "videos" / "archive.mkv"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"video")
+    store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=archive,
+        media_started_at_ms=10_000,
+        media_duration_ms=20_000,
+        clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="archive_segment",
+    )
+    playlist = tmp_path / "review_buffer" / "evidence.m3u8"
+    playlist.parent.mkdir(parents=True)
+    playlist.write_text(
+        "#EXTM3U\n#EXTINF:2.000,\nmissing.ts\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+    store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=playlist,
+        media_started_at_ms=14_000,
+        media_duration_ms=4_000,
+        clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="passage_review_window",
+    )
+
+    lookup = store.locate_passage(15_000)
+
+    assert lookup.locations[0].status == "located"
+    assert lookup.locations[0].video_path == archive.absolute()
+
+
 def test_reports_verified_clip_within_timing_error_as_near_boundary(tmp_path):
     store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
     _segment(

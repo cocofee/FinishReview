@@ -8,7 +8,7 @@ import socket
 import shutil
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -115,18 +115,83 @@ except ImportError:
 logger = logging.getLogger("FinishReview")
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
+LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
 
 
-def _high_speed_target_dates(events: tuple[PassageEvent, ...]) -> frozenset[date]:
+def _high_speed_target_dates(
+    events: tuple[PassageEvent, ...],
+    timestamp_overrides: dict[str, tuple[int, int]] | None = None,
+) -> frozenset[date]:
+    overrides = timestamp_overrides or {}
     dates = {
         datetime.fromtimestamp(
-            event.timeline_timestamp_ms / 1000.0,
+            (
+                overrides.get(
+                    event.event_id,
+                    (event.timeline_timestamp_ms, event.timeline_timestamp_ms),
+                )[1]
+                / 1000.0
+            ),
             tz=BEIJING_TIMEZONE,
         ).date()
         for event in events
         if event.timeline_timestamp_ms >= 86_400_000
     }
     return frozenset(dates or {datetime.now(BEIJING_TIMEZONE).date()})
+
+
+def _align_live_evidence_timestamp(
+    timestamp_ms: int,
+    received_at_ms: int,
+    *,
+    tolerance_ms: int = LIVE_EVIDENCE_DATE_TOLERANCE_MS,
+) -> int:
+    formal_time = datetime.fromtimestamp(
+        int(timestamp_ms) / 1000.0,
+        tz=BEIJING_TIMEZONE,
+    )
+    received_time = datetime.fromtimestamp(
+        int(received_at_ms) / 1000.0,
+        tz=BEIJING_TIMEZONE,
+    )
+    if formal_time.date() == received_time.date():
+        return int(timestamp_ms)
+    candidates = (
+        datetime.combine(
+            received_time.date() + timedelta(days=offset),
+            formal_time.timetz(),
+        )
+        for offset in (-1, 0, 1)
+    )
+    candidate = min(
+        candidates,
+        key=lambda value: abs(value.timestamp() * 1000.0 - received_at_ms),
+    )
+    candidate_ms = int(candidate.timestamp() * 1000.0)
+    if abs(candidate_ms - int(received_at_ms)) <= max(0, int(tolerance_ms)):
+        return candidate_ms
+    return int(timestamp_ms)
+
+
+def _historical_evidence_timestamp_overrides(
+    events: tuple[PassageEvent, ...],
+) -> dict[str, tuple[int, int]]:
+    overrides = {}
+    for event in events:
+        timestamp_ms = int(event.timeline_timestamp_ms)
+        if (
+            not event.is_active
+            or event.emitted_at_ms <= 0
+            or (event.passage_timestamp_ms is None and timestamp_ms < 86_400_000)
+        ):
+            continue
+        aligned_timestamp_ms = _align_live_evidence_timestamp(
+            timestamp_ms,
+            event.emitted_at_ms,
+        )
+        if aligned_timestamp_ms != timestamp_ms:
+            overrides[event.event_id] = (timestamp_ms, aligned_timestamp_ms)
+    return overrides
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,17 +255,20 @@ class FinishReviewLaunchDialog(QDialog):
         self.setMinimumWidth(760)
         self.setModal(True)
         self.setStyleSheet(
-            "QDialog { background: #eef2f5; color: #17212b; }"
-            "QLineEdit { min-height: 32px; padding: 0 8px; background: #ffffff; "
+            'QDialog { background: #eef2f5; color: #17212b; '
+            'font-family: "Microsoft YaHei UI"; font-size: 10pt; }'
+            "QLineEdit, QComboBox, QDoubleSpinBox { min-height: 32px; "
+            "font-size: 10pt; padding: 0 8px; background: #ffffff; "
             "border: 1px solid #aeb8c2; border-radius: 4px; }"
-            "QPushButton { min-height: 32px; padding: 0 12px; background: #ffffff; "
+            "QPushButton { min-height: 32px; padding: 0 12px; font-size: 10pt; "
+            "background: #ffffff; "
             "border: 1px solid #aeb8c2; border-radius: 4px; }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(14)
         title = QLabel("终点设备与赛事设置", self)
-        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        title.setStyleSheet("font-size: 14pt; font-weight: 700;")
         layout.addWidget(title)
 
         form = QFormLayout()
@@ -320,10 +388,11 @@ class FinishReviewLaunchDialog(QDialog):
 
         cycle_status = QLabel(
             f"自动发现本机“{socket.gethostname()}”，"
-            "同机或局域网电脑都无需共享目录、无需填写IP",
+            "同机或局域网电脑都无需共享目录、无需填写IP。"
+            "当前兼容模式未启用认证，仅限受信任赛事局域网。",
             self,
         )
-        cycle_status.setStyleSheet("color: #247a52; font-weight: 600;")
+        cycle_status.setStyleSheet("color: #a56300; font-weight: 600;")
         cycle_status.setWordWrap(True)
         form.addRow("CycleRace", cycle_status)
         self.camera_status_label = QLabel(self)
@@ -543,10 +612,19 @@ class FinishReviewWindow(PassageReviewDialog):
             else RaceMetadataStore(self.output_dir / "cyclerace_race_metadata.json")
         )
         timeline_store = VideoTimelineStore(self.output_dir / "video_timeline.jsonl")
+        historical_events = passage_store.events()
+        self._evidence_timestamp_overrides = (
+            _historical_evidence_timestamp_overrides(historical_events)
+            if self.timing_provider == "cyclerace"
+            else {}
+        )
         self._high_speed_catalog = AuyatRgbCatalog(
             self.high_speed_dir,
             cache_path=self.output_dir / HIGH_SPEED_INDEX_FILENAME,
-            target_dates=_high_speed_target_dates(passage_store.events()),
+            target_dates=_high_speed_target_dates(
+                historical_events,
+                self._evidence_timestamp_overrides,
+            ),
         )
         self._high_speed_scan_result = self._high_speed_catalog.snapshot()
         super().__init__(
@@ -664,7 +742,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self._high_speed_scan_worker.request_scan()
 
     def _include_high_speed_event_date(self, event: PassageEvent) -> None:
-        timestamp_ms = self._passage_timestamp(event)
+        timestamp_ms = self._evidence_timestamp(event)
         if timestamp_ms is None:
             return
         event_date = datetime.fromtimestamp(
@@ -898,6 +976,12 @@ class FinishReviewWindow(PassageReviewDialog):
                 for session in load_archive_recording_sessions(self.output_dir)
             ]
             self._unsupported_event_ids.clear()
+            historical_events = self.passage_store.events()
+            self._evidence_timestamp_overrides = (
+                _historical_evidence_timestamp_overrides(historical_events)
+                if self.timing_provider == "cyclerace"
+                else {}
+            )
             self._historical_passage_count = len(self.passage_store)
             self._received_passage_count = 0
             self._capture_error = ""
@@ -919,7 +1003,10 @@ class FinishReviewWindow(PassageReviewDialog):
                 output_dir / HIGH_SPEED_INDEX_FILENAME
             )
             self._high_speed_catalog.set_target_dates(
-                _high_speed_target_dates(self.passage_store.events())
+                _high_speed_target_dates(
+                    historical_events,
+                    self._evidence_timestamp_overrides,
+                )
             )
         if high_speed_changed or data_source_changed:
             self.invalidate_external_locations()
@@ -937,7 +1024,7 @@ class FinishReviewWindow(PassageReviewDialog):
         if self._settings_saver is not None:
             try:
                 self._settings_saver(settings)
-            except OSError as exc:
+            except Exception as exc:  # noqa: BLE001 - report persistence failures.
                 QMessageBox.warning(self, "设置未保存", str(exc))
         self._runtime_error = ""
         self._update_runtime_status()
@@ -948,10 +1035,11 @@ class FinishReviewWindow(PassageReviewDialog):
         panel.setStyleSheet(
             "QFrame#finishConsoleHeader { background: #f7f9fb; "
             "border: 1px solid #cfd7df; border-radius: 4px; }"
-            "QLabel { color: #44515d; font-size: 12px; font-weight: 600; }"
+            "QLabel { color: #44515d; font-size: 9pt; font-weight: 600; }"
             "QLabel[statusChip='true'] { background: #ffffff; border: 1px solid #c7d0d9; "
             "border-radius: 4px; padding: 6px 9px; }"
-            "QPushButton { min-height: 32px; padding: 0 12px; font-weight: 600; }"
+            "QPushButton { min-height: 32px; padding: 0 12px; "
+            "font-size: 10pt; font-weight: 600; }"
         )
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(10, 8, 10, 8)
@@ -960,12 +1048,12 @@ class FinishReviewWindow(PassageReviewDialog):
         title_row = QHBoxLayout()
         title_row.setSpacing(10)
         title = QLabel("终点多源核对", panel)
-        title.setStyleSheet("font-size: 18px; font-weight: 700; color: #17212b;")
+        title.setStyleSheet("font-size: 13pt; font-weight: 700; color: #17212b;")
         self.race_dir_label = QLabel(panel)
         self.race_dir_label.setStyleSheet("color: #667085; font-weight: 500;")
         self.beijing_clock_label = QLabel(panel)
         self.beijing_clock_label.setStyleSheet(
-            "font-family: Consolas; color: #17212b; font-size: 13px;"
+            "font-family: Consolas; color: #17212b; font-size: 10pt;"
         )
         title_row.addWidget(title)
         title_row.addWidget(self.race_dir_label)
@@ -1017,14 +1105,15 @@ class FinishReviewWindow(PassageReviewDialog):
         panel.setStyleSheet(
             "QFrame#finishOperatorBar { background: #ffffff; border: 1px solid #cfd7df; "
             "border-radius: 4px; }"
-            "QPushButton { min-height: 32px; padding: 0 12px; font-weight: 600; }"
+            "QPushButton { min-height: 32px; padding: 0 12px; "
+            "font-size: 10pt; font-weight: 600; }"
         )
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(8)
         self.operator_identity_label = QLabel("当前运动员：未选择", panel)
         self.operator_identity_label.setStyleSheet(
-            "font-size: 14px; font-weight: 700; color: #17212b;"
+            "font-size: 11pt; font-weight: 700; color: #17212b;"
         )
         layout.addWidget(self.operator_identity_label)
         layout.addStretch()
@@ -1103,6 +1192,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 metadata_store=self.metadata_store,
                 on_metadata_accepted=self._signal_bridge.metadata_accepted.emit,
             )
+        parameters = inspect.signature(self._receiver_factory).parameters.values()
         supports_focus = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
@@ -1304,6 +1394,15 @@ class FinishReviewWindow(PassageReviewDialog):
             return None
         return timestamp_ms
 
+    def _evidence_timestamp(self, event: PassageEvent) -> int | None:
+        timestamp_ms = self._passage_timestamp(event)
+        if timestamp_ms is None:
+            return None
+        override = self._evidence_timestamp_overrides.get(event.event_id)
+        if override is not None and override[0] == timestamp_ms:
+            return override[1]
+        return timestamp_ms
+
     def _register_passage(self, event: PassageEvent, *, scan: bool = True) -> None:
         if not event.is_active:
             self._discard_registered_passage(event.event_id)
@@ -1311,7 +1410,7 @@ class FinishReviewWindow(PassageReviewDialog):
         coordinator = self._coordinator
         if coordinator is None:
             return
-        timestamp_ms = self._passage_timestamp(event)
+        timestamp_ms = self._evidence_timestamp(event)
         if timestamp_ms is None:
             self._unsupported_event_ids.add(event.event_id)
             self._capture_windows.pop(event.event_id, None)
@@ -1350,6 +1449,30 @@ class FinishReviewWindow(PassageReviewDialog):
         return True
 
     def _on_passage_received(self, event: PassageEvent) -> None:
+        formal_timestamp_ms = self._passage_timestamp(event)
+        if not event.is_active:
+            self._evidence_timestamp_overrides.pop(event.event_id, None)
+        elif self.timing_provider == "cyclerace" and formal_timestamp_ms is not None:
+            alignment_reference_ms = (
+                event.emitted_at_ms
+                if event.emitted_at_ms > 0
+                else int(time.time() * 1000.0)
+            )
+            aligned_timestamp_ms = _align_live_evidence_timestamp(
+                formal_timestamp_ms,
+                alignment_reference_ms,
+            )
+            existing_override = self._evidence_timestamp_overrides.get(event.event_id)
+            if aligned_timestamp_ms != formal_timestamp_ms:
+                self._evidence_timestamp_overrides[event.event_id] = (
+                    formal_timestamp_ms,
+                    aligned_timestamp_ms,
+                )
+            elif (
+                existing_override is not None
+                and existing_override[0] != formal_timestamp_ms
+            ):
+                self._evidence_timestamp_overrides.pop(event.event_id, None)
         self._received_passage_count += 1
         self._historical_passage_count = len(self.passage_store)
         self._last_passage_monotonic = time.monotonic()
@@ -1474,6 +1597,17 @@ class FinishReviewWindow(PassageReviewDialog):
                 event for event in filtered if event.race_id == self.racetiger_rid
             )
         return filtered
+
+    def _lookup(self, event: PassageEvent):
+        evidence_timestamp_ms = self._evidence_timestamp(event)
+        if (
+            evidence_timestamp_ms is None
+            or evidence_timestamp_ms == event.timeline_timestamp_ms
+        ):
+            return super()._lookup(event)
+        return super()._lookup(
+            replace(event, passage_timestamp_ms=evidence_timestamp_ms)
+        )
 
     def _refresh_capture_windows(self) -> None:
         coordinator = self._coordinator
@@ -1616,46 +1750,51 @@ class FinishReviewWindow(PassageReviewDialog):
             pending_count = len(self._pending_passages)
             if pending_count:
                 self.receiver_status_label.setText(
-                    "CycleRace: 正在补同步，"
-                    f"已接收 {self._received_passage_count}，待处理 {pending_count}"
+                    "CycleRace: 监听中，正在处理；"
+                    f"本次收到 {self._received_passage_count} 条，待处理 {pending_count}"
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
-                    "通过记录已先写入本地审计日志，正在合并刷新录像定位和判读列表"
+                    "通过记录已先写入本地审计日志，正在合并刷新录像定位和判读列表。"
+                    "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
                 )
             elif self._received_passage_count:
                 self.receiver_status_label.setText(
-                    f"CycleRace: 本次已接收 {self._received_passage_count}"
+                    f"CycleRace: 监听中，本次收到 {self._received_passage_count} 条"
                 )
                 self.receiver_status_label.setStyleSheet("color: #247a52;")
                 self.receiver_status_label.setToolTip(
-                    "已收到CycleRace通过记录；当前协议没有持续心跳，不虚报长期在线"
+                    "本次运行已收到CycleRace通过记录。"
+                    "当前协议没有持续心跳，不能判断发送端持续在线。"
                 )
             elif metadata is not None:
                 race_label = metadata.race_name.strip() or metadata.race_id
                 stage_label = metadata.stage_name.strip() or metadata.stage_id
                 self.receiver_status_label.setText(
-                    f"CycleRace: 已同步 {race_label} / {stage_label}，等待通过"
+                    f"CycleRace: 监听中，已加载赛事 {race_label} / {stage_label}"
                 )
-                self.receiver_status_label.setStyleSheet("color: #247a52;")
+                self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
                     f"已读取 {len(metadata.groups)} 个组别、"
-                    f"{len(metadata.athletes)} 名运动员；等待真实通过时间"
+                    f"{len(metadata.athletes)} 名运动员；这些资料可能来自本地缓存。"
+                    "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
                 )
             elif self._historical_passage_count:
                 self.receiver_status_label.setText(
-                    "CycleRace: 等待本次数据，"
+                    "CycleRace: 监听中，"
                     f"已加载历史 {self._historical_passage_count} 条"
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
-                    "历史记录已加载，但本次运行还没有收到CycleRace新数据"
+                    "历史记录已加载，但本次运行还没有收到CycleRace新数据。"
+                    "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
                 )
             else:
-                self.receiver_status_label.setText("CycleRace: 等待数据")
+                self.receiver_status_label.setText("CycleRace: 监听中，等待数据")
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
-                    "接收服务已启动，收到首条通过记录后确认数据链路"
+                    "本机接收服务已启动，等待CycleRace主动发送数据。"
+                    "当前协议没有持续心跳，不能判断发送端是否在线。"
                 )
         else:
             self.receiver_status_label.setText(
@@ -1713,12 +1852,6 @@ class FinishReviewWindow(PassageReviewDialog):
 
         high_speed_result = self._high_speed_scan_result
         high_speed_root = self._high_speed_catalog.root
-        selected_lookup = self._lookups.get(self._selected_event_id)
-        selected_high_speed = (
-            source_location(selected_lookup, high_speed=True)
-            if selected_lookup is not None
-            else None
-        )
         high_speed_remote = is_network_share(high_speed_root)
         if high_speed_root is None:
             self.high_speed_status_label.setText("高速摄像: 未配置共享目录")
@@ -1737,30 +1870,24 @@ class FinishReviewWindow(PassageReviewDialog):
                 else "高速摄像: 本机测试目录不可用"
             )
             self.high_speed_status_label.setStyleSheet("color: #b54747;")
-        elif self._selected_event_id and selected_high_speed is not None:
-            self.high_speed_status_label.setText("高速摄像: 当前有画面")
-            self.high_speed_status_label.setStyleSheet("color: #247a52;")
         elif high_speed_result.waiting_file_count:
             self.high_speed_status_label.setText(
-                "高速摄像: 共享目录已连接，等待封口"
+                "高速摄像: 共享目录可访问，等待原厂软件完成判读"
                 if high_speed_remote
-                else "高速摄像: 本机测试目录已连接，等待封口"
+                else "高速摄像: 本机测试目录可读，等待原厂软件完成判读"
             )
             self.high_speed_status_label.setStyleSheet("color: #a56300;")
         elif high_speed_result.status == "waiting":
             self.high_speed_status_label.setText(
-                "高速摄像: 共享目录已连接，等待高速画面"
+                "高速摄像: 共享目录可访问，等待高速画面"
                 if high_speed_remote
-                else "高速摄像: 本机测试目录已连接，等待高速画面"
+                else "高速摄像: 本机测试目录可读，等待测试数据"
             )
             self.high_speed_status_label.setStyleSheet("color: #a56300;")
-        elif self._selected_event_id:
-            self.high_speed_status_label.setText("高速摄像: 当前无画面")
-            self.high_speed_status_label.setStyleSheet("color: #667085;")
         else:
             self.high_speed_status_label.setText(
-                f"高速摄像: {'共享目录' if high_speed_remote else '本机测试目录'}"
-                f"已连接，{len(high_speed_result.captures)} 段"
+                f"高速摄像: {'共享目录可访问' if high_speed_remote else '本机测试数据可读'}，"
+                f"{len(high_speed_result.captures)} 段"
             )
             self.high_speed_status_label.setStyleSheet("color: #247a52;")
         self.high_speed_status_label.setToolTip(
@@ -1788,6 +1915,7 @@ class FinishReviewWindow(PassageReviewDialog):
         counts = {state: 0 for state in PassageReviewState}
         for window in self._capture_windows.values():
             counts[window.state] += 1
+        aligned_event_count = len(self._evidence_timestamp_overrides)
         if self._capture_error:
             self.capture_status_label.setText(f"证据处理异常：{self._capture_error}")
             self.capture_status_label.setToolTip(self._capture_error)
@@ -1795,14 +1923,24 @@ class FinishReviewWindow(PassageReviewDialog):
                 "color: #b54747; font-weight: 700;"
             )
         else:
+            alignment_text = (
+                f"  |  证据日期已对齐 {aligned_event_count} 条"
+                if aligned_event_count
+                else ""
+            )
             self.capture_status_label.setText(
                 f"本次待封口 {counts[PassageReviewState.WAITING]}  |  "
                 f"本次可核对 {counts[PassageReviewState.READY]}  |  "
                 f"本次缺口 {counts[PassageReviewState.PARTIAL]}  |  "
                 f"已有证据 {self._available_evidence_count}  |  "
                 f"缺少绝对时间 {len(self._unsupported_event_ids)}"
+                f"{alignment_text}"
             )
-            self.capture_status_label.setToolTip("")
+            self.capture_status_label.setToolTip(
+                "仅将证据检索日期对齐到实时接收日期；CycleRace正式通过时间未改变。"
+                if aligned_event_count
+                else ""
+            )
             self.capture_status_label.setStyleSheet(
                 "color: #667085; font-weight: 500;"
             )

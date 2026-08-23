@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import multiprocessing
 import os
 import sys
+import tempfile
+import threading
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Callable
 
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from realtime.auyat_rgb import discover_auyat_root
+from realtime.passage_review import UI_BASE_FONT_POINT_SIZE, UI_FONT_FAMILY
 from realtime.passage_receiver import DEFAULT_HOST, DEFAULT_PORT
 from realtime.review_recorder import (
     is_supported_review_source,
@@ -26,7 +34,12 @@ from realtime.runtime_paths import (
     resolve_output_dir,
     resolve_runtime_path,
 )
+from realtime.secure_storage import protect_secret, unprotect_secret
 from realtime.stream_recorder import sanitize_recording_message
+
+
+logger = logging.getLogger("FinishReview.Entry")
+_MANAGED_LOG_HANDLER = "_finish_review_managed_handler"
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -55,6 +68,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="启动后自动开始录像，日常操作默认使用界面按钮",
     )
+    parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -98,6 +112,117 @@ def default_config_path() -> Path:
     return root / "FinishReview" / "config.json"
 
 
+def default_log_path() -> Path:
+    return default_config_path().parent / "logs" / "finish_review.log"
+
+
+def configure_runtime_logging(log_path: Path | None = None) -> Path:
+    """Configure a bounded UTF-8 log shared by all FinishReview components."""
+
+    resolved_path = Path(log_path or default_log_path()).expanduser().resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    application_logger = logging.getLogger("FinishReview")
+    for handler in tuple(application_logger.handlers):
+        if getattr(handler, _MANAGED_LOG_HANDLER, False):
+            application_logger.removeHandler(handler)
+            handler.close()
+    handler = RotatingFileHandler(
+        resolved_path,
+        maxBytes=2 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    setattr(handler, _MANAGED_LOG_HANDLER, True)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(threadName)s: %(message)s"
+        )
+    )
+    application_logger.addHandler(handler)
+    application_logger.setLevel(logging.INFO)
+    application_logger.propagate = False
+    return resolved_path
+
+
+def install_exception_logging() -> None:
+    """Record otherwise-unhandled main-thread and worker-thread exceptions."""
+
+    if not getattr(sys.excepthook, _MANAGED_LOG_HANDLER, False):
+        previous_sys_hook = sys.excepthook
+
+        def log_unhandled_exception(exc_type, exc_value, traceback) -> None:
+            if issubclass(exc_type, KeyboardInterrupt):
+                previous_sys_hook(exc_type, exc_value, traceback)
+                return
+            logger.critical(
+                "Unhandled application exception",
+                exc_info=(exc_type, exc_value, traceback),
+            )
+
+        setattr(log_unhandled_exception, _MANAGED_LOG_HANDLER, True)
+        sys.excepthook = log_unhandled_exception
+
+    if not getattr(threading.excepthook, _MANAGED_LOG_HANDLER, False):
+        previous_thread_hook = threading.excepthook
+
+        def log_unhandled_thread_exception(args: threading.ExceptHookArgs) -> None:
+            if args.exc_type is SystemExit:
+                previous_thread_hook(args)
+                return
+            logger.critical(
+                "Unhandled exception in thread %s",
+                args.thread.name if args.thread is not None else "unknown",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+
+        setattr(log_unhandled_thread_exception, _MANAGED_LOG_HANDLER, True)
+        threading.excepthook = log_unhandled_thread_exception
+
+
+def _load_secret(
+    payload: dict,
+    protected_key: str,
+    legacy_key: str,
+    secret_unprotector: Callable[[str], str],
+) -> str:
+    protected_value = str(payload.get(protected_key) or "")
+    if protected_value:
+        try:
+            return secret_unprotector(protected_value)
+        except Exception:  # noqa: BLE001 - an unreadable secret must not hide other settings.
+            logger.warning("Could not decrypt saved setting %s", protected_key)
+            return ""
+    return str(payload.get(legacy_key) or "")
+
+
+def _existing_config_payload(config_path: Path) -> dict:
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _protected_secret_for_save(
+    existing_payload: dict,
+    protected_key: str,
+    secret: str,
+    secret_protector: Callable[[str], str],
+    secret_unprotector: Callable[[str], str],
+) -> str:
+    if secret:
+        return secret_protector(secret)
+    existing_value = str(existing_payload.get(protected_key) or "")
+    if not existing_value:
+        return ""
+    try:
+        secret_unprotector(existing_value)
+    except Exception:  # noqa: BLE001 - preserve unreadable ciphertext verbatim.
+        logger.warning("Preserving unreadable saved setting %s", protected_key)
+        return existing_value
+    return ""
+
+
 def load_review_settings(
     config_path: Path,
     *,
@@ -106,6 +231,7 @@ def load_review_settings(
     passage_port: int,
     camera_index: int | None,
     high_speed_dir: Path | None = None,
+    secret_unprotector: Callable[[str], str] = unprotect_secret,
 ) -> FinishReviewSettings:
     source = ""
     saved_output_dir = None
@@ -137,7 +263,12 @@ def load_review_settings(
         racetiger_base_url = str(payload.get("racetiger_base_url") or "").strip()
         racetiger_pc = str(payload.get("racetiger_pc") or "").strip()
         racetiger_rid = str(payload.get("racetiger_rid") or "").strip()
-        racetiger_token = str(payload.get("racetiger_token") or "")
+        racetiger_token = _load_secret(
+            payload,
+            "racetiger_token_protected",
+            "racetiger_token",
+            secret_unprotector,
+        )
         try:
             racetiger_poll_interval_seconds = max(
                 0.5,
@@ -167,10 +298,17 @@ def load_review_settings(
     )
 
 
-def save_review_settings(config_path: Path, settings: FinishReviewSettings) -> None:
+def save_review_settings(
+    config_path: Path,
+    settings: FinishReviewSettings,
+    *,
+    secret_protector: Callable[[str], str] = protect_secret,
+    secret_unprotector: Callable[[str], str] = unprotect_secret,
+) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_payload = _existing_config_payload(config_path)
     payload = {
-        "schema_version": 5,
+        "schema_version": 6,
         "source": settings.source,
         "output_dir": str(settings.output_dir),
         "camera_index": settings.camera_index,
@@ -181,7 +319,13 @@ def save_review_settings(config_path: Path, settings: FinishReviewSettings) -> N
         "racetiger_base_url": settings.racetiger_base_url,
         "racetiger_pc": settings.racetiger_pc,
         "racetiger_rid": settings.racetiger_rid,
-        "racetiger_token": settings.racetiger_token,
+        "racetiger_token_protected": _protected_secret_for_save(
+            existing_payload,
+            "racetiger_token_protected",
+            settings.racetiger_token,
+            secret_protector,
+            secret_unprotector,
+        ),
         "racetiger_poll_interval_seconds": settings.racetiger_poll_interval_seconds,
     }
     temporary_path = config_path.with_suffix(config_path.suffix + ".tmp")
@@ -197,10 +341,51 @@ def save_review_settings(config_path: Path, settings: FinishReviewSettings) -> N
     os.replace(temporary_path, config_path)
 
 
+def configure_application_font(app: QApplication) -> None:
+    application_font = QFont(UI_FONT_FAMILY)
+    application_font.setPointSize(UI_BASE_FONT_POINT_SIZE)
+    app.setFont(application_font)
+
+
+def run_packaged_smoke_test(app_argv: list[str]) -> int:
+    """Create the packaged Qt window without starting external services."""
+
+    app = QApplication.instance() or QApplication(app_argv)
+    configure_application_font(app)
+    with tempfile.TemporaryDirectory(prefix="FinishReview-smoke-") as temp_dir:
+        window = FinishReviewWindow(
+            "",
+            Path(temp_dir),
+            passage_host="127.0.0.1",
+            passage_port=0,
+            high_speed_dir=None,
+        )
+        window.setAttribute(Qt.WA_DontShowOnScreen, True)
+        window.show()
+        app.processEvents()
+        if not window.isVisible() or int(window.winId()) == 0:
+            raise RuntimeError("packaged FinishReview window did not initialize")
+        window.close()
+        app.processEvents()
+    logger.info("Packaged Qt window smoke test passed")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     multiprocessing.freeze_support()
+    logging_error = ""
+    try:
+        log_path = configure_runtime_logging()
+    except Exception as exc:  # noqa: BLE001 - GUI startup must remain diagnosable.
+        logging_error = sanitize_recording_message(exc)
+        log_path = None
+    install_exception_logging()
+    logger.info("FinishReview starting%s", f"; log={log_path}" if log_path else "")
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    app_argv = [sys.argv[0]] if argv is not None else sys.argv
+    if getattr(args, "smoke_test", False):
+        return run_packaged_smoke_test(app_argv)
     source_override = requested_source(args, parser)
     runtime_root = application_dir(module_file=__file__)
     requested_output_dir = (
@@ -243,12 +428,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             save_review_settings(config_path, settings)
-        except OSError as exc:
-            parser.error(f"无法保存录像设备配置: {exc}")
+        except Exception as exc:  # noqa: BLE001 - installer must report DPAPI failures.
+            parser.error(
+                f"无法保存录像设备配置: {sanitize_recording_message(exc)}"
+            )
         return 0
 
-    app_argv = [sys.argv[0]] if argv is not None else sys.argv
     app = QApplication.instance() or QApplication(app_argv)
+    configure_application_font(app)
     settings = FinishReviewSettings(
         source=source_override or saved_settings.source,
         output_dir=saved_settings.output_dir,
@@ -284,6 +471,14 @@ def main(argv: list[str] | None = None) -> int:
         ffmpeg_path=Path(ffmpeg_path) if ffmpeg_path else None,
         settings_saver=lambda updated: save_review_settings(config_path, updated),
     )
+    window.showMaximized()
+    app.processEvents()
+    if logging_error:
+        QMessageBox.warning(
+            window,
+            "日志不可用",
+            f"无法创建运行日志：{logging_error}",
+        )
     try:
         window.start_receiver()
     except Exception as exc:  # noqa: BLE001 - the console remains usable for setup.
@@ -305,8 +500,9 @@ def main(argv: list[str] | None = None) -> int:
                 "自动录像启动失败",
                 sanitize_recording_message(exc),
             )
-    window.showMaximized()
-    return app.exec_()
+    result = app.exec_()
+    logger.info("FinishReview stopped with exit code %s", result)
+    return result
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
@@ -26,7 +26,7 @@ from realtime.review_window import (
     FinishReviewSettings,
     FinishReviewWindow,
 )
-from realtime.video_timeline import VideoTimelineStore
+from realtime.video_timeline import DEFAULT_CLOCK_SOURCE, VideoTimelineStore
 
 
 @pytest.fixture(scope="module")
@@ -256,7 +256,10 @@ def _window(tmp_path, *, passage_batch_interval_ms=0):
     )
 
 
-def test_runtime_status_reports_loaded_race_metadata(qapp, tmp_path):
+def test_runtime_status_reports_loaded_race_metadata_without_claiming_sync(
+    qapp,
+    tmp_path,
+):
     window = _window(tmp_path)
     window.start_receiver()
     window.metadata_store.store(
@@ -274,9 +277,10 @@ def test_runtime_status_reports_loaded_race_metadata(qapp, tmp_path):
     window._update_runtime_status()
 
     assert window.receiver_status_label.text() == (
-        "CycleRace: 已同步 11 / 1，等待通过"
+        "CycleRace: 监听中，已加载赛事 11 / 1"
     )
     assert "已读取 1 个组别" in window.receiver_status_label.toolTip()
+    assert "不能判断发送端持续在线" in window.receiver_status_label.toolTip()
     window.close()
 
 
@@ -369,14 +373,38 @@ def test_runtime_status_keeps_waiting_for_seal_visible_with_older_captures(
         status="ready",
         captures=(),
         changed=False,
-        message="已连接，等待 1 个高速文件封口",
+        message="目录可访问，等待高速摄像软件完成判读并释放 1 个文件",
         waiting_file_count=1,
     )
 
     window._update_runtime_status()
 
     assert window.high_speed_status_label.text() == (
-        "高速摄像: 本机测试目录已连接，等待封口"
+        "高速摄像: 本机测试目录可读，等待原厂软件完成判读"
+    )
+    window.close()
+
+
+def test_runtime_status_keeps_high_speed_directory_health_when_event_selected(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    high_speed_root = tmp_path / "vendor"
+    window.high_speed_dir = high_speed_root
+    window._high_speed_catalog.set_root(high_speed_root)
+    window._high_speed_scan_result = AuyatScanResult(
+        status="ready",
+        captures=(object(),),
+        changed=False,
+        message="",
+    )
+    window._selected_event_id = "event-without-high-speed-match"
+
+    window._update_runtime_status()
+
+    assert window.high_speed_status_label.text() == (
+        "高速摄像: 本机测试数据可读，1 段"
     )
     window.close()
 
@@ -477,7 +505,7 @@ def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
         }
     ]
     assert archive_calls == 1
-    assert "本次已接收 3" in window.receiver_status_label.text()
+    assert "本次收到 3 条" in window.receiver_status_label.text()
     window.close()
 
 
@@ -632,6 +660,7 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
     assert "本机目录仅用于单机测试" in visible_text
     assert "比赛数据" not in visible_text
     assert "无需共享目录、无需填写IP" in visible_text
+    assert "未启用认证，仅限受信任赛事局域网" in visible_text
     for forbidden in ("RTSP", "0.0.0.0", "18765", "端口", "机位"):
         assert forbidden not in visible_text
     dialog.close()
@@ -722,7 +751,7 @@ def test_runtime_status_hides_receiver_port(qapp, tmp_path):
 
     window.start()
 
-    assert window.receiver_status_label.text() == "CycleRace: 等待数据"
+    assert window.receiver_status_label.text() == "CycleRace: 监听中，等待数据"
     assert "18765" not in window.receiver_status_label.text()
     window.close()
 
@@ -736,7 +765,7 @@ def test_historical_passages_do_not_report_current_session_reception(qapp, tmp_p
     qapp.processEvents()
 
     assert window.receiver_status_label.text() == (
-        "CycleRace: 等待本次数据，已加载历史 1 条"
+        "CycleRace: 监听中，已加载历史 1 条"
     )
     assert "#a56300" in window.receiver_status_label.styleSheet()
     window.close()
@@ -756,6 +785,124 @@ def test_capture_error_remains_visible_while_recording(qapp, tmp_path):
     assert window.capture_status_label.toolTip() == "timeline publish failed"
     assert "#b54747" in window.capture_status_label.styleSheet()
     window.close()
+
+
+def test_runtime_status_does_not_block_on_stage_and_recording_date_mismatch(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    current_date = datetime.now(review_window_module.BEIJING_TIMEZONE).date()
+    stage_date = current_date - timedelta(days=1)
+    window.metadata_store.store(
+        RaceMetadata(
+            race_id="race-11",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            stage_date=stage_date.isoformat(),
+        )
+    )
+    window._received_passage_count = 1
+
+    window._update_runtime_status()
+
+    assert window.capture_status_label.text().startswith("本次待封口 0")
+    assert "赛事日期" not in window.capture_status_label.text()
+    assert "#667085" in window.capture_status_label.styleSheet()
+    window.close()
+
+
+def test_live_evidence_date_aligns_without_changing_formal_passage_time(
+    qapp,
+    tmp_path,
+):
+    received_time = datetime(2026, 8, 23, 8, 41, 22, tzinfo=timezone(timedelta(hours=8)))
+    formal_time = datetime(2026, 8, 14, 8, 41, 20, tzinfo=timezone(timedelta(hours=8)))
+    received_at_ms = int(received_time.timestamp() * 1000)
+    formal_timestamp_ms = int(formal_time.timestamp() * 1000)
+    event = _event(
+        event_id="date-alignment-event",
+        passage_timestamp_ms=formal_timestamp_ms,
+        emitted_at_ms=received_at_ms,
+    )
+    window = _window(tmp_path)
+
+    window._on_passage_received(event)
+    window._passage_batch_timer.stop()
+
+    assert event.timeline_timestamp_ms == formal_timestamp_ms
+    assert window._evidence_timestamp(event) == int(
+        datetime(2026, 8, 23, 8, 41, 20, tzinfo=timezone(timedelta(hours=8))).timestamp()
+        * 1000
+    )
+    assert date(2026, 8, 23) in window._high_speed_catalog.target_dates
+    assert "证据日期已对齐 1 条" in window.capture_status_label.text()
+    assert "正式通过时间未改变" in window.capture_status_label.toolTip()
+    window.close()
+
+
+def test_evidence_date_alignment_survives_reopening(qapp, tmp_path):
+    formal_time = datetime(
+        2026,
+        8,
+        14,
+        9,
+        55,
+        22,
+        606_000,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+    evidence_time = datetime(
+        2026,
+        8,
+        23,
+        9,
+        55,
+        22,
+        606_000,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+    event = _event(
+        event_id="restart-date-alignment-event",
+        passage_timestamp_ms=int(formal_time.timestamp() * 1000),
+        emitted_at_ms=int(evidence_time.timestamp() * 1000) + 1_000,
+    )
+    PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl").append(event)
+    video_path = tmp_path / "videos" / "camera_01.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    timeline_store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=video_path,
+        media_started_at_ms=int(evidence_time.timestamp() * 1000) - 1_000,
+        media_duration_ms=4_000,
+        clock_source=DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="archive_segment",
+        race_id=event.race_id,
+    )
+
+    window = _window(tmp_path)
+    qapp.processEvents()
+
+    assert window._evidence_timestamp(event) == int(evidence_time.timestamp() * 1000)
+    assert date(2026, 8, 23) in window._high_speed_catalog.target_dates
+    assert window.table.item(0, 6).text() == "可查看"
+    assert "证据日期已对齐 1 条" in window.capture_status_label.text()
+    window.close()
+
+
+def test_live_evidence_date_does_not_align_stale_bulk_data():
+    received_time = datetime(2026, 8, 23, 9, 30, tzinfo=timezone(timedelta(hours=8)))
+    formal_time = datetime(2026, 8, 14, 8, 41, 20, tzinfo=timezone(timedelta(hours=8)))
+
+    assert review_window_module._align_live_evidence_timestamp(
+        int(formal_time.timestamp() * 1000),
+        int(received_time.timestamp() * 1000),
+    ) == int(formal_time.timestamp() * 1000)
 
 
 def test_existing_timeline_evidence_is_counted_after_reopening(qapp, tmp_path):
@@ -818,7 +965,7 @@ def test_recheck_retries_a_failed_cyclerace_receiver(qapp, tmp_path):
 
     assert window.receiver is not None
     assert window.receiver.is_running
-    assert window.receiver_status_label.text() == "CycleRace: 等待数据"
+    assert window.receiver_status_label.text() == "CycleRace: 监听中，等待数据"
     window.close()
 
 
@@ -839,7 +986,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.record_button.text() == "开始录像"
     assert window.settings_button.text() == "设备设置"
     assert not hasattr(window, "import_high_speed_button")
-    assert window.receiver_status_label.text() == "CycleRace: 等待数据"
+    assert window.receiver_status_label.text() == "CycleRace: 监听中，等待数据"
     assert window.capture_status_label.y() > window.camera_status_label.y()
     assert window.capture_status_label.width() >= window.capture_status_label.sizeHint().width()
 

@@ -1139,6 +1139,10 @@ class PassageReviewTimelinePublisher:
         return f"evidence_{digest}_{window.passage_timestamp_ms}.m3u8"
 
     @staticmethod
+    def _published_pin_id(window: PassageReviewWindow) -> str:
+        return f"published:{window.event_id}:{window.passage_timestamp_ms}"
+
+    @staticmethod
     def _program_date_time(timestamp_ms: int) -> str:
         value = datetime.fromtimestamp(
             int(timestamp_ms) / 1000.0,
@@ -1200,6 +1204,12 @@ class PassageReviewTimelinePublisher:
     ) -> RecordingSegment:
         if window.state is not PassageReviewState.READY or not window.segments:
             raise ValueError("only a complete passage review window can be published")
+        self.ring_buffer.pin_window(
+            self._published_pin_id(window),
+            started_at_ms=window.started_at_ms,
+            ended_at_ms=window.ended_at_ms,
+            scan=False,
+        )
         playlist_path = self.ring_buffer.buffer_dir / self._playlist_name(window)
         self._write_playlist(playlist_path, window.segments)
         resolved_playlist = playlist_path.resolve()
