@@ -1739,6 +1739,9 @@ class PassageReviewDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        table_palette = self.table.palette()
+        table_palette.setColor(QPalette.HighlightedText, QColor("#17212b"))
+        self.table.setPalette(table_palette)
         self.table.verticalHeader().setDefaultSectionSize(34)
         for column in (6, 7, 8):
             self.table.setItemDelegateForColumn(

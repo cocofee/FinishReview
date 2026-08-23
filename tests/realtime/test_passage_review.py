@@ -5,7 +5,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, Qt, pyqtSignal
-from PyQt5.QtGui import QImage, QMouseEvent
+from PyQt5.QtGui import QColor, QImage, QMouseEvent, QPalette
+from PyQt5.QtWidgets import QStyleOptionViewItem
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QHeaderView
 
@@ -269,6 +270,14 @@ def test_review_uses_consistent_laptop_typography(qapp, tmp_path):
     style = dialog.styleSheet()
     assert f'font-family: "{passage_review.UI_FONT_FAMILY}"' in style
     assert f"font-size: {passage_review.UI_BASE_FONT_POINT_SIZE}pt" in style
+    assert "QTableWidget::item:selected { background: #dcecf8; }" in style
+    assert dialog.table.palette().color(QPalette.HighlightedText) == QColor("#17212b")
+    status_option = QStyleOptionViewItem()
+    dialog.table.itemDelegateForColumn(6).initStyleOption(
+        status_option,
+        dialog.table.model().index(0, 6),
+    )
+    assert status_option.palette.color(QPalette.HighlightedText) == QColor("#c0372b")
     assert dialog.table.verticalHeader().defaultSectionSize() == 34
     assert "font-size: 12pt" in dialog.current_passage_label.styleSheet()
     assert "font-size: 9pt" in dialog.summary_label.styleSheet()

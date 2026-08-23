@@ -4,9 +4,10 @@ from urllib.request import Request
 import pytest
 
 from realtime import racetiger_source as racetiger_source_module
-from realtime.passage_receiver import PassageEventStore
+from realtime.passage_receiver import PassageEvent, PassageEventStore
 from realtime.racetiger_source import (
     RaceTigerClient,
+    RaceTigerError,
     RaceTigerSource,
     parse_beijing_timestamp,
 )
@@ -52,6 +53,95 @@ def test_poll_once_keeps_finish_time_order_and_deduplicates(tmp_path):
     assert [event.bib for event in store.events()] == ["12", "15"]
     assert all(event.source == "racetiger" for event in accepted)
     assert source.poll_once() == ()
+
+
+def test_run_status_counts_only_current_racetiger_finish_records(tmp_path):
+    store = PassageEventStore(tmp_path / "racetiger.jsonl")
+    for sequence, (race_id, stage_id, source_name) in enumerate(
+        (
+            ("RID-CURRENT", "finish", "racetiger"),
+            ("RID-OLD", "finish", "racetiger"),
+            ("RID-CURRENT", "finish", "cyclerace"),
+            ("RID-CURRENT", "other-stage", "racetiger"),
+        ),
+        start=1,
+    ):
+        store.append(
+            PassageEvent(
+                event_id=f"event-{sequence}",
+                race_id=race_id,
+                stage_id=stage_id,
+                group_id="finish",
+                sequence=sequence,
+                bib=str(sequence),
+                source=source_name,
+            )
+        )
+
+    statuses = []
+    source = RaceTigerSource(
+        object(),
+        store,
+        race_id="RID-CURRENT",
+        on_status=statuses.append,
+    )
+    source.poll_once = lambda: ()
+
+    def capture_status(status):
+        statuses.append(status)
+        source._stop.set()
+
+    source._on_status = capture_status
+    source._run()
+
+    assert statuses[0].count == 1
+    assert statuses[0].message == "RaceTiger: received 1 records"
+
+
+def test_poll_once_enriches_score_identity_from_bio(tmp_path):
+    class RealShapeClient:
+        def post(self, endpoint, *, page=1):
+            payloads = {
+                "Dif/info": {"EventDate": "2026-08-23"},
+                "Dif/bio": [
+                    {
+                        "AthleteId": "101",
+                        "BIB": "1",
+                        "ChipCode": "A0000008",
+                        "Name": "Alice",
+                        "Category": "Women Elite",
+                    }
+                ],
+                "Dif/score": [
+                    {
+                        "EventId": "event-1",
+                        "AthleteId": "101",
+                        "FinishStatus": "FIN",
+                    }
+                ],
+                "Dif/split": [
+                    {
+                        "AthleteId": "101",
+                        "TpName": "FINISH",
+                        "PassTime": "2026-08-23 22:13:26",
+                    }
+                ],
+            }
+            return payloads[endpoint] if page == 1 else []
+
+    source = RaceTigerSource(
+        RealShapeClient(),
+        PassageEventStore(tmp_path / "racetiger.jsonl"),
+        race_id="RID-2026",
+    )
+
+    accepted = source.poll_once()
+
+    assert len(accepted) == 1
+    assert accepted[0].bib == "1"
+    assert accepted[0].chip_id == "A0000008"
+    assert accepted[0].athlete_name == "Alice"
+    assert accepted[0].group_name == "Women Elite"
 
 
 def test_poll_once_accepts_nested_case_variant_dif_rows(tmp_path):
@@ -236,6 +326,29 @@ def test_racetiger_client_uses_query_parameters_for_post():
     assert f"token={test_token}" in captured["url"]
     assert "page=1" in captured["url"]
     assert "Authorization" not in captured["headers"]
+
+
+def test_racetiger_client_reports_closed_event_data_interface():
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"code":1,"msg":"The event data interface has been closed"}'
+
+    client = RaceTigerClient(
+        "https://rqs.racetigertiming.com",
+        "placeholder",
+        pc="pc-1",
+        rid="rid-2",
+        opener=lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(RaceTigerError, match="赛虎赛事数据接口未开放"):
+        client.post("Dif/info")
 
 
 @pytest.mark.parametrize(

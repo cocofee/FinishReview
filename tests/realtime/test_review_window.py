@@ -759,11 +759,56 @@ def test_device_settings_expose_racetiger_configuration(qapp, tmp_path):
     )
 
     assert dialog.timing_provider_combo.currentData() == "racetiger"
-    assert dialog.racetiger_base_url_edit.isEnabled()
-    assert dialog.racetiger_rid_edit.text() == "RID-2026"
+    assert dialog.racetiger_info_url_edit.isEnabled()
+    assert dialog.racetiger_info_url_edit.text() == ""
+    assert "PC finish-pc / RID RID-2026" in dialog.racetiger_config_status.text()
+    assert "令牌已保存" in dialog.racetiger_config_status.text()
     assert dialog.settings.timing_provider == "racetiger"
     assert dialog.settings.racetiger_token == "local-test-token"
     dialog.close()
+
+
+def test_device_settings_parse_complete_racetiger_info_url(qapp, tmp_path):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://camera/live",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+            timing_provider="racetiger",
+        ),
+        device_provider=lambda: (),
+    )
+
+    dialog.racetiger_info_url_edit.setText(
+        "https://rqs.racetigertiming.com/Dif/info?"
+        "pc=test-pc&rid=RID-TEST&token=local-test-token"
+    )
+    dialog.racetiger_info_url_edit.editingFinished.emit()
+
+    assert dialog.racetiger_info_url_edit.text() == ""
+    assert "PC test-pc / RID RID-TEST" in dialog.racetiger_config_status.text()
+    assert "点击保存设置后生效" in dialog.racetiger_config_status.text()
+    assert "令牌已保存" not in dialog.racetiger_config_status.text()
+    assert dialog.settings.racetiger_base_url == "https://rqs.racetigertiming.com"
+    assert dialog.settings.racetiger_pc == "test-pc"
+    assert dialog.settings.racetiger_rid == "RID-TEST"
+    assert dialog.settings.racetiger_token == "local-test-token"
+    dialog.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.test/Dif/info?pc=1&rid=2&token=test",
+        "https://rqs.racetigertiming.com/Dif/score?pc=1&rid=2&token=test",
+        "https://rqs.racetigertiming.com/Dif/info?pc=1&rid=2",
+    ],
+)
+def test_parse_racetiger_info_url_rejects_wrong_or_incomplete_link(value):
+    with pytest.raises(ValueError):
+        review_window_module.parse_racetiger_info_url(value)
 
 
 def test_device_settings_expose_two_independent_rtsp_cameras(qapp, tmp_path):

@@ -400,9 +400,19 @@ class RaceTigerClient:
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise RaceTigerError(f"RaceTiger request failed: {type(error).__name__}") from error
         try:
-            return json.loads(raw.lstrip("\ufeff"))
+            payload = json.loads(raw.lstrip("\ufeff"))
         except json.JSONDecodeError as error:
             raise RaceTigerError("RaceTiger returned invalid JSON") from error
+        if isinstance(payload, Mapping):
+            code = _first(payload, "code", "errorCode", default=None)
+            message = str(
+                _first(payload, "msg", "message", "error", default="") or ""
+            ).strip()
+            if message.lower() == "the event data interface has been closed":
+                raise RaceTigerError("赛虎赛事数据接口未开放")
+            if code not in (None, "", 0, "0", 200, "200") and not _records(payload):
+                raise RaceTigerError(f"RaceTiger API rejected request (code {code})")
+        return payload
 
 
 def _text(mapping: Mapping[str, Any], *names: str) -> str:
@@ -470,19 +480,29 @@ class RaceTigerSource:
         if callback is not None:
             callback(status)
 
+    def _current_record_count(self) -> int:
+        return sum(
+            1
+            for event in self.store.events()
+            if event.race_id == self.race_id
+            and event.stage_id == self.stage_id
+            and event.source == "racetiger"
+        )
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 events = self.poll_once()
                 now_ms = int(time.time() * 1000.0)
-                message = f"RaceTiger: received {len(self.store)} records"
+                record_count = self._current_record_count()
+                message = f"RaceTiger: received {record_count} records"
                 if self._last_poll_skipped:
                     message += f"; skipped {self._last_poll_skipped}"
                 self._emit_status(
                     RaceTigerStatus(
                         "ok",
                         message,
-                        len(self.store),
+                        record_count,
                         now_ms,
                     )
                 )
@@ -615,12 +635,21 @@ class RaceTigerSource:
                 "PersonId",
                 "ID",
             )
-            bib = _text(score, "BIB", "BibNo", "Bib", "StartNo", "Number")
-            chip_id = _text(score, "ChipNo", "ChipId", "Chip", "Transponder")
+            score_bib = _text(
+                score, "BIB", "BibNo", "Bib", "StartNo", "Number"
+            )
+            bio = bio_by_id.get(athlete_id) or bio_by_bib.get(score_bib) or {}
+            bib = score_bib or _text(
+                bio, "BIB", "BibNo", "Bib", "StartNo", "Number"
+            )
+            chip_id = _text(
+                score, "ChipNo", "ChipId", "ChipCode", "Chip", "Transponder"
+            ) or _text(
+                bio, "ChipNo", "ChipId", "ChipCode", "Chip", "Transponder"
+            )
             if not bib and not chip_id:
                 self._last_poll_skipped += 1
                 continue
-            bio = bio_by_id.get(athlete_id) or bio_by_bib.get(bib) or {}
             split = split_by_id.get(athlete_id) or split_by_bib.get(bib) or {}
             pass_text = _text(
                 split,
@@ -667,6 +696,14 @@ class RaceTigerSource:
                 "CategoryID",
                 "Group",
                 "ClassId",
+            ) or _text(
+                bio,
+                "GroupId",
+                "GroupID",
+                "CategoryId",
+                "CategoryID",
+                "Category",
+                "WaveName",
             )
             group_name = _text(
                 score,
@@ -674,6 +711,12 @@ class RaceTigerSource:
                 "CategoryName",
                 "ClassName",
                 "Group",
+            ) or _text(
+                bio,
+                "GroupName",
+                "CategoryName",
+                "Category",
+                "WaveName",
             )
             current = self.store.get(event_id)
             athlete_name = _text(bio, "Name", "AthleteName", "RealName", "FullName")

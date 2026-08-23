@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence
@@ -148,6 +149,33 @@ logger = logging.getLogger("FinishReview")
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
+RACETIGER_BASE_URL = "https://rqs.racetigertiming.com"
+RACETIGER_INFO_PATH = "/Dif/info"
+
+
+def parse_racetiger_info_url(value: str) -> tuple[str, str, str, str]:
+    """Extract RaceTiger connection values from its copied info URL."""
+
+    parsed = urlsplit(str(value or "").strip())
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != "rqs.racetigertiming.com"
+        or parsed.port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path.rstrip("/").lower() != RACETIGER_INFO_PATH.lower()
+        or parsed.fragment
+    ):
+        raise ValueError("请粘贴赛虎后台完整的‘赛事信息接口’链接")
+
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    values: dict[str, str] = {}
+    for name, label in (("pc", "PC"), ("rid", "RID"), ("token", "令牌")):
+        candidates = [item.strip() for item in query.get(name, ()) if item.strip()]
+        if len(candidates) != 1:
+            raise ValueError(f"赛事信息接口缺少有效的{label}")
+        values[name] = candidates[0]
+    return RACETIGER_BASE_URL, values["pc"], values["rid"], values["token"]
 
 
 def _format_point_playback_time(timestamp_ms: int) -> str:
@@ -397,6 +425,7 @@ class FinishReviewLaunchDialog(QDialog):
         self._racetiger_pc = str(settings.racetiger_pc or "").strip()
         self._racetiger_rid = str(settings.racetiger_rid or "").strip()
         self._racetiger_token = str(settings.racetiger_token or "").strip()
+        self._racetiger_config_pending_save = False
         self._racetiger_poll_interval = max(
             0.5,
             float(settings.racetiger_poll_interval_seconds or 2.0),
@@ -489,24 +518,20 @@ class FinishReviewLaunchDialog(QDialog):
         )
         form.addRow("计时源", self.timing_provider_combo)
 
-        self.racetiger_base_url_edit = QLineEdit(self._racetiger_base_url, self)
-        self.racetiger_base_url_edit.setPlaceholderText(
-            "https://rqs.racetigertiming.com"
+        self.racetiger_info_url_edit = QLineEdit(self)
+        self.racetiger_info_url_edit.setEchoMode(QLineEdit.Password)
+        self.racetiger_info_url_edit.setPlaceholderText(
+            "粘贴赛虎后台的‘赛事信息接口’完整链接"
         )
-        form.addRow("赛虎接口地址", self.racetiger_base_url_edit)
+        self.racetiger_info_url_edit.editingFinished.connect(
+            self._apply_racetiger_info_url
+        )
+        form.addRow("赛事信息接口", self.racetiger_info_url_edit)
 
-        self.racetiger_pc_edit = QLineEdit(self._racetiger_pc, self)
-        self.racetiger_pc_edit.setPlaceholderText("赛事电脑标识 pc")
-        form.addRow("赛虎 PC", self.racetiger_pc_edit)
-
-        self.racetiger_rid_edit = QLineEdit(self._racetiger_rid, self)
-        self.racetiger_rid_edit.setPlaceholderText("赛事 RID")
-        form.addRow("赛虎赛事 RID", self.racetiger_rid_edit)
-
-        self.racetiger_token_edit = QLineEdit(self._racetiger_token, self)
-        self.racetiger_token_edit.setEchoMode(QLineEdit.Password)
-        self.racetiger_token_edit.setPlaceholderText("本机保存，不显示明文")
-        form.addRow("赛虎令牌", self.racetiger_token_edit)
+        self.racetiger_config_status = QLabel(self)
+        self.racetiger_config_status.setWordWrap(True)
+        form.addRow("", self.racetiger_config_status)
+        self._refresh_racetiger_config_status()
 
         self.racetiger_poll_interval_spin = QDoubleSpinBox(self)
         self.racetiger_poll_interval_spin.setRange(0.5, 60.0)
@@ -525,10 +550,8 @@ class FinishReviewLaunchDialog(QDialog):
         racetiger_hint.setStyleSheet("color: #667085;")
         form.addRow("", racetiger_hint)
         self.racetiger_controls = (
-            self.racetiger_base_url_edit,
-            self.racetiger_pc_edit,
-            self.racetiger_rid_edit,
-            self.racetiger_token_edit,
+            self.racetiger_info_url_edit,
+            self.racetiger_config_status,
             self.racetiger_poll_interval_spin,
             racetiger_hint,
         )
@@ -893,7 +916,7 @@ class FinishReviewLaunchDialog(QDialog):
         timing_label = "赛虎计时" if timing_provider == "racetiger" else "CycleRace"
         timing_location = "云端接口" if timing_provider == "racetiger" else "计时电脑"
         timing_address = (
-            self.racetiger_base_url_edit.text().strip()
+            self._racetiger_base_url
             if timing_provider == "racetiger"
             else self.cyclerace_ip_edit.text().strip()
         )
@@ -1148,6 +1171,51 @@ class FinishReviewLaunchDialog(QDialog):
         for control in self.racetiger_controls:
             self._set_form_row_visible(control, enabled)
 
+    def _refresh_racetiger_config_status(self, error: str = "") -> None:
+        if error:
+            self.racetiger_config_status.setText(error)
+            self.racetiger_config_status.setStyleSheet(
+                "color: #b54747; font-weight: 600;"
+            )
+            return
+        if all((self._racetiger_pc, self._racetiger_rid, self._racetiger_token)):
+            suffix = (
+                "点击保存设置后生效"
+                if self._racetiger_config_pending_save
+                else "令牌已保存"
+            )
+            self.racetiger_config_status.setText(
+                f"已配置：PC {self._racetiger_pc} / RID {self._racetiger_rid}；{suffix}"
+            )
+            self.racetiger_config_status.setStyleSheet(
+                "color: #247a52; font-weight: 600;"
+            )
+            return
+        self.racetiger_config_status.setText(
+            "复制赛虎后台的‘赛事信息接口’整行并粘贴，其他参数自动读取"
+        )
+        self.racetiger_config_status.setStyleSheet("color: #667085;")
+
+    def _apply_racetiger_info_url(self) -> bool:
+        value = self.racetiger_info_url_edit.text().strip()
+        if not value:
+            self._refresh_racetiger_config_status()
+            return True
+        try:
+            (
+                self._racetiger_base_url,
+                self._racetiger_pc,
+                self._racetiger_rid,
+                self._racetiger_token,
+            ) = parse_racetiger_info_url(value)
+        except ValueError as error:
+            self._refresh_racetiger_config_status(str(error))
+            return False
+        self._racetiger_config_pending_save = True
+        self.racetiger_info_url_edit.clear()
+        self._refresh_racetiger_config_status()
+        return True
+
     def _set_form_row_visible(self, field, visible: bool) -> None:
         label = self._device_form.labelForField(field)
         if label is not None:
@@ -1372,7 +1440,23 @@ class FinishReviewLaunchDialog(QDialog):
 
     def _accept_settings(self) -> None:
         try:
+            if (
+                self.timing_provider_combo.currentData() == "racetiger"
+                and not self._apply_racetiger_info_url()
+            ):
+                raise ValueError("请粘贴赛虎后台完整的‘赛事信息接口’链接")
             settings = self.settings
+            if settings.timing_provider == "racetiger" and not all(
+                (
+                    settings.racetiger_base_url,
+                    settings.racetiger_pc,
+                    settings.racetiger_rid,
+                    settings.racetiger_token,
+                )
+            ):
+                raise ValueError(
+                    "赛虎配置不完整，请粘贴完整的‘赛事信息接口’链接"
+                )
             if settings.secondary_source and not is_rtsp_source(
                 settings.secondary_source
             ):
@@ -1436,10 +1520,10 @@ class FinishReviewLaunchDialog(QDialog):
                 else None
             ),
             timing_provider=timing_provider,
-            racetiger_base_url=self.racetiger_base_url_edit.text().strip(),
-            racetiger_pc=self.racetiger_pc_edit.text().strip(),
-            racetiger_rid=self.racetiger_rid_edit.text().strip(),
-            racetiger_token=self.racetiger_token_edit.text(),
+            racetiger_base_url=self._racetiger_base_url,
+            racetiger_pc=self._racetiger_pc,
+            racetiger_rid=self._racetiger_rid,
+            racetiger_token=self._racetiger_token,
             racetiger_poll_interval_seconds=(
                 self.racetiger_poll_interval_spin.value()
             ),
