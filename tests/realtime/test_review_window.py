@@ -935,6 +935,78 @@ def test_existing_timeline_evidence_is_counted_after_reopening(qapp, tmp_path):
     window.close()
 
 
+def test_formal_window_opens_point_playback_around_current_selected_time(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    event = _event()
+    video_path = tmp_path / "videos" / "archive.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    segment = window.timeline_store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=video_path,
+        media_started_at_ms=event.timeline_timestamp_ms - 60_000,
+        media_duration_ms=120_000,
+        clock_source=DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=2_000,
+        end_reason="continuous_archive_fallback",
+        race_id=event.race_id,
+    )
+    location = window.timeline_store.locate_passage(
+        event.timeline_timestamp_ms,
+        race_id=event.race_id,
+    ).locations[0]
+    window._shared_delta_ms = 250
+    calls = {}
+
+    class _Session:
+        manifest_path = tmp_path / ".point.ffconcat"
+        available_started_at_ms = event.timeline_timestamp_ms - 44_750
+        available_ended_at_ms = event.timeline_timestamp_ms + 15_250
+        target_position_ms = 45_000
+
+        def cleanup(self):
+            calls["cleaned"] = True
+
+    def prepare(timeline_store, selected_location, **kwargs):
+        calls["timeline_store"] = timeline_store
+        calls["location"] = selected_location
+        calls["prepare_kwargs"] = kwargs
+        return _Session()
+
+    class _PlaybackDialog:
+        def __init__(self, video_path, parent, **kwargs):
+            calls["dialog_path"] = video_path
+            calls["dialog_parent"] = parent
+            calls["dialog_kwargs"] = kwargs
+
+        def exec_(self):
+            calls["executed"] = True
+
+    monkeypatch.setattr(review_window_module, "prepare_point_playback", prepare)
+    monkeypatch.setattr(review_window_module, "VideoPlaybackDialog", _PlaybackDialog)
+
+    assert window.regular_pane.open_btn.text() == "定点回放"
+    window._open_location_if_available(event, location)
+
+    assert calls["timeline_store"] is window.timeline_store
+    assert calls["location"].segment.segment_id == segment.segment_id
+    assert calls["prepare_kwargs"]["anchor_time_ms"] == (
+        event.timeline_timestamp_ms + 250
+    )
+    assert calls["prepare_kwargs"]["race_id"] == event.race_id
+    assert calls["dialog_kwargs"]["initial_position_ms"] == 35_000
+    assert calls["dialog_kwargs"]["target_position_ms"] == 45_000
+    assert calls["dialog_kwargs"]["autoplay"] is True
+    assert calls["executed"] is True
+    assert calls["cleaned"] is True
+    window.close()
+
+
 def test_recheck_retries_a_failed_cyclerace_receiver(qapp, tmp_path):
     class _FailOnceReceiver(_FakeReceiver):
         attempts = 0

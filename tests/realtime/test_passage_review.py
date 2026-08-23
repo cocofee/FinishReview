@@ -424,12 +424,48 @@ def test_review_shows_regular_and_high_speed_sources_on_one_row(
         dialog._lookup(passage_store.get("passage-1"))
     )
 
-    dialog.high_speed_pane.open_btn.click()
+    assert dialog.high_speed_pane.open_btn.isHidden()
+    assert not dialog.regular_pane.open_btn.isHidden()
+    assert not dialog.high_speed_pane.open_btn.isEnabled()
     dialog.regular_pane.open_btn.click()
     assert [location.segment.source_id for _event, location in opened] == [
-        "high_speed_02",
         "camera_01",
     ]
+    dialog.close()
+
+
+def test_high_speed_only_double_click_maximizes_judging_pane(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=20_050))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "high_speed_02.mp4",
+        source_id="high_speed_02",
+        camera_index=2,
+        started_at_ms=19_000,
+        ended_at_ms=21_000,
+        clock_source="external_clip_sidecar_beijing",
+        timing_error_ms=100,
+    )
+    opened = []
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        open_location=lambda event, location: opened.append((event, location)),
+    )
+    qapp.processEvents()
+
+    dialog._open_preferred_source(0, 7)
+
+    assert opened == []
+    assert dialog._maximized_pane is dialog.high_speed_pane
+    assert not dialog.high_speed_pane.isHidden()
+    assert dialog.regular_pane.isHidden()
     dialog.close()
 
 

@@ -906,7 +906,9 @@ class PassageEvidencePane(QFrame):
         self.maximize_btn.setToolTip("最大化或恢复该机位")
         self.mark_btn = QPushButton("标记")
         self.mark_btn.setToolTip("在画面中按住左键移动身份判读线")
-        self.open_btn = QPushButton("打开完整回放")
+        self.open_btn = QPushButton("定点回放")
+        self.open_btn.setToolTip("回看当前目标点前 45 秒、后 15 秒")
+        self.open_btn.setVisible(self.source_kind == REGULAR_SOURCE)
         self.open_btn.setEnabled(False)
         controls.addWidget(self.previous_frame_btn)
         controls.addWidget(self.play_btn)
@@ -1403,7 +1405,9 @@ class PassageEvidencePane(QFrame):
         self.video_label.clear_frame(message)
         self._set_transport_enabled(False)
         self.open_btn.setEnabled(
-            self._location is not None and self._location.video_path.is_file()
+            self.source_kind == REGULAR_SOURCE
+            and self._location is not None
+            and self._location.video_path.is_file()
         )
 
     def set_playing(self, playing: bool) -> None:
@@ -1475,6 +1479,7 @@ class PassageEvidencePane(QFrame):
         self.mark_btn.setEnabled(enabled and self.video_view.has_frame)
         self.open_btn.setEnabled(
             enabled
+            and self.source_kind == REGULAR_SOURCE
             and self._location is not None
             and self._location.status in _OPENABLE_STATUSES
             and self._location.segment.clock_source != AUYAT_CLOCK_SOURCE
@@ -1794,7 +1799,6 @@ class PassageReviewDialog(QDialog):
             "高速摄像", HIGH_SPEED_SOURCE, self
         )
         self.regular_pane.open_requested.connect(self._open_location_if_available)
-        self.high_speed_pane.open_requested.connect(self._open_location_if_available)
         for pane in (self.regular_pane, self.high_speed_pane):
             pane.step_requested.connect(self._step_both)
             pane.play_requested.connect(self._toggle_both)
@@ -2937,6 +2941,10 @@ class PassageReviewDialog(QDialog):
         event: PassageEvent,
         location: PassageVideoLocation,
     ) -> None:
+        if is_high_speed(location):
+            if self._maximized_pane is not self.high_speed_pane:
+                self._toggle_maximized_pane(self.high_speed_pane)
+            return
         if self._open_location is not None:
             self._open_location(event, location)
 

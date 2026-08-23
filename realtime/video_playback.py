@@ -41,6 +41,13 @@ from PyQt5.QtWidgets import (
 SUPPORTED_VIDEO_SUFFIXES = {".mkv", ".mp4", ".avi", ".mov", ".m4v"}
 
 
+def _open_video_capture(
+    video_path: Path,
+    capture_factory: Callable[[str], cv2.VideoCapture],
+):
+    return capture_factory(str(video_path))
+
+
 def find_recordings(race_dir: Path) -> list[Path]:
     videos_dir = Path(race_dir) / "videos"
     if not videos_dir.is_dir():
@@ -171,11 +178,11 @@ class SpringShuttleSlider(QWidget):
         self._value = 0
         self._display_speed = 0.0
         self._buttons = {}
-        self.setMinimumWidth(740)
-        self.setMaximumWidth(900)
-        self.setFixedHeight(50)
-        self.setAccessibleName("正倒放 Shuttle 控制")
-        self.setToolTip("点击一个档位后持续正放或倒放，点击停止结束播放")
+        self.setMinimumWidth(340)
+        self.setMaximumWidth(460)
+        self.setFixedHeight(48)
+        self.setAccessibleName("回放速度")
+        self.setToolTip("选择正向回放速度")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -184,27 +191,20 @@ class SpringShuttleSlider(QWidget):
         self._button_group.setExclusive(True)
 
         button_specs = (
-            (-5, "◀ 4x", "持续 4 倍速倒放", "shuttleReverse"),
-            (-4, "◀ 2x", "持续 2 倍速倒放", "shuttleReverse"),
-            (-3, "◀ 1x", "持续正常速度倒放", "shuttleReverse"),
-            (-2, "◀ 0.5x", "持续 0.5 倍速慢速倒放", "shuttleReverse"),
-            (-1, "◀ 0.25x", "持续 0.25 倍速慢速倒放", "shuttleReverse"),
-            (0, "■ 停止", "停止正放或倒放", "shuttleStop"),
-            (1, "0.25x ▶", "持续 0.25 倍速慢速正放", "shuttleForward"),
-            (2, "0.5x ▶", "持续 0.5 倍速慢速正放", "shuttleForward"),
-            (3, "1x ▶", "持续正常速度正放", "shuttleForward"),
-            (4, "2x ▶", "持续 2 倍速正放", "shuttleForward"),
-            (5, "4x ▶", "持续 4 倍速正放", "shuttleForward"),
+            (1, "0.25x", "0.25 倍速回放"),
+            (2, "0.5x", "0.5 倍速回放"),
+            (3, "1x", "正常速度回放"),
+            (4, "2x", "2 倍速回放"),
         )
-        for value, text, tooltip, object_name in button_specs:
+        for value, text, tooltip in button_specs:
             button = QPushButton(text, self)
-            button.setObjectName(object_name)
+            button.setObjectName("shuttleForward")
             button.setToolTip(tooltip)
             button.setAccessibleName(tooltip)
             button.setCheckable(True)
             button.setProperty("shuttleValue", value)
-            button.setMinimumWidth(62 if value else 68)
-            button.setFixedHeight(46)
+            button.setMinimumWidth(72)
+            button.setFixedHeight(42)
             button.clicked.connect(lambda _checked=False, selected=value: self.setValue(selected))
             self._button_group.addButton(button)
             self._buttons[value] = button
@@ -215,10 +215,6 @@ class SpringShuttleSlider(QWidget):
             "border-radius: 4px; background: #29313a; color: #e9eef2; "
             "font-size: 12px; font-weight: 700; }"
             "QPushButton:hover { background: #35414c; border-color: #8795a3; }"
-            "QPushButton#shuttleReverse:checked { background: #176b98; "
-            "border-color: #60bde9; color: #ffffff; }"
-            "QPushButton#shuttleStop:checked { background: #9a4038; "
-            "border-color: #e17669; color: #ffffff; }"
             "QPushButton#shuttleForward:checked { background: #24754f; "
             "border-color: #65bd8d; color: #ffffff; }"
         )
@@ -255,10 +251,16 @@ class SpringShuttleSlider(QWidget):
         self._sync_button_state()
 
     def _sync_button_state(self) -> None:
-        selected = self.value_for_speed(self._display_speed)
+        selected = (
+            self.value_for_speed(self._display_speed)
+            if abs(self._display_speed) > 0.01
+            else self._value
+        )
         button = self._buttons.get(selected)
-        if button is not None:
-            button.setChecked(True)
+        self._button_group.setExclusive(False)
+        for candidate in self._buttons.values():
+            candidate.setChecked(candidate is button)
+        self._button_group.setExclusive(True)
 
 
 class TargetTimelineSlider(QSlider):
@@ -490,7 +492,7 @@ class VideoPlaybackWorker(QThread):
         return True, capture_next_frame
 
     def run(self) -> None:
-        capture = self._capture_factory(str(self.video_path))
+        capture = _open_video_capture(self.video_path, self._capture_factory)
         try:
             if not capture or not capture.isOpened():
                 self.playback_error.emit(f"无法打开录像: {self.video_path}")
@@ -544,6 +546,7 @@ class VideoPlaybackWorker(QThread):
                     )
                     if ok:
                         last_frame_index = target
+                        anchor_frame = last_frame_index + direction
                     anchor_clock = time.monotonic()
                     continue
 
@@ -627,6 +630,7 @@ class VideoPlaybackDialog(QDialog):
         target_position_ms: Optional[int] = None,
         context_text: str = "",
         autoplay: bool = True,
+        window_title: str = "",
     ):
         super().__init__(parent)
         self.video_path = Path(video_path)
@@ -643,12 +647,13 @@ class VideoPlaybackDialog(QDialog):
             None if target_position_ms is None else max(0, int(target_position_ms))
         )
         self._context_text = str(context_text or "").strip()
+        self._window_title = str(window_title or "").strip()
         self._slider_dragging = False
         self._resume_after_seek = False
         self._resume_speed_after_seek = 1.0
         self._jog_origin_frame = 0
 
-        self.setWindowTitle(f"裁判回放 - {self.video_path.name}")
+        self.setWindowTitle(self._window_title or f"裁判回放 - {self.video_path.name}")
         self.resize(1260, 840)
         self.setMinimumSize(820, 580)
         self._init_ui()
@@ -662,6 +667,7 @@ class VideoPlaybackDialog(QDialog):
             self.worker.pause()
         self.worker.start()
         self._set_playing(self._playing)
+        self._set_shuttle_indicator(self._last_playback_speed if self._playing else 0.0)
 
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_shortcut.setContext(Qt.WindowShortcut)
@@ -746,26 +752,27 @@ class VideoPlaybackDialog(QDialog):
         transport.setContentsMargins(0, 0, 0, 0)
         transport.setSpacing(10)
         transport.addStretch()
+        self.target_btn = self._text_button(
+            "回到目标", "回到目标点并暂停（T / Home）", self._seek_target, 112
+        )
+        self.target_btn.setEnabled(self._target_position_ms is not None)
         self.previous_frame_btn = self._text_button(
             "|◀", "上一帧", lambda: self._step(-1), 54
         )
-        self.back_two_btn = self._jump_button("−2s", -2_000)
         self.back_one_btn = self._jump_button("−1s", -1_000)
         self.play_btn = self._text_button(
             "Ⅱ", "暂停", self._toggle_playback, 64, primary=True
         )
         self.forward_one_btn = self._jump_button("+1s", 1_000)
-        self.forward_two_btn = self._jump_button("+2s", 2_000)
         self.next_frame_btn = self._text_button(
             "▶|", "下一帧", lambda: self._step(1), 54
         )
         for button in (
+            self.target_btn,
             self.previous_frame_btn,
-            self.back_two_btn,
             self.back_one_btn,
             self.play_btn,
             self.forward_one_btn,
-            self.forward_two_btn,
             self.next_frame_btn,
         ):
             transport.addWidget(button)
@@ -827,6 +834,20 @@ class VideoPlaybackDialog(QDialog):
     def _jump(self, delta_ms: int) -> None:
         self.worker.jump(delta_ms)
 
+    def _seek_target(self) -> None:
+        if self._target_position_ms is None:
+            return
+        target_ms = self._target_position_ms
+        if self._duration_ms > 0:
+            target_ms = min(target_ms, self._duration_ms)
+        self.worker.pause()
+        self.worker.seek(target_ms)
+        self.timeline.setValue(target_ms)
+        self.current_time_label.setText(format_playback_time(target_ms))
+        self._update_target_status(target_ms)
+        self._set_playing(False)
+        self._set_shuttle_indicator(0.0)
+
     def _step(self, frame_delta: int) -> None:
         self.worker.step(frame_delta)
         self._set_playing(False)
@@ -840,7 +861,7 @@ class VideoPlaybackDialog(QDialog):
         self._set_shuttle_indicator(speed, update_slider=False)
 
     def _set_shuttle_indicator(self, speed: float, *, update_slider: bool = True) -> None:
-        if update_slider:
+        if update_slider and abs(speed) > 0.01:
             self.shuttle_slider.set_speed(speed, emit=False)
         self.shuttle_slider.set_display_speed(speed)
 
@@ -859,9 +880,8 @@ class VideoPlaybackDialog(QDialog):
         self.timeline.set_target_position(self._target_position_ms)
         self.duration_label.setText(f"总时长 {format_playback_time(self._duration_ms)}")
         self.frame_label.setText(f"帧 0 / {self._frame_count}")
-        self.setWindowTitle(
-            f"裁判回放 - {self.video_path.name} | {width}x{height} | {fps:.2f} FPS"
-        )
+        title = self._window_title or f"裁判回放 - {self.video_path.name}"
+        self.setWindowTitle(f"{title} | {width}x{height} | {fps:.2f} FPS")
         if self._initial_position_ms is not None:
             target_ms = min(self._initial_position_ms, self._duration_ms)
             self._initial_position_ms = None
@@ -985,6 +1005,10 @@ class VideoPlaybackDialog(QDialog):
         if event.key() in (Qt.Key_PageUp, Qt.Key_PageDown):
             direction = -1 if event.key() == Qt.Key_PageUp else 1
             self._jump(direction * 1_000)
+            event.accept()
+            return
+        if event.key() in (Qt.Key_Home, Qt.Key_T):
+            self._seek_target()
             event.accept()
             return
         super().keyPressEvent(event)

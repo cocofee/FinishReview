@@ -126,7 +126,7 @@ def test_review_recorder_uses_one_input_for_archive_and_short_hls(tmp_path):
     assert command.count("copy") == 2
     assert command[command.index("-segment_time") + 1] == "300"
     assert command[command.index("-hls_time") + 1] == "2"
-    assert command[command.index("-hls_list_size") + 1] == "47"
+    assert command[command.index("-hls_list_size") + 1] == "182"
     assert "temp_file" in command[command.index("-hls_flags") + 1]
     assert "program_date_time" in command[command.index("-hls_flags") + 1]
     assert playlist.parent.name == "camera_01"

@@ -15,6 +15,7 @@ from realtime.video_playback import (
     SpringShuttleSlider,
     VideoPlaybackDialog,
     VideoPlaybackWorker,
+    _open_video_capture,
     find_recordings,
     format_playback_time,
 )
@@ -48,37 +49,50 @@ def test_find_recordings_returns_supported_nonempty_files_newest_first(tmp_path)
     assert SpringShuttleSlider.value_for_speed(4.0) == 5
 
 
-def test_shuttle_speed_selection_persists_until_stop(qapp):
+def test_ffconcat_capture_opens_manifest_without_mutating_ffmpeg_options(tmp_path):
+    manifest = tmp_path / "point.ffconcat"
+    manifest.write_text("ffconcat version 1.0\n", encoding="utf-8")
+    observed = []
+    marker = object()
+
+    result = _open_video_capture(
+        manifest,
+        lambda path: observed.append(path) or marker,
+    )
+
+    assert result is marker
+    assert observed == [str(manifest)]
+
+
+def test_speed_selector_shows_only_common_forward_speeds(qapp):
     shuttle = SpringShuttleSlider()
     emitted = []
     shuttle.speed_changed.connect(emitted.append)
 
-    reverse_button = shuttle._buttons[-4]
     slow_forward_button = shuttle._buttons[1]
-    stop_button = shuttle._buttons[0]
-    reverse_button.click()
-    assert shuttle.value() == -4
-    assert emitted == [-2.0]
-    assert reverse_button.isChecked()
+    fast_forward_button = shuttle._buttons[4]
+    assert set(shuttle._buttons) == {1, 2, 3, 4}
 
     slow_forward_button.click()
     assert shuttle.value() == 1
-    assert emitted == [-2.0, 0.25]
+    assert emitted == [0.25]
     assert slow_forward_button.isChecked()
 
-    stop_button.click()
-    assert shuttle.value() == 0
-    assert emitted == [-2.0, 0.25, 0.0]
-    assert stop_button.isChecked()
-    assert not reverse_button.isChecked()
+    shuttle.set_display_speed(0.0)
+    assert slow_forward_button.isChecked()
+
+    fast_forward_button.click()
+    assert shuttle.value() == 4
+    assert emitted == [0.25, 2.0]
+    assert fast_forward_button.isChecked()
     shuttle.close()
 
 
 class _FakeCapture:
-    def __init__(self):
+    def __init__(self, frame_count=4):
         self.frames = [
-            np.full((24, 32, 3), value, dtype=np.uint8)
-            for value in (0, 64, 128, 192)
+            np.full((24, 32, 3), index % 256, dtype=np.uint8)
+            for index in range(frame_count)
         ]
         self.position = 0
         self.released = False
@@ -219,6 +233,37 @@ def test_dialog_marks_passage_target_and_updates_relative_time(qapp):
     dialog.close()
 
 
+def test_dialog_uses_compact_controls_and_returns_to_target(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        initial_position_ms=4_250,
+        target_position_ms=7_250,
+        autoplay=True,
+    )
+    qapp.processEvents()
+
+    assert dialog.target_btn.text() == "回到目标"
+    assert not hasattr(dialog, "back_two_btn")
+    assert not hasattr(dialog, "forward_two_btn")
+    assert [button.text() for button in dialog.shuttle_slider._buttons.values()] == [
+        "0.25x",
+        "0.5x",
+        "1x",
+        "2x",
+    ]
+
+    dialog.target_btn.click()
+    assert dialog.worker.seek_calls[-1] == 7_250
+    assert dialog.timeline.value() == 7_250
+    assert dialog._playing is False
+
+    dialog.worker.seek_calls.clear()
+    QTest.keyClick(dialog, Qt.Key_T)
+    assert dialog.worker.seek_calls == [7_250]
+    dialog.close()
+
+
 def test_dialog_reports_target_beyond_real_media_duration(qapp):
     dialog = VideoPlaybackDialog(
         Path("recording.mkv"),
@@ -267,4 +312,39 @@ def test_playback_worker_decodes_frames_and_stops_cleanly(qapp):
     assert positions
     assert positions[0] == 0
     assert positions[-1] <= 150
+    assert capture.released is True
+
+
+def test_playing_worker_continues_from_requested_seek_position(qapp):
+    capture = _FakeCapture(frame_count=100)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+    )
+    positions = []
+    first_seeked_index = []
+    loop = QEventLoop()
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def on_metadata(*_values):
+        worker.seek(2_000)
+
+    def on_frame(_image, position_ms, _frame_index):
+        positions.append(position_ms)
+        if position_ms >= 2_000 and not first_seeked_index:
+            first_seeked_index.append(len(positions) - 1)
+            QTimer.singleShot(250, finish)
+
+    worker.metadata_ready.connect(on_metadata)
+    worker.frame_ready.connect(on_frame)
+    QTimer.singleShot(2_000, finish)
+    worker.start()
+    loop.exec_()
+
+    assert worker.wait(2_000)
+    assert first_seeked_index
+    assert min(positions[first_seeked_index[0] :]) >= 2_000
     assert capture.released is True

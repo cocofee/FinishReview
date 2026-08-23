@@ -50,6 +50,7 @@ try:
         RaceFocus,
     )
     from .passage_review import PassageReviewDialog, source_location
+    from .point_playback import PointPlaybackUnavailable, prepare_point_playback
     from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
     from .race_metadata import RaceMetadata, RaceMetadataStore
     from .review_recorder import (
@@ -71,6 +72,7 @@ try:
         sanitize_recording_message,
     )
     from .video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
+    from .video_playback import VideoPlaybackDialog
 except ImportError:
     from auyat_rgb import (
         AuyatRgbCatalog,
@@ -89,6 +91,7 @@ except ImportError:
         RaceFocus,
     )
     from passage_review import PassageReviewDialog, source_location
+    from point_playback import PointPlaybackUnavailable, prepare_point_playback
     from racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
     from race_metadata import RaceMetadata, RaceMetadataStore
     from review_recorder import (
@@ -110,12 +113,18 @@ except ImportError:
         sanitize_recording_message,
     )
     from video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
+    from video_playback import VideoPlaybackDialog
 
 
 logger = logging.getLogger("FinishReview")
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
+
+
+def _format_point_playback_time(timestamp_ms: int) -> str:
+    value = datetime.fromtimestamp(int(timestamp_ms) / 1000.0, tz=BEIJING_TIMEZONE)
+    return value.strftime("%H:%M:%S.%f")[:-3]
 
 
 def _high_speed_target_dates(
@@ -558,7 +567,7 @@ class FinishReviewWindow(PassageReviewDialog):
         racetiger_token: str = "",
         racetiger_poll_interval_seconds: float = 2.0,
         ffmpeg_path: Path | None = None,
-        review_retention_seconds: int = 90,
+        review_retention_seconds: int = 360,
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
         refresh_interval_ms: int = 500,
         passage_batch_interval_ms: int = 150,
@@ -633,6 +642,7 @@ class FinishReviewWindow(PassageReviewDialog):
             parent,
             metadata_store=metadata_store,
             high_speed_locator=self._locate_high_speed,
+            open_location=self._open_point_playback,
         )
 
         self.setWindowTitle("终点复核系统")
@@ -724,6 +734,60 @@ class FinishReviewWindow(PassageReviewDialog):
             clock_offset_ms=clock_offset_ms,
             pre_roll_ms=pre_roll_ms,
         )
+
+    def _open_point_playback(self, event: PassageEvent, location) -> None:
+        evidence_timestamp_ms = self._evidence_timestamp(event)
+        if evidence_timestamp_ms is None:
+            QMessageBox.information(
+                self,
+                "无法定点回放",
+                "当前通过记录缺少可用于录像定位的绝对时间。",
+            )
+            return
+        anchor_time_ms = int(evidence_timestamp_ms) + int(self._shared_delta_ms)
+        try:
+            self._publish_archive_segments()
+            session = prepare_point_playback(
+                self.timeline_store,
+                location,
+                anchor_time_ms=anchor_time_ms,
+                race_id=event.race_id,
+                output_dir=self.output_dir,
+                ring_buffer=self._ring_buffer,
+            )
+        except (OSError, PointPlaybackUnavailable, RuntimeError, ValueError) as error:
+            QMessageBox.information(self, "无法定点回放", str(error))
+            return
+
+        identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        available_before_ms = max(
+            0,
+            anchor_time_ms - session.available_started_at_ms,
+        )
+        available_after_ms = max(
+            0,
+            session.available_ended_at_ms - anchor_time_ms,
+        )
+        context_text = (
+            f"{identity}号 | 目标 {_format_point_playback_time(anchor_time_ms)} | "
+            f"实际可用：前 {available_before_ms / 1000.0:.1f} 秒，"
+            f"后 {available_after_ms / 1000.0:.1f} 秒"
+        )
+        self._set_sync_playing(False)
+        self.regular_pane.set_playing(False)
+        playback = VideoPlaybackDialog(
+            session.manifest_path,
+            self,
+            initial_position_ms=max(0, session.target_position_ms - 10_000),
+            target_position_ms=session.target_position_ms,
+            context_text=context_text,
+            autoplay=True,
+            window_title=f"定点回放 - {identity}号",
+        )
+        try:
+            playback.exec_()
+        finally:
+            session.cleanup()
 
     def _on_high_speed_scan_finished(self, result: AuyatScanResult) -> None:
         self._high_speed_scan_result = result
