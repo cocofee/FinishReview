@@ -7,7 +7,7 @@ import pytest
 from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QMouseEvent
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QHeaderView
 
 import realtime.passage_review as passage_review
 from realtime.passage_evidence import (
@@ -225,6 +225,33 @@ def test_review_uses_consistent_laptop_typography(qapp, tmp_path):
     assert dialog.table.verticalHeader().defaultSectionSize() == 34
     assert "font-size: 12pt" in dialog.current_passage_label.styleSheet()
     assert "font-size: 9pt" in dialog.summary_label.styleSheet()
+    assert dialog.info_panel.minimumWidth() == passage_review.UI_INFO_PANEL_MIN_WIDTH
+    assert dialog.info_panel.maximumWidth() == passage_review.UI_INFO_PANEL_MAX_WIDTH
+    dialog.close()
+
+
+def test_review_auto_fits_table_columns_without_squeezing_them(qapp, tmp_path):
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+
+    header = dialog.table.horizontalHeader()
+    for column in range(dialog.table.columnCount()):
+        assert header.sectionResizeMode(column) == QHeaderView.Interactive
+    widths = passage_review._expanded_column_widths(
+        (42, 48, 160, 120, 42, 126, 84, 84, 84),
+        passage_review._TABLE_COLUMN_MIN_WIDTHS,
+        1_600,
+    )
+    assert sum(widths) == 1_102
+    assert sum(widths) < 1_600
+    assert widths[2] > widths[1]
+    assert widths[3] > widths[4]
+    assert all(
+        width >= minimum
+        for width, minimum in zip(widths, passage_review._TABLE_COLUMN_MIN_WIDTHS)
+    )
     dialog.close()
 
 

@@ -118,6 +118,9 @@ _STATUS_PRIORITY = {
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 UI_FONT_FAMILY = "Microsoft YaHei UI"
 UI_BASE_FONT_POINT_SIZE = 10
+UI_INFO_PANEL_MIN_WIDTH = 300
+UI_INFO_PANEL_MAX_WIDTH = 380
+UI_INFO_PANEL_DEFAULT_WIDTH = 330
 
 
 def format_passage_time(timestamp_ms: int) -> str:
@@ -243,6 +246,78 @@ class _StatusColorDelegate(QStyledItemDelegate):
         if isinstance(foreground, QBrush):
             option.palette.setBrush(QPalette.Text, foreground)
             option.palette.setBrush(QPalette.HighlightedText, foreground)
+
+
+_TABLE_COLUMN_MIN_WIDTHS = (58, 70, 120, 120, 58, 140, 104, 104, 104)
+_TABLE_COLUMN_EXPANSION_NUMERATOR = 6
+_TABLE_COLUMN_EXPANSION_DENOMINATOR = 5
+
+
+def _expanded_column_widths(
+    content_widths: tuple[int, ...],
+    minimum_widths: tuple[int, ...],
+    available_width: int,
+) -> tuple[int, ...]:
+    widths = [
+        max(int(content_width), int(minimum_width))
+        for content_width, minimum_width in zip(content_widths, minimum_widths)
+    ]
+    if not widths:
+        return ()
+    content_total = sum(widths)
+    expanded_total = (
+        content_total * _TABLE_COLUMN_EXPANSION_NUMERATOR
+        + _TABLE_COLUMN_EXPANSION_DENOMINATOR
+        - 1
+    ) // _TABLE_COLUMN_EXPANSION_DENOMINATOR
+    target_width = min(int(available_width), expanded_total)
+    extra_width = max(0, target_width - content_total)
+    if extra_width == 0:
+        return tuple(widths)
+
+    weight_total = sum(widths)
+    additions = [extra_width * width // weight_total for width in widths]
+    remainder = extra_width - sum(additions)
+    widest_first = sorted(range(len(widths)), key=widths.__getitem__, reverse=True)
+    for index in widest_first[:remainder]:
+        additions[index] += 1
+    return tuple(width + addition for width, addition in zip(widths, additions))
+
+
+class _AutoFitTableWidget(QTableWidget):
+    """Fit columns to their content, then use the remaining viewport width."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._column_fit_scheduled = False
+
+    def schedule_auto_fit(self) -> None:
+        if self._column_fit_scheduled:
+            return
+        self._column_fit_scheduled = True
+        QTimer.singleShot(0, self._fit_columns_to_viewport)
+
+    def _fit_columns_to_viewport(self) -> None:
+        self._column_fit_scheduled = False
+        if self.columnCount() != len(_TABLE_COLUMN_MIN_WIDTHS):
+            return
+        self.resizeColumnsToContents()
+        header = self.horizontalHeader()
+        content_widths = tuple(
+            header.sectionSize(column) for column in range(self.columnCount())
+        )
+        available_width = max(0, self.viewport().width() - 1)
+        widths = _expanded_column_widths(
+            content_widths,
+            _TABLE_COLUMN_MIN_WIDTHS,
+            available_width,
+        )
+        for column, width in enumerate(widths):
+            header.resizeSection(column, width)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.schedule_auto_fit()
 
 
 def review_status_text(
@@ -1552,11 +1627,11 @@ class PassageReviewDialog(QDialog):
         upper_splitter.setChildrenCollapsible(False)
         upper_splitter.setHandleWidth(5)
 
-        info_panel = QFrame(self)
-        info_panel.setObjectName("reviewPanel")
-        info_panel.setMinimumWidth(255)
-        info_panel.setMaximumWidth(340)
-        info_layout = QVBoxLayout(info_panel)
+        self.info_panel = QFrame(self)
+        self.info_panel.setObjectName("reviewPanel")
+        self.info_panel.setMinimumWidth(UI_INFO_PANEL_MIN_WIDTH)
+        self.info_panel.setMaximumWidth(UI_INFO_PANEL_MAX_WIDTH)
+        info_layout = QVBoxLayout(self.info_panel)
         info_layout.setContentsMargins(12, 10, 12, 10)
         info_layout.setSpacing(8)
         title = QLabel("赛事与组别")
@@ -1593,7 +1668,7 @@ class PassageReviewDialog(QDialog):
             "background: #e8f2fa; color: #15547f; padding: 7px; border-radius: 3px;"
         )
         info_layout.addWidget(authority)
-        upper_splitter.addWidget(info_panel)
+        upper_splitter.addWidget(self.info_panel)
 
         results_panel = QFrame(self)
         results_panel.setObjectName("reviewPanel")
@@ -1634,7 +1709,7 @@ class PassageReviewDialog(QDialog):
         filters.addWidget(refresh_btn)
         results_layout.addLayout(filters)
 
-        self.table = QTableWidget(0, 9, self)
+        self.table = _AutoFitTableWidget(0, 9, self)
         self.table.setHorizontalHeaderLabels(
             [
                 "序号",
@@ -1662,15 +1737,12 @@ class PassageReviewDialog(QDialog):
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.table.cellDoubleClicked.connect(self._open_preferred_source)
         header = self.table.horizontalHeader()
-        for column in (0, 4):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        for column in (1, 2, 3, 5, 6, 7, 8):
-            header.setSectionResizeMode(column, QHeaderView.Stretch)
+        header.setSectionResizeMode(QHeaderView.Interactive)
         results_layout.addWidget(self.table, 1)
         upper_splitter.addWidget(results_panel)
         upper_splitter.setStretchFactor(0, 0)
         upper_splitter.setStretchFactor(1, 1)
-        upper_splitter.setSizes([285, 1000])
+        upper_splitter.setSizes([UI_INFO_PANEL_DEFAULT_WIDTH, 1000])
         layout.addWidget(upper_splitter, 4)
 
         transport = QFrame(self)
@@ -2066,6 +2138,7 @@ class PassageReviewDialog(QDialog):
             self.table.setCurrentCell(selected_row, 0)
             self.table.selectRow(selected_row)
         self.table.blockSignals(False)
+        self.table.schedule_auto_fit()
 
         self._render_summary()
         if selected_row >= 0:
@@ -2168,6 +2241,7 @@ class PassageReviewDialog(QDialog):
             self.table.selectRow(selected_row)
             selected_event_changed = True
         self.table.blockSignals(False)
+        self.table.schedule_auto_fit()
 
         self._update_navigation_controls()
         self._render_summary()
