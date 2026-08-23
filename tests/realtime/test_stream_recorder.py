@@ -6,11 +6,13 @@ import pytest
 
 import realtime.stream_recorder as stream_recorder
 from realtime.stream_recorder import (
+    apply_rtsp_credentials,
     FfmpegStreamRecorder,
     ManualRecordingManager,
     RecordingError,
     find_ffmpeg_executable,
     sanitize_recording_message,
+    split_rtsp_credentials,
 )
 from realtime.video_timeline import VideoTimelineStore
 
@@ -120,6 +122,20 @@ def test_recording_errors_redact_rtsp_passwords():
 
     assert "top-secret" not in message
     assert "rtsp://admin:***@192.0.2.10/live" in message
+
+
+def test_rtsp_credentials_round_trip_without_plaintext_storage():
+    clean, username, password = split_rtsp_credentials(
+        "rtsp://review%20user:p%40ss@192.0.2.10:8554/live?profile=main"
+    )
+
+    assert clean == "rtsp://192.0.2.10:8554/live?profile=main"
+    assert username == "review user"
+    assert password == "p@ss"
+    assert (
+        apply_rtsp_credentials(clean, username, password)
+        == "rtsp://review%20user:p%40ss@192.0.2.10:8554/live?profile=main"
+    )
 
 
 def test_recorder_drains_and_redacts_ffmpeg_errors(tmp_path):

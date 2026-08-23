@@ -35,7 +35,12 @@ from realtime.runtime_paths import (
     resolve_runtime_path,
 )
 from realtime.secure_storage import protect_secret, unprotect_secret
-from realtime.stream_recorder import sanitize_recording_message
+from realtime.stream_recorder import (
+    apply_rtsp_credentials,
+    is_rtsp_source,
+    sanitize_recording_message,
+    split_rtsp_credentials,
+)
 
 
 logger = logging.getLogger("FinishReview.Entry")
@@ -234,6 +239,7 @@ def load_review_settings(
     secret_unprotector: Callable[[str], str] = unprotect_secret,
 ) -> FinishReviewSettings:
     source = ""
+    secondary_source = ""
     saved_output_dir = None
     saved_camera_index = None
     saved_high_speed_dir = None
@@ -243,11 +249,54 @@ def load_review_settings(
     racetiger_rid = ""
     racetiger_token = ""
     racetiger_poll_interval_seconds = 2.0
+    finishreview_ip = "192.168.50.10"
+    cyclerace_ip = "192.168.50.20"
+    high_speed_pc_ip = "192.168.50.30"
+    switch_ip = "192.168.50.2"
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
         candidate = str(payload.get("source") or "").strip()
+        clean_candidate, legacy_rtsp_username, legacy_rtsp_password = (
+            split_rtsp_credentials(candidate)
+        )
+        rtsp_username = str(
+            payload.get("rtsp_username") or legacy_rtsp_username
+        ).strip()
+        rtsp_password = _load_secret(
+            payload,
+            "rtsp_password_protected",
+            "rtsp_password",
+            secret_unprotector,
+        ) or legacy_rtsp_password
+        candidate = apply_rtsp_credentials(
+            clean_candidate,
+            rtsp_username,
+            rtsp_password,
+        )
         if is_supported_review_source(candidate):
             source = candidate
+        secondary_candidate = str(payload.get("secondary_source") or "").strip()
+        (
+            clean_secondary_candidate,
+            legacy_secondary_username,
+            legacy_secondary_password,
+        ) = split_rtsp_credentials(secondary_candidate)
+        secondary_username = str(
+            payload.get("secondary_rtsp_username") or legacy_secondary_username
+        ).strip()
+        secondary_password = _load_secret(
+            payload,
+            "secondary_rtsp_password_protected",
+            "secondary_rtsp_password",
+            secret_unprotector,
+        ) or legacy_secondary_password
+        secondary_candidate = apply_rtsp_credentials(
+            clean_secondary_candidate,
+            secondary_username,
+            secondary_password,
+        )
+        if is_rtsp_source(secondary_candidate):
+            secondary_source = secondary_candidate
         output_candidate = str(payload.get("output_dir") or "").strip()
         if output_candidate:
             saved_output_dir = Path(output_candidate).expanduser().resolve()
@@ -263,6 +312,14 @@ def load_review_settings(
         racetiger_base_url = str(payload.get("racetiger_base_url") or "").strip()
         racetiger_pc = str(payload.get("racetiger_pc") or "").strip()
         racetiger_rid = str(payload.get("racetiger_rid") or "").strip()
+        finishreview_ip = str(
+            payload.get("finishreview_ip") or finishreview_ip
+        ).strip()
+        cyclerace_ip = str(payload.get("cyclerace_ip") or cyclerace_ip).strip()
+        high_speed_pc_ip = str(
+            payload.get("high_speed_pc_ip") or high_speed_pc_ip
+        ).strip()
+        switch_ip = str(payload.get("switch_ip") or switch_ip).strip()
         racetiger_token = _load_secret(
             payload,
             "racetiger_token_protected",
@@ -280,6 +337,7 @@ def load_review_settings(
         pass
     return FinishReviewSettings(
         source=source,
+        secondary_source=secondary_source,
         output_dir=(output_dir or saved_output_dir or default_race_dir()).resolve(),
         passage_host=passage_host,
         passage_port=passage_port,
@@ -289,6 +347,10 @@ def load_review_settings(
             or saved_high_speed_dir
             or discover_auyat_root()
         ),
+        finishreview_ip=finishreview_ip,
+        cyclerace_ip=cyclerace_ip,
+        high_speed_pc_ip=high_speed_pc_ip,
+        switch_ip=switch_ip,
         timing_provider=timing_provider,
         racetiger_base_url=racetiger_base_url,
         racetiger_pc=racetiger_pc,
@@ -307,14 +369,44 @@ def save_review_settings(
 ) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     existing_payload = _existing_config_payload(config_path)
-    payload = {
-        "schema_version": 6,
-        "source": settings.source,
+    clean_source, rtsp_username, rtsp_password = split_rtsp_credentials(
+        settings.source
+    )
+    (
+        clean_secondary_source,
+        secondary_rtsp_username,
+        secondary_rtsp_password,
+    ) = split_rtsp_credentials(settings.secondary_source)
+    payload = dict(existing_payload)
+    payload.update({
+        "schema_version": 8,
+        "source": clean_source,
+        "rtsp_username": rtsp_username,
+        "rtsp_password_protected": _protected_secret_for_save(
+            existing_payload,
+            "rtsp_password_protected",
+            rtsp_password,
+            secret_protector,
+            secret_unprotector,
+        ),
+        "secondary_source": clean_secondary_source,
+        "secondary_rtsp_username": secondary_rtsp_username,
+        "secondary_rtsp_password_protected": _protected_secret_for_save(
+            existing_payload,
+            "secondary_rtsp_password_protected",
+            secondary_rtsp_password,
+            secret_protector,
+            secret_unprotector,
+        ),
         "output_dir": str(settings.output_dir),
         "camera_index": settings.camera_index,
         "high_speed_dir": (
             str(settings.high_speed_dir) if settings.high_speed_dir is not None else ""
         ),
+        "finishreview_ip": settings.finishreview_ip,
+        "cyclerace_ip": settings.cyclerace_ip,
+        "high_speed_pc_ip": settings.high_speed_pc_ip,
+        "switch_ip": settings.switch_ip,
         "timing_provider": settings.timing_provider,
         "racetiger_base_url": settings.racetiger_base_url,
         "racetiger_pc": settings.racetiger_pc,
@@ -327,7 +419,10 @@ def save_review_settings(
             secret_unprotector,
         ),
         "racetiger_poll_interval_seconds": settings.racetiger_poll_interval_seconds,
-    }
+    })
+    payload.pop("rtsp_password", None)
+    payload.pop("secondary_rtsp_password", None)
+    payload.pop("racetiger_token", None)
     temporary_path = config_path.with_suffix(config_path.suffix + ".tmp")
     with temporary_path.open("wb") as output:
         output.write(
@@ -414,11 +509,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.install_source:
         settings = FinishReviewSettings(
             source=source_override,
+            secondary_source=saved_settings.secondary_source,
             output_dir=requested_output_dir or saved_settings.output_dir,
             passage_host=args.passage_host,
             passage_port=args.passage_port,
             camera_index=args.camera_index or saved_settings.camera_index,
             high_speed_dir=saved_settings.high_speed_dir,
+            finishreview_ip=saved_settings.finishreview_ip,
+            cyclerace_ip=saved_settings.cyclerace_ip,
+            high_speed_pc_ip=saved_settings.high_speed_pc_ip,
+            switch_ip=saved_settings.switch_ip,
             timing_provider=saved_settings.timing_provider,
             racetiger_base_url=saved_settings.racetiger_base_url,
             racetiger_pc=saved_settings.racetiger_pc,
@@ -438,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_application_font(app)
     settings = FinishReviewSettings(
         source=source_override or saved_settings.source,
+        secondary_source=saved_settings.secondary_source,
         output_dir=saved_settings.output_dir,
         passage_host=args.passage_host,
         passage_port=args.passage_port,
@@ -447,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
             else saved_settings.camera_index
         ),
         high_speed_dir=saved_settings.high_speed_dir,
+        finishreview_ip=saved_settings.finishreview_ip,
+        cyclerace_ip=saved_settings.cyclerace_ip,
+        high_speed_pc_ip=saved_settings.high_speed_pc_ip,
+        switch_ip=saved_settings.switch_ip,
         timing_provider=saved_settings.timing_provider,
         racetiger_base_url=saved_settings.racetiger_base_url,
         racetiger_pc=saved_settings.racetiger_pc,
@@ -461,7 +566,12 @@ def main(argv: list[str] | None = None) -> int:
         passage_host=settings.passage_host,
         passage_port=settings.passage_port,
         camera_index=settings.camera_index,
+        secondary_source=settings.secondary_source,
         high_speed_dir=settings.high_speed_dir,
+        finishreview_ip=settings.finishreview_ip,
+        cyclerace_ip=settings.cyclerace_ip,
+        high_speed_pc_ip=settings.high_speed_pc_ip,
+        switch_ip=settings.switch_ip,
         timing_provider=settings.timing_provider,
         racetiger_base_url=settings.racetiger_base_url,
         racetiger_pc=settings.racetiger_pc,

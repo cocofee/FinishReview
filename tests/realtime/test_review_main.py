@@ -243,7 +243,7 @@ def test_review_settings_round_trip_installed_usb_source(tmp_path):
     )
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 6
+    assert payload["schema_version"] == 8
     assert payload["high_speed_dir"] == str(settings.high_speed_dir)
     assert payload["output_dir"] == str(settings.output_dir)
     assert payload["camera_index"] == 1
@@ -298,6 +298,44 @@ def test_review_settings_round_trip_racetiger_configuration(tmp_path):
     assert "local-test-token" not in config_path.read_text(encoding="utf-8")
 
 
+def test_review_settings_round_trip_two_encrypted_rtsp_sources(tmp_path):
+    config_path = tmp_path / "finish_review_config.json"
+    settings = FinishReviewSettings(
+        source="rtsp://review-one:secret-one@192.168.50.101/live",
+        secondary_source="rtsp://review-two:secret-two@192.168.50.102/live",
+        output_dir=tmp_path / "race",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    save_review_settings(
+        config_path,
+        settings,
+        secret_protector=_protect_for_test,
+    )
+    loaded = load_review_settings(
+        config_path,
+        output_dir=None,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+        secret_unprotector=_unprotect_for_test,
+    )
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert loaded.source == settings.source
+    assert loaded.secondary_source == settings.secondary_source
+    assert payload["source"] == "rtsp://192.168.50.101/live"
+    assert payload["secondary_source"] == "rtsp://192.168.50.102/live"
+    assert payload["secondary_rtsp_username"] == "review-two"
+    assert payload["secondary_rtsp_password_protected"] == _protect_for_test(
+        "secret-two"
+    )
+    assert "secret-one" not in config_path.read_text(encoding="utf-8")
+    assert "secret-two" not in config_path.read_text(encoding="utf-8")
+
+
 def test_legacy_plaintext_token_is_migrated_on_next_save(tmp_path):
     config_path = tmp_path / "finish_review_config.json"
     config_path.write_text(
@@ -327,7 +365,7 @@ def test_legacy_plaintext_token_is_migrated_on_next_save(tmp_path):
         secret_protector=_protect_for_test,
     )
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 6
+    assert payload["schema_version"] == 8
     assert "racetiger_token" not in payload
     assert payload["racetiger_token_protected"] == _protect_for_test(
         "legacy-token"
@@ -366,6 +404,78 @@ def test_unreadable_protected_token_survives_unrelated_settings_save(tmp_path):
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     assert payload["camera_index"] == 2
     assert payload["racetiger_token_protected"] == "unreadable-ciphertext"
+
+
+def test_legacy_plaintext_rtsp_password_is_migrated_on_next_save(tmp_path):
+    config_path = tmp_path / "finish_review_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 6,
+                "source": "rtsp://192.0.2.10:8554/live",
+                "rtsp_username": "review user",
+                "rtsp_password": "legacy-password",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_review_settings(
+        config_path,
+        output_dir=tmp_path / "race",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+        secret_unprotector=_unprotect_for_test,
+    )
+    assert loaded.source == (
+        "rtsp://review%20user:legacy-password@192.0.2.10:8554/live"
+    )
+
+    save_review_settings(
+        config_path,
+        loaded,
+        secret_protector=_protect_for_test,
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 8
+    assert payload["source"] == "rtsp://192.0.2.10:8554/live"
+    assert payload["rtsp_username"] == "review user"
+    assert "rtsp_password" not in payload
+    assert payload["rtsp_password_protected"] == _protect_for_test(
+        "legacy-password"
+    )
+    assert "legacy-password" not in config_path.read_text(encoding="utf-8")
+
+
+def test_saving_settings_preserves_unknown_configuration_fields(tmp_path):
+    config_path = tmp_path / "finish_review_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 99,
+                "future_device": {"enabled": True, "profile": "main"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = FinishReviewSettings(
+        source="rtsp://camera/live",
+        output_dir=tmp_path / "race",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    save_review_settings(
+        config_path,
+        settings,
+        secret_protector=_protect_for_test,
+    )
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 8
+    assert payload["future_device"] == {"enabled": True, "profile": "main"}
 
 
 def test_readable_protected_token_can_be_explicitly_cleared(tmp_path):

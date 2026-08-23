@@ -837,10 +837,15 @@ class PassageEvidencePane(QFrame):
         header = QHBoxLayout()
         self.title_label = QLabel(title)
         self.title_label.setObjectName("evidencePaneTitle")
+        self.camera_combo = QComboBox(self)
+        self.camera_combo.setMinimumWidth(88)
+        self.camera_combo.setToolTip("切换普通录像机位")
+        self.camera_combo.hide()
         self.status_label = QLabel("未选择通过记录")
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.status_label.setObjectName("evidencePaneStatus")
         header.addWidget(self.title_label)
+        header.addWidget(self.camera_combo)
         header.addStretch()
         header.addWidget(self.status_label)
         layout.addLayout(header)
@@ -1565,6 +1570,8 @@ class PassageReviewDialog(QDialog):
         self._lookup_cache: dict[str, tuple[tuple, PassageVideoLookup]] = {}
         self._timeline_signature: tuple = ()
         self._selected_event_id = ""
+        self._preferred_regular_camera_index = 0
+        self._regular_camera_choices: dict[str, int] = {}
         self._shared_delta_ms = 0
         self._sync_playing = False
         self._sync_origin_delta_ms = 0
@@ -1799,6 +1806,9 @@ class PassageReviewDialog(QDialog):
             "高速摄像", HIGH_SPEED_SOURCE, self
         )
         self.regular_pane.open_requested.connect(self._open_location_if_available)
+        self.regular_pane.camera_combo.currentIndexChanged.connect(
+            self._on_regular_camera_changed
+        )
         for pane in (self.regular_pane, self.high_speed_pane):
             pane.step_requested.connect(self._step_both)
             pane.play_requested.connect(self._toggle_both)
@@ -1916,6 +1926,29 @@ class PassageReviewDialog(QDialog):
         ):
             return None
         return association
+
+    def _source_location_with_saved_association(
+        self,
+        event_id: str,
+        lookup: PassageVideoLookup,
+        *,
+        high_speed: bool,
+    ) -> Optional[PassageVideoLocation]:
+        source_kind = HIGH_SPEED_SOURCE if high_speed else REGULAR_SOURCE
+        association = self.association_store.get(event_id, source_kind)
+        if association is not None:
+            associated = next(
+                (
+                    location
+                    for location in lookup.locations
+                    if is_high_speed(location) is bool(high_speed)
+                    and location.segment.segment_id == association.segment_id
+                ),
+                None,
+            )
+            if associated is not None:
+                return associated
+        return source_location(lookup, high_speed=high_speed)
 
     @staticmethod
     def _confirmation_status(
@@ -2042,8 +2075,16 @@ class PassageReviewDialog(QDialog):
         event: PassageEvent,
         lookup: PassageVideoLookup,
     ) -> None:
-        regular = source_location(lookup, high_speed=False)
-        high_speed = source_location(lookup, high_speed=True)
+        regular = self._source_location_with_saved_association(
+            event.event_id,
+            lookup,
+            high_speed=False,
+        )
+        high_speed = self._source_location_with_saved_association(
+            event.event_id,
+            lookup,
+            high_speed=True,
+        )
         readiness_status = review_status_text(lookup, regular, high_speed)
         regular_association = self._source_association(
             event.event_id, REGULAR_SOURCE, regular
@@ -2286,13 +2327,93 @@ class PassageReviewDialog(QDialog):
         if 0 <= row < len(self._visible_events):
             self._select_event(self._visible_events[row].event_id)
 
+    @staticmethod
+    def _regular_locations(
+        lookup: PassageVideoLookup,
+    ) -> tuple[PassageVideoLocation, ...]:
+        return tuple(
+            sorted(
+                (
+                    location
+                    for location in lookup.locations
+                    if not is_high_speed(location)
+                ),
+                key=lambda location: (
+                    _STATUS_PRIORITY.get(location.status, 99),
+                    location.segment.camera_index,
+                    location.segment.segment_id,
+                ),
+            )
+        )
+
+    def _regular_location_for_event(
+        self,
+        event_id: str,
+        lookup: PassageVideoLookup,
+    ) -> Optional[PassageVideoLocation]:
+        locations = self._regular_locations(lookup)
+        if not locations:
+            return None
+        selected_camera = self._regular_camera_choices.get(event_id)
+        if selected_camera is None:
+            association = self.association_store.get(event_id, REGULAR_SOURCE)
+            if association is not None:
+                associated = next(
+                    (
+                        location
+                        for location in locations
+                        if location.segment.segment_id == association.segment_id
+                    ),
+                    None,
+                )
+                if associated is not None:
+                    return associated
+            selected_camera = self._preferred_regular_camera_index
+        return next(
+            (
+                location
+                for location in locations
+                if location.segment.camera_index == selected_camera
+            ),
+            locations[0],
+        )
+
+    def _update_regular_camera_selector(
+        self,
+        event_id: str,
+        lookup: PassageVideoLookup,
+        selected: Optional[PassageVideoLocation],
+    ) -> None:
+        combo = self.regular_pane.camera_combo
+        locations = self._regular_locations(lookup)
+        combo.blockSignals(True)
+        combo.clear()
+        for location in locations:
+            camera_index = location.segment.camera_index
+            combo.addItem(f"机位 {camera_index}", camera_index)
+        if selected is not None:
+            index = combo.findData(selected.segment.camera_index)
+            combo.setCurrentIndex(max(0, index))
+        combo.setVisible(len(locations) > 1)
+        combo.blockSignals(False)
+
+    def _on_regular_camera_changed(self, _index: int) -> None:
+        event_id = self._selected_event_id
+        camera_index = int(self.regular_pane.camera_combo.currentData() or 0)
+        if not event_id or camera_index <= 0:
+            return
+        self._preferred_regular_camera_index = camera_index
+        self._regular_camera_choices[event_id] = camera_index
+        self._select_event(event_id)
+
     def _select_event(self, event_id: str) -> None:
         event = self.passage_store.get(event_id)
         lookup = self._lookups.get(event_id)
         if event is None or lookup is None:
             self.refresh()
             return
-        regular = source_location(lookup, high_speed=False)
+        regular = self._regular_location_for_event(event.event_id, lookup)
+        self._update_regular_camera_selector(event.event_id, lookup, regular)
         high_speed = source_location(lookup, high_speed=True)
         preserve_media = (
             self._selected_event_id == event.event_id
@@ -2393,6 +2514,7 @@ class PassageReviewDialog(QDialog):
         self._set_sync_playing(False)
         self._shared_delta_ms = 0
         self._selected_event_id = ""
+        self.regular_pane.camera_combo.hide()
         metadata = self._current_metadata()
         self.race_value.setText(
             (metadata.race_name.strip() or metadata.race_id)
@@ -2605,8 +2727,16 @@ class PassageReviewDialog(QDialog):
         lookup = self._lookups.get(event_id)
         if lookup is None:
             return
-        regular = source_location(lookup, high_speed=False)
-        high_speed = source_location(lookup, high_speed=True)
+        regular = self._source_location_with_saved_association(
+            event_id,
+            lookup,
+            high_speed=False,
+        )
+        high_speed = self._source_location_with_saved_association(
+            event_id,
+            lookup,
+            high_speed=True,
+        )
         regular_association = self._source_association(
             event_id, REGULAR_SOURCE, regular
         )

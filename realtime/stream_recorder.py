@@ -12,7 +12,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 try:
     from .runtime_paths import application_dir, resource_dir
@@ -43,6 +43,60 @@ def is_rtsp_source(source: object) -> bool:
     if not isinstance(source, str):
         return False
     return urlsplit(source.strip()).scheme.lower() in {"rtsp", "rtsps"}
+
+
+def split_rtsp_credentials(source: object) -> tuple[str, str, str]:
+    """Remove RTSP userinfo while returning decoded credentials separately."""
+
+    value = str(source or "").strip()
+    if not is_rtsp_source(value):
+        return value, "", ""
+    parsed = urlsplit(value)
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        return value, username, password
+    netloc = f"{host}:{port}" if port is not None else host
+    clean = urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+    return clean, username, password
+
+
+def apply_rtsp_credentials(source: object, username: str, password: str) -> str:
+    """Attach encoded credentials to one RTSP source for FFmpeg runtime use."""
+
+    clean, _old_username, _old_password = split_rtsp_credentials(source)
+    if not is_rtsp_source(clean):
+        return clean
+    parsed = urlsplit(clean)
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        return clean
+    host_port = f"{host}:{port}" if port is not None else host
+    resolved_username = str(username or "")
+    resolved_password = str(password or "")
+    if resolved_username or resolved_password:
+        encoded_user = quote(resolved_username, safe="")
+        encoded_password = quote(resolved_password, safe="")
+        userinfo = encoded_user
+        if resolved_password:
+            userinfo += f":{encoded_password}"
+        netloc = f"{userinfo}@{host_port}"
+    else:
+        netloc = host_port
+    return urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 def sanitize_recording_message(value: object) -> str:

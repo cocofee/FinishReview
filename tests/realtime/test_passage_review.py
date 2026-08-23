@@ -211,6 +211,53 @@ def test_review_uses_one_row_per_passage_and_opens_regular_video(
     dialog.close()
 
 
+def test_review_can_switch_between_two_regular_camera_locations(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first_path = tmp_path / "videos" / "camera_01.mkv"
+    second_path = tmp_path / "videos" / "camera_02.mkv"
+    _add_segment(
+        timeline_store,
+        first_path,
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        second_path,
+        source_id="camera_02",
+        camera_index=2,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+
+    assert dialog.regular_pane.camera_combo.isVisible() is False
+    dialog.show()
+    qapp.processEvents()
+    assert dialog.regular_pane.camera_combo.isVisible()
+    assert dialog.regular_pane.camera_combo.count() == 2
+    assert dialog.regular_pane.location.video_path == first_path.absolute()
+
+    dialog.regular_pane.camera_combo.setCurrentIndex(
+        dialog.regular_pane.camera_combo.findData(2)
+    )
+    qapp.processEvents()
+
+    assert dialog.regular_pane.location.segment.camera_index == 2
+    assert dialog.regular_pane.location.video_path == second_path.absolute()
+    dialog.close()
+
+
 def test_review_uses_consistent_laptop_typography(qapp, tmp_path):
     passage_store = PassageEventStore(tmp_path / "passages.jsonl")
     passage_store.append(_event())

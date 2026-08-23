@@ -9,12 +9,21 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
+from PyQt5.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+)
 
 from realtime import passage_review
 from realtime import review_window as review_window_module
 from realtime.auyat_rgb import AuyatScanResult
 from realtime.passage_receiver import PassageEvent, PassageEventStore, RaceFocus
+from realtime.preflight import PreflightJournal, PreflightRun
 from realtime.race_metadata import (
     RaceAthleteMetadata,
     RaceGroupMetadata,
@@ -310,6 +319,32 @@ def test_racetiger_mode_uses_racetiger_source_and_journal(qapp, tmp_path, monkey
     assert window.receiver_status_label.text() == "赛虎: 正在读取"
 
     window.stop()
+    window.close()
+
+
+def test_deployment_snapshot_reports_running_racetiger_without_cycle_error(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    _FakeRaceTigerSource.instances.clear()
+    monkeypatch.setattr(review_window_module, "RaceTigerSource", _FakeRaceTigerSource)
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        timing_provider="racetiger",
+        racetiger_base_url="https://rqs.racetigertiming.com",
+        racetiger_pc="finish-pc",
+        racetiger_rid="RID-2026",
+        racetiger_token="local-test-token",
+    )
+    window.start_receiver()
+
+    snapshot = window._deployment_runtime_snapshot()
+
+    assert snapshot["timing_state"] == "待检查"
+    assert snapshot["timing_detail"] == "赛虎读取服务运行中，尚未读取到本次终点记录"
+    assert "CycleRace" not in snapshot["timing_detail"]
     window.close()
 
 
@@ -647,7 +682,7 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
     )
 
     assert dialog.camera_status_label.text() == "未检测到USB/Type-C摄像头"
-    assert not dialog.start_button.isEnabled()
+    assert dialog.start_button.isEnabled()
     assert dialog.output_edit.isReadOnly()
     visible_text = " ".join(
         widget.text()
@@ -661,7 +696,15 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
     assert "比赛数据" not in visible_text
     assert "无需共享目录、无需填写IP" in visible_text
     assert "未启用认证，仅限受信任赛事局域网" in visible_text
-    for forbidden in ("RTSP", "0.0.0.0", "18765", "端口", "机位"):
+    assert "255.255.255.0" in visible_text
+    assert "网关和DNS留空" in visible_text
+    assert "192.168.1.10" in visible_text
+    assert "192.168.0.10" in visible_text
+    assert dialog.rtsp_address_edit.isHidden()
+    assert dialog.rtsp_username_edit.isHidden()
+    assert dialog.rtsp_password_edit.isHidden()
+    assert dialog.minimumSizeHint().height() <= 680
+    for forbidden in ("0.0.0.0", "18765", "端口"):
         assert forbidden not in visible_text
     dialog.close()
 
@@ -723,6 +766,32 @@ def test_device_settings_expose_racetiger_configuration(qapp, tmp_path):
     dialog.close()
 
 
+def test_device_settings_expose_two_independent_rtsp_cameras(qapp, tmp_path):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://one-user:one-pass@192.168.50.101/live",
+            secondary_source="rtsp://two-user:two-pass@192.168.50.102/live",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (),
+    )
+
+    assert dialog.secondary_rtsp_enabled_checkbox.isChecked()
+    assert dialog.secondary_rtsp_address_edit.text() == (
+        "rtsp://192.168.50.102/live"
+    )
+    assert dialog.secondary_rtsp_username_edit.text() == "two-user"
+    assert dialog.secondary_rtsp_password_edit.text() == "two-pass"
+    assert dialog.settings.secondary_source == (
+        "rtsp://two-user:two-pass@192.168.50.102/live"
+    )
+    assert dialog.minimumSizeHint().height() <= 680
+    dialog.close()
+
+
 def test_device_settings_do_not_report_unplugged_saved_camera_as_detected(
     qapp,
     tmp_path,
@@ -744,6 +813,341 @@ def test_device_settings_do_not_report_unplugged_saved_camera_as_detected(
     assert "当前未检测到" in dialog.device_combo.currentText()
     assert dialog.settings.source == source
     dialog.close()
+
+
+def test_preflight_does_not_require_group_metadata_and_starts_recording_first(
+    qapp,
+    tmp_path,
+):
+    calls = []
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://camera/live",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+            high_speed_dir=tmp_path / "auyat",
+        ),
+        device_provider=lambda: (),
+        passage_provider=lambda: calls.append("passages") or (),
+        recording_start_callback=lambda: calls.append("recording") or True,
+    )
+
+    assert dialog.preflight_start_button.isEnabled()
+    assert not hasattr(dialog, "preflight_group_combo")
+    assert dialog.preflight_hint.wordWrap()
+
+    dialog._start_preflight()
+
+    assert calls[:2] == ["recording", "passages"]
+    assert dialog._preflight_run is not None
+    assert dialog._preflight_run.group_id == ""
+    assert dialog._preflight_run.require_regular
+    assert dialog._preflight_run.require_high_speed
+    assert dialog.preflight_status_label.text() == (
+        "普通录像已启动，等待任意测试芯片新过线"
+    )
+    dialog.close()
+
+
+def test_preflight_requires_changed_video_settings_to_be_saved(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    recording_calls = []
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://camera/live",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+            high_speed_dir=tmp_path / "auyat",
+        ),
+        device_provider=lambda: (),
+        recording_start_callback=lambda: recording_calls.append(True) or True,
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args[1:]),
+    )
+    dialog.rtsp_address_edit.setText("rtsp://other-camera/live")
+
+    dialog._start_preflight()
+
+    assert dialog._preflight_run is None
+    assert not recording_calls
+    assert warnings and warnings[0][0] == "请先保存设置"
+    dialog.close()
+
+
+def test_preflight_recording_callback_starts_normal_recording(qapp, tmp_path):
+    window = _window(tmp_path)
+
+    assert window._recorder is None
+    assert window._start_preflight_recording()
+    assert window._recorder is not None and window._recorder.is_running
+    window.close()
+
+
+def test_two_rtsp_sources_start_independent_review_pipelines(qapp, tmp_path):
+    _FakeRecorder.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+
+    window.start_recording()
+
+    assert [recorder.camera_index for recorder in _FakeRecorder.instances] == [1, 2]
+    assert set(window._recorders) == {1, 2}
+    assert set(window._ring_buffers) == {1, 2}
+    assert window._recording_all_active()
+    assert window.camera_status_label.text() == "录像设备: 全部已连接"
+    window.close()
+
+
+def test_second_rtsp_start_failure_rolls_back_first_camera(qapp, tmp_path):
+    class _FailSecondRecorder(_FakeRecorder):
+        def start(self):
+            if self.camera_index == 2:
+                raise RuntimeError("camera two unavailable")
+            return super().start()
+
+    _FailSecondRecorder.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FailSecondRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+
+    with pytest.raises(RuntimeError, match="camera two unavailable"):
+        window.start_recording()
+
+    assert not window._recorders
+    assert _FailSecondRecorder.instances[0].stopped
+    assert not _FailSecondRecorder.instances[0].is_running
+    window.close()
+
+
+def test_closing_settings_cancels_running_rtsp_probe(qapp, tmp_path):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://camera/live",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (),
+    )
+
+    class _RunningProbe:
+        cancelled = False
+
+        def isRunning(self):
+            return True
+
+        def cancel(self):
+            self.cancelled = True
+
+    worker = _RunningProbe()
+    dialog._rtsp_probe_worker = worker
+
+    dialog.done(QDialog.Rejected)
+
+    assert worker.cancelled
+    assert dialog._pending_dialog_result == QDialog.Rejected
+    assert not dialog.isEnabled()
+    dialog._on_rtsp_probe_worker_finished()
+    assert dialog.result() == QDialog.Rejected
+
+
+def test_cancelled_settings_dialog_does_not_stop_recording(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.start_recording()
+    recorder = window._recorder
+
+    class _CancelledDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec_(self):
+            return QDialog.Rejected
+
+    monkeypatch.setattr(
+        review_window_module,
+        "FinishReviewLaunchDialog",
+        _CancelledDialog,
+    )
+
+    window._configure_devices()
+
+    assert recorder is not None and recorder.is_running
+    window.close()
+
+
+def test_settings_save_failure_keeps_runtime_and_recording_unchanged(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    def fail_save(_settings):
+        raise OSError("config is read-only")
+
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+        settings_saver=fail_save,
+    )
+    window.start_recording()
+    recorder = window._recorder
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args[1:]),
+    )
+    settings = FinishReviewSettings(
+        source="rtsp://other-camera/live",
+        output_dir=tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    applied = window._apply_settings(settings, stop_recording=True)
+
+    assert not applied
+    assert window.source == "rtsp://camera/live"
+    assert recorder is not None and recorder.is_running
+    assert warnings and warnings[0][0] == "设置未保存"
+    window.close()
+
+
+def test_invalid_output_directory_is_rejected_before_save_or_stop(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    saved = []
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path / "current",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+        settings_saver=saved.append,
+    )
+    window.start_recording()
+    window.start_receiver()
+    recorder = window._recorder
+    receiver = window._receiver
+    invalid_output = tmp_path / "not-a-directory"
+    invalid_output.write_text("file", encoding="utf-8")
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args[1:]),
+    )
+    settings = FinishReviewSettings(
+        source="rtsp://other-camera/live",
+        output_dir=invalid_output,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    applied = window._apply_settings(settings, stop_recording=True)
+
+    assert not applied
+    assert not saved
+    assert window.output_dir == (tmp_path / "current").resolve()
+    assert window.source == "rtsp://camera/live"
+    assert recorder is not None and recorder.is_running
+    assert receiver is not None and receiver.is_running
+    assert warnings and warnings[0][0] == "设置无法应用"
+    window.close()
+
+
+def test_preflight_filter_uses_race_stage_and_event_identity(qapp, tmp_path):
+    test_event = _event(event_id="shared-event")
+    run = PreflightRun.start(
+        (),
+        started_at_ms=0,
+        require_regular=False,
+        require_high_speed=False,
+    ).observe((test_event,))
+    PreflightJournal(tmp_path / "preflight_tests.jsonl").append(
+        run,
+        recorded_at_ms=test_event.emitted_at_ms,
+    )
+    window = _window(tmp_path)
+    later_race_event = _event(
+        event_id="shared-event",
+        race_id="race-2",
+        stage_id="stage-2",
+    )
+
+    visible = window._events_for_current_metadata((test_event, later_race_event))
+
+    assert visible == (later_race_event,)
+    window.close()
+
+
+def test_preflight_event_is_hidden_only_after_pass_and_can_be_restored(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    event = _event(event_id="preflight-event")
+    window.passage_store.append(event)
+    run = PreflightRun.start(
+        (),
+        started_at_ms=0,
+        require_regular=True,
+        require_high_speed=True,
+    ).observe((event,))
+
+    window._record_preflight_event(
+        run.with_evidence(regular_ready=False, high_speed_ready=False)
+    )
+    assert window._events_for_current_metadata((event,)) == (event,)
+
+    window._record_preflight_event(
+        run.with_evidence(regular_ready=True, high_speed_ready=True)
+    )
+    assert window._events_for_current_metadata((event,)) == ()
+
+    restored, detail = window._restore_latest_preflight_event()
+
+    assert restored
+    assert "原始计时记录未被修改" in detail
+    assert window._events_for_current_metadata((event,)) == (event,)
+    window.close()
 
 
 def test_runtime_status_hides_receiver_port(qapp, tmp_path):
@@ -1068,6 +1472,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.camera_status_label.text() in {
         "录像设备: 正在检查",
         "录像设备: 已连接",
+        "录像设备: 全部已连接",
     }
     window.close()
 
