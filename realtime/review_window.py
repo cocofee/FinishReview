@@ -1596,7 +1596,7 @@ class _CompactStatusIndicator(QFrame):
         self.setMaximumWidth(168)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 2, 10, 2)
+        layout.setContentsMargins(10, 3, 10, 3)
         layout.setSpacing(7)
         self._dot = QLabel(self)
         self._dot.setFixedSize(9, 9)
@@ -1606,11 +1606,11 @@ class _CompactStatusIndicator(QFrame):
         text_layout.setSpacing(0)
         self._title_label = QLabel(title, self)
         self._title_label.setStyleSheet(
-            "color: #17212b; font-size: 9pt; font-weight: 700;"
+            "color: #17212b; font-size: 10pt; font-weight: 700;"
         )
         self._detail_label = QLabel("--", self)
         self._detail_label.setStyleSheet(
-            "color: #667085; font-size: 8pt; font-weight: 500;"
+            "color: #667085; font-size: 9pt; font-weight: 500;"
         )
         text_layout.addWidget(self._title_label)
         text_layout.addWidget(self._detail_label)
@@ -2399,6 +2399,7 @@ class FinishReviewWindow(PassageReviewDialog):
     def _init_runtime_status(self) -> None:
         panel = QFrame(self)
         panel.setObjectName("finishConsoleHeader")
+        panel.setMinimumHeight(56)
         panel.setStyleSheet(
             "QFrame#finishConsoleHeader { background: #ffffff; "
             "border: 1px solid #cfd7df; border-radius: 4px; }"
@@ -2406,7 +2407,7 @@ class FinishReviewWindow(PassageReviewDialog):
             "font-size: 10pt; font-weight: 600; }"
         )
         panel_layout = QHBoxLayout(panel)
-        panel_layout.setContentsMargins(10, 6, 10, 6)
+        panel_layout.setContentsMargins(10, 8, 10, 8)
         panel_layout.setSpacing(10)
 
         panel_layout.addWidget(_FinishReviewLogo(panel))
@@ -2435,11 +2436,11 @@ class FinishReviewWindow(PassageReviewDialog):
         event_layout.setSpacing(0)
         self.event_name_label = QLabel("未加载赛事", panel)
         self.event_name_label.setStyleSheet(
-            "font-size: 10pt; font-weight: 700; color: #17212b;"
+            "font-size: 12pt; font-weight: 700; color: #17212b;"
         )
         self.event_path_label = QLabel("等待计时源赛事信息 · 终点", panel)
         self.event_path_label.setStyleSheet(
-            "font-size: 8pt; font-weight: 500; color: #667085;"
+            "font-size: 10pt; font-weight: 500; color: #667085;"
         )
         event_layout.addWidget(self.event_name_label)
         event_layout.addWidget(self.event_path_label)
@@ -2465,12 +2466,12 @@ class FinishReviewWindow(PassageReviewDialog):
         clock_layout.setSpacing(0)
         self.beijing_clock_label = QLabel(panel)
         self.beijing_clock_label.setStyleSheet(
-            "font-family: Consolas; color: #17212b; font-size: 10pt; font-weight: 700;"
+            "font-family: Consolas; color: #17212b; font-size: 11pt; font-weight: 700;"
         )
         self.beijing_zone_label = QLabel("北京时间", panel)
         self.beijing_zone_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.beijing_zone_label.setStyleSheet(
-            "color: #667085; font-size: 8pt; font-weight: 500;"
+            "color: #667085; font-size: 9pt; font-weight: 500;"
         )
         clock_layout.addWidget(self.beijing_clock_label)
         clock_layout.addWidget(self.beijing_zone_label)

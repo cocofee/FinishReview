@@ -1593,8 +1593,18 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.capture_status_label.isHidden()
     assert window.product_title_label.text() == "FinishReview"
     assert window.product_subtitle_label.text() == "终点多源复核"
+    assert window.event_name_label.font().pointSize() >= 12
+    assert window.event_path_label.font().pointSize() >= 10
+    assert window.receiver_status_label._title_label.font().pointSize() >= 10
+    assert window.receiver_status_label._detail_label.font().pointSize() >= 9
     assert len(window.beijing_clock_label.text().split(":")) == 3
+    assert window.beijing_clock_label.font().pointSize() >= 11
     assert window.beijing_zone_label.text() == "北京时间"
+    assert window.beijing_zone_label.font().pointSize() >= 9
+    assert window.findChild(
+        review_window_module.QFrame,
+        "finishConsoleHeader",
+    ).minimumHeight() >= 56
 
     window.start_recording()
     assert window.recorder.is_running
