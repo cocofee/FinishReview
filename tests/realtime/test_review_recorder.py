@@ -1,3 +1,4 @@
+import subprocess
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -307,6 +308,36 @@ def test_review_recorder_stop_reports_ffmpeg_failure_details(tmp_path):
 
     with pytest.raises(RecordingError, match="代码 7: socket failure"):
         recorder.stop()
+
+
+def test_review_recorder_keeps_process_handle_when_shutdown_is_unconfirmed(tmp_path):
+    class _UnstoppableProcess(_FakeProcess):
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("ffmpeg", timeout)
+
+        def terminate(self):
+            raise OSError("terminate unavailable")
+
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"binary")
+    factory = _ProcessFactory()
+    factory.process = _UnstoppableProcess()
+    recorder = FfmpegReviewRecorder(
+        "rtsp://camera/live",
+        tmp_path / "race",
+        camera_index=1,
+        ffmpeg_path=ffmpeg,
+        popen_factory=factory,
+    )
+    recorder.start()
+
+    with pytest.raises(OSError, match="terminate unavailable"):
+        recorder.stop()
+
+    assert recorder.is_running
+    factory.process.returncode = 0
+    recorder.stop()
+    assert not recorder.is_running
 
 
 def test_ring_buffer_indexes_only_completed_playlist_segments(tmp_path):

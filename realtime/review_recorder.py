@@ -610,9 +610,9 @@ class FfmpegReviewRecorder:
 
     def stop(self) -> None:
         process = self._process
-        self._process = None
         if process is None:
             return
+        shutdown_error: Exception | None = None
         if process.poll() is None:
             try:
                 if process.stdin is not None:
@@ -620,12 +620,19 @@ class FfmpegReviewRecorder:
                     process.stdin.flush()
                 process.wait(timeout=self.stop_timeout)
             except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                process.terminate()
                 try:
-                    process.wait(timeout=self.stop_timeout)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=self.stop_timeout)
+                    process.terminate()
+                    try:
+                        process.wait(timeout=self.stop_timeout)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=self.stop_timeout)
+                except Exception as exc:  # noqa: BLE001 - retain live process handle.
+                    shutdown_error = exc
+        if process.poll() is None:
+            if shutdown_error is not None:
+                raise shutdown_error
+            raise RecordingError("终点录像进程未停止")
         thread = self._stderr_thread
         if thread is not None:
             thread.join(timeout=1.0)
@@ -638,6 +645,8 @@ class FfmpegReviewRecorder:
             pass
         self._process = None
         self._stderr_thread = None
+        if shutdown_error is not None:
+            raise shutdown_error
         if process.returncode not in (0, None):
             message = f"终点录像停止异常，代码 {process.returncode}"
             if detail:

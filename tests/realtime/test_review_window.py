@@ -36,6 +36,7 @@ from realtime.review_window import (
     FinishReviewSettings,
     FinishReviewWindow,
 )
+from realtime.stream_recorder import RecordingError
 from realtime.video_timeline import DEFAULT_CLOCK_SOURCE, VideoTimelineStore
 
 
@@ -1029,6 +1030,174 @@ def test_second_rtsp_start_failure_rolls_back_first_camera(qapp, tmp_path):
     assert not window._recorders
     assert _FailSecondRecorder.instances[0].stopped
     assert not _FailSecondRecorder.instances[0].is_running
+    window.close()
+
+
+def test_recording_stop_failure_keeps_running_camera_for_retry(qapp, tmp_path):
+    class _FailOnceStopRecorder(_FakeRecorder):
+        def stop(self):
+            self.stop_calls = getattr(self, "stop_calls", 0) + 1
+            if self.stop_calls == 1:
+                raise OSError("shutdown unavailable")
+            super().stop()
+
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FailOnceStopRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_recording()
+    recorder = window._recorder
+
+    assert not window.stop_recording()
+    assert recorder is not None and recorder.is_running
+    assert set(window._recorders) == {1}
+    assert "机位1" in window._runtime_error
+
+    assert window.stop_recording()
+    assert not window._recorders
+    assert recorder.stop_calls == 2
+    assert window._runtime_error == ""
+    assert window.camera_status_label.text() != "录像设备: 异常"
+    window.close()
+
+
+def test_partial_stop_keeps_active_camera_archive_open(qapp, tmp_path, monkeypatch):
+    class _FailFirstCameraOnceRecorder(_FakeRecorder):
+        def stop(self):
+            self.stop_calls = getattr(self, "stop_calls", 0) + 1
+            if self.camera_index == 1 and self.stop_calls == 1:
+                raise OSError("shutdown unavailable")
+            super().stop()
+
+    class _CapturingArchivePublisher:
+        def __init__(self, recorder):
+            self.recorder = recorder
+            self.recording_values = []
+
+        def publish_completed(self, *, race_id, recording):
+            self.recording_values.append(recording)
+            return ()
+
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FailFirstCameraOnceRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_recording()
+    publishers = {
+        camera_index: _CapturingArchivePublisher(recorder)
+        for camera_index, recorder in window._recorders.items()
+    }
+    window._archive_publishers = list(publishers.values())
+    monkeypatch.setattr(window, "_current_archive_race_id", lambda: "race-1")
+
+    assert not window.stop_recording()
+
+    assert publishers[1].recording_values
+    assert all(publishers[1].recording_values)
+    assert publishers[2].recording_values
+    assert not any(publishers[2].recording_values)
+
+    assert window.stop_recording()
+    window.close()
+
+
+def test_stopped_recorder_warning_does_not_block_settings_apply(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    class _StoppedWithWarningRecorder(_FakeRecorder):
+        def stop(self):
+            self.is_running = False
+            self.stopped = True
+            raise RecordingError("ffmpeg exited with code 7")
+
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_StoppedWithWarningRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_recording()
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args[1:]),
+    )
+    settings = FinishReviewSettings(
+        source="rtsp://camera-two/live",
+        output_dir=tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    assert window._apply_settings(settings, stop_recording=True)
+    assert window.source == "rtsp://camera-two/live"
+    assert not any(title == "录像未停止" for title, _detail in warnings)
+    window.close()
+
+
+def test_settings_apply_rolls_back_when_recording_stop_fails(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    class _FailOnceStopRecorder(_FakeRecorder):
+        def stop(self):
+            self.stop_calls = getattr(self, "stop_calls", 0) + 1
+            if self.stop_calls == 1:
+                raise OSError("shutdown unavailable")
+            super().stop()
+
+    saved = []
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FailOnceStopRecorder,
+        receiver_factory=_FakeReceiver,
+        settings_saver=saved.append,
+    )
+    window.start_recording()
+    recorder = window._recorder
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args[1:]),
+    )
+    settings = FinishReviewSettings(
+        source="rtsp://camera-two/live",
+        output_dir=tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    applied = window._apply_settings(settings, stop_recording=True)
+
+    assert not applied
+    assert window.source == "rtsp://camera-one/live"
+    assert recorder is not None and recorder.is_running
+    assert saved[0] == settings
+    assert saved[-1].source == "rtsp://camera-one/live"
+    assert warnings and warnings[-1][0] == "录像未停止"
+
+    assert window.stop_recording()
     window.close()
 
 

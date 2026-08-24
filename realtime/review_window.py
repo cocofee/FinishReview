@@ -67,7 +67,7 @@ from .preflight import (
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
 from .receiver_controller import ReceiverController
-from .recording_controller import start_recording_pipeline
+from .recording_controller import RecordingSessionController
 from .review_recorder import (
     ArchiveTimelinePublisher,
     FfmpegReviewRecorder,
@@ -1563,7 +1563,6 @@ class FinishReviewWindow(PassageReviewDialog):
         self.ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self.review_retention_seconds = max(6, int(review_retention_seconds))
         self.timing_error_ms = max(0, int(timing_error_ms))
-        self._recorder_factory = recorder_factory
         self._settings_saver = settings_saver
 
         passage_store = PassageEventStore(
@@ -1610,6 +1609,13 @@ class FinishReviewWindow(PassageReviewDialog):
 
         self.setWindowTitle("终点复核系统")
         self.setMinimumSize(1180, 760)
+        self._recording_controller = RecordingSessionController(
+            recorder_factory=recorder_factory,
+            ring_buffer_factory=ReviewRingBuffer,
+            coordinator_factory=PassageReviewCoordinator,
+            timeline_publisher_factory=PassageReviewTimelinePublisher,
+            archive_publisher_factory=ArchiveTimelinePublisher,
+        )
         self._recorder: FfmpegReviewRecorder | None = None
         self._recorders: dict[int, FfmpegReviewRecorder] = {}
         self._receiver_controller = ReceiverController(
@@ -1634,6 +1640,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._published_keys: set[tuple[int, str, int]] = set()
         self._unsupported_event_ids: set[str] = set()
         self._runtime_error = ""
+        self._recording_stop_error = ""
         self._capture_error = ""
         self._receiver_error = ""
         self._racetiger_status: RaceTigerStatus | None = None
@@ -1701,15 +1708,22 @@ class FinishReviewWindow(PassageReviewDialog):
             sources.append((self.camera_index + 1, self.secondary_source))
         return tuple(sources)
 
+    def _sync_recording_components(self) -> None:
+        self._recorders = self._recording_controller.recorders
+        self._ring_buffers = self._recording_controller.ring_buffers
+        self._coordinators = self._recording_controller.coordinators
+        self._publishers = self._recording_controller.timeline_publishers
+        self._recorder = self._recorders.get(self.camera_index)
+        self._ring_buffer = self._ring_buffers.get(self.camera_index)
+        self._coordinator = self._coordinators.get(self.camera_index)
+        self._publisher = self._publishers.get(self.camera_index)
+
     def _recording_any_active(self) -> bool:
-        return any(recorder.is_running for recorder in self._recorders.values())
+        return self._recording_controller.any_active
 
     def _recording_all_active(self) -> bool:
-        configured = self._configured_recording_sources()
-        return bool(configured) and len(self._recorders) == len(configured) and all(
-            self._recorders.get(camera_index) is not None
-            and self._recorders[camera_index].is_running
-            for camera_index, _source in configured
+        return self._recording_controller.all_active(
+            self._configured_recording_sources()
         )
 
     @property
@@ -1994,6 +2008,7 @@ class FinishReviewWindow(PassageReviewDialog):
         stop_recording: bool = False,
     ) -> bool:
         self._runtime_error = ""
+        self._recording_stop_error = ""
         previous_settings = self._current_settings()
         output_dir = Path(settings.output_dir).expanduser().resolve()
         output_changed = output_dir != self.output_dir
@@ -2099,8 +2114,25 @@ class FinishReviewWindow(PassageReviewDialog):
                 return False
             self._passage_batch_timer.stop()
             self._pending_passages.clear()
-        if stop_recording:
-            self.stop_recording()
+        if stop_recording and not self.stop_recording():
+            stop_error = self._runtime_error or "Recording session did not stop"
+            recovery_errors = []
+            if self._settings_saver is not None:
+                try:
+                    self._settings_saver(previous_settings)
+                except Exception as exc:  # noqa: BLE001 - report rollback failure.
+                    recovery_errors.append(f"settings rollback: {exc}")
+            if receiver_restart_needed:
+                try:
+                    self.start_receiver()
+                except Exception as exc:  # noqa: BLE001 - restore current runtime.
+                    recovery_errors.append(
+                        "receiver restart: " + sanitize_recording_message(exc)
+                    )
+            detail = "; ".join((stop_error, *recovery_errors))
+            QMessageBox.warning(self, "录像未停止", detail)
+            self._update_runtime_status()
+            return False
         self.source = str(settings.source).strip()
         self.secondary_source = str(settings.secondary_source).strip()
         self.passage_host = str(settings.passage_host).strip()
@@ -2617,8 +2649,8 @@ class FinishReviewWindow(PassageReviewDialog):
     def start_recording(self) -> None:
         if self._recording_all_active():
             return
-        if self._recorders:
-            self.stop_recording()
+        if self._recording_controller.recorders and not self.stop_recording():
+            raise RecordingError("现有录像会话未能完全停止，请重试")
         configured_sources = self._configured_recording_sources()
         if not configured_sources:
             raise RecordingError("请先在设备设置中选择录像摄像头")
@@ -2628,42 +2660,22 @@ class FinishReviewWindow(PassageReviewDialog):
             raise RecordingError(f"无法检查赛事存储空间: {exc}") from exc
         if free_bytes < 1024**3:
             raise RecordingError("赛事存储空间不足 1 GB，无法开始录像")
-        recorders: dict[int, FfmpegReviewRecorder] = {}
-        ring_buffers: dict[int, ReviewRingBuffer] = {}
-        coordinators: dict[int, PassageReviewCoordinator] = {}
-        publishers: dict[int, PassageReviewTimelinePublisher] = {}
         archive_publishers = []
         try:
-            for camera_index, source in configured_sources:
-                pipeline = start_recording_pipeline(
-                    source=source,
-                    output_dir=self.output_dir,
-                    camera_index=camera_index,
-                    ffmpeg_path=self.ffmpeg_path,
-                    review_retention_seconds=self.review_retention_seconds,
-                    timeline_store=self.timeline_store,
-                    timing_error_ms=self.timing_error_ms,
-                    recorder_factory=self._recorder_factory,
-                    ring_buffer_factory=ReviewRingBuffer,
-                    coordinator_factory=PassageReviewCoordinator,
-                    timeline_publisher_factory=PassageReviewTimelinePublisher,
-                    archive_publisher_factory=ArchiveTimelinePublisher,
-                )
-                recorders[camera_index] = pipeline.recorder
-                ring_buffers[camera_index] = pipeline.ring_buffer
-                coordinators[camera_index] = pipeline.coordinator
-                publishers[camera_index] = pipeline.timeline_publisher
-                archive_publishers.append(pipeline.archive_publisher)
-            self._recorders = recorders
-            self._ring_buffers = ring_buffers
-            self._coordinators = coordinators
-            self._publishers = publishers
-            self._recorder = recorders.get(self.camera_index)
-            self._ring_buffer = ring_buffers.get(self.camera_index)
-            self._coordinator = coordinators.get(self.camera_index)
-            self._publisher = publishers.get(self.camera_index)
+            pipelines = self._recording_controller.start(
+                sources=configured_sources,
+                output_dir=self.output_dir,
+                ffmpeg_path=self.ffmpeg_path,
+                review_retention_seconds=self.review_retention_seconds,
+                timeline_store=self.timeline_store,
+                timing_error_ms=self.timing_error_ms,
+            )
+            self._sync_recording_components()
+            archive_publishers = [
+                pipeline.archive_publisher for pipeline in pipelines
+            ]
             self._capture_windows_by_camera = {
-                camera_index: {} for camera_index in coordinators
+                camera_index: {} for camera_index in self._coordinators
             }
             self._capture_windows = self._capture_windows_by_camera.setdefault(
                 self.camera_index,
@@ -2677,31 +2689,28 @@ class FinishReviewWindow(PassageReviewDialog):
             self._started = True
             self._recording_started_at = time.monotonic()
             self._runtime_error = ""
+            self._recording_stop_error = ""
             self._capture_error = ""
             self._refresh_timer.start()
             self._refresh_capture_windows()
             self._lookup_cache.clear()
             self.refresh()
         except Exception:
-            for recorder in recorders.values():
-                try:
-                    recorder.stop()
-                except Exception as cleanup_error:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to stop recorder during startup rollback: %s",
-                        cleanup_error,
-                    )
-            self._recorders = {}
-            self._ring_buffers = {}
-            self._coordinators = {}
-            self._publishers = {}
-            self._recorder = None
-            self._ring_buffer = None
-            self._coordinator = None
-            self._publisher = None
+            rollback_failures = self._recording_controller.stop()
+            for failure in rollback_failures:
+                logger.warning(
+                    "Failed to stop camera %s during window startup rollback: %s",
+                    failure.camera_index,
+                    failure.error,
+                )
+            self._sync_recording_components()
             for archive_publisher in archive_publishers:
                 if archive_publisher in self._archive_publishers:
                     self._archive_publishers.remove(archive_publisher)
+            self._started = self._recording_controller.any_active
+            if not self._started:
+                self._recording_started_at = 0.0
+                self._refresh_timer.stop()
             raise
         finally:
             self._update_runtime_status()
@@ -3352,35 +3361,37 @@ class FinishReviewWindow(PassageReviewDialog):
             )
         self._update_operator_controls()
 
-    def stop_recording(self) -> None:
+    def stop_recording(self) -> bool:
         recorders = tuple(self._recorders.items())
         if recorders:
-            errors = []
-            for camera_index, recorder in recorders:
-                try:
-                    recorder.stop()
-                except RecordingError as exc:
-                    errors.append(
-                        f"机位{camera_index}: {sanitize_recording_message(exc)}"
-                    )
+            failures = self._recording_controller.stop()
             try:
-                self._publish_archive_segments(recording=False)
+                self._publish_archive_segments()
                 self._refresh_capture_windows()
             except Exception:
                 logger.exception("Failed to publish final review segments")
-            if errors:
-                self._runtime_error = "; ".join(errors)
-        self._recorders = {}
-        self._ring_buffers = {}
-        self._coordinators = {}
-        self._publishers = {}
-        self._recorder = None
-        self._ring_buffer = None
-        self._coordinator = None
-        self._publisher = None
-        self._started = False
-        self._recording_started_at = 0.0
+            if failures:
+                self._recording_stop_error = "; ".join(
+                    f"机位{failure.camera_index}: "
+                    f"{sanitize_recording_message(failure.error)}"
+                    for failure in failures
+                )
+                self._runtime_error = self._recording_stop_error
+        else:
+            failures = self._recording_controller.stop()
+        if not failures:
+            if self._runtime_error == self._recording_stop_error:
+                self._runtime_error = ""
+            self._recording_stop_error = ""
+        self._sync_recording_components()
+        self._started = self._recording_controller.any_active
+        if not self._started:
+            self._recording_started_at = 0.0
         self._update_runtime_status()
+        return (
+            not any(failure.still_running for failure in failures)
+            and not self._recording_controller.any_active
+        )
 
     def stop_receiver(self) -> bool:
         errors = self._receiver_controller.stop()
@@ -3400,10 +3411,10 @@ class FinishReviewWindow(PassageReviewDialog):
             worker.stop()
             if not worker.wait(1_000):
                 return False
-        self.stop_recording()
+        recording_stopped = self.stop_recording()
         receiver_stopped = self.stop_receiver()
         self._update_runtime_status()
-        return receiver_stopped
+        return recording_stopped and receiver_stopped
 
     def closeEvent(self, event) -> None:
         self._clock_timer.stop()

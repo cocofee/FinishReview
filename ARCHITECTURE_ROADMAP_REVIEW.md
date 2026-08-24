@@ -378,5 +378,74 @@ artifacts\dist\FinishReviewConsole\FinishReviewConsole.exe --smoke-test
 - CycleRace 强制认证：等待发送端能力、威胁模型和双版本部署方案。
 - 时间轴、高速抓拍和 event row 索引：等待真实赛事超过性能阈值。
 - SQLite、快照和压缩：等待 JSONL 大小、启动耗时或内存压力达到触发条件。
-- 录像控制器和主窗口进一步拆分：等待现场基线实际执行，并按职责逐步抽取。
+- 录像控制器的自动恢复和更深层 UI 解耦：已完成创建及多机位启动/停止切片；自动重连、第三机位和状态事件仍等待现场基线后再设计。
 - 真实硬件自动化和数小时 soak test：等待固定测试机、摄像机及共享目录环境。
+
+## 九、录像会话控制器执行记录（2026-08-24）
+
+### 本阶段范围
+
+本阶段继续按“创建 recorder -> 启动/停止 -> 错误恢复”的顺序推进，只完成第二个切片。磁盘预检、Passage 注册、最终视频段发布、证据事实源和 UI 状态仍由 `FinishReviewWindow` 负责，没有迁移文件格式或正式证据语义。
+
+### 已完成
+
+1. **多机位会话控制器：** `realtime/recording_controller.py` 新增 `RecordingSessionController`，集中持有 `RecordingPipeline`，统一暴露 recorder、ring buffer、coordinator 和 publisher 映射。
+2. **原子启动：** 单/双机位只有全部启动成功后才提交为活动会话；后续机位启动失败时逆序停止已启动机位，并保留原始异常。
+3. **重复启动保护：** 相同来源的活动会话直接复用；不同来源不能覆盖仍在运行的会话。
+4. **可重试停止：** 停止会尝试所有机位；已停止机位立即移出活动状态，仍在运行的失败机位继续由控制器持有，允许再次停止。
+5. **窗口接线：** `realtime/review_window.py` 将多机位创建和停止委托给控制器，同时保留 `_recorders`、`_ring_buffers`、`_coordinators`、`_publishers` 兼容字段及原有最终片段发布顺序。
+6. **设置安全边界：** 录像未完全停止时不再继续应用摄像头或目录设置；已保存的新设置会回滚，运行中的 recorder 仍可追踪。
+
+### 新增测试
+
+- `tests/realtime/test_recording_controller.py`：覆盖双机位组件映射、相同会话幂等启动、不同会话拒绝、第二机位失败回滚、停止幂等、部分停止失败重试。
+- `tests/realtime/test_review_window.py`：覆盖窗口保留停止失败机位，以及设置应用在录像停止失败时回滚。
+
+### 本阶段验证
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/realtime/test_recording_controller.py tests/realtime/test_review_window.py -q
+.\.venv\Scripts\python.exe -m pytest -q --basetemp .pytest_tmp_recording_session
+.\.venv\Scripts\python.exe -m compileall -q realtime tests tools
+.\.venv\Scripts\python.exe -m pip check
+git diff --check
+.\packaging\build.ps1
+artifacts\dist\FinishReviewConsole\FinishReviewConsole.exe --smoke-test
+```
+
+结果：
+
+- 相关测试：`60 passed`。
+- 全量 pytest：`314 passed in 9.68s`。
+- `compileall`、`pip check`、`git diff --check`：通过。
+- PyInstaller clean build：通过，使用仓库 `.venv`。
+- 发布目录边界检查：通过，209 个文件，460,384,133 bytes。
+- EXE smoke test：退出码 0。
+- `Hidden import "sip" not found!`：仍为已知非阻断告警。
+
+### 尚未完成
+
+- 未连接真实 USB/RTSP 双机位、CycleRace、RaceTiger 或奥亚特共享目录。
+- 未执行网络中断、磁盘不足或数小时录像 soak test。
+- 未实现自动重连、指数退避或控制器向 Qt 发射状态事件；这些属于下一段“错误恢复”，应在现场基线实际执行后再推进。
+
+### Review 后修复（2026-08-24）
+
+针对录像会话实现复核发现的失败路径问题，本阶段追加完成：
+
+1. **保留真实 FFmpeg 句柄：** `FfmpegReviewRecorder.stop()` 只有在 `poll()` 确认进程退出后才清空 `_process` 和 stderr 线程；无法确认退出时保留句柄，允许后续重试。
+2. **启动回滚可追踪：** 多机位启动或单管线组装失败时，未能停止的完整 pipeline 或不完整 recorder 会继续由 `RecordingSessionController` 持有，不再只记录日志后丢失引用。
+3. **停止结果分级：** `RecordingStopFailure.still_running` 区分“仍在运行”与“已经停止但有退出告警”；只有前者阻止设置应用和窗口关闭。
+4. **按机位封口归档：** 部分停止失败时，仍在写入的机位继续按 `recording=True` 处理，只有确认停止的机位发布最后一个归档段。
+5. **错误状态恢复：** 停止重试成功后清除对应录像停止错误，不再让设备状态持续显示为异常。
+
+新增测试覆盖 FFmpeg `wait/terminate` 失败、单管线清理失败、多机位启动回滚失败、已停止告警、部分停止归档状态和错误恢复。
+
+修复后验证结果：
+
+- 录像相关测试：`82 passed`。
+- 全量 pytest：`320 passed in 9.06s`。
+- `compileall`、`pip check`、`git diff --check`：通过。
+- PyInstaller clean build及发布边界检查：通过，209 个文件，460,386,330 bytes。
+- EXE smoke test：退出码 0。
+- `Hidden import "sip" not found!`：仍为已知非阻断告警。
