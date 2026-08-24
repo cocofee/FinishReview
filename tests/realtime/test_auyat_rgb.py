@@ -502,8 +502,8 @@ def test_review_reuses_one_rgb_capture_and_marks_only_selected_identity(
     assert _wait_until(qapp, lambda: dialog.high_speed_pane.video_view.has_frame)
     first_worker = dialog.high_speed_pane._worker
     assert isinstance(first_worker, AuyatRgbPlaybackWorker)
-    assert dialog.table.item(dialog.table.currentRow(), 7).text() == "可查看"
-    assert dialog.table.item(dialog.table.currentRow(), 8).text() == "待核对"
+    assert dialog.table.item(dialog.table.currentRow(), 7).text() == "未确认"
+    assert dialog.table.item(dialog.table.currentRow(), 8).text() == "未确认"
     assert dialog.high_speed_pane.video_view._marker_simple
 
     dialog.high_speed_pane.video_view.set_actual_size()
@@ -531,7 +531,7 @@ def test_review_reuses_one_rgb_capture_and_marks_only_selected_identity(
         dialog.association_store.get(selected_event_id, HIGH_SPEED_SOURCE)
         is not None
     )
-    assert dialog.table.item(dialog.table.currentRow(), 7).text() == "已标记"
+    assert dialog.table.item(dialog.table.currentRow(), 7).text() == "已确认"
     assert dialog.table.item(dialog.table.currentRow(), 8).text() == "已确认"
 
     dialog.close()

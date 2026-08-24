@@ -216,9 +216,7 @@ def source_location(
 
 
 def compact_source_status(location: Optional[PassageVideoLocation]) -> str:
-    if location is not None and location.status in _OPENABLE_STATUSES:
-        return "可查看"
-    return "无画面"
+    return "未确认"
 
 
 def source_confirmation_status(
@@ -226,8 +224,8 @@ def source_confirmation_status(
     association: Optional[PassageEvidenceAssociation],
 ) -> str:
     if association is not None:
-        return "已标记"
-    return compact_source_status(location)
+        return "已确认"
+    return "未确认"
 
 
 def combined_review_status(
@@ -387,7 +385,7 @@ class EvidenceImageView(QGraphicsView):
             "QLabel#evidenceIdentityBadge {"
             " background: rgba(15, 23, 32, 225);"
             " color: #ffffff;"
-            " border: 2px solid #ffb020;"
+            " border: 2px solid #e26d68;"
             " border-radius: 3px;"
             " padding: 7px 13px;"
             " font-size: 24px;"
@@ -458,6 +456,7 @@ class EvidenceImageView(QGraphicsView):
             QRectF(0, 0, max(1, self.viewport().width()), max(1, self.viewport().height()))
         )
         self._message_item.setPlainText(str(message or ""))
+        self._message_item.setDefaultTextColor(QColor("#c9d2dc"))
         self._message_item.show()
         self._position_message()
         self.clear_identity_cue()
@@ -471,9 +470,9 @@ class EvidenceImageView(QGraphicsView):
             return
         status = str(status).strip()
         confirmed = status == "已确认"
-        background_color = "#1bbf83" if confirmed else "#ffb020"
-        text_color = "#07120e" if confirmed else "#231703"
-        border_color = "#4dd6a5" if confirmed else "#ffcc66"
+        background_color = "#1bbf83" if confirmed else "#c0372b"
+        text_color = "#07120e" if confirmed else "#ffffff"
+        border_color = "#4dd6a5" if confirmed else "#e26d68"
         self._identity_badge.setText(identity)
         self._identity_badge.setStyleSheet(
             "QLabel#evidenceIdentityBadge {"
@@ -727,7 +726,7 @@ class EvidenceImageView(QGraphicsView):
         x = x_normalized * self._source_width
         y = y_normalized * self._source_height
         scale = max(0.001, abs(self.transform().m11()))
-        color = QColor("#1bbf83" if confirmed else "#ffb020")
+        color = QColor("#1bbf83" if confirmed else "#c0372b")
         pen = QPen(color, 3)
         pen.setCosmetic(True)
         if not confirmed and not simple:
@@ -805,6 +804,11 @@ class PassageEvidencePane(QFrame):
     scrub_started = pyqtSignal()
 
     MAX_SCRUB_SPAN_MS = 6_000
+    STATUS_COLORS = {
+        "已确认": "#16845b",
+        "未确认": "#c0372b",
+        "未选择": "#667085",
+    }
 
     def __init__(self, title: str, source_kind: str, parent=None):
         super().__init__(parent)
@@ -845,9 +849,10 @@ class PassageEvidencePane(QFrame):
         self.camera_combo.setMinimumWidth(88)
         self.camera_combo.setToolTip("切换普通录像机位")
         self.camera_combo.hide()
-        self.status_label = QLabel("未选择通过记录")
+        self.status_label = QLabel("未选择")
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.status_label.setObjectName("evidencePaneStatus")
+        self._set_status_label("未选择")
         header.addWidget(self.title_label)
         header.addWidget(self.camera_combo)
         header.addStretch()
@@ -1057,24 +1062,44 @@ class PassageEvidencePane(QFrame):
         self._render_marker()
 
     def _update_status_label(self) -> None:
-        status = compact_source_status(self._location)
+        status = source_confirmation_status(self._location, self._association)
+        detail = ""
         if self._location is not None:
-            status = location_status_text(self._location)
+            detail = location_status_text(self._location)
         if self._association is not None:
-            status = f"{status} · 已标记 {self._identity}"
+            detail = f"{detail} · 已标记 {self._identity}" if detail else "已标记"
+        self._set_status_label(status, detail)
+
+    def _set_status_label(self, status: str, tooltip: str = "") -> None:
+        color = self.STATUS_COLORS.get(status, "#667085")
         self.status_label.setText(status)
+        self.status_label.setToolTip(tooltip)
+        self.status_label.setStyleSheet(
+            f"color: {color}; font-size: 9pt; font-weight: 700;"
+        )
+
+    def _empty_message(
+        self,
+        location: Optional[PassageVideoLocation],
+    ) -> str:
+        source = "普通录像" if self.source_kind == REGULAR_SOURCE else "高速画面"
+        if location is not None and location.status == "recording":
+            return f"等待{source}"
+        return f"暂无{source}"
+
+    def _locating_message(self) -> str:
+        source = "普通录像" if self.source_kind == REGULAR_SOURCE else "高速画面"
+        return f"正在定位{source}"
 
     def _render_marker(self) -> None:
         marker = self._pending_marker
         if self.is_auyat_rgb:
             self.video_view.clear_identity_cue()
         else:
-            if marker is not None:
-                cue_status = "待确认"
-            elif self._association is not None:
+            if self._association is not None:
                 cue_status = "已确认"
             else:
-                cue_status = "待判读"
+                cue_status = "未确认"
             self.video_view.set_identity_cue(self._identity, cue_status)
         if marker is not None:
             self.video_view.set_marker(
@@ -1175,9 +1200,9 @@ class PassageEvidencePane(QFrame):
             self.timeline.setRange(0, 0)
             self.timeline.setEnabled(False)
             self._target_position_ms = 0
-            status = compact_source_status(location)
-            self.status_label.setText(status)
-            self.video_label.clear_frame(status)
+            detail = location_status_text(location) if location is not None else ""
+            self._set_status_label("未确认", detail)
+            self.video_label.clear_frame(self._empty_message(location))
             self.time_label.setText("--:--:--.---")
             self._set_transport_enabled(False)
             return
@@ -1185,7 +1210,7 @@ class PassageEvidencePane(QFrame):
         self._target_position_ms = int(location.passage_position_ms)
         self._update_status_label()
         if not same_context:
-            self.video_label.clear_frame(f"正在定位 {self._identity} 号...")
+            self.video_label.clear_frame(self._locating_message())
         self.time_label.setText(f"目标 {self._target_position_ms / 1000.0:.3f} s")
         initial_position_ms = max(0, self._target_position_ms + int(initial_delta_ms))
 
@@ -1258,7 +1283,7 @@ class PassageEvidencePane(QFrame):
         self.timeline.setEnabled(False)
         self.play_btn.setText("▶")
         self.mark_btn.setText("标线")
-        self.status_label.setText("未选择通过记录")
+        self._set_status_label("未选择")
         self.time_label.setText("--:--:--.---")
         self.video_view.set_marker_mode(False)
         self.video_view.clear_marker()
@@ -1308,6 +1333,7 @@ class PassageEvidencePane(QFrame):
             source_width=self._source_width,
             source_height=self._source_height,
         )
+        self._update_status_label()
         self.mark_btn.setEnabled(True)
         self.video_view.set_marker_mode(self._marking_enabled)
         self._render_marker()
@@ -1404,8 +1430,8 @@ class PassageEvidencePane(QFrame):
             return
         self._playing = False
         self.play_btn.setText("▶")
-        self.status_label.setText("打开失败")
-        self.video_label.clear_frame(message)
+        self._set_status_label("未确认", message)
+        self.video_label.clear_frame("画面读取失败")
         self._set_transport_enabled(False)
         self.open_btn.setEnabled(
             self.source_kind == REGULAR_SOURCE
@@ -1642,7 +1668,7 @@ class PassageReviewDialog(QDialog):
             "QHeaderView::section { background: #eef2f5; color: #526170; "
             "font-size: 10pt; font-weight: 600; padding: 5px; "
             "border: none; border-right: 1px solid #d5dce3; border-bottom: 1px solid #c8d1da; }"
-            "QTableWidget::item:selected { background: #dcecf8; color: #17212b; }"
+            "QTableWidget::item:selected { background: #dcecf8; }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1734,6 +1760,9 @@ class PassageReviewDialog(QDialog):
         results_layout.addLayout(filters)
 
         self.table = _AutoFitTableWidget(0, 9, self)
+        table_palette = self.table.palette()
+        table_palette.setColor(QPalette.HighlightedText, QColor("#17212b"))
+        self.table.setPalette(table_palette)
         self.table.setHorizontalHeaderLabels(
             [
                 "序号",
@@ -2080,6 +2109,10 @@ class PassageReviewDialog(QDialog):
         return fallback
 
     @staticmethod
+    def _display_confirmation_status(status: str) -> str:
+        return "已确认" if status == "已确认" else "未确认"
+
+    @staticmethod
     def _saved_delta_ms(
         regular_location: Optional[PassageVideoLocation],
         high_speed_location: Optional[PassageVideoLocation],
@@ -2212,6 +2245,7 @@ class PassageReviewDialog(QDialog):
             high_speed_association,
             readiness_status,
         )
+        display_review_status = self._display_confirmation_status(review_status)
         self._event_review_statuses[event.event_id] = review_status
         self._record_summary_state(
             event.event_id,
@@ -2235,7 +2269,7 @@ class PassageReviewDialog(QDialog):
             format_passage_time(event.timeline_timestamp_ms),
             source_confirmation_status(regular, regular_association),
             source_confirmation_status(high_speed, high_speed_association),
-            review_status,
+            display_review_status,
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
@@ -2500,14 +2534,11 @@ class PassageReviewDialog(QDialog):
 
     @staticmethod
     def _status_color(value: str) -> QColor:
-        if value in {
-            "已标记",
-            "已确认",
-        }:
+        if value == "已确认":
             return QColor("#16845b")
-        if value == "可查看":
-            return QColor("#15734f")
-        if value in {"无画面", "受阻"}:
+        if value == "未确认":
+            return QColor("#c0372b")
+        if value in {"异常", "受阻"}:
             return QColor("#c0372b")
         if value == "待核对":
             return QColor("#7d5b0c")
@@ -2518,9 +2549,9 @@ class PassageReviewDialog(QDialog):
         item.setForeground(cls._status_color(value))
         font = item.font()
         font.setBold(value in {
-            "无画面",
+            "未确认",
+            "异常",
             "受阻",
-            "已标记",
             "已确认",
         })
         item.setFont(font)
@@ -2655,6 +2686,7 @@ class PassageReviewDialog(QDialog):
             high_speed_association,
             review_status_text(lookup, regular, high_speed),
         )
+        display_status = self._display_confirmation_status(status)
         self.race_value.setText(
             (metadata.race_name.strip() if metadata is not None else "")
             or event.race_name.strip()
@@ -2678,7 +2710,7 @@ class PassageReviewDialog(QDialog):
         self.athlete_value.setText(athlete_name)
         self.team_value.setText(team_name)
         self.selected_time_value.setText(passage_time)
-        self.source_value.setText(status)
+        self.source_value.setText(display_status)
         athlete_summary = (
             f"{identity} {athlete_name if athlete_name != '--' else ''}".strip()
         )
@@ -2693,7 +2725,7 @@ class PassageReviewDialog(QDialog):
         self.current_context_label.setText(
             " · ".join(
                 value
-                for value in (group_label, position_text, status)
+                for value in (group_label, position_text, display_status)
                 if value and value != "--"
             )
         )
@@ -2982,7 +3014,7 @@ class PassageReviewDialog(QDialog):
         row_values = (
             (6, source_confirmation_status(regular, regular_association)),
             (7, source_confirmation_status(high_speed, high_speed_association)),
-            (8, status),
+            (8, self._display_confirmation_status(status)),
         )
         for row, event in enumerate(self._visible_events):
             if event.event_id != event_id:
@@ -2994,7 +3026,7 @@ class PassageReviewDialog(QDialog):
                     self._apply_status_style(item, value)
             break
         if event_id == self._selected_event_id:
-            self.source_value.setText(status)
+            self.source_value.setText(self._display_confirmation_status(status))
         if self._active_review_filter != "all":
             self.refresh()
             return

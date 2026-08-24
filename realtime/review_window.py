@@ -2036,7 +2036,9 @@ class FinishReviewWindow(PassageReviewDialog):
             )
             group_label = self.group_value.text().strip()
             review_status = (
-                self._event_review_statuses.get(self._selected_event_id, "")
+                self._display_confirmation_status(
+                    self._event_review_statuses.get(self._selected_event_id, "")
+                )
                 if event is not None
                 else "尚无通过记录"
             )

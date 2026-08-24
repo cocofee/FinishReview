@@ -540,8 +540,8 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert window.race_value.text() == "2026 城市自行车赛"
     assert window.stage_value.text() == "第一赛段"
     assert window.group_value.text() == "男子公开组"
-    assert window.operator_identity_label.text() == "男子公开组 · 1 / 1 · 待核对"
-    assert window.table.item(0, 6).text() == "可查看"
+    assert window.operator_identity_label.text() == "男子公开组 · 1 / 1 · 未确认"
+    assert window.table.item(0, 6).text() == "未确认"
     assert len(window.timeline_store.segments()) == 1
     assert "可核对 1" in window.capture_status_label.text()
 
@@ -1416,7 +1416,7 @@ def test_evidence_date_alignment_survives_reopening(qapp, tmp_path):
 
     assert window._evidence_timestamp(event) == int(evidence_time.timestamp() * 1000)
     assert date(2026, 8, 23) in window._high_speed_catalog.target_dates
-    assert window.table.item(0, 6).text() == "可查看"
+    assert window.table.item(0, 6).text() == "未确认"
     assert "证据日期已对齐 1 条" in window.capture_status_label.text()
     window.close()
 

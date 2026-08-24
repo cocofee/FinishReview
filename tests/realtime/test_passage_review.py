@@ -6,7 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, Qt, pyqtSignal
-from PyQt5.QtGui import QImage, QMouseEvent
+from PyQt5.QtGui import QImage, QMouseEvent, QPalette
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QHeaderView
 
@@ -197,10 +197,10 @@ def test_review_uses_one_row_per_passage_and_opens_regular_video(
     qapp.processEvents()
 
     assert dialog.table.rowCount() == 1
-    assert dialog.table.item(0, 6).text() == "可查看"
-    assert dialog.table.item(0, 7).text() == "无画面"
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 7).text() == "未确认"
     assert dialog.table.item(0, 7).foreground().color().name() == "#c0372b"
-    assert dialog.table.item(0, 8).text() == "待核对"
+    assert dialog.table.item(0, 8).text() == "未确认"
     assert dialog.regular_pane.location.video_path == video_path.absolute()
     assert dialog.high_speed_pane.location is None
     assert fake_playback.instances[0].seek_calls == [5_500]
@@ -467,8 +467,8 @@ def test_review_marks_legacy_video_as_unverified(qapp, tmp_path, fake_playback):
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
 
-    assert dialog.table.item(0, 6).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "待核对"
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 8).text() == "未确认"
     assert dialog.regular_pane.open_btn.isEnabled()
     dialog.close()
 
@@ -481,11 +481,50 @@ def test_review_shows_missing_evidence_without_starting_workers(qapp, tmp_path):
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
 
-    assert dialog.table.item(0, 6).text() == "无画面"
-    assert dialog.table.item(0, 7).text() == "无画面"
-    assert dialog.table.item(0, 8).text() == "受阻"
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 7).text() == "未确认"
+    assert dialog.table.item(0, 8).text() == "未确认"
     assert dialog.regular_pane._worker is None
     assert dialog.high_speed_pane._worker is None
+    assert dialog.regular_pane.status_label.text() == "未确认"
+    assert dialog.high_speed_pane.status_label.text() == "未确认"
+    assert dialog.regular_pane.video_view._message_item.toPlainText() == "暂无普通录像"
+    assert dialog.high_speed_pane.video_view._message_item.toPlainText() == "暂无高速画面"
+    assert (
+        dialog.regular_pane.video_view._message_item.defaultTextColor().name()
+        == "#c9d2dc"
+    )
+    dialog.close()
+
+
+def test_review_shows_active_recording_as_waiting(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event())
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    video_path = tmp_path / "videos" / "camera_01.mkv"
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"video")
+    timeline_store.start_segment(
+        source_id="camera_01",
+        camera_index=1,
+        video_path=video_path,
+        started_at_ms=10_000,
+        race_id="race-1",
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 6).foreground().color().name() == "#c0372b"
+    assert dialog.table.item(0, 7).text() == "未确认"
+    assert dialog.regular_pane.status_label.text() == "未确认"
+    assert dialog.regular_pane.video_view._message_item.toPlainText() == "等待普通录像"
+    assert (
+        dialog.regular_pane.video_view._message_item.defaultTextColor().name()
+        == "#c9d2dc"
+    )
+    assert dialog.regular_pane._worker is None
     dialog.close()
 
 
@@ -513,9 +552,9 @@ def test_review_shows_high_speed_boundary_independently(
     qapp.processEvents()
 
     assert dialog.table.rowCount() == 1
-    assert dialog.table.item(0, 6).text() == "无画面"
-    assert dialog.table.item(0, 7).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "待核对"
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 7).text() == "未确认"
+    assert dialog.table.item(0, 8).text() == "未确认"
     assert dialog.high_speed_pane.location.status == "near_boundary"
     assert dialog.high_speed_pane.location.playback_position_ms == 0
     dialog.close()
@@ -560,9 +599,9 @@ def test_review_shows_regular_and_high_speed_sources_on_one_row(
     qapp.processEvents()
 
     assert dialog.table.rowCount() == 1
-    assert dialog.table.item(0, 6).text() == "可查看"
-    assert dialog.table.item(0, 7).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "待核对"
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 7).text() == "未确认"
+    assert dialog.table.item(0, 8).text() == "未确认"
     assert dialog.regular_pane.location.segment.source_id == "camera_01"
     assert dialog.high_speed_pane.location.segment.source_id == "high_speed_02"
     assert "另有 1 个机位位于误差边界" in lookup_status_text(
@@ -762,9 +801,10 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     assert dialog.table.item(0, 1).text() == "15"
     assert dialog.table.item(0, 2).text() == "张三"
     assert (
-        "QTableWidget::item:selected { background: #dcecf8; color: #17212b; }"
+        "QTableWidget::item:selected { background: #dcecf8; }"
         in dialog.styleSheet()
     )
+    assert dialog.table.palette().color(QPalette.HighlightedText).name() == "#17212b"
     assert dialog.current_passage_label.text() == "15 张三"
     assert dialog.group_combo.itemText(1) == "男子公开组"
     assert dialog.group_combo.itemData(1) == "men-open"
@@ -1052,9 +1092,9 @@ def test_review_rejects_external_clip_from_another_race(qapp, tmp_path):
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
 
-    assert dialog.table.item(0, 6).text() == "无画面"
-    assert dialog.table.item(0, 7).text() == "无画面"
-    assert dialog.table.item(0, 8).text() == "受阻"
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 7).text() == "未确认"
+    assert dialog.table.item(0, 8).text() == "未确认"
     dialog.close()
 
 
@@ -1180,7 +1220,7 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     regular_view = dialog.regular_pane.video_view
     assert regular_view._identity_badge.isVisible()
     assert regular_view._identity_badge.text() == "15"
-    assert "background: #ffb020" in regular_view._identity_badge.styleSheet()
+    assert "background: #c0372b" in regular_view._identity_badge.styleSheet()
     assert regular_view._marker is None
     QTest.mouseClick(
         regular_view.viewport(),
@@ -1189,7 +1229,7 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     )
     assert dialog.regular_pane.has_pending_marker
     assert regular_view._identity_badge.text() == "15"
-    assert "background: #ffb020" in regular_view._identity_badge.styleSheet()
+    assert "background: #c0372b" in regular_view._identity_badge.styleSheet()
     pending_marker = regular_view._marker
     assert pending_marker is not None
     assert pending_marker[2:] == ("15", False)
@@ -1206,7 +1246,7 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     assert regular_view._identity_badge.text() == "15"
     assert "background: #1bbf83" in regular_view._identity_badge.styleSheet()
     assert not regular_view._marker_mode
-    assert dialog.table.item(0, 6).text() == "已标记"
+    assert dialog.table.item(0, 6).text() == "已确认"
     assert dialog.table.item(0, 8).text() == "已确认"
 
     QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Space)
@@ -1467,8 +1507,8 @@ def test_escape_cancels_pending_marker_and_delete_clears_confirmed_marker(
     QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Delete)
     qapp.processEvents()
     assert association_store.get("passage-1", REGULAR_SOURCE) is None
-    assert dialog.table.item(0, 6).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "待核对"
+    assert dialog.table.item(0, 6).text() == "未确认"
+    assert dialog.table.item(0, 8).text() == "未确认"
     dialog.close()
 
 
