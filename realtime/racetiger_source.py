@@ -15,15 +15,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-try:
-    from .passage_receiver import PassageEvent, PassageEventStore
-except ImportError:
-    from passage_receiver import PassageEvent, PassageEventStore
+from .passage_receiver import PassageEvent, PassageEventStore
 
 logger = logging.getLogger("FinishReview.RaceTiger")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+UNEXPECTED_ERROR_LOG_INTERVAL_SECONDS = 60.0
 
 
 class RaceTigerError(RuntimeError):
@@ -445,7 +443,10 @@ class RaceTigerSource:
         self.store = store
         self.race_id = str(race_id).strip()
         self.stage_id = str(stage_id).strip() or "finish"
-        self.poll_interval_seconds = max(0.5, float(poll_interval_seconds))
+        poll_interval_seconds = float(poll_interval_seconds)
+        if not math.isfinite(poll_interval_seconds):
+            raise ValueError("RaceTiger poll interval must be finite")
+        self.poll_interval_seconds = max(0.5, poll_interval_seconds)
         self._on_event = on_event
         self._on_status = on_status
         self._thread: Optional[threading.Thread] = None
@@ -490,6 +491,9 @@ class RaceTigerSource:
         )
 
     def _run(self) -> None:
+        last_unexpected_signature: tuple[str, str] | None = None
+        last_unexpected_log_at = 0.0
+        suppressed_unexpected_errors = 0
         while not self._stop.is_set():
             try:
                 events = self.poll_once()
@@ -509,10 +513,47 @@ class RaceTigerSource:
                 for event in events:
                     if self._on_event is not None:
                         self._on_event(event)
-            except Exception as error:
+                if suppressed_unexpected_errors:
+                    logger.info(
+                        "RaceTiger polling recovered after suppressing %s repeated "
+                        "internal failures",
+                        suppressed_unexpected_errors,
+                    )
+                last_unexpected_signature = None
+                last_unexpected_log_at = 0.0
+                suppressed_unexpected_errors = 0
+            except RaceTigerError as error:
+                last_unexpected_signature = None
+                last_unexpected_log_at = 0.0
+                suppressed_unexpected_errors = 0
                 logger.warning("RaceTiger poll failed: %s", error)
                 self._emit_status(
                     RaceTigerStatus("error", f"RaceTiger: API error ({error})")
+                )
+            except Exception as error:
+                now = time.monotonic()
+                signature = (type(error).__name__, str(error))
+                should_log_traceback = (
+                    signature != last_unexpected_signature
+                    or now - last_unexpected_log_at
+                    >= UNEXPECTED_ERROR_LOG_INTERVAL_SECONDS
+                )
+                if should_log_traceback:
+                    if suppressed_unexpected_errors:
+                        logger.exception(
+                            "Unexpected RaceTiger polling failure; suppressed %s "
+                            "repeated failures",
+                            suppressed_unexpected_errors,
+                        )
+                    else:
+                        logger.exception("Unexpected RaceTiger polling failure")
+                    last_unexpected_signature = signature
+                    last_unexpected_log_at = now
+                    suppressed_unexpected_errors = 0
+                else:
+                    suppressed_unexpected_errors += 1
+                self._emit_status(
+                    RaceTigerStatus("error", "RaceTiger: internal polling error")
                 )
             self._stop.wait(self.poll_interval_seconds)
 

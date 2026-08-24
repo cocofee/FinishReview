@@ -1,5 +1,8 @@
 import json
+import subprocess
+import sys
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +16,34 @@ from realtime.external_clip_import import (
     race_id_from_passage_store,
 )
 from realtime.video_timeline import VideoTimelineStore
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        [sys.executable, "-m", "realtime.external_clip_import", "--help"],
+        [
+            sys.executable,
+            str(ROOT / "realtime" / "external_clip_import.py"),
+            "--help",
+        ],
+    ),
+)
+def test_external_clip_import_cli_help(command):
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "sidecar" in result.stdout
+    assert "timeline" in result.stdout
 
 
 def _timestamp_ms(value):

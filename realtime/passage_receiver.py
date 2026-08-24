@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import math
 import os
 import socket
 import threading
@@ -15,24 +16,15 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
-try:
-    from .race_metadata import (
-        ACK_MESSAGE_TYPE as METADATA_ACK_MESSAGE_TYPE,
-        MESSAGE_TYPE as METADATA_MESSAGE_TYPE,
-        RaceMetadata,
-        RaceMetadataConflictError,
-        RaceMetadataError,
-        RaceMetadataStore,
-    )
-except ImportError:
-    from race_metadata import (
-        ACK_MESSAGE_TYPE as METADATA_ACK_MESSAGE_TYPE,
-        MESSAGE_TYPE as METADATA_MESSAGE_TYPE,
-        RaceMetadata,
-        RaceMetadataConflictError,
-        RaceMetadataError,
-        RaceMetadataStore,
-    )
+from .race_metadata import (
+    ACK_MESSAGE_TYPE as METADATA_ACK_MESSAGE_TYPE,
+    MESSAGE_TYPE as METADATA_MESSAGE_TYPE,
+    RaceMetadata,
+    RaceMetadataConflictError,
+    RaceMetadataError,
+    RaceMetadataIngestResult,
+    RaceMetadataStore,
+)
 
 
 logger = logging.getLogger("FinishReview.PassageReceiver")
@@ -49,6 +41,7 @@ DEFAULT_DISCOVERY_PORT = 18766
 DISCOVERY_REQUEST = b"CYCLERACE_DISCOVER_VIDEOPIPE_V1"
 DISCOVERY_SERVICE = "videopipe-finish"
 MAX_BODY_BYTES = 1024 * 1024
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 
 _MISSING = object()
 
@@ -520,6 +513,34 @@ class PassageEventIngestor:
         return result
 
 
+class _RaceMetadataIngestor:
+    """Persist metadata before delivery while allowing failed callbacks to retry."""
+
+    def __init__(
+        self,
+        store: RaceMetadataStore,
+        on_accepted: Optional[Callable[[RaceMetadata], None]] = None,
+    ):
+        self.store = store
+        self._on_accepted = on_accepted
+        self._delivery_lock = threading.RLock()
+        self._delivered: RaceMetadata | None = None
+
+    def ingest(self, metadata: RaceMetadata) -> RaceMetadataIngestResult:
+        with self._delivery_lock:
+            result = self.store.store(metadata)
+            current = self.store.current()
+            if current != metadata:
+                return result
+            if self._on_accepted is not None and self._delivered != current:
+                try:
+                    self._on_accepted(current)
+                except Exception as error:
+                    raise PassageEventDeliveryError(str(error)) from error
+                self._delivered = current
+            return result
+
+
 class _PassageHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -622,15 +643,19 @@ class PassageDiscoveryResponder:
 
 def _handler_type(
     ingestor: PassageEventIngestor,
-    metadata_store: RaceMetadataStore,
-    on_metadata_accepted: Optional[Callable[[RaceMetadata], None]],
+    metadata_ingestor: _RaceMetadataIngestor,
     on_focus_accepted: Optional[Callable[[RaceFocus], None]],
     request_path: str,
     max_body_bytes: int,
+    request_timeout_seconds: float,
     shared_token: str,
 ):
     class PassageRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(request_timeout_seconds)
 
         def do_POST(self) -> None:
             if urlsplit(self.path).path != request_path:
@@ -655,6 +680,7 @@ def _handler_type(
             if content_length > max_body_bytes:
                 self._send_json(413, "rejected", "passage event payload is too large")
                 return
+            ack_message_type = ACK_MESSAGE_TYPE
             try:
                 raw_body = self.rfile.read(content_length)
                 payload = json.loads(raw_body.decode("utf-8"))
@@ -665,22 +691,16 @@ def _handler_type(
                 )
                 if message_type == MESSAGE_TYPE:
                     result = ingestor.ingest_payload(payload)
-                    ack_message_type = ACK_MESSAGE_TYPE
                 elif message_type == METADATA_MESSAGE_TYPE:
-                    metadata = RaceMetadata.from_payload(payload)
-                    result = metadata_store.store(metadata)
-                    if (
-                        result.value == PassageIngestResult.ACCEPTED.value
-                        and on_metadata_accepted is not None
-                    ):
-                        on_metadata_accepted(metadata)
                     ack_message_type = METADATA_ACK_MESSAGE_TYPE
+                    metadata = RaceMetadata.from_payload(payload)
+                    result = metadata_ingestor.ingest(metadata)
                 elif message_type == FOCUS_MESSAGE_TYPE:
+                    ack_message_type = FOCUS_ACK_MESSAGE_TYPE
                     focus = RaceFocus.from_payload(payload)
                     if on_focus_accepted is not None:
                         on_focus_accepted(focus)
                     result = PassageIngestResult.ACCEPTED
-                    ack_message_type = FOCUS_ACK_MESSAGE_TYPE
                 else:
                     raise PassageEventError(
                         "message_type must be passage, race_metadata, or race_focus"
@@ -692,19 +712,43 @@ def _handler_type(
                     message_type=ack_message_type,
                 )
             except (PassageEventConflictError, RaceMetadataConflictError) as error:
-                self._send_json(409, "rejected", str(error))
+                self._send_json(
+                    409,
+                    "rejected",
+                    str(error),
+                    message_type=ack_message_type,
+                )
             except (
                 UnicodeDecodeError,
                 json.JSONDecodeError,
                 PassageEventError,
                 RaceMetadataError,
             ) as error:
-                self._send_json(400, "rejected", str(error))
+                self._send_json(
+                    400,
+                    "rejected",
+                    str(error),
+                    message_type=ack_message_type,
+                )
             except PassageEventDeliveryError as error:
-                self._send_json(503, "retry", str(error))
-            except Exception as error:
+                logger.warning("CycleRace callback delivery failed: %s", error)
+                self._send_json(
+                    503,
+                    "retry",
+                    "delivery_failed",
+                    message_type=ack_message_type,
+                )
+            except TimeoutError:
+                logger.warning("CycleRace request body timed out")
+                self._send_json(408, "rejected", "request_timeout")
+            except Exception:
                 logger.exception("Passage event request failed")
-                self._send_json(500, "error", str(error))
+                self._send_json(
+                    500,
+                    "error",
+                    "internal_error",
+                    message_type=ack_message_type,
+                )
 
         def _send_json(
             self,
@@ -766,6 +810,7 @@ class PassageEventReceiver:
         *,
         request_path: str = DEFAULT_PATH,
         max_body_bytes: int = MAX_BODY_BYTES,
+        request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         discovery_port: int | None = DEFAULT_DISCOVERY_PORT,
         shared_token: str = "",
         on_accepted: Optional[Callable[[PassageEvent], None]] = None,
@@ -784,12 +829,16 @@ class PassageEventReceiver:
             raise ValueError("passage receiver path must start with /")
         if int(max_body_bytes) <= 0:
             raise ValueError("max_body_bytes must be positive")
+        request_timeout_seconds = float(request_timeout_seconds)
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive and finite")
         if discovery_port is not None and not 0 <= int(discovery_port) <= 65535:
             raise ValueError("discovery port is out of range")
         self.host = host
         self.port = port
         self.request_path = request_path
         self.max_body_bytes = int(max_body_bytes)
+        self.request_timeout_seconds = request_timeout_seconds
         self.discovery_port = (
             None if discovery_port is None else int(discovery_port)
         )
@@ -799,7 +848,10 @@ class PassageEventReceiver:
         self.metadata_store = metadata_store or RaceMetadataStore(
             store.journal_path.with_name("cyclerace_race_metadata.json")
         )
-        self._on_metadata_accepted = on_metadata_accepted
+        self.metadata_ingestor = _RaceMetadataIngestor(
+            self.metadata_store,
+            on_accepted=on_metadata_accepted,
+        )
         self._on_focus_accepted = on_focus_accepted
         self._lock = threading.RLock()
         self._server: Optional[_PassageHTTPServer] = None
@@ -813,11 +865,11 @@ class PassageEventReceiver:
                 return
             handler = _handler_type(
                 self.ingestor,
-                self.metadata_store,
-                self._on_metadata_accepted,
+                self.metadata_ingestor,
                 self._on_focus_accepted,
                 self.request_path,
                 self.max_body_bytes,
+                self.request_timeout_seconds,
                 self.shared_token,
             )
             server = _PassageHTTPServer((self.host, self.port), handler)
@@ -860,7 +912,6 @@ class PassageEventReceiver:
             thread = self._thread
             discovery = self._discovery
             self._server = None
-            self._thread = None
             self._discovery = None
         if discovery is not None:
             discovery.stop()
@@ -871,6 +922,10 @@ class PassageEventReceiver:
             thread.join(timeout=5.0)
             if thread.is_alive():
                 logger.error("CycleRace passage receiver did not stop within 5 seconds")
+            else:
+                with self._lock:
+                    if self._thread is thread:
+                        self._thread = None
 
     @property
     def listen_port(self) -> int:
@@ -896,6 +951,7 @@ __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PATH",
     "DEFAULT_PORT",
+    "DEFAULT_REQUEST_TIMEOUT_SECONDS",
     "DISCOVERY_REQUEST",
     "DISCOVERY_SERVICE",
     "FOCUS_ACK_MESSAGE_TYPE",

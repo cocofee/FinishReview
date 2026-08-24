@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-import inspect
 import socket
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -41,108 +40,59 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-try:
-    from .auyat_rgb import (
-        AuyatRgbCatalog,
-        AuyatRgbScanWorker,
-        AuyatScanResult,
-        is_network_share,
-    )
-    from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
-    from .passage_evidence import PassageEvidenceAssociationStore
-    from .passage_receiver import (
-        DEFAULT_HOST,
-        DEFAULT_PORT,
-        PassageEvent,
-        PassageEventReceiver,
-        PassageEventStore,
-        RaceFocus,
-    )
-    from .passage_review import PassageReviewDialog, source_location
-    from .point_playback import PointPlaybackUnavailable, prepare_point_playback
-    from .preflight import (
-        PreflightJournal,
-        PreflightRun,
-        local_ipv4_addresses,
-        validate_event_network,
-    )
-    from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
-    from .race_metadata import RaceMetadata, RaceMetadataStore
-    from .review_recorder import (
-        ArchiveTimelinePublisher,
-        FfmpegReviewRecorder,
-        PassageReviewCoordinator,
-        PassageReviewState,
-        PassageReviewTimelinePublisher,
-        PassageReviewWindow,
-        ReviewRingBuffer,
-        discover_directshow_video_devices,
-        is_supported_review_source,
-        load_archive_recording_sessions,
-        make_directshow_source,
-        parse_directshow_source,
-    )
-    from .stream_recorder import (
-        apply_rtsp_credentials,
-        find_ffmpeg_executable,
-        is_rtsp_source,
-        RecordingError,
-        sanitize_recording_message,
-        split_rtsp_credentials,
-    )
-    from .video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
-    from .video_playback import VideoPlaybackDialog
-except ImportError:
-    from auyat_rgb import (
-        AuyatRgbCatalog,
-        AuyatRgbScanWorker,
-        AuyatScanResult,
-        is_network_share,
-    )
-    from external_clip_import import ExternalClipImportError, race_id_from_passage_store
-    from passage_evidence import PassageEvidenceAssociationStore
-    from passage_receiver import (
-        DEFAULT_HOST,
-        DEFAULT_PORT,
-        PassageEvent,
-        PassageEventReceiver,
-        PassageEventStore,
-        RaceFocus,
-    )
-    from passage_review import PassageReviewDialog, source_location
-    from point_playback import PointPlaybackUnavailable, prepare_point_playback
-    from preflight import (
-        PreflightJournal,
-        PreflightRun,
-        local_ipv4_addresses,
-        validate_event_network,
-    )
-    from racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
-    from race_metadata import RaceMetadata, RaceMetadataStore
-    from review_recorder import (
-        ArchiveTimelinePublisher,
-        FfmpegReviewRecorder,
-        PassageReviewCoordinator,
-        PassageReviewState,
-        PassageReviewTimelinePublisher,
-        PassageReviewWindow,
-        ReviewRingBuffer,
-        discover_directshow_video_devices,
-        is_supported_review_source,
-        load_archive_recording_sessions,
-        make_directshow_source,
-        parse_directshow_source,
-    )
-    from stream_recorder import (
-        apply_rtsp_credentials,
-        find_ffmpeg_executable,
-        is_rtsp_source,
-        RecordingError,
-        sanitize_recording_message,
-        split_rtsp_credentials,
-    )
-    from video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
-    from video_playback import VideoPlaybackDialog
+from .auyat_rgb import (
+    AuyatRgbCatalog,
+    AuyatRgbScanWorker,
+    AuyatScanResult,
+    is_network_share,
+)
+from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
+from .passage_evidence import PassageEvidenceAssociationStore
+from .passage_receiver import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    PassageEvent,
+    PassageEventReceiver,
+    PassageEventStore,
+    RaceFocus,
+)
+from .passage_review import PassageReviewDialog, source_location
+from .point_playback import PointPlaybackUnavailable, prepare_point_playback
+from .preflight import (
+    PreflightJournal,
+    PreflightRun,
+    local_ipv4_addresses,
+    validate_event_network,
+)
+from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
+from .race_metadata import RaceMetadata, RaceMetadataStore
+from .receiver_controller import ReceiverController
+from .recording_controller import start_recording_pipeline
+from .review_recorder import (
+    ArchiveTimelinePublisher,
+    FfmpegReviewRecorder,
+    PassageReviewCoordinator,
+    PassageReviewState,
+    PassageReviewTimelinePublisher,
+    PassageReviewWindow,
+    ReviewRingBuffer,
+    discover_directshow_video_devices,
+    is_supported_review_source,
+    load_archive_recording_sessions,
+    make_directshow_source,
+    parse_directshow_source,
+)
+from .settings import FinishReviewSettings
+from .stream_recorder import (
+    apply_rtsp_credentials,
+    find_ffmpeg_executable,
+    is_rtsp_source,
+    RecordingError,
+    sanitize_recording_message,
+    split_rtsp_credentials,
+)
+from .video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
+from .video_playback import VideoPlaybackDialog
 
 
 logger = logging.getLogger("FinishReview")
@@ -257,27 +207,6 @@ def _historical_evidence_timestamp_overrides(
         if aligned_timestamp_ms != timestamp_ms:
             overrides[event.event_id] = (timestamp_ms, aligned_timestamp_ms)
     return overrides
-
-
-@dataclass(frozen=True, slots=True)
-class FinishReviewSettings:
-    source: str
-    output_dir: Path
-    passage_host: str
-    passage_port: int
-    camera_index: int
-    secondary_source: str = ""
-    high_speed_dir: Path | None = None
-    finishreview_ip: str = "192.168.50.10"
-    cyclerace_ip: str = "192.168.50.20"
-    high_speed_pc_ip: str = "192.168.50.30"
-    switch_ip: str = "192.168.50.2"
-    timing_provider: str = "cyclerace"
-    racetiger_base_url: str = ""
-    racetiger_pc: str = ""
-    racetiger_rid: str = ""
-    racetiger_token: str = ""
-    racetiger_poll_interval_seconds: float = 2.0
 
 
 class _RtspProbeWorker(QThread):
@@ -1564,7 +1493,8 @@ class _PassageSignalBridge(QObject):
     accepted = pyqtSignal(object)
     metadata_accepted = pyqtSignal(object)
     focus_accepted = pyqtSignal(object)
-    timing_status = pyqtSignal(object)
+    racetiger_event = pyqtSignal(object, int)
+    timing_status = pyqtSignal(object, int)
 
 
 class FinishReviewWindow(PassageReviewDialog):
@@ -1634,7 +1564,6 @@ class FinishReviewWindow(PassageReviewDialog):
         self.review_retention_seconds = max(6, int(review_retention_seconds))
         self.timing_error_ms = max(0, int(timing_error_ms))
         self._recorder_factory = recorder_factory
-        self._receiver_factory = receiver_factory
         self._settings_saver = settings_saver
 
         passage_store = PassageEventStore(
@@ -1683,8 +1612,11 @@ class FinishReviewWindow(PassageReviewDialog):
         self.setMinimumSize(1180, 760)
         self._recorder: FfmpegReviewRecorder | None = None
         self._recorders: dict[int, FfmpegReviewRecorder] = {}
-        self._receiver: PassageEventReceiver | None = None
-        self._racetiger_source: RaceTigerSource | None = None
+        self._receiver_controller = ReceiverController(
+            receiver_factory=receiver_factory,
+            racetiger_client_factory=RaceTigerClient,
+            racetiger_source_factory=RaceTigerSource,
+        )
         self._ring_buffer: ReviewRingBuffer | None = None
         self._ring_buffers: dict[int, ReviewRingBuffer] = {}
         self._coordinator: PassageReviewCoordinator | None = None
@@ -1705,7 +1637,6 @@ class FinishReviewWindow(PassageReviewDialog):
         self._capture_error = ""
         self._receiver_error = ""
         self._racetiger_status: RaceTigerStatus | None = None
-        self._racetiger_generation = 0
         self._started = False
         self._last_cleanup_at = 0.0
         self._recording_started_at = 0.0
@@ -1721,6 +1652,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._signal_bridge.accepted.connect(self._on_passage_received)
         self._signal_bridge.metadata_accepted.connect(self._on_metadata_received)
         self._signal_bridge.focus_accepted.connect(self._on_focus_received)
+        self._signal_bridge.racetiger_event.connect(self._on_racetiger_event)
         self._signal_bridge.timing_status.connect(self._on_racetiger_status)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(max(100, int(refresh_interval_ms)))
@@ -1783,6 +1715,14 @@ class FinishReviewWindow(PassageReviewDialog):
     @property
     def receiver(self) -> PassageEventReceiver | None:
         return self._receiver
+
+    @property
+    def _receiver(self) -> PassageEventReceiver | None:
+        return self._receiver_controller.receiver
+
+    @property
+    def _racetiger_source(self) -> RaceTigerSource | None:
+        return self._receiver_controller.racetiger_source
 
     def _locate_high_speed(
         self,
@@ -1987,27 +1927,30 @@ class FinishReviewWindow(PassageReviewDialog):
             QMessageBox.critical(self, "无法开始录像", self._runtime_error)
             self._update_runtime_status()
 
+    def _current_settings(self) -> FinishReviewSettings:
+        return FinishReviewSettings(
+            source=self.source,
+            output_dir=self.output_dir,
+            passage_host=self.passage_host,
+            passage_port=self.passage_port,
+            camera_index=self.camera_index,
+            secondary_source=self.secondary_source,
+            high_speed_dir=self.high_speed_dir,
+            finishreview_ip=self.finishreview_ip,
+            cyclerace_ip=self.cyclerace_ip,
+            high_speed_pc_ip=self.high_speed_pc_ip,
+            switch_ip=self.switch_ip,
+            timing_provider=self.timing_provider,
+            racetiger_base_url=self.racetiger_base_url,
+            racetiger_pc=self.racetiger_pc,
+            racetiger_rid=self.racetiger_rid,
+            racetiger_token=self.racetiger_token,
+            racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
+        )
+
     def _configure_devices(self) -> None:
         dialog = FinishReviewLaunchDialog(
-            FinishReviewSettings(
-                source=self.source,
-                output_dir=self.output_dir,
-                passage_host=self.passage_host,
-                passage_port=self.passage_port,
-                camera_index=self.camera_index,
-                secondary_source=self.secondary_source,
-                high_speed_dir=self.high_speed_dir,
-                finishreview_ip=self.finishreview_ip,
-                cyclerace_ip=self.cyclerace_ip,
-                high_speed_pc_ip=self.high_speed_pc_ip,
-                switch_ip=self.switch_ip,
-                timing_provider=self.timing_provider,
-                racetiger_base_url=self.racetiger_base_url,
-                racetiger_pc=self.racetiger_pc,
-                racetiger_rid=self.racetiger_rid,
-                racetiger_token=self.racetiger_token,
-                racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
-            ),
+            self._current_settings(),
             self,
             ffmpeg_path=self.ffmpeg_path,
             passage_provider=lambda: self.passage_store.events(),
@@ -2051,6 +1994,7 @@ class FinishReviewWindow(PassageReviewDialog):
         stop_recording: bool = False,
     ) -> bool:
         self._runtime_error = ""
+        previous_settings = self._current_settings()
         output_dir = Path(settings.output_dir).expanduser().resolve()
         output_changed = output_dir != self.output_dir
         next_timing_provider = str(settings.timing_provider or "cyclerace").strip().lower()
@@ -2134,12 +2078,29 @@ class FinishReviewWindow(PassageReviewDialog):
             except Exception as exc:  # noqa: BLE001 - keep current runtime unchanged.
                 QMessageBox.warning(self, "设置未保存", str(exc))
                 return False
-        if stop_recording:
-            self.stop_recording()
         if receiver_restart_needed:
-            self.stop_receiver()
+            if not self.stop_receiver():
+                stop_error = self._receiver_error or "Timing source did not stop"
+                recovery_errors = []
+                if self._settings_saver is not None:
+                    try:
+                        self._settings_saver(previous_settings)
+                    except Exception as exc:  # noqa: BLE001 - report rollback failure.
+                        recovery_errors.append(f"settings rollback: {exc}")
+                try:
+                    self.start_receiver()
+                except Exception as exc:  # noqa: BLE001 - restore current runtime.
+                    recovery_errors.append(
+                        "receiver restart: " + sanitize_recording_message(exc)
+                    )
+                detail = "; ".join((stop_error, *recovery_errors))
+                QMessageBox.warning(self, "计时源未停止", detail)
+                self._update_runtime_status()
+                return False
             self._passage_batch_timer.stop()
             self._pending_passages.clear()
+        if stop_recording:
+            self.stop_recording()
         self.source = str(settings.source).strip()
         self.secondary_source = str(settings.secondary_source).strip()
         self.passage_host = str(settings.passage_host).strip()
@@ -2371,7 +2332,10 @@ class FinishReviewWindow(PassageReviewDialog):
     def start_receiver(self) -> None:
         if self.timing_provider == "racetiger":
             if self._receiver is not None:
-                self.stop_receiver()
+                if not self.stop_receiver():
+                    raise RuntimeError(
+                        self._receiver_error or "CycleRace receiver did not stop"
+                    )
             if self._racetiger_source is not None and self._racetiger_source.is_running:
                 return
             try:
@@ -2386,103 +2350,41 @@ class FinishReviewWindow(PassageReviewDialog):
                 raise
             return
         if self._racetiger_source is not None:
-            self.stop_receiver()
+            if not self.stop_receiver():
+                raise RuntimeError(
+                    self._receiver_error or "RaceTiger source did not stop"
+                )
         if self._receiver is not None and self._receiver.is_running:
             return
-        receiver_kwargs = {
-            "on_accepted": self._signal_bridge.accepted.emit,
-        }
-        parameters = inspect.signature(self._receiver_factory).parameters.values()
-        supports_metadata = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        ) or "metadata_store" in {
-            parameter.name for parameter in parameters
-        }
-        if supports_metadata:
-            receiver_kwargs.update(
+        try:
+            self._receiver_controller.start_cyclerace(
+                self.passage_host,
+                self.passage_port,
+                self.passage_store,
+                on_accepted=self._signal_bridge.accepted.emit,
                 metadata_store=self.metadata_store,
                 on_metadata_accepted=self._signal_bridge.metadata_accepted.emit,
+                on_focus_accepted=self._signal_bridge.focus_accepted.emit,
             )
-        parameters = inspect.signature(self._receiver_factory).parameters.values()
-        supports_focus = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        ) or "on_focus_accepted" in {
-            parameter.name for parameter in parameters
-        }
-        if supports_focus:
-            receiver_kwargs["on_focus_accepted"] = (
-                self._signal_bridge.focus_accepted.emit
-            )
-        receiver = self._receiver_factory(
-            self.passage_host,
-            self.passage_port,
-            self.passage_store,
-            **receiver_kwargs,
-        )
-        try:
-            receiver.start()
         except Exception as exc:
             self._receiver_error = sanitize_recording_message(exc)
-            try:
-                receiver.stop()
-            except Exception as exc:  # noqa: BLE001 - rollback is best effort.
-                logger.warning("Failed to stop CycleRace receiver: %s", exc)
             self._update_runtime_status()
             raise
-        self._receiver = receiver
         self._receiver_error = ""
         self._refresh_timer.start()
         self._update_runtime_status()
 
     def _start_racetiger_source(self) -> None:
-        missing = [
-            label
-            for label, value in (
-                ("接口地址", self.racetiger_base_url),
-                ("PC", self.racetiger_pc),
-                ("RID", self.racetiger_rid),
-                ("令牌", self.racetiger_token),
-            )
-            if not value
-        ]
-        if missing:
-            raise ValueError("赛虎配置不完整，请填写：" + "、".join(missing))
-        client = RaceTigerClient(
+        self._receiver_controller.start_racetiger(
             self.racetiger_base_url,
             self.racetiger_token,
             pc=self.racetiger_pc,
             rid=self.racetiger_rid,
-        )
-        generation = self._racetiger_generation
-
-        def emit_event(event: PassageEvent) -> None:
-            if generation == self._racetiger_generation:
-                self._signal_bridge.accepted.emit(event)
-
-        def emit_status(status: RaceTigerStatus) -> None:
-            if generation == self._racetiger_generation:
-                self._signal_bridge.timing_status.emit(status)
-
-        source = RaceTigerSource(
-            client,
-            self.passage_store,
-            race_id=self.racetiger_rid,
-            stage_id="finish",
+            store=self.passage_store,
             poll_interval_seconds=self.racetiger_poll_interval_seconds,
-            on_event=emit_event,
-            on_status=emit_status,
+            on_event=self._signal_bridge.racetiger_event.emit,
+            on_status=self._signal_bridge.timing_status.emit,
         )
-        try:
-            source.start()
-        except Exception:
-            try:
-                source.stop()
-            except Exception:  # noqa: BLE001 - startup rollback is best effort.
-                logger.exception("Failed to stop RaceTiger source after startup error")
-            raise
-        self._racetiger_source = source
         self._receiver_error = ""
         self._racetiger_status = RaceTigerStatus(
             "starting",
@@ -2733,31 +2635,25 @@ class FinishReviewWindow(PassageReviewDialog):
         archive_publishers = []
         try:
             for camera_index, source in configured_sources:
-                recorder = self._recorder_factory(
-                    source,
-                    self.output_dir,
+                pipeline = start_recording_pipeline(
+                    source=source,
+                    output_dir=self.output_dir,
                     camera_index=camera_index,
                     ffmpeg_path=self.ffmpeg_path,
                     review_retention_seconds=self.review_retention_seconds,
-                )
-                playlist_path = recorder.start()
-                recorders[camera_index] = recorder
-                ring_buffer = ReviewRingBuffer(
-                    playlist_path,
-                    camera_index=camera_index,
-                    retention_seconds=self.review_retention_seconds,
-                )
-                ring_buffer.scan()
-                ring_buffers[camera_index] = ring_buffer
-                coordinators[camera_index] = PassageReviewCoordinator(ring_buffer)
-                publishers[camera_index] = PassageReviewTimelinePublisher(
-                    ring_buffer,
-                    self.timeline_store,
+                    timeline_store=self.timeline_store,
                     timing_error_ms=self.timing_error_ms,
+                    recorder_factory=self._recorder_factory,
+                    ring_buffer_factory=ReviewRingBuffer,
+                    coordinator_factory=PassageReviewCoordinator,
+                    timeline_publisher_factory=PassageReviewTimelinePublisher,
+                    archive_publisher_factory=ArchiveTimelinePublisher,
                 )
-                archive_publishers.append(
-                    ArchiveTimelinePublisher(recorder, self.timeline_store)
-                )
+                recorders[camera_index] = pipeline.recorder
+                ring_buffers[camera_index] = pipeline.ring_buffer
+                coordinators[camera_index] = pipeline.coordinator
+                publishers[camera_index] = pipeline.timeline_publisher
+                archive_publishers.append(pipeline.archive_publisher)
             self._recorders = recorders
             self._ring_buffers = ring_buffers
             self._coordinators = coordinators
@@ -2993,7 +2889,18 @@ class FinishReviewWindow(PassageReviewDialog):
         self._apply_pending_focus()
         self._update_runtime_status()
 
-    def _on_racetiger_status(self, status: RaceTigerStatus) -> None:
+    def _on_racetiger_event(self, event: PassageEvent, generation: int) -> None:
+        if not self._receiver_controller.is_racetiger_generation_current(generation):
+            return
+        self._on_passage_received(event)
+
+    def _on_racetiger_status(
+        self,
+        status: RaceTigerStatus,
+        generation: int,
+    ) -> None:
+        if not self._receiver_controller.is_racetiger_generation_current(generation):
+            return
         self._racetiger_status = status
         if status.state == "error":
             self._receiver_error = status.message
@@ -3475,23 +3382,14 @@ class FinishReviewWindow(PassageReviewDialog):
         self._recording_started_at = 0.0
         self._update_runtime_status()
 
-    def stop_receiver(self) -> None:
-        self._racetiger_generation += 1
-        receiver = self._receiver
-        self._receiver = None
-        if receiver is not None:
-            try:
-                receiver.stop()
-            except Exception as exc:  # noqa: BLE001 - receiver factories may vary.
-                logger.warning("Failed to stop CycleRace receiver: %s", exc)
-        racetiger_source = self._racetiger_source
-        self._racetiger_source = None
-        if racetiger_source is not None:
-            try:
-                racetiger_source.stop()
-            except Exception as exc:  # noqa: BLE001 - shutdown is best effort.
-                logger.warning("Failed to stop RaceTiger source: %s", exc)
+    def stop_receiver(self) -> bool:
+        errors = self._receiver_controller.stop()
+        if errors:
+            self._receiver_error = "; ".join(errors)
+        else:
+            self._receiver_error = ""
         self._update_runtime_status()
+        return not errors
 
     def stop(self) -> bool:
         self._refresh_timer.stop()
@@ -3503,9 +3401,9 @@ class FinishReviewWindow(PassageReviewDialog):
             if not worker.wait(1_000):
                 return False
         self.stop_recording()
-        self.stop_receiver()
+        receiver_stopped = self.stop_receiver()
         self._update_runtime_status()
-        return True
+        return receiver_stopped
 
     def closeEvent(self, event) -> None:
         self._clock_timer.stop()

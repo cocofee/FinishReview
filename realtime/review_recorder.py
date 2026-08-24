@@ -16,34 +16,19 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-try:
-    from .stream_recorder import (
-        RecordingError,
-        find_ffmpeg_executable,
-        is_rtsp_source,
-        sanitize_recording_message,
-    )
-    from .video_timeline import (
-        DEFAULT_CLOCK_SOURCE,
-        DEFAULT_TIMING_ERROR_MS,
-        RecordingSegment,
-        VideoTimelineStore,
-        probe_video_duration_ms,
-    )
-except ImportError:
-    from stream_recorder import (
-        RecordingError,
-        find_ffmpeg_executable,
-        is_rtsp_source,
-        sanitize_recording_message,
-    )
-    from video_timeline import (
-        DEFAULT_CLOCK_SOURCE,
-        DEFAULT_TIMING_ERROR_MS,
-        RecordingSegment,
-        VideoTimelineStore,
-        probe_video_duration_ms,
-    )
+from .stream_recorder import (
+    RecordingError,
+    find_ffmpeg_executable,
+    is_rtsp_source,
+    sanitize_recording_message,
+)
+from .video_timeline import (
+    DEFAULT_CLOCK_SOURCE,
+    DEFAULT_TIMING_ERROR_MS,
+    RecordingSegment,
+    VideoTimelineStore,
+    probe_video_duration_ms,
+)
 
 
 DEFAULT_ARCHIVE_SEGMENT_SECONDS = 300

@@ -14,20 +14,12 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-try:
-    from .runtime_paths import application_dir, resource_dir
-    from .video_timeline import (
-        DEFAULT_TIMING_ERROR_MS,
-        VideoTimelineStore,
-        probe_video_duration_ms,
-    )
-except ImportError:
-    from runtime_paths import application_dir, resource_dir
-    from video_timeline import (
-        DEFAULT_TIMING_ERROR_MS,
-        VideoTimelineStore,
-        probe_video_duration_ms,
-    )
+from .runtime_paths import application_dir, resource_dir
+from .video_timeline import (
+    DEFAULT_TIMING_ERROR_MS,
+    VideoTimelineStore,
+    probe_video_duration_ms,
+)
 
 
 _RTSP_CREDENTIAL_PATTERN = re.compile(

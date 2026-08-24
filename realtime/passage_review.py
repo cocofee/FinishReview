@@ -47,50 +47,27 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
-try:
-    from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
-    from .external_clip_import import EXTERNAL_CLOCK_SOURCE
-    from .passage_evidence import (
-        HIGH_SPEED_SOURCE,
-        REGULAR_SOURCE,
-        PassageEvidenceAssociation,
-        PassageEvidenceAssociationStore,
-    )
-    from .passage_receiver import PassageEvent, PassageEventStore
-    from .race_metadata import (
-        RaceAthleteMetadata,
-        RaceMetadata,
-        RaceMetadataStore,
-    )
-    from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
-    from .video_timeline import (
-        DEFAULT_CLOCK_SOURCE,
-        PassageVideoLocation,
-        PassageVideoLookup,
-        VideoTimelineStore,
-    )
-except ImportError:
-    from auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
-    from external_clip_import import EXTERNAL_CLOCK_SOURCE
-    from passage_evidence import (
-        HIGH_SPEED_SOURCE,
-        REGULAR_SOURCE,
-        PassageEvidenceAssociation,
-        PassageEvidenceAssociationStore,
-    )
-    from passage_receiver import PassageEvent, PassageEventStore
-    from race_metadata import (
-        RaceAthleteMetadata,
-        RaceMetadata,
-        RaceMetadataStore,
-    )
-    from video_playback import TargetTimelineSlider, VideoPlaybackWorker
-    from video_timeline import (
-        DEFAULT_CLOCK_SOURCE,
-        PassageVideoLocation,
-        PassageVideoLookup,
-        VideoTimelineStore,
-    )
+from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
+from .external_clip_import import EXTERNAL_CLOCK_SOURCE
+from .passage_evidence import (
+    HIGH_SPEED_SOURCE,
+    REGULAR_SOURCE,
+    PassageEvidenceAssociation,
+    PassageEvidenceAssociationStore,
+)
+from .passage_receiver import PassageEvent, PassageEventStore
+from .race_metadata import (
+    RaceAthleteMetadata,
+    RaceMetadata,
+    RaceMetadataStore,
+)
+from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
+from .video_timeline import (
+    DEFAULT_CLOCK_SOURCE,
+    PassageVideoLocation,
+    PassageVideoLookup,
+    VideoTimelineStore,
+)
 
 
 _STATUS_TEXT = {

@@ -1,3 +1,4 @@
+import logging
 from urllib.error import HTTPError
 from urllib.request import Request
 
@@ -96,6 +97,112 @@ def test_run_status_counts_only_current_racetiger_finish_records(tmp_path):
 
     assert statuses[0].count == 1
     assert statuses[0].message == "RaceTiger: received 1 records"
+
+
+def test_run_logs_expected_racetiger_error_without_traceback(tmp_path, caplog):
+    statuses = []
+    source = RaceTigerSource(
+        object(),
+        PassageEventStore(tmp_path / "expected-error.jsonl"),
+        race_id="RID-EXPECTED",
+        on_status=statuses.append,
+    )
+
+    def fail_poll():
+        source._stop.set()
+        raise RaceTigerError("RaceTiger request failed: TimeoutError")
+
+    source.poll_once = fail_poll
+    with caplog.at_level(logging.WARNING, logger="FinishReview.RaceTiger"):
+        source._run()
+
+    warning = next(record for record in caplog.records if record.levelno == logging.WARNING)
+    assert warning.exc_info is None
+    assert statuses[-1].message == "RaceTiger: API error (RaceTiger request failed: TimeoutError)"
+
+
+def test_run_logs_unexpected_error_with_traceback_and_generic_status(tmp_path, caplog):
+    statuses = []
+    source = RaceTigerSource(
+        object(),
+        PassageEventStore(tmp_path / "unexpected-error.jsonl"),
+        race_id="RID-UNEXPECTED",
+        on_status=statuses.append,
+    )
+
+    def fail_poll():
+        source._stop.set()
+        raise AttributeError("private implementation detail")
+
+    source.poll_once = fail_poll
+    with caplog.at_level(logging.ERROR, logger="FinishReview.RaceTiger"):
+        source._run()
+
+    error = next(record for record in caplog.records if record.levelno == logging.ERROR)
+    assert error.exc_info is not None
+    assert statuses[-1].message == "RaceTiger: internal polling error"
+    assert "private implementation detail" not in statuses[-1].message
+
+
+def test_run_throttles_repeated_unexpected_error_tracebacks(tmp_path, caplog):
+    statuses = []
+    source = RaceTigerSource(
+        object(),
+        PassageEventStore(tmp_path / "repeated-error.jsonl"),
+        race_id="RID-REPEATED",
+        on_status=statuses.append,
+    )
+
+    class FastStop:
+        def __init__(self):
+            self.stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, _timeout):
+            return self.stopped
+
+    stop = FastStop()
+    source._stop = stop
+    attempts = 0
+
+    def fail_poll():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            stop.set()
+        raise AttributeError("repeated implementation failure")
+
+    source.poll_once = fail_poll
+    with caplog.at_level(logging.ERROR, logger="FinishReview.RaceTiger"):
+        source._run()
+
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert attempts == 2
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert [status.message for status in statuses] == [
+        "RaceTiger: internal polling error",
+        "RaceTiger: internal polling error",
+    ]
+
+
+@pytest.mark.parametrize(
+    "poll_interval",
+    [float("nan"), float("inf"), -float("inf")],
+)
+def test_source_rejects_nonfinite_poll_interval(tmp_path, poll_interval):
+    with pytest.raises(ValueError, match="poll interval must be finite"):
+        RaceTigerSource(
+            object(),
+            PassageEventStore(tmp_path / "invalid-interval.jsonl"),
+            race_id="RID-INVALID",
+            poll_interval_seconds=poll_interval,
+        )
 
 
 def test_poll_once_enriches_score_identity_from_bio(tmp_path):

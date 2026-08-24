@@ -12,6 +12,10 @@ $ForbiddenRelativePaths = @(
     "finish_review_config.json",
     "global_config.json"
 )
+$ForbiddenDependencyNames = @(
+    "psutil",
+    "pyreadline3"
+)
 
 $Found = @(
     foreach ($RelativePath in $ForbiddenRelativePaths) {
@@ -26,4 +30,19 @@ if ($Found.Count -gt 0) {
     throw "Distribution contains runtime state: $($Found -join ', ')"
 }
 
-Write-Host "Distribution runtime-state check passed: $ResolvedAppDir"
+$FoundDependencies = @(
+    foreach ($Item in Get-ChildItem -LiteralPath $ResolvedAppDir -Recurse -Force) {
+        foreach ($DependencyName in $ForbiddenDependencyNames) {
+            if ($Item.Name -match "(?i)^$([regex]::Escape($DependencyName))([.\-]|$)") {
+                $Item.FullName
+                break
+            }
+        }
+    }
+)
+
+if ($FoundDependencies.Count -gt 0) {
+    throw "Distribution contains unexpected dependencies: $($FoundDependencies -join ', ')"
+}
+
+Write-Host "Distribution boundary check passed: $ResolvedAppDir"

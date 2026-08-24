@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import multiprocessing
 import os
 import sys
@@ -25,16 +26,14 @@ from realtime.review_recorder import (
     is_supported_review_source,
     make_directshow_source,
 )
-from realtime.review_window import (
-    FinishReviewSettings,
-    FinishReviewWindow,
-)
+from realtime.review_window import FinishReviewWindow
 from realtime.runtime_paths import (
     application_dir,
     resolve_output_dir,
     resolve_runtime_path,
 )
 from realtime.secure_storage import protect_secret, unprotect_secret
+from realtime.settings import FinishReviewSettings
 from realtime.stream_recorder import (
     apply_rtsp_credentials,
     is_rtsp_source,
@@ -208,6 +207,31 @@ def _existing_config_payload(config_path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _review_settings_payload(config_path: Path) -> dict:
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as error:
+        logger.warning(
+            "Could not load saved configuration (%s)",
+            type(error).__name__,
+        )
+        return {}
+    if not isinstance(payload, dict):
+        logger.warning(
+            "Ignoring saved configuration: configuration root must be an object"
+        )
+        return {}
+    return payload
+
+
+def _warn_invalid_setting(name: str, error: Exception) -> None:
+    logger.warning(
+        "Ignoring invalid saved setting %s (%s)",
+        name,
+        type(error).__name__,
+    )
+
+
 def _protected_secret_for_save(
     existing_payload: dict,
     protected_key: str,
@@ -253,8 +277,9 @@ def load_review_settings(
     cyclerace_ip = "192.168.50.20"
     high_speed_pc_ip = "192.168.50.30"
     switch_ip = "192.168.50.2"
+    payload = _review_settings_payload(config_path)
+
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
         candidate = str(payload.get("source") or "").strip()
         clean_candidate, legacy_rtsp_username, legacy_rtsp_password = (
             split_rtsp_credentials(candidate)
@@ -275,6 +300,10 @@ def load_review_settings(
         )
         if is_supported_review_source(candidate):
             source = candidate
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        _warn_invalid_setting("source", error)
+
+    try:
         secondary_candidate = str(payload.get("secondary_source") or "").strip()
         (
             clean_secondary_candidate,
@@ -297,44 +326,63 @@ def load_review_settings(
         )
         if is_rtsp_source(secondary_candidate):
             secondary_source = secondary_candidate
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        _warn_invalid_setting("secondary_source", error)
+
+    try:
         output_candidate = str(payload.get("output_dir") or "").strip()
         if output_candidate:
             saved_output_dir = Path(output_candidate).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        _warn_invalid_setting("output_dir", error)
+
+    try:
         camera_candidate = int(payload.get("camera_index", 0))
         if camera_candidate > 0:
             saved_camera_index = camera_candidate
+    except (TypeError, ValueError) as error:
+        _warn_invalid_setting("camera_index", error)
+
+    try:
         high_speed_candidate = str(payload.get("high_speed_dir") or "").strip()
         if high_speed_candidate:
             saved_high_speed_dir = Path(high_speed_candidate).expanduser().absolute()
-        candidate_provider = str(payload.get("timing_provider") or "").strip().lower()
-        if candidate_provider in {"cyclerace", "racetiger"}:
-            timing_provider = candidate_provider
-        racetiger_base_url = str(payload.get("racetiger_base_url") or "").strip()
-        racetiger_pc = str(payload.get("racetiger_pc") or "").strip()
-        racetiger_rid = str(payload.get("racetiger_rid") or "").strip()
-        finishreview_ip = str(
-            payload.get("finishreview_ip") or finishreview_ip
-        ).strip()
-        cyclerace_ip = str(payload.get("cyclerace_ip") or cyclerace_ip).strip()
-        high_speed_pc_ip = str(
-            payload.get("high_speed_pc_ip") or high_speed_pc_ip
-        ).strip()
-        switch_ip = str(payload.get("switch_ip") or switch_ip).strip()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        _warn_invalid_setting("high_speed_dir", error)
+
+    candidate_provider = str(payload.get("timing_provider") or "").strip().lower()
+    if candidate_provider in {"cyclerace", "racetiger"}:
+        timing_provider = candidate_provider
+    racetiger_base_url = str(payload.get("racetiger_base_url") or "").strip()
+    racetiger_pc = str(payload.get("racetiger_pc") or "").strip()
+    racetiger_rid = str(payload.get("racetiger_rid") or "").strip()
+    finishreview_ip = str(payload.get("finishreview_ip") or finishreview_ip).strip()
+    cyclerace_ip = str(payload.get("cyclerace_ip") or cyclerace_ip).strip()
+    high_speed_pc_ip = str(
+        payload.get("high_speed_pc_ip") or high_speed_pc_ip
+    ).strip()
+    switch_ip = str(payload.get("switch_ip") or switch_ip).strip()
+
+    try:
         racetiger_token = _load_secret(
             payload,
             "racetiger_token_protected",
             "racetiger_token",
             secret_unprotector,
         )
-        try:
-            racetiger_poll_interval_seconds = max(
-                0.5,
-                float(payload.get("racetiger_poll_interval_seconds", 2.0)),
-            )
-        except (TypeError, ValueError):
-            racetiger_poll_interval_seconds = 2.0
-    except (OSError, TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as error:
+        _warn_invalid_setting("racetiger_token", error)
+
+    try:
+        poll_interval_candidate = float(
+            payload.get("racetiger_poll_interval_seconds", 2.0)
+        )
+        if not math.isfinite(poll_interval_candidate):
+            raise ValueError("poll interval must be finite")
+        racetiger_poll_interval_seconds = max(0.5, poll_interval_candidate)
+    except (TypeError, ValueError) as error:
+        _warn_invalid_setting("racetiger_poll_interval_seconds", error)
+
     return FinishReviewSettings(
         source=source,
         secondary_source=secondary_source,

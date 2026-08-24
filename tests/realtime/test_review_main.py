@@ -298,6 +298,88 @@ def test_review_settings_round_trip_racetiger_configuration(tmp_path):
     assert "local-test-token" not in config_path.read_text(encoding="utf-8")
 
 
+def test_load_review_settings_ignores_non_object_json_root(tmp_path, caplog):
+    config_path = tmp_path / "finish_review_config.json"
+    config_path.write_text("[]", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="FinishReview.Entry"):
+        loaded = load_review_settings(
+            config_path,
+            output_dir=tmp_path / "race",
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=2,
+            high_speed_dir=tmp_path / "high-speed",
+        )
+
+    assert loaded.output_dir == (tmp_path / "race").resolve()
+    assert loaded.camera_index == 2
+    assert loaded.timing_provider == "cyclerace"
+    assert "configuration root must be an object" in caplog.text
+
+
+def test_load_review_settings_isolates_invalid_field_from_later_values(
+    tmp_path,
+    caplog,
+):
+    config_path = tmp_path / "finish_review_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "camera_index": "not-an-integer",
+                "high_speed_dir": str(tmp_path / "saved-high-speed"),
+                "timing_provider": "racetiger",
+                "racetiger_base_url": "https://rqs.racetigertiming.com",
+                "racetiger_pc": "finish-pc",
+                "racetiger_rid": "RID-2026",
+                "racetiger_poll_interval_seconds": 3.5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="FinishReview.Entry"):
+        loaded = load_review_settings(
+            config_path,
+            output_dir=tmp_path / "race",
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=None,
+        )
+
+    assert loaded.camera_index == 1
+    assert loaded.high_speed_dir == (tmp_path / "saved-high-speed").absolute()
+    assert loaded.timing_provider == "racetiger"
+    assert loaded.racetiger_base_url == "https://rqs.racetigertiming.com"
+    assert loaded.racetiger_pc == "finish-pc"
+    assert loaded.racetiger_rid == "RID-2026"
+    assert loaded.racetiger_poll_interval_seconds == 3.5
+    assert "camera_index" in caplog.text
+
+
+def test_load_review_settings_rejects_nonfinite_poll_interval(tmp_path, caplog):
+    config_path = tmp_path / "finish_review_config.json"
+    config_path.write_text(
+        '{"timing_provider":"racetiger",'
+        '"racetiger_poll_interval_seconds":1e309}',
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="FinishReview.Entry"):
+        loaded = load_review_settings(
+            config_path,
+            output_dir=tmp_path / "race",
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+            high_speed_dir=tmp_path / "high-speed",
+        )
+
+    assert loaded.timing_provider == "racetiger"
+    assert loaded.racetiger_poll_interval_seconds == 2.0
+    assert "racetiger_poll_interval_seconds" in caplog.text
+
+
 def test_review_settings_round_trip_two_encrypted_rtsp_sources(tmp_path):
     config_path = tmp_path / "finish_review_config.json"
     settings = FinishReviewSettings(

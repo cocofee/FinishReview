@@ -582,6 +582,7 @@ def test_callback_failure_returns_retry_and_duplicate_retry_delivers(tmp_path):
 
     assert first_status == 503
     assert first_ack["status"] == "retry"
+    assert first_ack["error"] == "delivery_failed"
     assert second_status == 200
     assert second_ack["status"] == "duplicate"
     assert attempts == [
@@ -590,6 +591,114 @@ def test_callback_failure_returns_retry_and_duplicate_retry_delivers(tmp_path):
     ]
     assert len(store) == 1
     assert len(store.journal_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_metadata_callback_failure_retries_delivery_without_rewriting_snapshot(
+    tmp_path,
+):
+    internal_message = r"C:\private\race\event.db failed"
+    attempts = []
+
+    def deliver_metadata(metadata):
+        attempts.append(metadata.revision)
+        if len(attempts) == 1:
+            raise RuntimeError(internal_message)
+
+    metadata_store = RaceMetadataStore(tmp_path / "race-metadata.json")
+    receiver = PassageEventReceiver(
+        "127.0.0.1",
+        0,
+        PassageEventStore(tmp_path / "passage-events.jsonl"),
+        discovery_port=None,
+        metadata_store=metadata_store,
+        on_metadata_accepted=deliver_metadata,
+    )
+    receiver.start()
+    try:
+        first_status, first_ack = post_json(receiver, metadata_payload())
+        second_status, second_ack = post_json(receiver, metadata_payload())
+    finally:
+        receiver.stop()
+
+    assert first_status == 503
+    assert first_ack == {
+        "schema_version": 1,
+        "message_type": "race_metadata_ack",
+        "status": "retry",
+        "error": "delivery_failed",
+    }
+    assert second_status == 200
+    assert second_ack == {
+        "schema_version": 1,
+        "message_type": "race_metadata_ack",
+        "status": "duplicate",
+    }
+    assert attempts == [1_787_388_800_000, 1_787_388_800_000]
+    assert metadata_store.current() is not None
+    assert internal_message not in json.dumps(first_ack)
+
+
+def test_internal_receiver_error_is_not_returned_to_client(tmp_path):
+    internal_message = r"C:\private\race\event.db failed"
+
+    class FailingMetadataStore:
+        def store(self, _metadata):
+            raise RuntimeError(internal_message)
+
+    receiver = PassageEventReceiver(
+        "127.0.0.1",
+        0,
+        PassageEventStore(tmp_path / "passage-events.jsonl"),
+        discovery_port=None,
+        metadata_store=FailingMetadataStore(),
+    )
+    receiver.start()
+    try:
+        status, ack = post_json(receiver, metadata_payload())
+    finally:
+        receiver.stop()
+
+    assert status == 500
+    assert ack["message_type"] == "race_metadata_ack"
+    assert ack["status"] == "error"
+    assert ack["error"] == "internal_error"
+    assert internal_message not in json.dumps(ack)
+
+
+def test_receiver_times_out_incomplete_request_body(tmp_path):
+    receiver = PassageEventReceiver(
+        "127.0.0.1",
+        0,
+        PassageEventStore(tmp_path / "passage-events.jsonl"),
+        discovery_port=None,
+        request_timeout_seconds=0.1,
+    )
+    receiver.start()
+    client = socket.create_connection(("127.0.0.1", receiver.listen_port), timeout=2.0)
+    client.settimeout(2.0)
+    try:
+        client.sendall(
+            b"POST /api/v1/passage-events HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 128\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        response = b""
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+    finally:
+        client.close()
+        receiver.stop()
+
+    header, body = response.split(b"\r\n\r\n", 1)
+    ack = json.loads(body.decode("utf-8"))
+    assert b" 408 " in header
+    assert ack["status"] == "rejected"
+    assert ack["error"] == "request_timeout"
 
 
 def test_store_recovers_incomplete_tail_and_restores_latest_revision(tmp_path):
@@ -654,3 +763,36 @@ def test_stop_is_idempotent(tmp_path):
     receiver.stop()
 
     assert receiver.is_running is False
+
+
+def test_stop_keeps_thread_reference_after_join_timeout(tmp_path):
+    class _StuckThread:
+        def __init__(self):
+            self.alive = True
+            self.join_calls = 0
+
+        def join(self, timeout=None):
+            self.join_calls += 1
+
+        def is_alive(self):
+            return self.alive
+
+    receiver = PassageEventReceiver(
+        "127.0.0.1",
+        0,
+        PassageEventStore(tmp_path / "passage-events.jsonl"),
+        discovery_port=None,
+    )
+    thread = _StuckThread()
+    receiver._thread = thread
+
+    receiver.stop()
+
+    assert receiver.is_running is True
+    assert thread.join_calls == 1
+
+    thread.alive = False
+    receiver.stop()
+
+    assert receiver.is_running is False
+    assert thread.join_calls == 2

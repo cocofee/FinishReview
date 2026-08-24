@@ -11,18 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-try:
-    from .video_timeline import (
-        PassageVideoLocation,
-        RecordingSegment,
-        VideoTimelineStore,
-    )
-except ImportError:
-    from video_timeline import (
-        PassageVideoLocation,
-        RecordingSegment,
-        VideoTimelineStore,
-    )
+from .video_timeline import (
+    PassageVideoLocation,
+    RecordingSegment,
+    VideoTimelineStore,
+)
 
 
 POINT_PLAYBACK_BEFORE_MS = 45_000

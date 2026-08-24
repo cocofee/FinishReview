@@ -41,8 +41,25 @@ $env:FINISH_REVIEW_FFMPEG = "C:\path\to\ffmpeg.exe"
 .\packaging\build.ps1
 ```
 
+脚本优先使用仓库 `.venv\Scripts\python.exe`。需要使用其他隔离环境时显式指定：
+
+```powershell
+.\packaging\build.ps1 -PythonPath C:\path\to\python.exe
+```
+
 输出位于 `artifacts\dist\FinishReviewConsole`。打包脚本显式排除检测、OCR 和模型框架，
-并检查发布目录没有混入比赛数据、日志或本机配置。
+并检查发布目录没有混入比赛数据、日志、本机配置或已知的非项目依赖。
+
+## Performance and field validation
+
+合成性能基线不进入默认 pytest，可在固定测试机上手动执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.benchmark_review --sizes 500 2000 5000
+```
+
+真实设备、网络故障、磁盘不足和长时间运行的发布前检查见
+`.field_validation\README.md`。合成基准不能替代真实赛事目录和现场硬件验收。
 
 ## Runtime security and diagnostics
 

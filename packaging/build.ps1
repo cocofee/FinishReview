@@ -1,5 +1,6 @@
 param(
-    [string]$FfmpegPath
+    [string]$FfmpegPath,
+    [string]$PythonPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +11,19 @@ $BuildRoot = Join-Path $Artifacts "build"
 $Spec = Join-Path $PSScriptRoot "FinishReview.spec"
 $AppName = "FinishReviewConsole"
 $AppDir = Join-Path $DistRoot $AppName
+$RepoPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$ResolvedPython = if ($PythonPath) {
+    if (Test-Path -LiteralPath $PythonPath -PathType Leaf) {
+        (Resolve-Path -LiteralPath $PythonPath).Path
+    } else {
+        (Get-Command $PythonPath -ErrorAction Stop).Source
+    }
+} elseif (Test-Path -LiteralPath $RepoPython -PathType Leaf) {
+    (Resolve-Path -LiteralPath $RepoPython).Path
+} else {
+    Write-Warning "Repository .venv not found; using the active PATH Python."
+    (Get-Command python -ErrorAction Stop).Source
+}
 $ResolvedFfmpeg = if ($FfmpegPath) {
     (Resolve-Path -LiteralPath $FfmpegPath).Path
 } else {
@@ -52,7 +66,8 @@ $env:FINISH_REVIEW_FFMPEG = $ResolvedFfmpeg
 
 Push-Location $RepoRoot
 try {
-    python -m PyInstaller --noconfirm --clean --distpath $DistRoot --workpath $BuildRoot $Spec
+    Write-Host "Build Python: $ResolvedPython"
+    & $ResolvedPython -m PyInstaller --noconfirm --clean --distpath $DistRoot --workpath $BuildRoot $Spec
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
     }

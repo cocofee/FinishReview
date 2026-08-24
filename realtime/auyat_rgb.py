@@ -20,10 +20,7 @@ import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 
-try:
-    from .video_timeline import PassageVideoLocation, RecordingSegment
-except ImportError:
-    from video_timeline import PassageVideoLocation, RecordingSegment
+from .video_timeline import PassageVideoLocation, RecordingSegment
 
 
 AUYAT_CLOCK_SOURCE = "auyat_rgb_beijing"

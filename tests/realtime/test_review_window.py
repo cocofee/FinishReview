@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -217,6 +218,9 @@ class _FakeRaceTigerSource:
     def deliver(self, event):
         self.on_event(event)
 
+    def deliver_status(self, status):
+        self.on_status(status)
+
 
 def _event(*, absolute=True, **overrides):
     recorder_timestamp_ms = (
@@ -372,6 +376,46 @@ def test_stopped_racetiger_source_cannot_deliver_late_events(
     qapp.processEvents()
 
     assert not window._pending_passages
+    window.close()
+
+
+def test_queued_racetiger_callbacks_are_discarded_after_stop(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    _FakeRaceTigerSource.instances.clear()
+    monkeypatch.setattr(review_window_module, "RaceTigerSource", _FakeRaceTigerSource)
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        timing_provider="racetiger",
+        racetiger_base_url="https://rqs.racetigertiming.com",
+        racetiger_pc="finish-pc",
+        racetiger_rid="RID-2026",
+        racetiger_token="local-test-token",
+    )
+    window.start_receiver()
+    source = _FakeRaceTigerSource.instances[0]
+    queued_status = review_window_module.RaceTigerStatus(
+        "error",
+        "stale queued status",
+    )
+
+    worker = threading.Thread(
+        target=lambda: (
+            source.deliver(_event(race_id="RID-2026", event_id="queued-event")),
+            source.deliver_status(queued_status),
+        )
+    )
+    worker.start()
+    worker.join()
+    window.stop_receiver()
+    qapp.processEvents()
+
+    assert not window._pending_passages
+    assert window._receiver_error == ""
+    assert window._racetiger_status is not queued_status
     window.close()
 
 
@@ -1088,6 +1132,57 @@ def test_settings_save_failure_keeps_runtime_and_recording_unchanged(
     assert window.source == "rtsp://camera/live"
     assert recorder is not None and recorder.is_running
     assert warnings and warnings[0][0] == "设置未保存"
+    window.close()
+
+
+def test_settings_apply_rolls_back_when_receiver_stop_fails(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    class _FailOnceStopReceiver(_FakeReceiver):
+        def stop(self):
+            self.stop_calls = getattr(self, "stop_calls", 0) + 1
+            if self.stop_calls == 1:
+                raise OSError("shutdown unavailable")
+            super().stop()
+
+    saved = []
+    current_output = tmp_path / "current"
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        current_output,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        receiver_factory=_FailOnceStopReceiver,
+        settings_saver=saved.append,
+    )
+    window.start_receiver()
+    receiver = window.receiver
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args[1:]),
+    )
+    settings = FinishReviewSettings(
+        source="rtsp://camera/live",
+        output_dir=tmp_path / "next",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    applied = window._apply_settings(settings)
+
+    assert not applied
+    assert window.output_dir == current_output.resolve()
+    assert receiver is not None and receiver.is_running
+    assert saved[0] == settings
+    assert saved[-1].output_dir == current_output.resolve()
+    assert warnings and warnings[-1][0] == "计时源未停止"
+
+    assert window.stop_receiver()
     window.close()
 
 

@@ -5,22 +5,24 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-try:
-    from .passage_receiver import PassageEventStore, PassageJournalError
-    from .video_timeline import (
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from realtime.passage_receiver import PassageEventStore, PassageJournalError
+    from realtime.video_timeline import (
         RecordingSegment,
         VideoTimelineError,
         VideoTimelineStore,
         probe_video_duration_ms,
     )
-except ImportError:
-    from passage_receiver import PassageEventStore, PassageJournalError
-    from video_timeline import (
+else:
+    from .passage_receiver import PassageEventStore, PassageJournalError
+    from .video_timeline import (
         RecordingSegment,
         VideoTimelineError,
         VideoTimelineStore,
