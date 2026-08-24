@@ -6,6 +6,7 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
+.field_validation/generated/
 .venv/
 artifacts/
 build/

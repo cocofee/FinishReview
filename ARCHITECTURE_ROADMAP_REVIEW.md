@@ -497,3 +497,47 @@ artifacts\dist\FinishReviewConsole\FinishReviewConsole.exe --smoke-test
 - `Hidden import "sip" not found!`：仍为已知非阻断告警。
 
 本阶段没有运行 Python 3.10 本地测试，跨版本结果仍由 GitHub Actions 验证；也没有因为首次 coverage 数据低于某个百分比而补写低价值测试或设置硬门槛。
+
+## 十一、现场验收基线可重复化（2026-08-24）
+
+### 本阶段范围
+
+本阶段只补齐 P1 现场验收基线中不依赖真实设备的部分：确定性脱敏样本、机器可读结果模板和安全生成规则。没有把合成样本当作 CycleRace、USB/RTSP 摄像机、奥亚特共享目录或网络故障的现场通过记录，也没有据此启用自动重连或索引重构。
+
+### 已完成
+
+1. **固定样本生成器：** 新增 `tools/generate_field_validation_fixture.py`，通过现有 `RaceMetadataStore` 和 `PassageEventStore` 在 `expected/finish_review` 生成赛事元数据与两条 Passage 的预期快照，另建空的 `runtime/finish_review` 作为接收目录，并生成包含一次重复 Passage 投递和一次焦点消息的 CycleRace 请求序列。
+2. **高速脱敏样本：** 生成一段确定性的奥亚特 RGB 文件；两个样本 Passage 均位于该 capture 的时间范围内，可由现有 `scan_rgb_file()` 解析。
+3. **完整性清单：** `fixture_manifest.json` 记录 fixture ID、预期 Passage/请求/capture 数量、HTTP ACK 顺序和不可变样本文件的 SHA-256，不包含绝对路径或真实身份数据。
+4. **验收结果模板：** `validation_result.json` 为清单中的 10 个现场场景建立 `not_run` 记录，预留环境、日志、证据和备注字段；不包含 Token 或密码字段，并明确作为现场可变记录排除在 SHA-256 校验之外。
+5. **覆盖保护：** 生成器仅接受不存在或空目录，拒绝覆盖已有现场记录；`.field_validation/generated/` 默认不进入 Git。
+6. **现场说明：** `.field_validation/README.md` 增加生成、空目录启动、HTTP 回放命令、预期 ACK 顺序和 `not_run/passed/failed/blocked` 状态约定，明确预期快照不得作为应用输出目录。
+
+### 新增测试
+
+- 两个不同目录生成的全部文件逐字节一致。
+- 元数据、Passage JSONL 和奥亚特 RGB 可由现有生产解析器重新加载。
+- 请求序列包含相同 Passage 的重复投递；结果模板全部保持 `not_run`。
+- 请求序列通过真实 HTTP 接收器投递到空运行目录，ACK 依次为接受、接受、重复、接受、接受，且最终仅落盘两条 Passage。
+- manifest 中每个不可变文件的 SHA-256 与实际文件一致；`validation_result.json` 明确列为可变文件且不参与校验。
+- 非空目录被拒绝且已有文件保持不变。
+- CLI 返回成功并打印 manifest 的绝对路径。
+
+### 验证结果
+
+- 新增专项测试：`5 passed in 0.40s`。
+- 全量 pytest（coverage 下运行）：`327 passed in 10.63s`。
+- 分支覆盖率：`79%`，仍不设置硬门槛。
+- Ruff、`compileall`、`pip check`、`git diff --check`：通过。
+- PyInstaller clean build及发布边界检查：通过，209 个文件，460,387,081 bytes。
+- EXE smoke test：退出码 0。
+- 上一提交 `a1eb448` 的 GitHub Actions CI：成功。
+- `Hidden import "sip" not found!`：仍为已知非阻断告警。
+
+### 仍需现场完成
+
+- 用真实 CycleRace sender 完成元数据、重复 Passage 和焦点消息闭环。
+- 用真实 USB/RTSP 双机位完成录像、断线、人工一键恢复和停止后 FFmpeg 进程检查。
+- 用真实奥亚特共享目录验证只读扫描、共享离线与恢复。
+- 在隔离测试盘验证磁盘不足，并执行至少 2 小时发布候选运行。
+- 只有上述结果写入 `validation_result.json` 且关键场景为 `passed` 后，才重新评估后台自动重连和更深层控制器状态事件。

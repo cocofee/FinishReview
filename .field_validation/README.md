@@ -13,6 +13,70 @@
 
 不得在记录中保存 Token、密码、运动员隐私数据或未脱敏的赛事目录。
 
+## 固定脱敏样本
+
+在仓库根目录生成一套确定性样本：
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.generate_field_validation_fixture `
+  --output .field_validation\generated\sample-2026-08-24
+```
+
+输出包括：
+
+- `expected\finish_review`，包含预期赛事元数据和两条 Passage 的只读快照；
+- `runtime\finish_review`，用于启动应用并接收回放请求的空运行目录；
+- `cyclerace_requests.jsonl`，包含元数据、两条 Passage、一次重复投递和一次焦点消息；
+- `auyat\Photo\validation_sample.RGB`，可由现有奥亚特解析器定位到两条样本 Passage；
+- `fixture_manifest.json`，记录预期 ACK 顺序及不可变样本文件的 SHA-256；
+- `validation_result.json`，所有场景初始状态均为 `not_run`，用于记录真实现场结果。
+
+`expected\finish_review` 只用于检查解析结果，不得作为应用的 `--output`。启动验收实例时，
+必须使用空的 `runtime\finish_review`：
+
+```powershell
+$fixture = (Resolve-Path .field_validation\generated\sample-2026-08-24).Path
+.\.venv\Scripts\python.exe -m realtime.review_main `
+  --output "$fixture\runtime\finish_review" `
+  --high-speed-dir "$fixture\auyat"
+```
+
+保持应用运行，在另一个 PowerShell 窗口回放请求：
+
+```powershell
+$fixture = (Resolve-Path .field_validation\generated\sample-2026-08-24).Path
+$uri = "http://127.0.0.1:18765/api/v1/passage-events"
+
+Get-Content "$fixture\cyclerace_requests.jsonl" | ForEach-Object {
+  $body = ($_ | ConvertFrom-Json) | ConvertTo-Json -Depth 20 -Compress
+  $response = Invoke-WebRequest `
+    -Uri $uri `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body ([Text.Encoding]::UTF8.GetBytes($body)) `
+    -UseBasicParsing
+  $ack = $response.Content | ConvertFrom-Json
+  [PSCustomObject]@{
+    HttpStatus = [int]$response.StatusCode
+    MessageType = $ack.message_type
+    Status = $ack.status
+  }
+} | Format-Table
+```
+
+预期顺序为：元数据 `201 accepted`、第一条 Passage `201 accepted`、重复 Passage
+`200 duplicate`、第二条 Passage `201 accepted`、焦点消息 `201 accepted`。回放完成后，
+`runtime\finish_review\cyclerace_passage_events.jsonl` 必须正好包含两行。
+再次验证时应生成一个新的 fixture 目录；不得向已经产生 JSONL 的运行目录重复执行整组回放，
+否则首次 Passage 也会被正确地判定为 `duplicate`，无法验证首次接受路径。
+
+生成器只接受不存在或空目录，不会覆盖已有验收记录。`.field_validation\generated`
+默认不进入 Git，现场记录中仍不得填写 Token、密码或真实运动员身份信息。该样本只验证
+格式、导入和重复投递语义，不能替代真实 CycleRace、摄像机、共享目录或网络故障验收。
+现场填写 `validation_result.json` 时，状态只使用 `not_run`、`passed`、`failed` 或
+`blocked`；`blocked` 必须在 `notes` 中记录缺失的设备或环境前置条件。该结果文件属于
+现场可变记录，不参与 `fixture_manifest.json` 的 SHA-256 校验。
+
 ## 必测流程
 
 | 场景 | 操作 | 完成标准 |
