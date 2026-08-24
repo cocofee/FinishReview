@@ -48,7 +48,7 @@ _MANAGED_LOG_HANDLER = "_finish_review_managed_handler"
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="终点复核系统")
+    parser = argparse.ArgumentParser(description="FinishReview · 终点多源复核")
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--source", help="安装人员使用的网络录像源地址")
     source_group.add_argument("--usb-device", help="安装人员使用的 Windows 摄像头名称")

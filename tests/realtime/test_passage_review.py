@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -199,7 +200,7 @@ def test_review_uses_one_row_per_passage_and_opens_regular_video(
     assert dialog.table.item(0, 6).text() == "可查看"
     assert dialog.table.item(0, 7).text() == "无画面"
     assert dialog.table.item(0, 7).foreground().color().name() == "#c0372b"
-    assert dialog.table.item(0, 8).text() == "芯片记录"
+    assert dialog.table.item(0, 8).text() == "待核对"
     assert dialog.regular_pane.location.video_path == video_path.absolute()
     assert dialog.high_speed_pane.location is None
     assert fake_playback.instances[0].seek_calls == [5_500]
@@ -291,14 +292,111 @@ def test_review_auto_fits_table_columns_without_squeezing_them(qapp, tmp_path):
         passage_review._TABLE_COLUMN_MIN_WIDTHS,
         1_600,
     )
-    assert sum(widths) == 1_102
-    assert sum(widths) < 1_600
+    assert sum(widths) == 1_600
     assert widths[2] > widths[1]
     assert widths[3] > widths[4]
     assert all(
         width >= minimum
         for width, minimum in zip(widths, passage_review._TABLE_COLUMN_MIN_WIDTHS)
     )
+    dialog.close()
+
+
+def test_large_finish_queue_supports_debounced_search_and_status_filters(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    journal_path = tmp_path / "passages.jsonl"
+    events = [
+        _event(
+            event_id=f"passage-{index:04d}",
+            sequence=index + 1,
+            passage_time_ms=index,
+            passage_timestamp_ms=1_800_000_000_000 + index,
+            bib=f"{index:04d}",
+            chip_id=f"chip-{index:04d}",
+            athlete_name=f"运动员{index:04d}",
+        )
+        for index in range(5_000)
+    ]
+    journal_path.write_text(
+        "\n".join(
+            json.dumps(event.to_payload(), ensure_ascii=False)
+            for event in events
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    timeline_path = tmp_path / "video_timeline.jsonl"
+    timeline_records = []
+    for index in range(160):
+        segment_id = f"segment-{index:04d}"
+        started_at_ms = 1_799_000_000_000 + index * 1_000
+        timeline_records.extend(
+            (
+                {
+                    "schema_version": 1,
+                    "record_type": "segment_started",
+                    "segment_id": segment_id,
+                    "source_id": "camera_01",
+                    "camera_index": 1,
+                    "video_path": "videos/camera_01.mkv",
+                    "started_at_ms": started_at_ms,
+                    "clock_source": "videopipe_system_clock",
+                    "timing_error_ms": 1_000,
+                    "race_id": "race-1",
+                },
+                {
+                    "schema_version": 1,
+                    "record_type": "segment_ended",
+                    "segment_id": segment_id,
+                    "ended_at_ms": started_at_ms + 900,
+                    "end_reason": "rotation",
+                    "media_duration_ms": 900,
+                    "media_started_at_ms": started_at_ms,
+                },
+            )
+        )
+    timeline_path.write_text(
+        "\n".join(
+            json.dumps(record, ensure_ascii=False) for record in timeline_records
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dialog = PassageReviewDialog(
+        PassageEventStore(journal_path),
+        VideoTimelineStore(timeline_path),
+    )
+    qapp.processEvents()
+
+    assert dialog.table.rowCount() == 5_000
+    source_location_calls = 0
+    original_source_location = dialog._source_location_with_saved_association
+
+    def counted_source_location(*args, **kwargs):
+        nonlocal source_location_calls
+        source_location_calls += 1
+        return original_source_location(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dialog,
+        "_source_location_with_saved_association",
+        counted_source_location,
+    )
+    dialog.identity_search.setText("4999")
+    assert dialog._search_refresh_timer.isActive()
+    QTest.qWait(180)
+    qapp.processEvents()
+
+    assert dialog.table.rowCount() == 1
+    assert dialog.table.item(0, 1).text() == "4999"
+    assert source_location_calls < 20
+    dialog.review_filter_buttons["pending"].click()
+    assert dialog.table.rowCount() == 0
+    dialog.review_filter_buttons["blocked"].click()
+    assert dialog.table.rowCount() == 1
     dialog.close()
 
 
@@ -370,7 +468,7 @@ def test_review_marks_legacy_video_as_unverified(qapp, tmp_path, fake_playback):
     qapp.processEvents()
 
     assert dialog.table.item(0, 6).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "芯片记录"
+    assert dialog.table.item(0, 8).text() == "待核对"
     assert dialog.regular_pane.open_btn.isEnabled()
     dialog.close()
 
@@ -385,7 +483,7 @@ def test_review_shows_missing_evidence_without_starting_workers(qapp, tmp_path):
 
     assert dialog.table.item(0, 6).text() == "无画面"
     assert dialog.table.item(0, 7).text() == "无画面"
-    assert dialog.table.item(0, 8).text() == "芯片记录"
+    assert dialog.table.item(0, 8).text() == "受阻"
     assert dialog.regular_pane._worker is None
     assert dialog.high_speed_pane._worker is None
     dialog.close()
@@ -417,7 +515,7 @@ def test_review_shows_high_speed_boundary_independently(
     assert dialog.table.rowCount() == 1
     assert dialog.table.item(0, 6).text() == "无画面"
     assert dialog.table.item(0, 7).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "芯片记录"
+    assert dialog.table.item(0, 8).text() == "待核对"
     assert dialog.high_speed_pane.location.status == "near_boundary"
     assert dialog.high_speed_pane.location.playback_position_ms == 0
     dialog.close()
@@ -464,7 +562,7 @@ def test_review_shows_regular_and_high_speed_sources_on_one_row(
     assert dialog.table.rowCount() == 1
     assert dialog.table.item(0, 6).text() == "可查看"
     assert dialog.table.item(0, 7).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "芯片记录"
+    assert dialog.table.item(0, 8).text() == "待核对"
     assert dialog.regular_pane.location.segment.source_id == "camera_01"
     assert dialog.high_speed_pane.location.segment.source_id == "high_speed_02"
     assert "另有 1 个机位位于误差边界" in lookup_status_text(
@@ -642,23 +740,26 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     assert dialog.selected_identity_value.text() == "15"
     assert dialog.athlete_value.text() == "张三"
     assert dialog.team_value.text() == "示例车队"
+    visible_columns = [
+        column
+        for column in range(dialog.table.columnCount())
+        if not dialog.table.isColumnHidden(column)
+    ]
     assert [
         dialog.table.horizontalHeaderItem(column).text()
-        for column in range(dialog.table.columnCount())
+        for column in visible_columns
     ] == [
-        "序号",
-        "号码",
+        "运动员编号",
         "姓名",
         "组别",
-        "圈次",
         "通过时间",
         "普通录像",
         "高速摄像",
-        "核对状态",
+        "复核状态",
     ]
     assert dialog.table.item(0, 1).text() == "15"
     assert dialog.table.item(0, 2).text() == "张三"
-    assert dialog.current_passage_label.text() == "当前运动员 15 张三"
+    assert dialog.current_passage_label.text() == "15 张三"
     assert dialog.group_combo.itemText(1) == "男子公开组"
     assert dialog.group_combo.itemData(1) == "men-open"
     dialog.close()
@@ -734,7 +835,10 @@ def test_race_metadata_populates_context_before_first_passage(qapp, tmp_path):
     dialog.close()
 
 
-def test_switching_to_metadata_context_clears_stale_test_identity(qapp, tmp_path):
+def test_selected_identity_does_not_pollute_search_across_metadata_context(
+    qapp,
+    tmp_path,
+):
     passage_store = PassageEventStore(tmp_path / "passages.jsonl")
     passage_store.append(_event(event_id="old-test", bib="TEST-15"))
     metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")
@@ -744,8 +848,8 @@ def test_switching_to_metadata_context_clears_stale_test_identity(qapp, tmp_path
         metadata_store=metadata_store,
     )
     qapp.processEvents()
-    assert dialog.identity_search.text() == "TEST-15"
-    assert dialog.regular_pane.mark_btn.text() == "标线 TEST-15"
+    assert dialog.identity_search.text() == ""
+    assert dialog.regular_pane.mark_btn.text() == "标线"
 
     metadata_store.store(
         RaceMetadata(
@@ -763,8 +867,8 @@ def test_switching_to_metadata_context_clears_stale_test_identity(qapp, tmp_path
 
     assert dialog.table.rowCount() == 0
     assert dialog.identity_search.text() == ""
-    assert dialog.regular_pane.mark_btn.text() == "标记"
-    assert dialog.high_speed_pane.mark_btn.text() == "标记"
+    assert dialog.regular_pane.mark_btn.text() == "标线"
+    assert dialog.high_speed_pane.mark_btn.text() == "标线"
     dialog.close()
 
 
@@ -944,7 +1048,7 @@ def test_review_rejects_external_clip_from_another_race(qapp, tmp_path):
 
     assert dialog.table.item(0, 6).text() == "无画面"
     assert dialog.table.item(0, 7).text() == "无画面"
-    assert dialog.table.item(0, 8).text() == "芯片记录"
+    assert dialog.table.item(0, 8).text() == "受阻"
     dialog.close()
 
 
@@ -1097,7 +1201,7 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     assert "background: #1bbf83" in regular_view._identity_badge.styleSheet()
     assert not regular_view._marker_mode
     assert dialog.table.item(0, 6).text() == "已标记"
-    assert dialog.table.item(0, 8).text() == "录像标记"
+    assert dialog.table.item(0, 8).text() == "已确认"
 
     QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Space)
     qapp.processEvents()
@@ -1238,7 +1342,7 @@ def test_manual_marker_restores_and_upgrades_to_dual_source_confirmation(
     assert regular_worker.seek_calls[-1] == 10_050
     assert high_speed_worker.seek_calls[-1] == 1_050
     assert dialog.regular_pane.association is not None
-    assert dialog.table.item(0, 8).text() == "录像标记"
+    assert dialog.table.item(0, 8).text() == "已确认"
 
     frame = QImage(1280, 720, QImage.Format_RGB888)
     frame.fill(0)
@@ -1276,8 +1380,8 @@ def test_manual_marker_restores_and_upgrades_to_dual_source_confirmation(
     assert high_speed_association is not None
     assert high_speed_association.segment_id == high_speed_segment.segment_id
     assert high_speed_view.zoom_percent == zoom_before_confirmation
-    assert dialog.table.item(0, 8).text() == "双源标记"
-    assert dialog.source_value.text() == "双源标记"
+    assert dialog.table.item(0, 8).text() == "已确认"
+    assert dialog.source_value.text() == "已确认"
     assert dialog.table.item(0, 6).foreground().color().name() == "#16845b"
     assert dialog.table.item(0, 7).foreground().color().name() == "#16845b"
     dialog.close()
@@ -1358,7 +1462,7 @@ def test_escape_cancels_pending_marker_and_delete_clears_confirmed_marker(
     qapp.processEvents()
     assert association_store.get("passage-1", REGULAR_SOURCE) is None
     assert dialog.table.item(0, 6).text() == "可查看"
-    assert dialog.table.item(0, 8).text() == "芯片记录"
+    assert dialog.table.item(0, 8).text() == "待核对"
     dialog.close()
 
 
@@ -1410,7 +1514,7 @@ def test_enter_stays_by_default_and_opt_in_auto_advance_moves_to_next_passage(
 
     assert not dialog.auto_advance_checkbox.isChecked()
     assert association_store.get("passage-12", REGULAR_SOURCE) is not None
-    assert dialog.table.item(0, 8).text() == "录像标记"
+    assert dialog.table.item(0, 8).text() == "已确认"
     assert dialog.table.currentRow() == 0
     assert dialog._selected_event_id == "passage-12"
 
@@ -1429,7 +1533,7 @@ def test_enter_stays_by_default_and_opt_in_auto_advance_moves_to_next_passage(
     assert dialog.table.currentRow() == 1
     assert dialog._selected_event_id == "passage-15"
     assert dialog.selected_identity_value.text() == "15"
-    assert dialog.identity_search.text() == "15"
+    assert dialog.identity_search.text() == ""
 
     QTest.keyClick(view, Qt.Key_PageUp)
     qapp.processEvents()
@@ -1530,8 +1634,8 @@ def test_confirm_updates_current_row_without_full_refresh_or_reseek(
     assert refresh_calls == 0
     assert worker.seek_calls == seek_calls_before
     assert association_store.get("passage-12", REGULAR_SOURCE) is not None
-    assert dialog.table.item(0, 8).text() == "录像标记"
-    assert dialog.source_value.text() == "录像标记"
+    assert dialog.table.item(0, 8).text() == "已确认"
+    assert dialog.source_value.text() == "已确认"
     dialog.close()
 
 

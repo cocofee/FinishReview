@@ -28,6 +28,7 @@ from realtime.race_metadata import (
     RaceAthleteMetadata,
     RaceGroupMetadata,
     RaceMetadata,
+    RaceMetadataStore,
 )
 from realtime.review_recorder import make_directshow_source
 from realtime.review_window import (
@@ -417,7 +418,81 @@ def test_runtime_status_keeps_waiting_for_seal_visible_with_older_captures(
     assert window.high_speed_status_label.text() == (
         "高速摄像: 本机测试目录可读，等待原厂软件完成判读"
     )
+    assert window.high_speed_status_label._title_label.text() == "高速摄像待机"
     window.close()
+
+
+def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
+    root = tmp_path / "events"
+    window = _window(root)
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[-1]
+    metadata = RaceMetadata(
+        race_id="race-2026",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=1,
+        race_name="2026 城市公路自行车赛",
+        stage_name="终点",
+    )
+
+    receiver.deliver_metadata(metadata)
+    qapp.processEvents()
+
+    event_dir = root / "2026 城市公路自行车赛"
+    assert window.workspace_root == root.resolve()
+    assert window.output_dir == event_dir.resolve()
+    assert window.metadata_store.current() == metadata
+    assert window.event_name_label.text() == metadata.race_name
+    assert window._receiver_passage_store.journal_path.parent == (
+        root / review_window_module.CYCLERACE_INBOX_DIRNAME
+    ).resolve()
+    assert receiver.stopped
+
+    active_receiver = _FakeReceiver.instances[-1]
+    event = _event(race_id=metadata.race_id, event_id="race-2026-passage-15")
+    active_receiver.deliver(event)
+    qapp.processEvents()
+
+    assert window.passage_store.get(event.event_id) == event
+    assert window.passage_store.journal_path.parent == event_dir.resolve()
+    assert window._current_settings().output_dir == root.resolve()
+    assert window._apply_settings(window._current_settings())
+    assert window.output_dir == event_dir.resolve()
+    window.close()
+
+    restored = _window(root)
+    assert restored.output_dir == event_dir.resolve()
+    assert restored.metadata_store.current() == metadata
+    assert restored.passage_store.get(event.event_id) == event
+    restored.close()
+
+
+def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
+    root = tmp_path / "events"
+    occupied = root / "城市赛"
+    RaceMetadataStore(occupied / "cyclerace_race_metadata.json").store(
+        RaceMetadata(
+            race_id="race-old",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="城市赛",
+            stage_name="终点",
+        )
+    )
+    metadata = RaceMetadata(
+        race_id="race-new",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=2,
+        race_name="城市赛",
+        stage_name="终点",
+    )
+
+    event_dir = review_window_module._event_workspace_dir(root, metadata)
+
+    assert event_dir == (root / "城市赛_race-new").resolve()
 
 
 def test_runtime_status_keeps_high_speed_directory_health_when_event_selected(
@@ -441,6 +516,7 @@ def test_runtime_status_keeps_high_speed_directory_health_when_event_selected(
     assert window.high_speed_status_label.text() == (
         "高速摄像: 本机测试数据可读，1 段"
     )
+    assert window.high_speed_status_label._title_label.text() == "高速摄像就绪"
     window.close()
 
 
@@ -459,7 +535,7 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert window.race_value.text() == "2026 城市自行车赛"
     assert window.stage_value.text() == "第一赛段"
     assert window.group_value.text() == "男子公开组"
-    assert window.operator_identity_label.text() == "当前运动员：15 张三"
+    assert window.operator_identity_label.text() == "男子公开组 · 1 / 1 · 待核对"
     assert window.table.item(0, 6).text() == "可查看"
     assert len(window.timeline_store.segments()) == 1
     assert "可核对 1" in window.capture_status_label.text()
@@ -586,7 +662,9 @@ def test_focus_before_passage_shows_roster_then_auto_selects_passage(
     assert window._selected_event_id == ""
     assert window.selected_identity_value.text() == "15"
     assert window.selected_time_value.text() == "尚无通过记录"
-    assert window.operator_identity_label.text() == "当前运动员：15 十五号运动员"
+    assert window.operator_identity_label.text() == (
+        "男子公开组 · 未进入终点记录 · 尚无通过记录"
+    )
 
     receiver.deliver(_event())
     qapp.processEvents()
@@ -615,7 +693,7 @@ def test_confirm_and_next_does_not_advance_when_confirmation_fails(
     window.close()
 
 
-def test_plain_enter_confirms_pending_marker_without_advancing(
+def test_search_enter_does_not_confirm_pending_marker(
     qapp,
     tmp_path,
     monkeypatch,
@@ -628,11 +706,7 @@ def test_plain_enter_confirms_pending_marker_without_advancing(
     window.regular_pane._pending_marker = (0.5, 0.5, 1, 100)
     confirmed_panes = []
     move_calls = []
-    monkeypatch.setattr(
-        window,
-        "_confirm_pending_marker",
-        lambda pane: confirmed_panes.append(pane) or True,
-    )
+    window.regular_pane.confirmation_requested.connect(confirmed_panes.append)
     monkeypatch.setattr(window, "_move_selection", move_calls.append)
     window._update_operator_controls()
     window.identity_search.setFocus()
@@ -640,8 +714,13 @@ def test_plain_enter_confirms_pending_marker_without_advancing(
     QTest.keyClick(window.identity_search, Qt.Key_Return)
     qapp.processEvents()
 
-    assert confirmed_panes == [window.regular_pane]
+    assert confirmed_panes == []
     assert move_calls == []
+
+    QTest.keyClick(window.regular_pane.video_view, Qt.Key_Return)
+    qapp.processEvents()
+
+    assert confirmed_panes == [window.regular_pane]
     window.close()
 
 
@@ -689,7 +768,7 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
         for widget_type in (QLabel, QLineEdit, QPushButton)
         for widget in dialog.findChildren(widget_type)
     )
-    assert "录像证据保存" in visible_text
+    assert "赛事保存根目录" in visible_text
     assert "高速电脑共享目录" in visible_text
     assert "另一台高速摄像电脑" in visible_text
     assert "本机目录仅用于单机测试" in visible_text
@@ -1183,11 +1262,49 @@ def test_capture_error_remains_visible_while_recording(qapp, tmp_path):
     window._update_runtime_status()
 
     assert window.recorder.is_running
+    assert window.runtime_alert_label.text() == "证据处理异常"
+    assert window.runtime_alert_label.toolTip() == "timeline publish failed"
+    assert not window.runtime_alert_label.isHidden()
     assert window.capture_status_label.text() == (
         "证据处理异常：timeline publish failed"
     )
     assert window.capture_status_label.toolTip() == "timeline publish failed"
     assert "#b54747" in window.capture_status_label.styleSheet()
+    window.close()
+
+
+def test_low_storage_is_visible_in_runtime_alert(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    disk_usage = type("DiskUsage", (), {"free": 10 * 1024**3})()
+    monkeypatch.setattr(review_window_module.shutil, "disk_usage", lambda _path: disk_usage)
+
+    window._update_runtime_status()
+
+    assert window.runtime_alert_label.text() == "磁盘空间不足"
+    assert "10.0 GB" in window.runtime_alert_label.toolTip()
+    assert "#a56300" in window.runtime_alert_label.styleSheet()
+    assert not window.runtime_alert_label.isHidden()
+    window.close()
+
+
+def test_storage_failure_and_capture_error_share_runtime_alert(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+
+    def fail_disk_usage(_path):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(review_window_module.shutil, "disk_usage", fail_disk_usage)
+    window._capture_error = "timeline publish failed"
+    window._update_runtime_status()
+
+    assert window.runtime_alert_label.text() == "多项运行异常"
+    assert "timeline publish failed" in window.runtime_alert_label.toolTip()
+    assert "disk unavailable" in window.runtime_alert_label.toolTip()
+    assert not window.runtime_alert_label.isHidden()
     window.close()
 
 
@@ -1456,15 +1573,23 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "终点复核系统"
+    assert window.windowTitle() == "FinishReview · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
-    assert window.settings_button.text() == "设备设置"
+    assert window.settings_button.text() == "⚙"
+    assert window.settings_button.toolTip() == "设备与赛事设置"
     assert not hasattr(window, "import_high_speed_button")
     assert window.receiver_status_label.text() == "CycleRace: 监听中，等待数据"
-    assert window.capture_status_label.y() > window.camera_status_label.y()
-    assert window.capture_status_label.width() >= window.capture_status_label.sizeHint().width()
+    assert window.operator_identity_label is window.current_context_label
+    assert window.mark_regular_button is window.regular_pane.mark_btn
+    assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
+    assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
+    assert window.capture_status_label.isHidden()
+    assert window.product_title_label.text() == "FinishReview"
+    assert window.product_subtitle_label.text() == "终点多源复核"
+    assert len(window.beijing_clock_label.text().split(":")) == 3
+    assert window.beijing_zone_label.text() == "北京时间"
 
     window.start_recording()
     assert window.recorder.is_running
