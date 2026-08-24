@@ -1006,6 +1006,34 @@ def test_two_rtsp_sources_start_independent_review_pipelines(qapp, tmp_path):
     window.close()
 
 
+def test_partial_camera_failure_uses_one_click_session_recovery(qapp, tmp_path):
+    _FakeRecorder.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_recording()
+    original_recorders = tuple(_FakeRecorder.instances)
+    original_recorders[1].is_running = False
+    window._update_runtime_status()
+
+    assert window.record_button.text() == "恢复录像"
+
+    window._toggle_recording()
+
+    assert len(_FakeRecorder.instances) == 4
+    assert all(recorder.stopped for recorder in original_recorders)
+    assert all(recorder.is_running for recorder in _FakeRecorder.instances[2:])
+    assert window._recording_all_active()
+    assert window.record_button.text() == "停止录像"
+    window.close()
+
+
 def test_second_rtsp_start_failure_rolls_back_first_camera(qapp, tmp_path):
     class _FailSecondRecorder(_FakeRecorder):
         def start(self):

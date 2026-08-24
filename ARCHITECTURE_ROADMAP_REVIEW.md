@@ -449,3 +449,25 @@ artifacts\dist\FinishReviewConsole\FinishReviewConsole.exe --smoke-test
 - PyInstaller clean build及发布边界检查：通过，209 个文件，460,386,330 bytes。
 - EXE smoke test：退出码 0。
 - `Hidden import "sip" not found!`：仍为已知非阻断告警。
+
+### 一键恢复录像（2026-08-24）
+
+在缺少真实 USB/RTSP 现场基线的前提下，本阶段没有引入后台自动重连、指数退避或新的线程状态事件，而是先完成可由操作员明确触发、可通过现有测试验证的一键会话恢复：
+
+1. **区分完整与残缺会话：** `FinishReviewWindow._recording_needs_recovery()` 在存在 recorder、但配置的全部机位未同时健康时判定需要恢复。
+2. **明确操作状态：** 残缺会话的按钮显示为“恢复录像”，状态显示为“普通录像: 需要恢复”，并使用独立的警示色和提示文本。
+3. **整组恢复：** 点击“恢复录像”会先停止控制器仍持有的 recorder，再按当前完整配置重建全部机位；健康会话仍保持原有“停止录像”行为。
+4. **不改变证据语义：** 本次没有修改录像文件格式、视频段发布规则、Passage 关联或证据 JSONL。
+
+新增 `tests/realtime/test_review_window.py::test_partial_camera_failure_uses_one_click_session_recovery`，覆盖双机位中一个 recorder 失效后显示恢复状态、一次点击替换两个 recorder、旧 recorder 全部停止且新会话恢复完整活动状态。
+
+验证结果：
+
+- 相关测试：`83 passed in 2.09s`。
+- 全量 pytest：`321 passed in 9.53s`。
+- `compileall`、`pip check`、`git diff --check`：通过。
+- PyInstaller clean build及发布边界检查：通过，209 个文件，460,386,573 bytes。
+- EXE smoke test：退出码 0。
+- `Hidden import "sip" not found!`：仍为已知非阻断告警。
+
+仍未覆盖真实 USB/RTSP 断线、网络抖动、磁盘不足和数小时录像；后台自动重连继续等待现场基线，不把单元测试中的 fake recorder 结果当作设备验收结论。

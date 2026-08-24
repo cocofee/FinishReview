@@ -1726,6 +1726,11 @@ class FinishReviewWindow(PassageReviewDialog):
             self._configured_recording_sources()
         )
 
+    def _recording_needs_recovery(self) -> bool:
+        return bool(self._recording_controller.recorders) and not (
+            self._recording_all_active()
+        )
+
     @property
     def receiver(self) -> PassageEventReceiver | None:
         return self._receiver
@@ -1927,7 +1932,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self._move_selection(1)
 
     def _toggle_recording(self) -> None:
-        if self._recording_any_active():
+        if self._recording_all_active():
             self.stop_recording()
             return
         if not is_supported_review_source(self.source):
@@ -3070,6 +3075,7 @@ class FinishReviewWindow(PassageReviewDialog):
         configured_sources = self._configured_recording_sources()
         recording_active = self._recording_any_active()
         recording_all_active = self._recording_all_active()
+        recording_needs_recovery = self._recording_needs_recovery()
         segments_by_camera = {
             camera_index: ring_buffer.segments()
             for camera_index, ring_buffer in self._ring_buffers.items()
@@ -3129,6 +3135,9 @@ class FinishReviewWindow(PassageReviewDialog):
             recording_text = f"普通录像: {hours:02d}:{minutes:02d}:{seconds:02d}"
             recording_color = "#247a52"
             recording_tooltip = f"{len(configured_sources)} 个机位：5分钟赛事存档 + 2秒判读时间片"
+        elif recording_needs_recovery:
+            recording_text, recording_color = "普通录像: 需要恢复", "#a56300"
+            recording_tooltip = "点击恢复录像将停止残余进程并重新启动全部普通机位"
         elif recording_active:
             recording_text, recording_color = "普通录像: 部分机位异常", "#b54747"
             recording_tooltip = "请停止录像并检查异常机位后重新开始"
@@ -3138,12 +3147,21 @@ class FinishReviewWindow(PassageReviewDialog):
         self.recording_status_label.setText(recording_text)
         self.recording_status_label.setToolTip(recording_tooltip)
         self.recording_status_label.setStyleSheet(f"color: {recording_color};")
-        self.record_button.setText("停止录像" if recording_active else "开始录像")
-        self.record_button.setStyleSheet(
-            "background: #a33d4b; color: white; border: 1px solid #a33d4b;"
-            if recording_active
-            else "background: #247a52; color: white; border: 1px solid #247a52;"
-        )
+        if recording_needs_recovery:
+            self.record_button.setText("恢复录像")
+            self.record_button.setStyleSheet(
+                "background: #a56300; color: white; border: 1px solid #a56300;"
+            )
+        elif recording_active:
+            self.record_button.setText("停止录像")
+            self.record_button.setStyleSheet(
+                "background: #a33d4b; color: white; border: 1px solid #a33d4b;"
+            )
+        else:
+            self.record_button.setText("开始录像")
+            self.record_button.setStyleSheet(
+                "background: #247a52; color: white; border: 1px solid #247a52;"
+            )
 
         receiver = self._receiver
         if receiver is not None and receiver.is_running:
