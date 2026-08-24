@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QStyle,
     QTabWidget,
     QTableWidget,
@@ -79,13 +80,14 @@ try:
     from .review_export import export_review_summary
     from .review_recorder import (
         ArchiveTimelinePublisher,
+        DirectShowVideoDevice,
         FfmpegReviewRecorder,
         PassageReviewCoordinator,
         PassageReviewState,
         PassageReviewTimelinePublisher,
         PassageReviewWindow,
         ReviewRingBuffer,
-        discover_directshow_video_devices,
+        discover_directshow_video_device_choices,
         is_supported_review_source,
         load_archive_recording_sessions,
         make_directshow_source,
@@ -145,13 +147,14 @@ except ImportError:
     from review_export import export_review_summary
     from review_recorder import (
         ArchiveTimelinePublisher,
+        DirectShowVideoDevice,
         FfmpegReviewRecorder,
         PassageReviewCoordinator,
         PassageReviewState,
         PassageReviewTimelinePublisher,
         PassageReviewWindow,
         ReviewRingBuffer,
-        discover_directshow_video_devices,
+        discover_directshow_video_device_choices,
         is_supported_review_source,
         load_archive_recording_sessions,
         make_directshow_source,
@@ -181,6 +184,8 @@ BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
 CYCLERACE_INBOX_DIRNAME = ".finishreview"
+_TEST_GROUP_NAMES = frozenset({"test", "testgroup"})
+_TEST_GROUP_MARKERS = ("测试", "检测")
 _INVALID_EVENT_FOLDER_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -261,6 +266,13 @@ def _align_live_evidence_timestamp(
     if abs(candidate_ms - int(received_at_ms)) <= max(0, int(tolerance_ms)):
         return candidate_ms
     return int(timestamp_ms)
+
+
+def _is_test_group_name(value: str) -> bool:
+    normalized = re.sub(r"[\s_-]+", "", str(value or "")).casefold()
+    return normalized in _TEST_GROUP_NAMES or any(
+        marker in normalized for marker in _TEST_GROUP_MARKERS
+    )
 
 
 def _historical_evidence_timestamp_overrides(
@@ -612,7 +624,10 @@ class FinishReviewLaunchDialog(QDialog):
         parent=None,
         *,
         ffmpeg_path: Path | None = None,
-        device_provider: Callable[[], tuple[str, ...]] | None = None,
+        device_provider: Callable[
+            [], tuple[str | DirectShowVideoDevice, ...]
+        ]
+        | None = None,
         passage_provider: Callable[[], tuple[PassageEvent, ...]] | None = None,
         evidence_provider: Callable[[PassageEvent], tuple[bool, bool, str, str]]
         | None = None,
@@ -672,7 +687,7 @@ class FinishReviewLaunchDialog(QDialog):
         self._ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self._detected_device_names: set[str] = set()
         self._device_provider = device_provider or (
-            lambda: discover_directshow_video_devices(self._ffmpeg_path)
+            lambda: discover_directshow_video_device_choices(self._ffmpeg_path)
         )
         self._passage_provider = passage_provider or (lambda: ())
         self._evidence_provider = evidence_provider or (
@@ -820,7 +835,7 @@ class FinishReviewLaunchDialog(QDialog):
         self.source_type_combo.currentIndexChanged.connect(
             self._refresh_source_fields
         )
-        form.addRow("录像连接", self.source_type_combo)
+        form.addRow("机位1连接", self.source_type_combo)
 
         self.rtsp_address_edit = QLineEdit(
             self._clean_rtsp_source if is_rtsp_source(self._source) else "",
@@ -849,17 +864,36 @@ class FinishReviewLaunchDialog(QDialog):
         rtsp_credentials_row.addWidget(self.rtsp_test_button)
         form.addRow("RTSP凭据", rtsp_credentials_row)
 
-        self.secondary_rtsp_enabled_checkbox = QCheckBox(
-            "启用第二台RTSP普通摄像机",
-            self,
+        secondary_device_row = QHBoxLayout()
+        self.secondary_device_row = secondary_device_row
+        secondary_device_row.setSpacing(6)
+        self.secondary_enabled_checkbox = QCheckBox("启用", self)
+        self.secondary_enabled_checkbox.setChecked(
+            is_supported_review_source(self._secondary_source)
         )
-        self.secondary_rtsp_enabled_checkbox.setChecked(
-            is_rtsp_source(self._secondary_source)
+        self.secondary_enabled_checkbox.toggled.connect(self._refresh_source_fields)
+        self.secondary_rtsp_enabled_checkbox = self.secondary_enabled_checkbox
+        secondary_device_row.addWidget(self.secondary_enabled_checkbox)
+        self.secondary_source_type_combo = QComboBox(self)
+        self.secondary_source_type_combo.addItem("USB/Type-C", "usb")
+        self.secondary_source_type_combo.addItem("RTSP", "rtsp")
+        self.secondary_source_type_combo.setCurrentIndex(
+            1 if is_rtsp_source(self._secondary_source) else 0
         )
-        self.secondary_rtsp_enabled_checkbox.toggled.connect(
+        self.secondary_source_type_combo.currentIndexChanged.connect(
             self._refresh_source_fields
         )
-        form.addRow("普通机位2", self.secondary_rtsp_enabled_checkbox)
+        secondary_device_row.addWidget(self.secondary_source_type_combo)
+        self.secondary_device_combo = QComboBox(self)
+        self.secondary_device_combo.setMinimumWidth(280)
+        self.secondary_device_combo.currentIndexChanged.connect(
+            self._refresh_camera_status
+        )
+        secondary_device_row.addWidget(self.secondary_device_combo, 1)
+        self.secondary_detect_button = QPushButton("重新检测", self)
+        self.secondary_detect_button.clicked.connect(self._refresh_devices)
+        secondary_device_row.addWidget(self.secondary_detect_button)
+        form.addRow("普通机位2", secondary_device_row)
 
         self.secondary_rtsp_address_edit = QLineEdit(
             self._clean_secondary_rtsp_source,
@@ -922,19 +956,19 @@ class FinishReviewLaunchDialog(QDialog):
         self.detect_button = QPushButton("重新检测", self)
         self.detect_button.clicked.connect(self._refresh_devices)
         device_row.addWidget(self.detect_button)
-        form.addRow("本机录像设备", device_row)
+        form.addRow("机位1 USB设备", device_row)
 
         self.video_size_combo = QComboBox(self)
         self.video_size_combo.addItem("自动", None)
         for value in ("1920x1080", "2560x1440", "3840x2160"):
             self.video_size_combo.addItem(value, value)
-        form.addRow("录像分辨率", self.video_size_combo)
+        form.addRow("USB录像分辨率", self.video_size_combo)
 
         self.framerate_combo = QComboBox(self)
         self.framerate_combo.addItem("自动", None)
         for value in (25.0, 30.0, 50.0, 60.0):
             self.framerate_combo.addItem(f"{value:g} FPS", value)
-        form.addRow("录像帧率", self.framerate_combo)
+        form.addRow("USB录像帧率", self.framerate_combo)
 
         high_speed_row = QHBoxLayout()
         high_speed_row.setSpacing(6)
@@ -1297,23 +1331,18 @@ class FinishReviewLaunchDialog(QDialog):
         else:
             local_state = "异常"
             local_detail = "未检测到本机IPv4地址"
-        camera_address = (
+        camera_addresses = [
             self.rtsp_address_edit.text().strip()
             if self.source_type_combo.currentData() == "rtsp"
             else self.device_combo.currentText()
-        )
-        if (
-            self.source_type_combo.currentData() == "rtsp"
-            and self.secondary_rtsp_enabled_checkbox.isChecked()
-        ):
-            camera_address = " / ".join(
-                value
-                for value in (
-                    camera_address,
-                    self.secondary_rtsp_address_edit.text().strip(),
-                )
-                if value
+        ]
+        if self.secondary_enabled_checkbox.isChecked():
+            camera_addresses.append(
+                self.secondary_rtsp_address_edit.text().strip()
+                if self.secondary_source_type_combo.currentData() == "rtsp"
+                else self.secondary_device_combo.currentText()
             )
+        camera_address = " / ".join(value for value in camera_addresses if value)
         timing_provider = str(
             self.timing_provider_combo.currentData() or "cyclerace"
         )
@@ -1595,19 +1624,25 @@ class FinishReviewLaunchDialog(QDialog):
             self.rtsp_password_row,
         ):
             self._set_form_row_visible(field, is_rtsp)
-        self._set_form_row_visible(self.secondary_rtsp_enabled_checkbox, is_rtsp)
-        secondary_visible = (
-            is_rtsp and self.secondary_rtsp_enabled_checkbox.isChecked()
+        secondary_enabled = self.secondary_enabled_checkbox.isChecked()
+        secondary_is_rtsp = (
+            secondary_enabled
+            and self.secondary_source_type_combo.currentData() == "rtsp"
         )
+        secondary_is_usb = secondary_enabled and not secondary_is_rtsp
+        self.secondary_source_type_combo.setVisible(secondary_enabled)
+        self.secondary_device_combo.setVisible(secondary_is_usb)
+        self.secondary_detect_button.setVisible(secondary_is_usb)
         for field in (
             self.secondary_rtsp_address_edit,
             self.secondary_rtsp_username_edit,
             self.secondary_rtsp_password_row,
         ):
-            self._set_form_row_visible(field, secondary_visible)
+            self._set_form_row_visible(field, secondary_is_rtsp)
         self._set_form_row_visible(self.device_row, not is_rtsp)
-        self._set_form_row_visible(self.video_size_combo, not is_rtsp)
-        self._set_form_row_visible(self.framerate_combo, not is_rtsp)
+        usb_settings_visible = not is_rtsp or secondary_is_usb
+        self._set_form_row_visible(self.video_size_combo, usb_settings_visible)
+        self._set_form_row_visible(self.framerate_combo, usb_settings_visible)
         self._refresh_camera_status()
 
     def _invalidate_rtsp_probe(self) -> None:
@@ -1630,13 +1665,35 @@ class FinishReviewLaunchDialog(QDialog):
         )
 
     def _current_secondary_rtsp_source(self) -> str:
-        if not self.secondary_rtsp_enabled_checkbox.isChecked():
+        if (
+            not self.secondary_enabled_checkbox.isChecked()
+            or self.secondary_source_type_combo.currentData() != "rtsp"
+        ):
             return ""
         return apply_rtsp_credentials(
             self.secondary_rtsp_address_edit.text().strip(),
             self.secondary_rtsp_username_edit.text(),
             self.secondary_rtsp_password_edit.text(),
         )
+
+    def _selected_usb_source(self, combo: QComboBox) -> str:
+        selected = str(combo.currentData() or "").strip()
+        if is_supported_review_source(selected):
+            return selected
+        if not selected:
+            return ""
+        return make_directshow_source(
+            selected,
+            video_size=self.video_size_combo.currentData(),
+            framerate=self.framerate_combo.currentData(),
+        )
+
+    def _selected_secondary_recording_source(self) -> str:
+        if not self.secondary_enabled_checkbox.isChecked():
+            return ""
+        if self.secondary_source_type_combo.currentData() == "rtsp":
+            return self._current_secondary_rtsp_source()
+        return self._selected_usb_source(self.secondary_device_combo)
 
     def _test_rtsp_source(self) -> None:
         source = self._current_rtsp_source()
@@ -1713,30 +1770,68 @@ class FinishReviewLaunchDialog(QDialog):
         QDialog.done(self, pending_result)
 
     def _refresh_devices(self) -> None:
-        current_source = self._source
-        parsed_source = parse_directshow_source(current_source)
-        selected_name = parsed_source.device_name if parsed_source is not None else ""
-        self.device_combo.blockSignals(True)
-        self.device_combo.clear()
-        if is_supported_review_source(current_source) and parsed_source is None:
-            self.device_combo.addItem("网络摄像机（已配置）", current_source)
+        parsed_source = parse_directshow_source(self._source)
+        parsed_secondary_source = parse_directshow_source(self._secondary_source)
         try:
-            devices = tuple(self._device_provider())
+            discovered = tuple(self._device_provider())
         except Exception:  # noqa: BLE001 - device discovery is best effort.
-            devices = ()
-        self._detected_device_names = set(devices)
-        for device_name in devices:
-            self.device_combo.addItem(device_name, device_name)
-        if selected_name and self.device_combo.findData(selected_name) < 0:
-            self.device_combo.addItem(f"{selected_name}（当前未检测到）", selected_name)
-        selected_index = self.device_combo.findData(
-            current_source if parsed_source is None else selected_name
+            discovered = ()
+        devices: list[DirectShowVideoDevice] = []
+        seen_inputs: set[str] = set()
+        for item in discovered:
+            if isinstance(item, DirectShowVideoDevice):
+                choice = item
+            else:
+                name = str(item).strip()
+                if not name:
+                    continue
+                choice = DirectShowVideoDevice(name, name, name)
+            if not choice.input_name or choice.input_name in seen_inputs:
+                continue
+            seen_inputs.add(choice.input_name)
+            devices.append(choice)
+        self._detected_device_names = {device.input_name for device in devices}
+
+        def resolved_device_name(selected_name: str) -> str:
+            if not selected_name or selected_name in self._detected_device_names:
+                return selected_name
+            normalized = selected_name.strip().casefold()
+            friendly_matches = [
+                device.input_name
+                for device in devices
+                if (device.friendly_name or device.display_name).strip().casefold()
+                == normalized
+            ]
+            return friendly_matches[0] if len(friendly_matches) == 1 else selected_name
+
+        def populate(combo: QComboBox, selected_name: str) -> None:
+            selected_name = resolved_device_name(selected_name)
+            combo.blockSignals(True)
+            combo.clear()
+            for device in devices:
+                combo.addItem(device.display_name, device.input_name)
+            if selected_name and combo.findData(selected_name) < 0:
+                combo.addItem(f"{selected_name}（当前未检测到）", selected_name)
+            selected_index = combo.findData(selected_name)
+            combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+            combo.blockSignals(False)
+
+        populate(
+            self.device_combo,
+            parsed_source.device_name if parsed_source is not None else "",
         )
-        self.device_combo.setCurrentIndex(max(0, selected_index))
-        self.device_combo.blockSignals(False)
-        if parsed_source is not None:
-            size_index = self.video_size_combo.findData(parsed_source.video_size)
-            fps_index = self.framerate_combo.findData(parsed_source.framerate)
+        populate(
+            self.secondary_device_combo,
+            (
+                parsed_secondary_source.device_name
+                if parsed_secondary_source is not None
+                else ""
+            ),
+        )
+        usb_source = parsed_source or parsed_secondary_source
+        if usb_source is not None:
+            size_index = self.video_size_combo.findData(usb_source.video_size)
+            fps_index = self.framerate_combo.findData(usb_source.framerate)
             self.video_size_combo.setCurrentIndex(max(0, size_index))
             self.framerate_combo.setCurrentIndex(max(0, fps_index))
         self._refresh_camera_status()
@@ -1753,57 +1848,89 @@ class FinishReviewLaunchDialog(QDialog):
             else:
                 text = self._rtsp_probe_message or "机位1已配置，尚未测试实际画面"
                 color = "#a56300"
-            secondary_source = self._current_secondary_rtsp_source()
-            if self.secondary_rtsp_enabled_checkbox.isChecked():
+        else:
+            selected = str(self.device_combo.currentData() or "")
+            if not selected:
+                text = "未检测到USB/Type-C摄像头"
+                color = "#b54747"
+            elif selected not in self._detected_device_names:
+                text = "录像设备已配置，但当前未检测到"
+                color = "#b54747"
+            else:
+                text = "已检测到摄像头，开始录像后验证画面"
+                color = "#247a52"
+
+        if self.secondary_enabled_checkbox.isChecked():
+            if self.source_type_combo.currentData() == "usb":
+                text = {
+                    "未检测到USB/Type-C摄像头": "机位1未检测到USB/Type-C摄像头",
+                    "录像设备已配置，但当前未检测到": "机位1已配置，但当前未检测到",
+                    "已检测到摄像头，开始录像后验证画面": (
+                        "机位1已检测到，开始录像后验证画面"
+                    ),
+                }.get(text, text)
+            if self.secondary_source_type_combo.currentData() == "rtsp":
+                secondary_source = self._current_secondary_rtsp_source()
                 if not is_rtsp_source(secondary_source):
                     secondary_text = "机位2地址无效"
-                    color = "#b54747"
+                    secondary_color = "#b54747"
                 elif (
                     self._secondary_rtsp_probe_ok
                     and secondary_source == self._secondary_rtsp_probe_source
                 ):
                     secondary_text = "机位2已读取到画面"
+                    secondary_color = "#247a52"
                 else:
                     secondary_text = (
                         self._secondary_rtsp_probe_message
                         or "机位2尚未测试实际画面"
                     )
-                    if color != "#b54747":
-                        color = "#a56300"
-                text = f"{text}；{secondary_text}"
-            self.camera_status_label.setText(text)
-            self.camera_status_label.setStyleSheet(
-                f"color: {color}; font-weight: 600;"
-            )
-            return
-        configured = self.device_combo.currentIndex() >= 0
-        selected = str(self.device_combo.currentData() or "")
-        if not configured:
-            text = "未检测到USB/Type-C摄像头"
-        elif is_supported_review_source(selected):
-            text = "网络摄像机配置已保留，开始录像后验证画面"
-        elif selected not in self._detected_device_names:
-            text = "录像设备已配置，但当前未检测到"
-        else:
-            text = "已检测到摄像头，开始录像后验证画面"
-        ready = configured and (
-            is_supported_review_source(selected)
-            or selected in self._detected_device_names
-        )
+                    secondary_color = "#a56300"
+            else:
+                secondary_selected = str(
+                    self.secondary_device_combo.currentData() or ""
+                )
+                primary_selected = str(self.device_combo.currentData() or "")
+                if not secondary_selected:
+                    secondary_text = "机位2未检测到USB/Type-C摄像头"
+                    secondary_color = "#b54747"
+                elif (
+                    self.source_type_combo.currentData() == "usb"
+                    and secondary_selected == primary_selected
+                ):
+                    secondary_text = "机位1和机位2选择了同一设备"
+                    secondary_color = "#b54747"
+                elif secondary_selected not in self._detected_device_names:
+                    secondary_text = "机位2已配置，但当前未检测到"
+                    secondary_color = "#b54747"
+                else:
+                    secondary_text = "机位2已检测到，开始录像后验证画面"
+                    secondary_color = "#247a52"
+            text = f"{text}；{secondary_text}"
+            if secondary_color == "#b54747" or color == "#b54747":
+                color = "#b54747"
+            elif secondary_color == "#a56300" or color == "#a56300":
+                color = "#a56300"
+            else:
+                color = "#247a52"
         self.camera_status_label.setText(text)
-        self.camera_status_label.setStyleSheet(
-            "color: #247a52; font-weight: 600;"
-            if ready
-            else "color: #b54747; font-weight: 600;"
-        )
+        self.camera_status_label.setStyleSheet(f"color: {color}; font-weight: 600;")
 
     def _accept_settings(self) -> None:
         try:
             settings = self.settings
-            if settings.secondary_source and not is_rtsp_source(
+            if settings.secondary_source and not is_supported_review_source(
                 settings.secondary_source
             ):
-                raise ValueError("机位2必须填写有效的RTSP地址")
+                raise ValueError("机位2必须选择有效的录像设备")
+            primary_usb = parse_directshow_source(settings.source)
+            secondary_usb = parse_directshow_source(settings.secondary_source)
+            if (
+                primary_usb is not None
+                and secondary_usb is not None
+                and primary_usb.device_name == secondary_usb.device_name
+            ):
+                raise ValueError("机位1和机位2不能选择同一台USB/Type-C摄像头")
             validate_event_network(
                 (
                     settings.finishreview_ip,
@@ -1887,11 +2014,7 @@ class FinishReviewLaunchDialog(QDialog):
         timing_provider = str(self.timing_provider_combo.currentData() or "cyclerace")
         return FinishReviewSettings(
             source=source,
-            secondary_source=(
-                self._current_secondary_rtsp_source()
-                if self.source_type_combo.currentData() == "rtsp"
-                else ""
-            ),
+            secondary_source=self._selected_secondary_recording_source(),
             output_dir=self._output_dir,
             passage_host=self._passage_host,
             passage_port=self._passage_port,
@@ -1918,16 +2041,7 @@ class FinishReviewLaunchDialog(QDialog):
     def _selected_recording_source(self) -> str:
         if self.source_type_combo.currentData() == "rtsp":
             return self._current_rtsp_source()
-        selected = str(self.device_combo.currentData() or "").strip()
-        if is_supported_review_source(selected):
-            return selected
-        if not selected:
-            return ""
-        return make_directshow_source(
-            selected,
-            video_size=self.video_size_combo.currentData(),
-            framerate=self.framerate_combo.currentData(),
-        )
+        return self._selected_usb_source(self.device_combo)
 
     def done(self, result: int) -> None:
         self._dialog_timer.stop()
@@ -1953,12 +2067,41 @@ class _PassageSignalBridge(QObject):
     timing_status = pyqtSignal(object)
 
 
+class _ElidedLabel(QLabel):
+    """Keep the full value available while eliding long display text."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setText(text)
+
+    def text(self) -> str:
+        return self._full_text
+
+    def setText(self, value: str) -> None:
+        self._full_text = str(value)
+        self._refresh_display_text()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_display_text()
+
+    def _refresh_display_text(self) -> None:
+        width = max(0, self.contentsRect().width())
+        rendered = self.fontMetrics().elidedText(
+            self._full_text,
+            Qt.ElideRight,
+            width,
+        )
+        QLabel.setText(self, rendered)
+
+
 class _FinishReviewLogo(QWidget):
     """Small scalable brand mark that does not require packaged image assets."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(38, 38)
+        self.setFixedSize(34, 34)
         self.setToolTip("FinishReview 终点多源复核")
 
     def paintEvent(self, event) -> None:
@@ -2003,41 +2146,36 @@ class _FinishReviewLogo(QWidget):
 
 
 class _CompactStatusIndicator(QFrame):
-    """Two-line status item while preserving the QLabel-like test surface."""
+    """Compact one-line runtime status with details kept in the tooltip."""
 
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
         self._base_title = title
         self._raw_text = ""
         self._status_style = ""
+        self._surface_style = ""
         self._state = "waiting"
-        self.setMinimumWidth(128)
-        self.setMaximumWidth(168)
+        self.setMinimumWidth(150)
+        self.setMaximumWidth(220)
+        self.setMinimumHeight(30)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 3, 10, 3)
-        layout.setSpacing(7)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(6)
         self._dot = QLabel(self)
-        self._dot.setFixedSize(9, 9)
+        self._dot.setFixedSize(8, 8)
         layout.addWidget(self._dot, 0, Qt.AlignVCenter)
-        text_layout = QVBoxLayout()
-        text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(0)
         self._title_label = QLabel(title, self)
         self._title_label.setStyleSheet(
-            "color: #17212b; font-size: 10pt; font-weight: 700;"
+            "color: #344054; font-size: 9pt; font-weight: 600;"
         )
-        self._detail_label = QLabel("--", self)
+        layout.addWidget(self._title_label)
+        self._detail_label = QLabel("待机", self)
         self._detail_label.setStyleSheet(
-            "color: #667085; font-size: 9pt; font-weight: 500;"
+            "color: #667085; font-size: 9pt; font-weight: 700;"
         )
-        text_layout.addWidget(self._title_label)
-        text_layout.addWidget(self._detail_label)
-        layout.addLayout(text_layout, 1)
-        QFrame.setStyleSheet(
-            self,
-            "QFrame { border-left: 1px solid #dce2e6; background: transparent; }",
-        )
+        layout.addWidget(self._detail_label)
+        layout.addStretch(1)
         self._apply_color("#667085")
 
     def text(self) -> str:
@@ -2045,14 +2183,8 @@ class _CompactStatusIndicator(QFrame):
 
     def setText(self, value: str) -> None:
         self._raw_text = str(value)
-        _prefix, separator, detail = self._raw_text.partition(":")
-        if not separator:
-            detail = self._raw_text
-        detail = detail.strip() or "--"
         self._title_label.setText(self._display_title())
-        self._detail_label.setText(
-            detail if len(detail) <= 18 else f"{detail[:17]}…"
-        )
+        self._detail_label.setText(self._display_state())
 
     def setStatus(self, value: str, state: str) -> None:
         if state not in {"waiting", "busy", "ready", "error"}:
@@ -2070,19 +2202,42 @@ class _CompactStatusIndicator(QFrame):
             self._apply_color(match.group(1))
 
     def _display_title(self) -> str:
+        return self._base_title
+
+    def _display_state(self) -> str:
         if self._state == "error":
-            return f"{self._base_title}异常"
+            return "异常"
         if self._state == "busy":
-            return f"{self._base_title}处理中"
+            return "处理中"
         if self._state == "ready" and self._base_title == "高速摄像":
-            return "高速摄像就绪"
+            return "就绪"
         if self._state == "ready":
-            return f"{self._base_title}正常"
-        return f"{self._base_title}待机"
+            return "正常"
+        if self._base_title == "计时源":
+            return "待数据"
+        return "待机"
 
     def _apply_color(self, color: str) -> None:
+        normalized = color.lower()
+        detail_color = {
+            "#247a52": "#176b49",
+            "#16845b": "#176b49",
+            "#a56300": "#8a5700",
+            "#b54747": "#a43b3b",
+        }.get(
+            normalized,
+            "#667085",
+        )
+        self._surface_style = "QFrame { background: transparent; border: none; }"
+        QFrame.setStyleSheet(self, self._surface_style)
+        self._title_label.setStyleSheet(
+            "color: #344054; font-size: 9pt; font-weight: 600;"
+        )
+        self._detail_label.setStyleSheet(
+            f"color: {detail_color}; font-size: 9pt; font-weight: 700;"
+        )
         self._dot.setStyleSheet(
-            f"background: {color}; border: 2px solid #e7efec; border-radius: 4px;"
+            f"background: {color}; border: none; border-radius: 4px;"
         )
 
 
@@ -2241,6 +2396,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._published_keys: set[tuple[int, str, int]] = set()
         self._unsupported_event_ids: set[str] = set()
         self._runtime_error = ""
+        self._auto_recording_error = ""
         self._capture_error = ""
         self._workspace_notice = ""
         self._receiver_error = ""
@@ -2305,7 +2461,7 @@ class FinishReviewWindow(PassageReviewDialog):
         sources = []
         if is_supported_review_source(self.source):
             sources.append((self.camera_index, self.source))
-        if is_rtsp_source(self.secondary_source):
+        if is_supported_review_source(self.secondary_source):
             sources.append((self.camera_index + 1, self.secondary_source))
         return tuple(sources)
 
@@ -2686,6 +2842,7 @@ class FinishReviewWindow(PassageReviewDialog):
         reload_data_source: bool = False,
     ) -> bool:
         self._runtime_error = ""
+        self._auto_recording_error = ""
         requested_output_dir = Path(settings.output_dir).expanduser().resolve()
         workspace_root_changed = bool(
             update_workspace_root and requested_output_dir != self.workspace_root
@@ -2921,83 +3078,86 @@ class FinishReviewWindow(PassageReviewDialog):
     def _init_runtime_status(self) -> None:
         panel = QFrame(self)
         panel.setObjectName("finishConsoleHeader")
-        panel.setMinimumHeight(56)
+        panel.setMinimumHeight(78)
         panel.setStyleSheet(
             "QFrame#finishConsoleHeader { background: #ffffff; "
             "border: 1px solid #cfd7df; border-radius: 4px; }"
-            "QPushButton { min-height: 32px; padding: 0 11px; "
+            "QPushButton { min-height: 32px; padding: 0 10px; "
             "font-size: 10pt; font-weight: 600; }"
         )
-        panel_layout = QHBoxLayout(panel)
-        panel_layout.setContentsMargins(10, 8, 10, 8)
-        panel_layout.setSpacing(10)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(10, 5, 10, 5)
+        panel_layout.setSpacing(4)
 
-        panel_layout.addWidget(_FinishReviewLogo(panel))
-        brand_layout = QVBoxLayout()
-        brand_layout.setContentsMargins(0, 0, 0, 0)
-        brand_layout.setSpacing(0)
+        top_layout = QHBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(8)
+
+        top_layout.addWidget(_FinishReviewLogo(panel))
         self.product_title_label = QLabel("FinishReview", panel)
         self.product_title_label.setStyleSheet(
-            "font-size: 13pt; font-weight: 700; color: #17212b;"
+            "font-size: 12pt; font-weight: 700; color: #17212b;"
         )
         self.product_subtitle_label = QLabel("终点多源复核", panel)
-        self.product_subtitle_label.setStyleSheet(
-            "font-size: 8pt; font-weight: 600; color: #667085;"
-        )
-        brand_layout.addWidget(self.product_title_label)
-        brand_layout.addWidget(self.product_subtitle_label)
-        panel_layout.addLayout(brand_layout)
+        self.product_subtitle_label.hide()
+        top_layout.addWidget(self.product_title_label)
 
         brand_separator = QFrame(panel)
         brand_separator.setFrameShape(QFrame.VLine)
         brand_separator.setStyleSheet("color: #dce2e6;")
-        panel_layout.addWidget(brand_separator)
+        top_layout.addWidget(brand_separator)
 
-        event_layout = QVBoxLayout()
+        event_layout = QHBoxLayout()
         event_layout.setContentsMargins(0, 0, 0, 0)
-        event_layout.setSpacing(0)
-        self.event_name_label = QLabel("未加载赛事", panel)
+        event_layout.setSpacing(10)
+        self.event_name_label = _ElidedLabel("未加载赛事", panel)
         self.event_name_label.setStyleSheet(
-            "font-size: 12pt; font-weight: 700; color: #17212b;"
+            "font-size: 11pt; font-weight: 700; color: #17212b;"
         )
-        self.event_path_label = QLabel("等待计时源赛事信息 · 终点", panel)
+        self.event_name_label.setMinimumWidth(180)
+        self.event_name_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        self.event_path_label = _ElidedLabel(
+            "等待计时源赛事信息 · 终点",
+            panel,
+        )
         self.event_path_label.setStyleSheet(
-            "font-size: 10pt; font-weight: 500; color: #667085;"
+            "font-size: 10pt; font-weight: 600; color: #667085;"
         )
-        event_layout.addWidget(self.event_name_label)
-        event_layout.addWidget(self.event_path_label)
-        panel_layout.addLayout(event_layout, 1)
-
-        self.receiver_status_label = self._status_chip("计时源", panel)
-        self.camera_status_label = self._status_chip("普通摄像", panel)
-        self.high_speed_status_label = self._status_chip("高速摄像", panel)
-        panel_layout.addWidget(self.receiver_status_label)
-        panel_layout.addWidget(self.camera_status_label)
-        panel_layout.addWidget(self.high_speed_status_label)
+        self.event_path_label.setMinimumWidth(150)
+        self.event_path_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        event_layout.addWidget(self.event_name_label, 3)
+        event_layout.addWidget(self.event_path_label, 2)
+        top_layout.addLayout(event_layout, 1)
 
         self.runtime_alert_label = QLabel(panel)
         self.runtime_alert_label.setStyleSheet(
             "color: #b54747; font-size: 9pt; font-weight: 700;"
         )
-        self.runtime_alert_label.setMaximumWidth(160)
+        self.runtime_alert_label.setMaximumWidth(180)
         self.runtime_alert_label.hide()
-        panel_layout.addWidget(self.runtime_alert_label)
+        top_layout.addWidget(self.runtime_alert_label)
 
-        clock_layout = QVBoxLayout()
+        clock_layout = QHBoxLayout()
         clock_layout.setContentsMargins(0, 0, 0, 0)
-        clock_layout.setSpacing(0)
+        clock_layout.setSpacing(4)
         self.beijing_clock_label = QLabel(panel)
         self.beijing_clock_label.setStyleSheet(
             "font-family: Consolas; color: #17212b; font-size: 11pt; font-weight: 700;"
         )
         self.beijing_zone_label = QLabel("北京时间", panel)
-        self.beijing_zone_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.beijing_zone_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.beijing_zone_label.setStyleSheet(
             "color: #667085; font-size: 9pt; font-weight: 500;"
         )
         clock_layout.addWidget(self.beijing_clock_label)
         clock_layout.addWidget(self.beijing_zone_label)
-        panel_layout.addLayout(clock_layout)
+        top_layout.addLayout(clock_layout)
 
         self.race_dir_label = QLabel(panel)
         self.race_dir_label.hide()
@@ -3008,20 +3168,54 @@ class FinishReviewWindow(PassageReviewDialog):
         self.capture_status_label = QLabel(panel)
         self.capture_status_label.hide()
 
-        self.recheck_button = QPushButton("↻", panel)
-        self.recheck_button.setFixedWidth(36)
+        self.recheck_button = QPushButton("刷新", panel)
+        self.recheck_button.setObjectName("finishRecheckButton")
+        self.recheck_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.recheck_button.setFixedHeight(32)
         self.recheck_button.setToolTip("重新检查连接")
         self.recheck_button.clicked.connect(self._recheck_connections)
-        panel_layout.addWidget(self.recheck_button)
-        self.settings_button = QPushButton("⚙", panel)
-        self.settings_button.setFixedWidth(36)
+        top_layout.addWidget(self.recheck_button)
+        self.settings_button = QPushButton("设置", panel)
+        self.settings_button.setObjectName("finishSettingsButton")
+        self.settings_button.setFixedHeight(32)
         self.settings_button.setToolTip("设备与赛事设置")
         self.settings_button.clicked.connect(self._configure_devices)
-        panel_layout.addWidget(self.settings_button)
+        top_layout.addWidget(self.settings_button)
+        tool_button_style = (
+            "QPushButton { background: #eef3f5; color: #17212b; "
+            "border: 1px solid #aab6bf; border-radius: 4px; "
+            "font-size: 10pt; font-weight: 600; }"
+            "QPushButton:hover { background: #dfe9ed; border-color: #617783; }"
+            "QPushButton:pressed { background: #cfdde2; }"
+        )
+        self.recheck_button.setStyleSheet(tool_button_style)
+        self.settings_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
+        self.record_button.setMinimumWidth(88)
         self.record_button.clicked.connect(self._toggle_recording)
-        panel_layout.addWidget(self.record_button)
+        top_layout.addWidget(self.record_button)
+        panel_layout.addLayout(top_layout)
+
+        status_strip = QFrame(panel)
+        status_strip.setObjectName("finishStatusStrip")
+        status_strip.setStyleSheet(
+            "QFrame#finishStatusStrip { background: #f5f7f8; "
+            "border: none; border-radius: 3px; }"
+        )
+        status_layout = QHBoxLayout(status_strip)
+        status_layout.setContentsMargins(2, 0, 2, 0)
+        status_layout.setSpacing(2)
+        self.receiver_status_label = self._status_chip("计时源", status_strip)
+        self.camera_status_label = self._status_chip("普通摄像", status_strip)
+        self.high_speed_status_label = self._status_chip("高速摄像", status_strip)
+        status_layout.addWidget(self.receiver_status_label)
+        status_layout.addWidget(self.camera_status_label)
+        status_layout.addWidget(self.high_speed_status_label)
+        status_layout.addStretch(1)
+        panel_layout.addWidget(status_strip)
+        self.runtime_status_strip = status_strip
+        self.runtime_header = panel
         root_layout = self.layout()
         if root_layout is not None:
             root_layout.insertWidget(0, panel)
@@ -3066,7 +3260,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self.event_name_label.setText(race_name)
         self.event_path_label.setText(detail_text)
         self.event_name_label.setToolTip(
-            f"{race_name}\n{identity_text}赛事目录：{self.output_dir}"
+            f"{race_name}\n{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
         )
         self.event_path_label.setToolTip(
             f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
@@ -3544,6 +3738,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self._started = True
             self._recording_started_at = time.monotonic()
             self._runtime_error = ""
+            self._auto_recording_error = ""
             self._capture_error = ""
             self._workspace_notice = ""
             self._refresh_timer.start()
@@ -3699,6 +3894,88 @@ class FinishReviewWindow(PassageReviewDialog):
             self._workspace_notice = "已切换新赛事，录像待重新开始"
         return applied
 
+    def _is_test_passage(self, event: PassageEvent) -> bool:
+        event_key = (event.race_id, event.stage_id, event.event_id)
+        if event_key in self._preflight_event_keys:
+            return True
+        group_names = [event.group_id, event.group_name]
+        metadata = self._current_metadata()
+        if metadata is not None and (
+            metadata.race_id == event.race_id
+            and metadata.stage_id == event.stage_id
+        ):
+            group_names.append(metadata.group_label(event.group_id))
+        return any(_is_test_group_name(name) for name in group_names)
+
+    def _is_live_passage(self, event: PassageEvent) -> bool:
+        timestamp_ms = self._evidence_timestamp(event)
+        if timestamp_ms is None:
+            return False
+        received_at_ms = (
+            event.received_at_ms
+            if event.received_at_ms > 0
+            else int(time.time() * 1000.0)
+        )
+        return (
+            abs(int(timestamp_ms) - int(received_at_ms))
+            <= LIVE_EVIDENCE_DATE_TOLERANCE_MS
+        )
+
+    def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
+        if (
+            self._workspace_mode != "live"
+            or not event.is_active
+            or self._recording_any_active()
+            or self._is_test_passage(event)
+            or not self._is_live_passage(event)
+        ):
+            return False
+        try:
+            self.start_recording()
+        except Exception as error:  # noqa: BLE001 - passage storage must survive.
+            self._runtime_error = sanitize_recording_message(error)
+            self._auto_recording_error = self._runtime_error
+            logger.exception(
+                "Failed to auto-start recording for live passage %s",
+                event.event_id,
+            )
+            return False
+        logger.info(
+            "Recording auto-started for live passage %s in group %s",
+            event.event_id,
+            event.group_id,
+        )
+        return True
+
+    def _auto_start_recording_for_metadata(self, metadata: RaceMetadata) -> bool:
+        if (
+            self._workspace_mode != "live"
+            or self._recording_any_active()
+            or not any(
+                not _is_test_group_name(group.name)
+                and not _is_test_group_name(group.group_id)
+                for group in metadata.groups
+            )
+        ):
+            return False
+        try:
+            self.start_recording()
+        except Exception as error:  # noqa: BLE001 - metadata handling must survive.
+            self._runtime_error = sanitize_recording_message(error)
+            self._auto_recording_error = self._runtime_error
+            logger.exception(
+                "Failed to auto-start recording for live metadata %s/%s",
+                metadata.race_id,
+                metadata.stage_id,
+            )
+            return False
+        logger.info(
+            "Recording auto-started for live metadata %s/%s",
+            metadata.race_id,
+            metadata.stage_id,
+        )
+        return True
+
     def _on_passage_received(self, event: PassageEvent) -> None:
         if self.timing_provider == "cyclerace":
             if self._workspace_mode == "archive":
@@ -3771,6 +4048,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._historical_passage_count = len(self.passage_store)
         self._last_passage_monotonic = time.monotonic()
         self._include_high_speed_event_date(event)
+        self._auto_start_recording_for_passage(event)
         self._pending_passages[event.event_id] = event
         if not self._passage_batch_timer.isActive():
             self._passage_batch_timer.start()
@@ -3839,6 +4117,7 @@ class FinishReviewWindow(PassageReviewDialog):
             logger.exception("Failed to activate CycleRace event workspace")
             self._update_runtime_status()
             return
+        self._auto_start_recording_for_metadata(metadata)
         pending_focus = self._pending_focus
         if pending_focus is not None and (
             pending_focus.race_id != metadata.race_id
@@ -4169,6 +4448,10 @@ class FinishReviewWindow(PassageReviewDialog):
                 camera_text, camera_color = "录像设备: 全部已连接", "#247a52"
                 camera_state = "ready"
                 camera_tooltip = f"{len(configured_sources)} 个普通机位持续生成可判读画面"
+        elif self._auto_recording_error and configured_sources:
+            camera_text, camera_color = "录像设备: 自动启动失败", "#b54747"
+            camera_state = "error"
+            camera_tooltip = self._auto_recording_error
         elif configured_sources:
             camera_text, camera_color = "录像设备: 已配置", "#526170"
             camera_state = "waiting"
@@ -4238,9 +4521,11 @@ class FinishReviewWindow(PassageReviewDialog):
                         if background_count
                         else "当前查看历史赛事"
                     ),
-                    "ready",
+                    "ready" if background_count else "waiting",
                 )
-                self.receiver_status_label.setStyleSheet("color: #247a52;")
+                self.receiver_status_label.setStyleSheet(
+                    "color: #247a52;" if background_count else "color: #a56300;"
+                )
                 self.receiver_status_label.setToolTip(
                     "实时数据继续保存到独立收件箱，不会写入当前历史赛事目录。"
                 )
@@ -4270,7 +4555,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 stage_label = metadata.stage_name.strip() or metadata.stage_id
                 self.receiver_status_label.setStatus(
                     f"CycleRace: 监听中，已加载赛事 {race_label} / {stage_label}",
-                    "ready",
+                    "waiting",
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
@@ -4282,7 +4567,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 self.receiver_status_label.setStatus(
                     "CycleRace: 监听中，"
                     f"已加载历史 {self._historical_passage_count} 条",
-                    "ready",
+                    "waiting",
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
@@ -4291,7 +4576,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 )
             else:
                 self.receiver_status_label.setStatus(
-                    "CycleRace: 监听中，等待数据", "ready"
+                    "CycleRace: 监听中，等待数据", "waiting"
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(

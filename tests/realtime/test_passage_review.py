@@ -400,8 +400,15 @@ def test_large_finish_queue_supports_debounced_search_and_status_filters(
     assert source_location_calls < 20
     dialog.review_filter_buttons["pending"].click()
     assert dialog.table.rowCount() == 0
+    assert dialog.review_filter_buttons["pending"].text().startswith("✓ ")
+    assert dialog.summary_label.text() == "当前筛选：待核对 · 0 / 5,000 条"
     dialog.review_filter_buttons["blocked"].click()
     assert dialog.table.rowCount() == 1
+    assert dialog.review_filter_buttons["blocked"].text().startswith("✓ 待确认 ")
+    assert dialog.summary_label.text() == "当前筛选：待确认 · 1 / 5,000 条"
+    dialog.review_filter_buttons["all"].click()
+    assert dialog.table.rowCount() == 1
+    assert dialog.review_filter_buttons["all"].text().startswith("✓ ")
     dialog.close()
 
 
@@ -891,6 +898,38 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     assert dialog.current_passage_label.text() == "15 张三"
     assert dialog.group_combo.itemText(1) == "男子公开组"
     assert dialog.group_combo.itemData(1) == "men-open"
+    dialog.close()
+
+
+def test_group_filter_popup_fits_long_group_names(qapp, tmp_path):
+    long_group_name = "山地自行车男子公开组"
+    metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    metadata_store.store(
+        RaceMetadata(
+            race_id="race-1",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            groups=(RaceGroupMetadata("mountain-open", long_group_name),),
+        )
+    )
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        metadata_store=metadata_store,
+    )
+    qapp.processEvents()
+
+    group_index = dialog.group_combo.findData("mountain-open")
+    assert group_index >= 0
+    assert dialog.group_combo.minimumWidth() >= 180
+    assert dialog.group_combo.view().minimumWidth() >= (
+        dialog.group_combo.fontMetrics().horizontalAdvance(long_group_name) + 44
+    )
+    assert (
+        dialog.group_combo.itemData(group_index, Qt.ToolTipRole)
+        == long_group_name
+    )
     dialog.close()
 
 

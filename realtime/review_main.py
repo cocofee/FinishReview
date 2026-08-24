@@ -297,7 +297,7 @@ def load_review_settings(
             secondary_username,
             secondary_password,
         )
-        if is_rtsp_source(secondary_candidate):
+        if is_supported_review_source(secondary_candidate):
             secondary_source = secondary_candidate
         output_candidate = str(payload.get("output_dir") or "").strip()
         if output_candidate:

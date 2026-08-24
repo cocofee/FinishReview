@@ -12,6 +12,7 @@ from PyQt5.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontMetrics,
     QImage,
     QKeySequence,
     QPainter,
@@ -1745,8 +1746,12 @@ class PassageReviewDialog(QDialog):
             "QPushButton:disabled { color: #9ba5ae; background: #f4f6f8; }"
             "QPushButton[queueFilter='true'] { min-height: 28px; padding: 0 8px; "
             "border-color: transparent; color: #526170; font-weight: 600; }"
-            "QPushButton[queueFilterActive='true'] { background: #ffffff; "
-            "border-color: #b8c5cf; color: #17212b; }"
+            "QPushButton[queueFilterActive='true'], "
+            "QPushButton[queueFilter='true']:checked { background: #185f73; "
+            "border-color: #185f73; color: #ffffff; font-weight: 700; }"
+            "QPushButton[queueFilterActive='true']:hover, "
+            "QPushButton[queueFilter='true']:checked:hover { background: #124d5e; "
+            "border-color: #124d5e; color: #ffffff; }"
             "QCheckBox, QComboBox, QLineEdit, QSpinBox { min-height: 28px; font-size: 10pt; }"
             "QComboBox, QLineEdit, QSpinBox { background: #ffffff; "
             "border: 1px solid #b8c5cf; border-radius: 4px; padding: 0 7px; }"
@@ -1792,7 +1797,7 @@ class PassageReviewDialog(QDialog):
         self.review_filter_buttons: dict[str, QPushButton] = {}
         self.review_filter_labels = {
             "pending": "待核对",
-            "blocked": "受阻",
+            "blocked": "待确认",
             "confirmed": "已确认",
             "all": "全部",
         }
@@ -1809,14 +1814,14 @@ class PassageReviewDialog(QDialog):
 
         filters.addStretch(1)
         self.group_combo = QComboBox(self)
-        self.group_combo.setMinimumWidth(135)
-        self.group_combo.setMaximumWidth(180)
+        self.group_combo.setMinimumWidth(180)
+        self.group_combo.setMaximumWidth(220)
         self.group_combo.currentIndexChanged.connect(self._on_group_changed)
         filters.addWidget(self.group_combo)
         self.identity_search = QLineEdit(self)
         self.identity_search.setPlaceholderText("运动员编号 / 姓名")
         self.identity_search.setClearButtonEnabled(True)
-        self.identity_search.setMinimumWidth(210)
+        self.identity_search.setMinimumWidth(180)
         self.identity_search.setMaximumWidth(320)
         self.identity_search.textChanged.connect(self._on_search_changed)
         self.identity_search.returnPressed.connect(self._find_identity)
@@ -2274,6 +2279,24 @@ class PassageReviewDialog(QDialog):
                 return athlete
         return None
 
+    def _resize_group_popup(self) -> None:
+        metrics = QFontMetrics(self.group_combo.font())
+        widest_text = max(
+            (
+                metrics.horizontalAdvance(self.group_combo.itemText(index))
+                for index in range(self.group_combo.count())
+            ),
+            default=0,
+        )
+        popup_width = min(360, max(self.group_combo.minimumWidth(), widest_text + 44))
+        self.group_combo.view().setMinimumWidth(popup_width)
+        for index in range(self.group_combo.count()):
+            self.group_combo.setItemData(
+                index,
+                self.group_combo.itemText(index),
+                Qt.ToolTipRole,
+            )
+
     def _update_group_combo(self, events: tuple[PassageEvent, ...]) -> bool:
         previous_group = str(self.group_combo.currentData() or "")
         group_labels = {
@@ -2299,6 +2322,7 @@ class PassageReviewDialog(QDialog):
             for index in range(1, self.group_combo.count())
         ]
         if current_items == expected_items:
+            self._resize_group_popup()
             return False
         self.group_combo.blockSignals(True)
         self.group_combo.clear()
@@ -2308,6 +2332,7 @@ class PassageReviewDialog(QDialog):
         group_index = self.group_combo.findData(previous_group)
         self.group_combo.setCurrentIndex(max(0, group_index))
         self.group_combo.blockSignals(False)
+        self._resize_group_popup()
         return str(self.group_combo.currentData() or "") != previous_group
 
     def _write_event_row(
@@ -3171,13 +3196,23 @@ class PassageReviewDialog(QDialog):
             "all": self._total_event_count,
         }
         for filter_key, button in self.review_filter_buttons.items():
+            prefix = "✓ " if filter_key == self._active_review_filter else ""
             button.setText(
-                f"{self.review_filter_labels[filter_key]} {counts[filter_key]:,}"
+                f"{prefix}{self.review_filter_labels[filter_key]} "
+                f"{counts[filter_key]:,}"
             )
-        self.summary_label.setText(
-            f"当前显示 {len(self._visible_events):,} / "
-            f"{self._total_event_count:,} 条"
-        )
+        active_label = self.review_filter_labels[self._active_review_filter]
+        if self._active_review_filter == "all":
+            summary = (
+                f"当前显示 {len(self._visible_events):,} / "
+                f"{self._total_event_count:,} 条"
+            )
+        else:
+            summary = (
+                f"当前筛选：{active_label} · "
+                f"{len(self._visible_events):,} / {self._total_event_count:,} 条"
+            )
+        self.summary_label.setText(summary)
         self._available_evidence_count = len(self._located_event_ids)
 
     def _all_available_sources_confirmed(self, event_id: str) -> bool:

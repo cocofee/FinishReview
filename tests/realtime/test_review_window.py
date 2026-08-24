@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
 )
 
 from realtime import passage_review
@@ -37,7 +38,7 @@ from realtime.race_metadata import (
     RaceMetadataStore,
 )
 from realtime.review_export import REVIEW_SUMMARY_FILENAME
-from realtime.review_recorder import make_directshow_source
+from realtime.review_recorder import DirectShowVideoDevice, make_directshow_source
 from realtime.review_window import (
     FinishReviewLaunchDialog,
     FinishReviewSettings,
@@ -303,6 +304,8 @@ def test_runtime_status_reports_loaded_race_metadata_without_claiming_sync(
     assert "赛事ID：race-11" in window.event_path_label.toolTip()
     assert "已读取 1 个组别" in window.receiver_status_label.toolTip()
     assert "不能判断发送端持续在线" in window.receiver_status_label.toolTip()
+    assert window.receiver_status_label._detail_label.text() == "待数据"
+    assert "background: #a56300" in window.receiver_status_label._dot.styleSheet()
     window.close()
 
 
@@ -430,7 +433,8 @@ def test_runtime_status_keeps_waiting_for_seal_visible_with_older_captures(
     assert window.high_speed_status_label.text() == (
         "高速摄像: 本机测试目录可读，等待原厂软件完成判读"
     )
-    assert window.high_speed_status_label._title_label.text() == "高速摄像待机"
+    assert window.high_speed_status_label._title_label.text() == "高速摄像"
+    assert window.high_speed_status_label._detail_label.text() == "待机"
     window.close()
 
 
@@ -800,7 +804,8 @@ def test_runtime_status_keeps_high_speed_directory_health_when_event_selected(
     assert window.high_speed_status_label.text() == (
         "高速摄像: 本机测试数据可读，1 段"
     )
-    assert window.high_speed_status_label._title_label.text() == "高速摄像就绪"
+    assert window.high_speed_status_label._title_label.text() == "高速摄像"
+    assert window.high_speed_status_label._detail_label.text() == "就绪"
     window.close()
 
 
@@ -830,6 +835,207 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     qapp.processEvents()
     assert recorder.stopped
     assert receiver.stopped
+
+
+def test_first_live_formal_passage_auto_starts_recording(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+
+    _FakeReceiver.instances[-1].deliver(_event())
+    qapp.processEvents()
+
+    assert window.recorder is not None and window.recorder.is_running
+    assert len(_FakeRecorder.instances) == 1
+    assert window.passage_store.get("race-1-stage-1-passage-15") is not None
+    window.close()
+
+
+def test_live_formal_metadata_starts_recording_before_first_passage(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    window.start_receiver()
+
+    _FakeReceiver.instances[-1].deliver_metadata(
+        RaceMetadata(
+            race_id="race-formal",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="正式赛事",
+            stage_name="终点",
+            groups=(RaceGroupMetadata("men-open", "男子公开组"),),
+        )
+    )
+    qapp.processEvents()
+
+    assert window.recorder is not None and window.recorder.is_running
+    assert len(_FakeRecorder.instances) == 1
+    assert window.passage_store.events() == ()
+    window.close()
+
+
+def test_live_test_only_metadata_does_not_start_recording(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+
+    _FakeReceiver.instances[-1].deliver_metadata(
+        RaceMetadata(
+            race_id="race-test",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            groups=(RaceGroupMetadata("test-group", "测试组"),),
+        )
+    )
+    qapp.processEvents()
+
+    assert window.recorder is None
+    window.close()
+
+
+def test_archive_workspace_ignores_live_metadata_recording_trigger(qapp, tmp_path):
+    window = _window(tmp_path)
+    window._workspace_mode = "archive"
+
+    window._on_metadata_received(
+        RaceMetadata(
+            race_id="race-formal",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            groups=(RaceGroupMetadata("men-open", "男子公开组"),),
+        )
+    )
+    qapp.processEvents()
+
+    assert window.recorder is None
+    window.close()
+
+
+@pytest.mark.parametrize("test_group_name", ["测试组", "检测组"])
+def test_live_test_group_passage_does_not_auto_start_recording(
+    qapp,
+    tmp_path,
+    test_group_name,
+):
+    window = _window(tmp_path)
+    window.metadata_store.store(
+        RaceMetadata(
+            race_id="race-1",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            groups=(RaceGroupMetadata("test-group", test_group_name),),
+        )
+    )
+    window.start_receiver()
+
+    _FakeReceiver.instances[-1].deliver(
+        _event(group_id="test-group", group_name="")
+    )
+    qapp.processEvents()
+
+    assert window.recorder is None
+    assert window.table.rowCount() == 1
+    window.close()
+
+
+def test_live_test_group_id_without_metadata_does_not_auto_start_recording(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    window.start_receiver()
+
+    _FakeReceiver.instances[-1].deliver(
+        _event(group_id="test-group", group_name="")
+    )
+    qapp.processEvents()
+
+    assert window.recorder is None
+    assert window.table.rowCount() == 1
+    window.close()
+
+
+def test_first_formal_passage_after_test_group_starts_only_one_recorder(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    window.metadata_store.store(
+        RaceMetadata(
+            race_id="race-1",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            groups=(
+                RaceGroupMetadata("test-group", "检测组"),
+                RaceGroupMetadata("men-open", "男子公开组"),
+            ),
+        )
+    )
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[-1]
+
+    receiver.deliver(_event(group_id="test-group", group_name="检测组"))
+    qapp.processEvents()
+    assert window.recorder is None
+
+    receiver.deliver(_event(event_id="formal-first", sequence=16))
+    qapp.processEvents()
+    assert window.recorder is not None and window.recorder.is_running
+
+    receiver.deliver(_event(event_id="formal-second", sequence=17))
+    qapp.processEvents()
+    assert len(_FakeRecorder.instances) == 1
+    window.close()
+
+
+def test_historical_passage_does_not_auto_start_recording(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+    historical_timestamp_ms = int(time.time() * 1000.0) - 10 * 60 * 1000
+
+    _FakeReceiver.instances[-1].deliver(
+        _event(passage_timestamp_ms=historical_timestamp_ms)
+    )
+    qapp.processEvents()
+
+    assert window.recorder is None
+    assert window.table.rowCount() == 1
+    window.close()
+
+
+def test_auto_recording_failure_does_not_drop_live_passage(qapp, tmp_path):
+    class _FailRecorder(_FakeRecorder):
+        def start(self):
+            raise RuntimeError("camera unavailable")
+
+    _FailRecorder.instances.clear()
+    _FakeReceiver.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        passage_batch_interval_ms=0,
+        recorder_factory=_FailRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_receiver()
+
+    _FakeReceiver.instances[-1].deliver(_event())
+    qapp.processEvents()
+
+    assert window.recorder is None
+    assert window.passage_store.get("race-1-stage-1-passage-15") is not None
+    assert window.table.rowCount() == 1
+    assert window._runtime_error == "camera unavailable"
+    assert window.camera_status_label.text() == "录像设备: 自动启动失败"
+    assert window.camera_status_label.toolTip() == "camera unavailable"
+    window.close()
 
 
 def test_live_passage_shows_preview_before_full_post_roll_is_ready(
@@ -927,6 +1133,7 @@ def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
 ):
     window = _window(tmp_path, passage_batch_interval_ms=1_000)
     window.start_receiver()
+    window.start_recording()
     receiver = _FakeReceiver.instances[0]
     refreshed_batches = []
     archive_calls = 0
@@ -1291,6 +1498,150 @@ def test_device_settings_expose_two_independent_rtsp_cameras(qapp, tmp_path):
     dialog.close()
 
 
+def test_device_settings_allow_two_independent_usb_cameras(qapp, tmp_path):
+    first_input = "@device_pnp_dji_one"
+    second_input = "@device_pnp_dji_two"
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source=make_directshow_source(first_input),
+            secondary_source=make_directshow_source(second_input),
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (
+            DirectShowVideoDevice("DJI Osmo Action 5 Pro（1）", first_input),
+            DirectShowVideoDevice("DJI Osmo Action 5 Pro（2）", second_input),
+        ),
+    )
+
+    assert dialog.secondary_enabled_checkbox.isChecked()
+    assert dialog.secondary_source_type_combo.currentData() == "usb"
+    assert dialog.device_combo.currentData() == first_input
+    assert dialog.secondary_device_combo.currentData() == second_input
+    assert dialog.device_combo.currentText().endswith("（1）")
+    assert dialog.secondary_device_combo.currentText().endswith("（2）")
+    assert dialog.settings.source == make_directshow_source(first_input)
+    assert dialog.settings.secondary_source == make_directshow_source(second_input)
+    assert "机位1已检测到" in dialog.camera_status_label.text()
+    assert "机位2已检测到" in dialog.camera_status_label.text()
+    dialog.close()
+
+
+def test_device_settings_migrate_unique_legacy_usb_name(qapp, tmp_path):
+    unique_input = "@device_pnp_dji_one"
+    legacy_source = make_directshow_source(
+        "DJI Osmo Action 5 Pro",
+        video_size="1920x1080",
+        framerate=50,
+    )
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source=legacy_source,
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (
+            DirectShowVideoDevice(
+                "DJI Osmo Action 5 Pro",
+                unique_input,
+                "DJI Osmo Action 5 Pro",
+            ),
+        ),
+    )
+
+    assert dialog.device_combo.currentData() == unique_input
+    assert dialog.camera_status_label.text() == (
+        "已检测到摄像头，开始录像后验证画面"
+    )
+    assert dialog.settings.source == make_directshow_source(
+        unique_input,
+        video_size="1920x1080",
+        framerate=50,
+    )
+    dialog.close()
+
+
+def test_device_settings_do_not_guess_ambiguous_legacy_usb_name(qapp, tmp_path):
+    legacy_name = "DJI Osmo Action 5 Pro"
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source=make_directshow_source(legacy_name),
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (
+            DirectShowVideoDevice(
+                "DJI Osmo Action 5 Pro（1）",
+                "@device_pnp_dji_one",
+                legacy_name,
+            ),
+            DirectShowVideoDevice(
+                "DJI Osmo Action 5 Pro（2）",
+                "@device_pnp_dji_two",
+                legacy_name,
+            ),
+        ),
+    )
+
+    assert dialog.device_combo.currentData() == legacy_name
+    assert dialog.device_combo.currentText().endswith("（当前未检测到）")
+    assert dialog.camera_status_label.text() == "录像设备已配置，但当前未检测到"
+    assert dialog.settings.source == make_directshow_source(legacy_name)
+    dialog.close()
+
+
+def test_device_settings_allow_dji_and_other_usb_camera(qapp, tmp_path):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source=make_directshow_source("DJI Osmo Action 5 Pro"),
+            secondary_source=make_directshow_source("USB Camera"),
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: ("DJI Osmo Action 5 Pro", "USB Camera"),
+    )
+
+    assert dialog.device_combo.currentText() == "DJI Osmo Action 5 Pro"
+    assert dialog.secondary_device_combo.currentText() == "USB Camera"
+    assert dialog.settings.secondary_source == make_directshow_source("USB Camera")
+    dialog.close()
+
+
+def test_device_settings_allow_rtsp_and_secondary_usb_camera(qapp, tmp_path):
+    secondary_input = "@device_pnp_dji_two"
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://camera-one/live",
+            secondary_source=make_directshow_source(secondary_input),
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (
+            DirectShowVideoDevice("DJI Osmo Action 5 Pro", secondary_input),
+        ),
+    )
+
+    assert dialog.source_type_combo.currentData() == "rtsp"
+    assert dialog.secondary_source_type_combo.currentData() == "usb"
+    assert dialog.secondary_device_combo.currentData() == secondary_input
+    assert not dialog.video_size_combo.isHidden()
+    assert dialog.settings.source == "rtsp://camera-one/live"
+    assert dialog.settings.secondary_source == make_directshow_source(
+        secondary_input
+    )
+    dialog.close()
+
+
 def test_device_settings_do_not_report_unplugged_saved_camera_as_detected(
     qapp,
     tmp_path,
@@ -1412,6 +1763,26 @@ def test_two_rtsp_sources_start_independent_review_pipelines(qapp, tmp_path):
     assert set(window._ring_buffers) == {1, 2}
     assert window._recording_all_active()
     assert window.camera_status_label.text() == "录像设备: 全部已连接"
+    window.close()
+
+
+def test_two_usb_sources_start_independent_review_pipelines(qapp, tmp_path):
+    _FakeRecorder.instances.clear()
+    window = FinishReviewWindow(
+        make_directshow_source("@device_pnp_dji_one"),
+        tmp_path,
+        secondary_source=make_directshow_source("@device_pnp_dji_two"),
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+
+    window.start_recording()
+
+    assert [recorder.camera_index for recorder in _FakeRecorder.instances] == [1, 2]
+    assert set(window._recorders) == {1, 2}
+    assert window._recording_all_active()
     window.close()
 
 
@@ -2022,7 +2393,8 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
-    assert window.settings_button.text() == "⚙"
+    assert window.recheck_button.text() == "刷新"
+    assert window.settings_button.text() == "设置"
     assert window.settings_button.toolTip() == "设备与赛事设置"
     assert not hasattr(window, "import_high_speed_button")
     assert window.receiver_status_label.text() == "CycleRace: 监听中，等待数据"
@@ -2033,18 +2405,40 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.capture_status_label.isHidden()
     assert window.product_title_label.text() == "FinishReview"
     assert window.product_subtitle_label.text() == "终点多源复核"
-    assert window.event_name_label.font().pointSize() >= 12
+    assert window.product_subtitle_label.isHidden()
+    assert window.event_path_label.isVisible()
+    assert window.event_name_label.font().pointSize() >= 11
     assert window.event_path_label.font().pointSize() >= 10
-    assert window.receiver_status_label._title_label.font().pointSize() >= 10
+    assert window.receiver_status_label._title_label.font().pointSize() >= 9
     assert window.receiver_status_label._detail_label.font().pointSize() >= 9
     assert len(window.beijing_clock_label.text().split(":")) == 3
     assert window.beijing_clock_label.font().pointSize() >= 11
     assert window.beijing_zone_label.text() == "北京时间"
     assert window.beijing_zone_label.font().pointSize() >= 9
-    assert window.findChild(
+    header = window.findChild(
         review_window_module.QFrame,
         "finishConsoleHeader",
-    ).minimumHeight() >= 56
+    )
+    assert header.minimumHeight() >= 78
+    assert (
+        window.event_name_label.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Ignored
+    )
+    assert window.recheck_button.isVisible()
+    assert window.settings_button.isVisible()
+    assert "color: #17212b" in window.recheck_button.styleSheet()
+    assert "color: #17212b" in window.settings_button.styleSheet()
+    assert window.recheck_button.geometry().right() < window.settings_button.geometry().left()
+    assert window.settings_button.geometry().right() < window.record_button.geometry().left()
+    assert (
+        window.event_name_label.geometry().right()
+        < window.event_path_label.geometry().left()
+    )
+    assert (
+        window.event_path_label.geometry().right()
+        < window.beijing_clock_label.geometry().left()
+    )
+    assert window.runtime_status_strip.geometry().top() > window.event_name_label.geometry().top()
 
     window.start_recording()
     assert window.recorder.is_running
@@ -2055,6 +2449,32 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
         "录像设备: 全部已连接",
     }
     window.close()
+
+
+def test_compact_ready_status_uses_a_visible_green_indicator(qapp):
+    indicator = review_window_module._CompactStatusIndicator("普通摄像")
+
+    indicator.setStatus("录像设备: 全部已连接", "ready")
+    indicator.setStyleSheet("color: #247a52;")
+
+    assert "background: transparent" in indicator._surface_style
+    assert indicator._title_label.text() == "普通摄像"
+    assert indicator._detail_label.text() == "正常"
+    assert "color: #176b49" in indicator._detail_label.styleSheet()
+    assert "background: #247a52" in indicator._dot.styleSheet()
+    indicator.close()
+
+
+def test_compact_timing_status_distinguishes_waiting_from_ready(qapp):
+    indicator = review_window_module._CompactStatusIndicator("计时源")
+
+    indicator.setStatus("CycleRace: 监听中，等待数据", "waiting")
+    indicator.setStyleSheet("color: #a56300;")
+
+    assert indicator._detail_label.text() == "待数据"
+    assert "background: #a56300" in indicator._dot.styleSheet()
+    assert "正常" not in indicator._detail_label.text()
+    indicator.close()
 
 
 def test_recording_health_scans_buffer_without_pending_passages(

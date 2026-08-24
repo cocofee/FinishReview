@@ -58,6 +58,9 @@ BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 _DIRECTSHOW_SCHEME = "dshow"
 _VIDEO_SIZE_PATTERN = re.compile(r"^[1-9]\d{1,4}x[1-9]\d{1,4}$")
 _DIRECTSHOW_VIDEO_DEVICE_PATTERN = re.compile(r'"(?P<name>[^"]+)"\s+\(video\)')
+_DIRECTSHOW_ALTERNATIVE_DEVICE_PATTERN = re.compile(
+    r'Alternative name "(?P<name>[^"]+)"'
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,15 @@ class DirectShowReviewSource:
     device_name: str
     video_size: str | None = None
     framerate: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectShowVideoDevice:
+    """One selectable DirectShow input with a stable FFmpeg identity."""
+
+    display_name: str
+    input_name: str
+    friendly_name: str = ""
 
 
 def make_directshow_source(
@@ -145,12 +157,12 @@ def is_supported_review_source(source: object) -> bool:
     return is_rtsp_source(source) or parse_directshow_source(source) is not None
 
 
-def discover_directshow_video_devices(
+def discover_directshow_video_device_choices(
     ffmpeg_path: Path | None = None,
     *,
     run_factory: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> tuple[str, ...]:
-    """List Windows DirectShow video inputs without exposing FFmpeg details."""
+) -> tuple[DirectShowVideoDevice, ...]:
+    """List DirectShow inputs while retaining each device's unique identity."""
 
     executable = Path(ffmpeg_path).resolve() if ffmpeg_path else find_ffmpeg_executable()
     if executable is None or not executable.is_file():
@@ -185,11 +197,70 @@ def discover_directshow_video_devices(
         str(value or "")
         for value in (getattr(result, "stdout", ""), getattr(result, "stderr", ""))
     )
+    discovered: list[tuple[str, str]] = []
+    pending_index: int | None = None
+    for line in output.splitlines():
+        video_match = _DIRECTSHOW_VIDEO_DEVICE_PATTERN.search(line)
+        if video_match is not None:
+            friendly_name = video_match.group("name").strip()
+            if friendly_name:
+                discovered.append((friendly_name, friendly_name))
+                pending_index = len(discovered) - 1
+            continue
+        if "(audio)" in line:
+            pending_index = None
+            continue
+        alternative_match = _DIRECTSHOW_ALTERNATIVE_DEVICE_PATTERN.search(line)
+        if alternative_match is not None and pending_index is not None:
+            input_name = alternative_match.group("name").strip()
+            if input_name:
+                friendly_name, _current_input = discovered[pending_index]
+                discovered[pending_index] = (friendly_name, input_name)
+            pending_index = None
+
+    unique_devices: list[tuple[str, str]] = []
+    seen_inputs: set[str] = set()
+    for friendly_name, input_name in discovered:
+        if input_name in seen_inputs:
+            continue
+        seen_inputs.add(input_name)
+        unique_devices.append((friendly_name, input_name))
+
+    totals: dict[str, int] = {}
+    for friendly_name, _input_name in unique_devices:
+        totals[friendly_name] = totals.get(friendly_name, 0) + 1
+    indexes: dict[str, int] = {}
+    choices = []
+    for friendly_name, input_name in unique_devices:
+        indexes[friendly_name] = indexes.get(friendly_name, 0) + 1
+        display_name = (
+            f"{friendly_name}（{indexes[friendly_name]}）"
+            if totals[friendly_name] > 1
+            else friendly_name
+        )
+        choices.append(
+            DirectShowVideoDevice(display_name, input_name, friendly_name)
+        )
+    return tuple(choices)
+
+
+def discover_directshow_video_devices(
+    ffmpeg_path: Path | None = None,
+    *,
+    run_factory: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> tuple[str, ...]:
+    """Compatibility helper returning unique friendly device names."""
+
     devices = []
-    for match in _DIRECTSHOW_VIDEO_DEVICE_PATTERN.finditer(output):
-        name = match.group("name").strip()
-        if name and name not in devices:
-            devices.append(name)
+    for choice in discover_directshow_video_device_choices(
+        ffmpeg_path,
+        run_factory=run_factory,
+    ):
+        friendly_name = choice.friendly_name or re.sub(
+            r"（\d+）$", "", choice.display_name
+        )
+        if friendly_name not in devices:
+            devices.append(friendly_name)
     return tuple(devices)
 
 
@@ -1341,6 +1412,7 @@ __all__ = [
     "DEFAULT_REVIEW_RETENTION_SECONDS",
     "DEFAULT_REVIEW_SEGMENT_SECONDS",
     "DirectShowReviewSource",
+    "DirectShowVideoDevice",
     "FfmpegReviewRecorder",
     "PassageReviewCoordinator",
     "PassageReviewState",
@@ -1348,6 +1420,7 @@ __all__ = [
     "PassageReviewWindow",
     "ReviewRingBuffer",
     "ReviewSegment",
+    "discover_directshow_video_device_choices",
     "discover_directshow_video_devices",
     "is_supported_review_source",
     "load_archive_recording_sessions",

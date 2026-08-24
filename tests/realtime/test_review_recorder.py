@@ -12,6 +12,7 @@ from realtime.review_recorder import (
     PassageReviewState,
     PassageReviewTimelinePublisher,
     ReviewRingBuffer,
+    discover_directshow_video_device_choices,
     discover_directshow_video_devices,
     is_supported_review_source,
     load_archive_recording_sessions,
@@ -102,6 +103,40 @@ def test_directshow_device_discovery_returns_video_inputs_only(tmp_path):
         "dshow",
         "-i",
         "dummy",
+    ]
+
+
+def test_directshow_device_choices_keep_identical_cameras_separate(tmp_path):
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"exe")
+
+    def fake_run(_command, **_kwargs):
+        return SimpleNamespace(
+            stdout="",
+            stderr=(
+                '[dshow @ 0001] "DJI Osmo Action 5 Pro" (video)\n'
+                '[dshow @ 0001]   Alternative name "@device_pnp_dji_one"\n'
+                '[dshow @ 0001] "DJI Osmo Action 5 Pro" (video)\n'
+                '[dshow @ 0001]   Alternative name "@device_pnp_dji_two"\n'
+            ),
+        )
+
+    choices = discover_directshow_video_device_choices(
+        ffmpeg,
+        run_factory=fake_run,
+    )
+
+    assert [choice.display_name for choice in choices] == [
+        "DJI Osmo Action 5 Pro（1）",
+        "DJI Osmo Action 5 Pro（2）",
+    ]
+    assert [choice.input_name for choice in choices] == [
+        "@device_pnp_dji_one",
+        "@device_pnp_dji_two",
+    ]
+    assert [choice.friendly_name for choice in choices] == [
+        "DJI Osmo Action 5 Pro",
+        "DJI Osmo Action 5 Pro",
     ]
 
 
