@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import inspect
+import os
 import re
 import socket
 import shutil
@@ -48,6 +49,14 @@ try:
         is_network_share,
     )
     from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
+    from .event_workspace import (
+        EventWorkspaceDescriptor,
+        EventWorkspaceError,
+        EventWorkspaceSummary,
+        discover_event_workspaces,
+        summarize_event_workspace,
+        validate_event_workspace,
+    )
     from .passage_evidence import PassageEvidenceAssociationStore
     from .passage_receiver import (
         DEFAULT_HOST,
@@ -100,6 +109,14 @@ except ImportError:
         is_network_share,
     )
     from external_clip_import import ExternalClipImportError, race_id_from_passage_store
+    from event_workspace import (
+        EventWorkspaceDescriptor,
+        EventWorkspaceError,
+        EventWorkspaceSummary,
+        discover_event_workspaces,
+        summarize_event_workspace,
+        validate_event_workspace,
+    )
     from passage_evidence import PassageEvidenceAssociationStore
     from passage_receiver import (
         DEFAULT_HOST,
@@ -147,6 +164,7 @@ except ImportError:
 
 
 logger = logging.getLogger("FinishReview")
+IS_WINDOWS = os.name == "nt"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
@@ -160,6 +178,17 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
+
+
+def _open_event_directory(event_dir: Path) -> bool:
+    if IS_WINDOWS:
+        try:
+            subprocess.Popen(["explorer.exe", "/n,", str(event_dir)])
+        except OSError:
+            logger.exception("Failed to launch Windows Explorer")
+        else:
+            return True
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(event_dir)))
 
 
 def _format_point_playback_time(timestamp_ms: int) -> str:
@@ -396,6 +425,166 @@ class _RtspProbeWorker(QThread):
             pass
 
 
+class EventWorkspacePickerDialog(QDialog):
+    """Compact picker for saved CycleRace event workspaces."""
+
+    def __init__(
+        self,
+        workspaces: tuple[EventWorkspaceDescriptor, ...],
+        parent=None,
+        *,
+        current_dir: Path | None = None,
+        summary_provider: Callable[
+            [EventWorkspaceDescriptor], EventWorkspaceSummary
+        ] = summarize_event_workspace,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("打开赛事")
+        self.setMinimumSize(720, 430)
+        self.resize(820, 500)
+        self._workspaces = tuple(workspaces)
+        self._summary_provider = summary_provider
+        self._selected_path: Path | None = None
+        self._summary_cache: dict[Path, EventWorkspaceSummary | str] = {}
+        current_path = current_dir.resolve() if current_dir is not None else None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("已保存赛事", self)
+        title.setStyleSheet("font-size: 14pt; font-weight: 700; color: #17212b;")
+        layout.addWidget(title)
+
+        self.search_edit = QLineEdit(self)
+        self.search_edit.setPlaceholderText("搜索赛事或赛段")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._filter_rows)
+        layout.addWidget(self.search_edit)
+
+        self.table = QTableWidget(len(self._workspaces), 4, self)
+        self.table.setHorizontalHeaderLabels(("赛事名称", "赛段", "最后更新", "状态"))
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self._update_selection)
+        self.table.cellDoubleClicked.connect(self._open_selected_row)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        selected_row = -1
+        for row, workspace in enumerate(self._workspaces):
+            modified = datetime.fromtimestamp(
+                workspace.modified_at_ms / 1000.0
+            ).strftime("%Y-%m-%d %H:%M") if workspace.modified_at_ms else "--"
+            is_current = current_path is not None and workspace.path == current_path
+            values = (
+                workspace.race_name,
+                workspace.stage_name,
+                modified,
+                "当前打开" if is_current else "已保存",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.UserRole, str(workspace.path))
+                    item.setToolTip(str(workspace.path))
+                if column in {2, 3}:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, column, item)
+            if is_current:
+                selected_row = row
+        layout.addWidget(self.table, 1)
+
+        self.summary_label = QLabel("选择一个赛事", self)
+        self.summary_label.setStyleSheet("color: #526170; font-weight: 600;")
+        layout.addWidget(self.summary_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Open | QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        self.open_button = buttons.button(QDialogButtonBox.Open)
+        self.open_button.setText("打开赛事")
+        self.open_button.setEnabled(False)
+        self.cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        self.cancel_button.setText("取消")
+        buttons.accepted.connect(self._accept_selected)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        if selected_row < 0 and self._workspaces:
+            selected_row = 0
+        if selected_row >= 0:
+            self.table.selectRow(selected_row)
+        elif not self._workspaces:
+            self.summary_label.setText("当前保存根目录中没有可打开的赛事")
+
+    @property
+    def selected_path(self) -> Path | None:
+        return self._selected_path
+
+    def _workspace_for_row(self, row: int) -> EventWorkspaceDescriptor | None:
+        if row < 0 or row >= len(self._workspaces):
+            return None
+        return self._workspaces[row]
+
+    def _filter_rows(self, text: str) -> None:
+        query = str(text).strip().casefold()
+        first_visible = -1
+        for row, workspace in enumerate(self._workspaces):
+            searchable = " ".join(
+                (workspace.race_name, workspace.stage_name, workspace.path.name)
+            ).casefold()
+            hidden = bool(query and query not in searchable)
+            self.table.setRowHidden(row, hidden)
+            if not hidden and first_visible < 0:
+                first_visible = row
+        if first_visible >= 0:
+            self.table.selectRow(first_visible)
+        else:
+            self.table.clearSelection()
+            self.summary_label.setText("没有匹配的赛事")
+
+    def _update_selection(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        workspace = self._workspace_for_row(rows[0].row()) if rows else None
+        self._selected_path = workspace.path if workspace is not None else None
+        self.open_button.setEnabled(workspace is not None)
+        if workspace is None:
+            return
+        summary = self._summary_cache.get(workspace.path)
+        if summary is None:
+            try:
+                summary = self._summary_provider(workspace)
+            except EventWorkspaceError as error:
+                summary = str(error)
+            self._summary_cache[workspace.path] = summary
+        if isinstance(summary, str):
+            self.summary_label.setText(summary)
+            self.summary_label.setStyleSheet("color: #b54747; font-weight: 600;")
+            self.open_button.setEnabled(False)
+            return
+        self.summary_label.setStyleSheet("color: #526170; font-weight: 600;")
+        self.summary_label.setText(
+            f"通过记录 {summary.passage_count:,} 条 · "
+            f"已确认 {summary.confirmed_count:,} 条"
+        )
+
+    def _open_selected_row(self, row: int, _column: int) -> None:
+        if self._workspace_for_row(row) is None:
+            return
+        self.table.selectRow(row)
+        self._accept_selected()
+
+    def _accept_selected(self) -> None:
+        if self._selected_path is not None and self.open_button.isEnabled():
+            self.accept()
+
+
 class FinishReviewLaunchDialog(QDialog):
     """Operator-facing device and race-directory settings."""
 
@@ -411,6 +600,16 @@ class FinishReviewLaunchDialog(QDialog):
         | None = None,
         runtime_snapshot_provider: Callable[[], dict[str, str]] | None = None,
         event_export_callback: Callable[[], object] | None = None,
+        event_workspace_provider: Callable[
+            [], tuple[EventWorkspaceDescriptor, ...]
+        ]
+        | None = None,
+        event_workspace_summary_provider: Callable[
+            [EventWorkspaceDescriptor], EventWorkspaceSummary
+        ]
+        | None = None,
+        event_open_callback: Callable[[Path], bool] | None = None,
+        return_live_event_callback: Callable[[], bool] | None = None,
         recheck_callback: Callable[[], None] | None = None,
         recording_start_callback: Callable[[], bool] | None = None,
         preflight_event_callback: Callable[[PreflightRun], None] | None = None,
@@ -463,6 +662,12 @@ class FinishReviewLaunchDialog(QDialog):
         )
         self._runtime_snapshot_provider = runtime_snapshot_provider or (lambda: {})
         self._event_export_callback = event_export_callback
+        self._event_workspace_provider = event_workspace_provider
+        self._event_workspace_summary_provider = (
+            event_workspace_summary_provider or summarize_event_workspace
+        )
+        self._event_open_callback = event_open_callback
+        self._return_live_event_callback = return_live_event_callback
         self._recheck_callback = recheck_callback
         self._recording_start_callback = recording_start_callback or (lambda: True)
         self._preflight_event_callback = preflight_event_callback
@@ -785,11 +990,19 @@ class FinishReviewLaunchDialog(QDialog):
         page_layout.setSpacing(12)
         self._event_dir: Path | None = None
 
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
         self.event_status_label = QLabel("等待 CycleRace 赛事信息", self)
         self.event_status_label.setStyleSheet(
             "color: #a56300; font-size: 11pt; font-weight: 700;"
         )
-        page_layout.addWidget(self.event_status_label)
+        status_row.addWidget(self.event_status_label)
+        status_row.addStretch(1)
+        self.return_live_event_button = QPushButton("返回当前赛事", self)
+        self.return_live_event_button.clicked.connect(self._return_to_live_event)
+        self.return_live_event_button.setVisible(False)
+        status_row.addWidget(self.return_live_event_button)
+        page_layout.addLayout(status_row)
 
         form = QFormLayout()
         form.setHorizontalSpacing(14)
@@ -797,7 +1010,16 @@ class FinishReviewLaunchDialog(QDialog):
 
         self.event_name_edit = QLineEdit(self)
         self.event_name_edit.setReadOnly(True)
-        form.addRow("当前赛事", self.event_name_edit)
+        event_name_row = QHBoxLayout()
+        event_name_row.setSpacing(6)
+        event_name_row.addWidget(self.event_name_edit, 1)
+        self.open_saved_event_button = QPushButton("打开赛事", self)
+        self.open_saved_event_button.setIcon(
+            self.style().standardIcon(QStyle.SP_DialogOpenButton)
+        )
+        self.open_saved_event_button.clicked.connect(self._open_saved_event)
+        event_name_row.addWidget(self.open_saved_event_button)
+        form.addRow("当前赛事", event_name_row)
 
         self.event_stage_edit = QLineEdit(self)
         self.event_stage_edit.setReadOnly(True)
@@ -1007,9 +1229,14 @@ class FinishReviewLaunchDialog(QDialog):
             ) or "等待 CycleRace 赛事信息"
 
         has_event = bool(event_name and event_dir)
+        workspace_mode = snapshot.get("workspace_mode", "live")
+        is_archive = workspace_mode == "archive"
+        recording_active = snapshot.get("recording_active", "") == "1"
         self.event_status_label.setText(event_state)
         self.event_status_label.setStyleSheet(
-            "color: #247a52; font-size: 11pt; font-weight: 700;"
+            "color: #a56300; font-size: 11pt; font-weight: 700;"
+            if is_archive
+            else "color: #247a52; font-size: 11pt; font-weight: 700;"
             if has_event
             else "color: #a56300; font-size: 11pt; font-weight: 700;"
         )
@@ -1020,6 +1247,21 @@ class FinishReviewLaunchDialog(QDialog):
         self.event_dir_edit.setCursorPosition(0)
         self._event_dir = Path(event_dir) if event_dir else None
         self.open_event_dir_button.setEnabled(self._event_dir is not None)
+        can_open_saved = bool(
+            timing_provider == "cyclerace"
+            and self._event_workspace_provider is not None
+            and self._event_open_callback is not None
+            and not recording_active
+        )
+        self.open_saved_event_button.setEnabled(can_open_saved)
+        self.open_saved_event_button.setToolTip(
+            "停止录像后可打开历史赛事"
+            if recording_active
+            else "打开已保存的 CycleRace 赛事"
+        )
+        self.return_live_event_button.setVisible(
+            is_archive and timing_provider == "cyclerace"
+        )
 
     def _refresh_deployment_table(
         self,
@@ -1582,8 +1824,33 @@ class FinishReviewLaunchDialog(QDialog):
                     "复核清单未更新",
                     f"无法更新终点复核清单：{error}\n仍将打开赛事目录。",
                 )
-        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(event_dir))):
+        if not _open_event_directory(event_dir):
             QMessageBox.warning(self, "无法打开赛事目录", str(event_dir))
+
+    def _open_saved_event(self) -> None:
+        if self._event_workspace_provider is None or self._event_open_callback is None:
+            return
+        try:
+            workspaces = self._event_workspace_provider()
+        except EventWorkspaceError as error:
+            QMessageBox.warning(self, "无法读取赛事列表", str(error))
+            return
+        picker = EventWorkspacePickerDialog(
+            workspaces,
+            self,
+            current_dir=self._event_dir,
+            summary_provider=self._event_workspace_summary_provider,
+        )
+        if picker.exec_() != QDialog.Accepted or picker.selected_path is None:
+            return
+        if self._event_open_callback(picker.selected_path):
+            self.reject()
+
+    def _return_to_live_event(self) -> None:
+        if self._return_live_event_callback is None:
+            return
+        if self._return_live_event_callback():
+            self.reject()
 
     def _browse_high_speed_dir(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -1871,6 +2138,8 @@ class FinishReviewWindow(PassageReviewDialog):
         self._recorder_factory = recorder_factory
         self._receiver_factory = receiver_factory
         self._settings_saver = settings_saver
+        self._workspace_mode = "live"
+        self._archive_background_passage_count = 0
 
         inbox_dir = self.workspace_root / CYCLERACE_INBOX_DIRNAME
         self._receiver_passage_store = PassageEventStore(
@@ -2265,6 +2534,82 @@ class FinishReviewWindow(PassageReviewDialog):
             racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
         )
 
+    def _saved_event_workspaces(self) -> tuple[EventWorkspaceDescriptor, ...]:
+        return discover_event_workspaces(self.workspace_root)
+
+    @staticmethod
+    def _saved_event_summary(
+        workspace: EventWorkspaceDescriptor,
+    ) -> EventWorkspaceSummary:
+        return summarize_event_workspace(workspace)
+
+    def _open_saved_event_workspace(self, path: Path) -> bool:
+        if self.timing_provider != "cyclerace":
+            QMessageBox.warning(self, "无法打开赛事", "打开赛事仅支持 CycleRace。")
+            return False
+        if self._recording_any_active():
+            QMessageBox.warning(self, "无法打开赛事", "请先停止普通录像。")
+            return False
+        try:
+            workspace = validate_event_workspace(path, self.workspace_root)
+        except EventWorkspaceError as error:
+            QMessageBox.warning(self, "无法打开赛事", str(error))
+            return False
+        if workspace.path == self.output_dir.resolve() and self._workspace_mode == "live":
+            return True
+
+        self._export_review_summary()
+        applied = self._apply_settings(
+            self._current_settings(output_dir=workspace.path),
+            persist_settings=False,
+            update_workspace_root=False,
+            preserve_cyclerace_receiver=True,
+        )
+        if not applied:
+            return False
+        self._workspace_mode = "archive"
+        self._archive_background_passage_count = 0
+        self._workspace_notice = ""
+        self._capture_error = ""
+        self.refresh()
+        self._update_runtime_status()
+        return True
+
+    def _return_to_live_event(self) -> bool:
+        if self._workspace_mode != "archive":
+            return True
+        metadata = self._receiver_metadata_store.current()
+        if metadata is None:
+            QMessageBox.warning(
+                self,
+                "无法返回当前赛事",
+                "尚未收到 CycleRace 当前赛事信息。",
+            )
+            return False
+        try:
+            applied = self._activate_cyclerace_workspace(
+                metadata,
+                force=True,
+                preserve_cyclerace_receiver=True,
+            )
+        except Exception as error:  # noqa: BLE001 - keep the archive open on failure.
+            QMessageBox.warning(
+                self,
+                "无法返回当前赛事",
+                sanitize_recording_message(error),
+            )
+            return False
+        if not applied:
+            return False
+        self._workspace_mode = "live"
+        self._archive_background_passage_count = 0
+        self._workspace_notice = ""
+        self._capture_error = ""
+        self.refresh()
+        self._apply_pending_focus()
+        self._update_runtime_status()
+        return True
+
     def _configure_devices(self) -> None:
         dialog = FinishReviewLaunchDialog(
             self._current_settings(),
@@ -2276,6 +2621,10 @@ class FinishReviewWindow(PassageReviewDialog):
             event_export_callback=lambda: self._export_review_summary(
                 show_warning=True
             ),
+            event_workspace_provider=self._saved_event_workspaces,
+            event_workspace_summary_provider=self._saved_event_summary,
+            event_open_callback=self._open_saved_event_workspace,
+            return_live_event_callback=self._return_to_live_event,
             recheck_callback=self._recheck_connections,
             recording_start_callback=self._start_preflight_recording,
             preflight_event_callback=self._record_preflight_event,
@@ -2315,6 +2664,8 @@ class FinishReviewWindow(PassageReviewDialog):
         stop_recording: bool = False,
         persist_settings: bool = True,
         update_workspace_root: bool = True,
+        preserve_cyclerace_receiver: bool = False,
+        reload_data_source: bool = False,
     ) -> bool:
         self._runtime_error = ""
         requested_output_dir = Path(settings.output_dir).expanduser().resolve()
@@ -2345,10 +2696,24 @@ class FinishReviewWindow(PassageReviewDialog):
             self.racetiger_token,
             self.racetiger_poll_interval_seconds,
         )
-        data_source_changed = output_changed or timing_changed or workspace_root_changed
-        receiver_restart_needed = data_source_changed or (
-            self.timing_provider == "racetiger" and racetiger_changed
+        data_source_changed = bool(
+            reload_data_source
+            or output_changed
+            or timing_changed
+            or workspace_root_changed
         )
+        preserve_running_receiver = bool(
+            preserve_cyclerace_receiver
+            and self.timing_provider == "cyclerace"
+            and next_timing_provider == "cyclerace"
+            and not workspace_root_changed
+            and self._receiver is not None
+            and self._receiver.is_running
+        )
+        receiver_restart_needed = (
+            data_source_changed
+            or (self.timing_provider == "racetiger" and racetiger_changed)
+        ) and not preserve_running_receiver
         prepared_data_source = None
         if data_source_changed:
             try:
@@ -2424,6 +2789,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self.stop_recording()
         if receiver_restart_needed:
             self.stop_receiver()
+        if data_source_changed:
             self._passage_batch_timer.stop()
             self._pending_passages.clear()
         self.source = str(settings.source).strip()
@@ -2495,19 +2861,20 @@ class FinishReviewWindow(PassageReviewDialog):
             self._received_event_order.clear()
             self._capture_error = ""
             self.refresh()
-            try:
-                self.start_receiver()
-            except Exception as exc:  # noqa: BLE001 - settings remain applied.
-                self._runtime_error = sanitize_recording_message(exc)
-                QMessageBox.warning(
-                    self,
-                    (
-                        "赛虎读取未启动"
-                        if self.timing_provider == "racetiger"
-                        else "CycleRace监听未启动"
-                    ),
-                    self._runtime_error,
-                )
+            if not preserve_running_receiver:
+                try:
+                    self.start_receiver()
+                except Exception as exc:  # noqa: BLE001 - settings remain applied.
+                    self._runtime_error = sanitize_recording_message(exc)
+                    QMessageBox.warning(
+                        self,
+                        (
+                            "赛虎读取未启动"
+                            if self.timing_provider == "racetiger"
+                            else "CycleRace监听未启动"
+                        ),
+                        self._runtime_error,
+                    )
             self._high_speed_catalog.set_cache_path(
                 output_dir / HIGH_SPEED_INDEX_FILENAME
             )
@@ -2668,7 +3035,12 @@ class FinishReviewWindow(PassageReviewDialog):
         if not group_name or group_name == "--":
             group_name = "全部组别"
         detail_parts = []
-        for value in (stage_label, group_name, "终点"):
+        context_values = (
+            ("历史复核", stage_label, group_name, "终点")
+            if self._workspace_mode == "archive"
+            else (stage_label, group_name, "终点")
+        )
+        for value in context_values:
             if value and value not in detail_parts:
                 detail_parts.append(value)
         detail_text = " · ".join(detail_parts)
@@ -2930,7 +3302,9 @@ class FinishReviewWindow(PassageReviewDialog):
                 else ""
             )
             event_state = (
-                "赛事已加载"
+                "历史赛事已打开"
+                if metadata is not None and self._workspace_mode == "archive"
+                else "赛事已加载"
                 if metadata is not None
                 else "等待 CycleRace 赛事信息"
             )
@@ -2955,6 +3329,8 @@ class FinishReviewWindow(PassageReviewDialog):
             "event_stage": event_stage,
             "event_dir": event_dir,
             "workspace_root": str(self.workspace_root),
+            "workspace_mode": self._workspace_mode,
+            "recording_active": "1" if self._recording_any_active() else "0",
         }
 
     def _preflight_evidence_status(
@@ -3080,6 +3456,8 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_runtime_status()
 
     def start_recording(self) -> None:
+        if self._workspace_mode == "archive":
+            raise RecordingError("历史赛事模式不能开始录像，请先返回当前赛事")
         if self._recording_all_active():
             return
         if self._recorders:
@@ -3248,12 +3626,19 @@ class FinishReviewWindow(PassageReviewDialog):
         self._published_keys.add(key)
         return True
 
-    def _activate_cyclerace_workspace(self, metadata: RaceMetadata) -> bool:
+    def _activate_cyclerace_workspace(
+        self,
+        metadata: RaceMetadata,
+        *,
+        force: bool = False,
+        preserve_cyclerace_receiver: bool = False,
+    ) -> bool:
         if self.timing_provider != "cyclerace" or self.metadata_store is None:
             return False
         current_metadata = self.metadata_store.current()
         if (
-            current_metadata is not None
+            not force
+            and current_metadata is not None
             and current_metadata.race_id == metadata.race_id
         ):
             self.metadata_store.store(metadata)
@@ -3286,13 +3671,23 @@ class FinishReviewWindow(PassageReviewDialog):
             stop_recording=recording_was_active,
             persist_settings=False,
             update_workspace_root=False,
+            preserve_cyclerace_receiver=preserve_cyclerace_receiver,
+            reload_data_source=force,
         )
+        if applied:
+            self._workspace_mode = "live"
+            self._archive_background_passage_count = 0
         if applied and recording_was_active:
             self._workspace_notice = "已切换新赛事，录像待重新开始"
         return applied
 
     def _on_passage_received(self, event: PassageEvent) -> None:
         if self.timing_provider == "cyclerace":
+            if self._workspace_mode == "archive":
+                self._archive_background_passage_count += 1
+                self._last_passage_monotonic = time.monotonic()
+                self._update_runtime_status()
+                return
             inbox_metadata = self._receiver_metadata_store.current()
             active_metadata = (
                 self.metadata_store.current()
@@ -3417,6 +3812,9 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_runtime_status()
 
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
+        if self._workspace_mode == "archive":
+            self._update_runtime_status()
+            return
         try:
             self._activate_cyclerace_workspace(metadata)
             self._capture_error = ""
@@ -3459,6 +3857,8 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _on_focus_received(self, focus: RaceFocus) -> None:
         self._pending_focus = focus
+        if self._workspace_mode == "archive":
+            return
         self._apply_pending_focus()
 
     def _apply_pending_focus(self) -> bool:
@@ -3687,7 +4087,10 @@ class FinishReviewWindow(PassageReviewDialog):
         self.camera_status_label.setToolTip(camera_tooltip)
         self.camera_status_label.setStyleSheet(f"color: {camera_color};")
 
-        if self._runtime_error and not recording_all_active:
+        if self._workspace_mode == "archive" and not recording_active:
+            recording_text, recording_color = "普通录像: 历史查看", "#667085"
+            recording_tooltip = "返回当前赛事后可开始录像"
+        elif self._runtime_error and not recording_all_active:
             recording_text, recording_color = "普通录像: 异常", "#b54747"
             recording_tooltip = self._runtime_error
         elif recording_all_active:
@@ -3706,10 +4109,21 @@ class FinishReviewWindow(PassageReviewDialog):
         self.recording_status_label.setText(recording_text)
         self.recording_status_label.setToolTip(recording_tooltip)
         self.recording_status_label.setStyleSheet(f"color: {recording_color};")
-        self.record_button.setText("停止录像" if recording_active else "开始录像")
+        self.record_button.setText(
+            "停止录像"
+            if recording_active
+            else "历史查看中"
+            if self._workspace_mode == "archive"
+            else "开始录像"
+        )
+        self.record_button.setEnabled(
+            recording_active or self._workspace_mode != "archive"
+        )
         self.record_button.setStyleSheet(
             "background: #a33d4b; color: white; border: 1px solid #a33d4b;"
             if recording_active
+            else "background: #eef1f4; color: #667085; border: 1px solid #cfd7df;"
+            if self._workspace_mode == "archive"
             else "background: #247a52; color: white; border: 1px solid #247a52;"
         )
 
@@ -3721,7 +4135,22 @@ class FinishReviewWindow(PassageReviewDialog):
                 else None
             )
             pending_count = len(self._pending_passages)
-            if pending_count:
+            if self._workspace_mode == "archive":
+                background_count = self._archive_background_passage_count
+                self.receiver_status_label.setStatus(
+                    "CycleRace: 后台监听，"
+                    + (
+                        f"已收到 {background_count} 条"
+                        if background_count
+                        else "当前查看历史赛事"
+                    ),
+                    "ready",
+                )
+                self.receiver_status_label.setStyleSheet("color: #247a52;")
+                self.receiver_status_label.setToolTip(
+                    "实时数据继续保存到独立收件箱，不会写入当前历史赛事目录。"
+                )
+            elif pending_count:
                 self.receiver_status_label.setStatus(
                     "CycleRace: 监听中，正在处理；"
                     f"本次收到 {self._received_passage_count} 条，待处理 {pending_count}",
@@ -4090,6 +4519,7 @@ class FinishReviewWindow(PassageReviewDialog):
 
 
 __all__ = [
+    "EventWorkspacePickerDialog",
     "FinishReviewLaunchDialog",
     "FinishReviewSettings",
     "FinishReviewWindow",

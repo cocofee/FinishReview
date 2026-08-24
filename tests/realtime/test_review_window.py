@@ -23,6 +23,10 @@ from PyQt5.QtWidgets import (
 from realtime import passage_review
 from realtime import review_window as review_window_module
 from realtime.auyat_rgb import AuyatScanResult
+from realtime.passage_evidence import (
+    REGULAR_SOURCE,
+    PassageEvidenceAssociationStore,
+)
 from realtime.passage_receiver import PassageEvent, PassageEventStore, RaceFocus
 from realtime.preflight import PreflightJournal, PreflightRun
 from realtime.race_metadata import (
@@ -543,6 +547,212 @@ def test_switching_cyclerace_event_exports_previous_review_summary(qapp, tmp_pat
     window.close()
 
 
+def test_saved_event_picker_filters_and_fits_laptop_screen(qapp, tmp_path):
+    current_dir = tmp_path / "当前赛事"
+    archive_dir = tmp_path / "历史赛事"
+    for path, race_id, race_name in (
+        (current_dir, "race-live", "当前城市赛"),
+        (archive_dir, "race-archive", "历史公路赛"),
+    ):
+        RaceMetadataStore(path / "cyclerace_race_metadata.json").store(
+            RaceMetadata(
+                race_id=race_id,
+                stage_id="stage-1",
+                revision=1,
+                emitted_at_ms=1,
+                race_name=race_name,
+                stage_name="终点",
+            )
+        )
+
+    dialog = review_window_module.EventWorkspacePickerDialog(
+        review_window_module.discover_event_workspaces(tmp_path),
+        current_dir=current_dir,
+    )
+
+    assert dialog.minimumSize().height() <= 500
+    assert dialog.table.rowCount() == 2
+    assert dialog.cancel_button.text() == "取消"
+    assert any(
+        dialog.table.item(row, 3).text() == "当前打开"
+        for row in range(dialog.table.rowCount())
+    )
+
+    dialog.search_edit.setText("历史")
+    qapp.processEvents()
+
+    visible_rows = [
+        row
+        for row in range(dialog.table.rowCount())
+        if not dialog.table.isRowHidden(row)
+    ]
+    assert len(visible_rows) == 1
+    assert dialog.table.item(visible_rows[0], 0).text() == "历史公路赛"
+    assert dialog.selected_path == archive_dir.resolve()
+    dialog.close()
+
+
+def test_opening_saved_event_isolates_live_data_and_returns_to_current_event(
+    qapp,
+    tmp_path,
+):
+    root = tmp_path / "events"
+    window = _window(root)
+    window.start_receiver()
+    initial_receiver = _FakeReceiver.instances[-1]
+    live_metadata = RaceMetadata(
+        race_id="race-live",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=1,
+        race_name="当前赛事",
+        stage_name="终点",
+    )
+    initial_receiver.deliver_metadata(live_metadata)
+    qapp.processEvents()
+    live_dir = window.output_dir
+    receiver = window._receiver
+    assert receiver is not None and receiver.is_running
+
+    archive_dir = root / "历史赛事"
+    archive_metadata = RaceMetadata(
+        race_id="race-archive",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=1,
+        race_name="历史赛事",
+        stage_name="终点",
+    )
+    RaceMetadataStore(archive_dir / "cyclerace_race_metadata.json").store(
+        archive_metadata
+    )
+    archive_event = _event(
+        event_id="archive-passage",
+        race_id=archive_metadata.race_id,
+    )
+    PassageEventStore(archive_dir / "cyclerace_passage_events.jsonl").append(
+        archive_event
+    )
+    PassageEvidenceAssociationStore(
+        archive_dir / "passage_evidence_associations.jsonl"
+    ).confirm(
+        passage_event_id=archive_event.event_id,
+        bib=archive_event.bib,
+        confirmed_source=REGULAR_SOURCE,
+        segment_id="archive-segment",
+        frame_index=12,
+        position_ms=480,
+        marker_x_normalized=0.5,
+        marker_y_normalized=0.5,
+        confirmed_at_ms=2_000,
+    )
+    video_path = archive_dir / "race_video" / "camera_01.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    VideoTimelineStore(archive_dir / "video_timeline.jsonl").add_completed_segment(
+        source_id="camera_01",
+        camera_index=1,
+        video_path=video_path,
+        media_started_at_ms=archive_event.timeline_timestamp_ms - 1_000,
+        media_duration_ms=4_000,
+        clock_source=DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="test",
+        race_id=archive_metadata.race_id,
+    )
+    saved_settings = []
+    window._settings_saver = saved_settings.append
+
+    assert window._open_saved_event_workspace(archive_dir)
+
+    assert window._workspace_mode == "archive"
+    assert window.output_dir == archive_dir.resolve()
+    assert window.passage_store.get(archive_event.event_id) == archive_event
+    assert window.association_store.get(
+        archive_event.event_id,
+        REGULAR_SOURCE,
+    ) is not None
+    assert len(window.timeline_store.segments()) == 1
+    assert window._receiver is receiver
+    assert receiver.is_running and not receiver.stopped
+    assert not window.record_button.isEnabled()
+    assert saved_settings == []
+
+    live_event = _event(event_id="live-passage", race_id=live_metadata.race_id)
+    receiver.deliver(live_event)
+    qapp.processEvents()
+
+    assert window._receiver_passage_store.get(live_event.event_id) == live_event
+    assert window.passage_store.get(live_event.event_id) is None
+    assert PassageEventStore(
+        archive_dir / "cyclerace_passage_events.jsonl"
+    ).get(live_event.event_id) is None
+    assert window.receiver_status_label.text() == (
+        "CycleRace: 后台监听，已收到 1 条"
+    )
+
+    updated_live_metadata = RaceMetadata(
+        race_id=live_metadata.race_id,
+        stage_id=live_metadata.stage_id,
+        revision=2,
+        emitted_at_ms=2,
+        race_name=live_metadata.race_name,
+        stage_name=live_metadata.stage_name,
+    )
+    receiver.deliver_metadata(updated_live_metadata)
+    qapp.processEvents()
+
+    assert window.output_dir == archive_dir.resolve()
+    assert window.metadata_store.current() == archive_metadata
+    assert window._receiver_metadata_store.current() == updated_live_metadata
+
+    assert window._return_to_live_event()
+
+    assert window._workspace_mode == "live"
+    assert window.output_dir == live_dir
+    assert window.metadata_store.current() == updated_live_metadata
+    assert window.passage_store.get(live_event.event_id) == live_event
+    assert window._receiver is receiver
+    assert receiver.is_running and not receiver.stopped
+    assert window.record_button.isEnabled()
+    assert saved_settings == []
+    window.close()
+
+
+def test_opening_saved_event_is_blocked_while_recording(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    archive_dir = tmp_path / "历史赛事"
+    RaceMetadataStore(archive_dir / "cyclerace_race_metadata.json").store(
+        RaceMetadata(
+            race_id="race-archive",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="历史赛事",
+            stage_name="终点",
+        )
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    window = _window(tmp_path)
+    window.start_recording()
+    original_dir = window.output_dir
+
+    assert not window._open_saved_event_workspace(archive_dir)
+
+    assert window.output_dir == original_dir
+    assert window._workspace_mode == "live"
+    assert warnings == [("无法打开赛事", "请先停止普通录像。")]
+    window.close()
+
+
 def test_closing_active_event_exports_review_summary(qapp, tmp_path):
     root = tmp_path / "events"
     window = _window(root)
@@ -874,9 +1084,9 @@ def test_event_settings_show_and_open_active_cyclerace_workspace(
     event_dir.mkdir()
     operations = []
     monkeypatch.setattr(
-        review_window_module.QDesktopServices,
-        "openUrl",
-        lambda url: operations.append(("open", Path(url.toLocalFile()))) or True,
+        review_window_module,
+        "_open_event_directory",
+        lambda path: operations.append(("open", path)) or True,
     )
     dialog = FinishReviewLaunchDialog(
         FinishReviewSettings(
@@ -910,6 +1120,23 @@ def test_event_settings_show_and_open_active_cyclerace_workspace(
         ("open", event_dir),
     ]
     dialog.close()
+
+
+def test_windows_event_directory_opens_in_a_new_explorer_window(
+    tmp_path,
+    monkeypatch,
+):
+    launched = []
+    monkeypatch.setattr(review_window_module, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        review_window_module.subprocess,
+        "Popen",
+        lambda command: launched.append(command),
+    )
+
+    assert review_window_module._open_event_directory(tmp_path)
+
+    assert launched == [["explorer.exe", "/n,", str(tmp_path)]]
 
 
 def test_device_settings_select_preinstalled_usb_camera_without_manual_ip(
