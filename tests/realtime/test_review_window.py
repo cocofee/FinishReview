@@ -1,3 +1,4 @@
+import csv
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -30,6 +31,7 @@ from realtime.race_metadata import (
     RaceMetadata,
     RaceMetadataStore,
 )
+from realtime.review_export import REVIEW_SUMMARY_FILENAME
 from realtime.review_recorder import make_directshow_source
 from realtime.review_window import (
     FinishReviewLaunchDialog,
@@ -506,6 +508,63 @@ def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
     assert event_dir == (root / "城市赛_race-new").resolve()
 
 
+def test_switching_cyclerace_event_exports_previous_review_summary(qapp, tmp_path):
+    root = tmp_path / "events"
+    window = _window(root)
+    first_metadata = RaceMetadata(
+        race_id="race-first",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=1,
+        race_name="第一场赛事",
+        stage_name="终点",
+    )
+    second_metadata = RaceMetadata(
+        race_id="race-second",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=2,
+        race_name="第二场赛事",
+        stage_name="终点",
+    )
+    assert window._activate_cyclerace_workspace(first_metadata)
+    window.passage_store.append(
+        _event(race_id="race-first", event_id="first-passage")
+    )
+    first_event_dir = window.output_dir
+
+    assert window._activate_cyclerace_workspace(second_metadata)
+
+    summary_path = first_event_dir / REVIEW_SUMMARY_FILENAME
+    assert summary_path.is_file()
+    with summary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[1][1:4] == ["15", "张三", "男子公开组"]
+    window.close()
+
+
+def test_closing_active_event_exports_review_summary(qapp, tmp_path):
+    root = tmp_path / "events"
+    window = _window(root)
+    metadata = RaceMetadata(
+        race_id="race-close",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=1,
+        race_name="退出导出赛事",
+        stage_name="终点",
+    )
+    assert window._activate_cyclerace_workspace(metadata)
+    window.passage_store.append(
+        _event(race_id="race-close", event_id="close-passage")
+    )
+    event_dir = window.output_dir
+
+    window.close()
+
+    assert (event_dir / REVIEW_SUMMARY_FILENAME).is_file()
+
+
 def test_runtime_status_keeps_high_speed_directory_health_when_event_selected(
     qapp,
     tmp_path,
@@ -813,11 +872,11 @@ def test_event_settings_show_and_open_active_cyclerace_workspace(
 ):
     event_dir = tmp_path / "2026 城市公路自行车赛"
     event_dir.mkdir()
-    opened = []
+    operations = []
     monkeypatch.setattr(
         review_window_module.QDesktopServices,
         "openUrl",
-        lambda url: opened.append(url.toLocalFile()) or True,
+        lambda url: operations.append(("open", Path(url.toLocalFile()))) or True,
     )
     dialog = FinishReviewLaunchDialog(
         FinishReviewSettings(
@@ -835,6 +894,7 @@ def test_event_settings_show_and_open_active_cyclerace_workspace(
             "event_stage": "第 1 赛段",
             "event_dir": str(event_dir),
         },
+        event_export_callback=lambda: operations.append(("export", event_dir)),
     )
 
     assert dialog.event_status_label.text() == "赛事已加载"
@@ -845,7 +905,10 @@ def test_event_settings_show_and_open_active_cyclerace_workspace(
 
     dialog._open_event_dir()
 
-    assert [Path(value) for value in opened] == [event_dir]
+    assert operations == [
+        ("export", event_dir),
+        ("open", event_dir),
+    ]
     dialog.close()
 
 

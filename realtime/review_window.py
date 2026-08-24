@@ -67,6 +67,7 @@ try:
     )
     from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
     from .race_metadata import RaceMetadata, RaceMetadataStore
+    from .review_export import export_review_summary
     from .review_recorder import (
         ArchiveTimelinePublisher,
         FfmpegReviewRecorder,
@@ -118,6 +119,7 @@ except ImportError:
     )
     from racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
     from race_metadata import RaceMetadata, RaceMetadataStore
+    from review_export import export_review_summary
     from review_recorder import (
         ArchiveTimelinePublisher,
         FfmpegReviewRecorder,
@@ -408,6 +410,7 @@ class FinishReviewLaunchDialog(QDialog):
         evidence_provider: Callable[[PassageEvent], tuple[bool, bool, str, str]]
         | None = None,
         runtime_snapshot_provider: Callable[[], dict[str, str]] | None = None,
+        event_export_callback: Callable[[], object] | None = None,
         recheck_callback: Callable[[], None] | None = None,
         recording_start_callback: Callable[[], bool] | None = None,
         preflight_event_callback: Callable[[PreflightRun], None] | None = None,
@@ -459,6 +462,7 @@ class FinishReviewLaunchDialog(QDialog):
             lambda _event: (False, False, "等待普通录像", "等待高速画面")
         )
         self._runtime_snapshot_provider = runtime_snapshot_provider or (lambda: {})
+        self._event_export_callback = event_export_callback
         self._recheck_callback = recheck_callback
         self._recording_start_callback = recording_start_callback or (lambda: True)
         self._preflight_event_callback = preflight_event_callback
@@ -1568,6 +1572,16 @@ class FinishReviewLaunchDialog(QDialog):
         if event_dir is None or not event_dir.is_dir():
             QMessageBox.warning(self, "赛事目录不可用", "当前赛事目录尚未创建")
             return
+        if self._event_export_callback is not None:
+            try:
+                self._event_export_callback()
+            except Exception as error:  # noqa: BLE001 - opening the directory must continue.
+                logger.exception("Failed to update the event review summary")
+                QMessageBox.warning(
+                    self,
+                    "复核清单未更新",
+                    f"无法更新终点复核清单：{error}\n仍将打开赛事目录。",
+                )
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(event_dir))):
             QMessageBox.warning(self, "无法打开赛事目录", str(event_dir))
 
@@ -2259,6 +2273,9 @@ class FinishReviewWindow(PassageReviewDialog):
             passage_provider=lambda: self.passage_store.events(),
             evidence_provider=self._preflight_evidence_status,
             runtime_snapshot_provider=self._deployment_runtime_snapshot,
+            event_export_callback=lambda: self._export_review_summary(
+                show_warning=True
+            ),
             recheck_callback=self._recheck_connections,
             recording_start_callback=self._start_preflight_recording,
             preflight_event_callback=self._record_preflight_event,
@@ -3242,6 +3259,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self.metadata_store.store(metadata)
             return False
 
+        self._export_review_summary()
         target_dir = _event_workspace_dir(self.workspace_root, metadata)
         target_dir.mkdir(parents=True, exist_ok=True)
         target_metadata_store = RaceMetadataStore(
@@ -3465,6 +3483,29 @@ class FinishReviewWindow(PassageReviewDialog):
         if metadata is not None:
             return metadata.race_id
         return race_id_from_passage_store(self.passage_store)
+
+    def _export_review_summary(self, *, show_warning: bool = False) -> Path | None:
+        metadata = self._current_metadata()
+        if self.timing_provider == "cyclerace" and metadata is None:
+            return None
+        if self.timing_provider == "racetiger" and not self.racetiger_rid:
+            return None
+        try:
+            return export_review_summary(
+                self.output_dir,
+                self._events_for_current_metadata(self.passage_store.events()),
+                self.association_store,
+                metadata,
+            )
+        except Exception as error:  # noqa: BLE001 - review operation must not be blocked.
+            logger.exception("Failed to export the event review summary")
+            if show_warning:
+                QMessageBox.warning(
+                    self,
+                    "复核清单未更新",
+                    f"无法更新终点复核清单：{error}",
+                )
+            return None
 
     def _events_for_current_metadata(
         self,
@@ -4044,6 +4085,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self.setWindowTitle("FinishReview · 终点多源复核 - 正在停止高速目录扫描")
             QTimer.singleShot(100, self.close)
             return
+        self._export_review_summary()
         super().closeEvent(event)
 
 
