@@ -61,8 +61,14 @@ def test_distribution_check_rejects_known_non_project_dependencies():
         ROOT / "packaging" / "assert_clean_distribution.ps1"
     ).read_text(encoding="utf-8")
 
-    assert '"psutil"' in clean_check
-    assert '"pyreadline3"' in clean_check
+    for dependency_name in (
+        "coverage",
+        "psutil",
+        "pyreadline3",
+        "ruff",
+        "tomli",
+    ):
+        assert f'"{dependency_name}"' in clean_check
     assert "Distribution contains unexpected dependencies" in clean_check
 
 

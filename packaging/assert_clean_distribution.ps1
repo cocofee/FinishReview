@@ -13,8 +13,11 @@ $ForbiddenRelativePaths = @(
     "global_config.json"
 )
 $ForbiddenDependencyNames = @(
+    "coverage",
     "psutil",
-    "pyreadline3"
+    "pyreadline3",
+    "ruff",
+    "tomli"
 )
 
 $Found = @(

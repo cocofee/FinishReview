@@ -91,7 +91,11 @@ from .stream_recorder import (
     sanitize_recording_message,
     split_rtsp_credentials,
 )
-from .video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
+from .video_timeline import (
+    DEFAULT_CLOCK_SOURCE,
+    DEFAULT_TIMING_ERROR_MS,
+    VideoTimelineStore,
+)
 from .video_playback import VideoPlaybackDialog
 
 

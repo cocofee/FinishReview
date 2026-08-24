@@ -17,8 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "coverage[toml]>=7.15,<8",
     "pyinstaller>=6,<7",
     "pytest>=8,<10",
+    "ruff>=0.16,<1",
 ]
 
 [project.scripts]
@@ -30,3 +32,17 @@ include = ["realtime*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.coverage.run]
+branch = true
+source = ["realtime"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

@@ -21,13 +21,17 @@ CycleRace / RaceTiger 过线事件接入、奥亚特高速相机文件读取和�
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]" -c constraints-dev.txt
+.\.venv\Scripts\python -m ruff check realtime tests tools
 .\.venv\Scripts\python -m pytest -q --basetemp .pytest_tmp_finish_review
+.\.venv\Scripts\python -m coverage run -m pytest -q --basetemp .pytest_tmp_coverage
+.\.venv\Scripts\python -m coverage report
 .\.venv\Scripts\python -m realtime.review_main
 ```
 
 `constraints-dev.txt` 固定了已验证的 Windows 开发与打包依赖版本。CI 在 Python 3.10
 和 Python 3.12 上执行同一套安装、编译和测试命令，并在 Python 3.12 上构建发布包及
-执行打包后 EXE 冒烟检查。
+执行打包后 EXE 冒烟检查。Ruff 只阻断未定义名称、局部变量先引用以及明确的语法和
+控制流错误；coverage 只报告当前覆盖率，不设置发布门槛。
 
 系统需要可用的 FFmpeg。可以把 `ffmpeg.exe` 放在程序目录，加入 `PATH`，或设置：
 

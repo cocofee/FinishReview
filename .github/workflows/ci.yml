@@ -28,8 +28,14 @@ jobs:
       - name: Compile sources
         run: python -m compileall -q realtime tests
 
-      - name: Run tests
-        run: python -m pytest -q --basetemp .pytest_tmp_ci
+      - name: Lint critical errors
+        run: python -m ruff check realtime tests tools
+
+      - name: Run tests with coverage
+        run: |
+          python -m coverage erase
+          python -m coverage run -m pytest -q --basetemp .pytest_tmp_ci
+          python -m coverage report
 
   package:
     runs-on: windows-latest

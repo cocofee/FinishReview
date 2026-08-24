@@ -1676,6 +1676,34 @@ def test_existing_timeline_evidence_is_counted_after_reopening(qapp, tmp_path):
     window.close()
 
 
+def test_preflight_evidence_accepts_default_clock_recording(qapp, tmp_path):
+    window = _window(tmp_path)
+    event = _event()
+    video_path = tmp_path / "race_video" / "camera_01.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    window.timeline_store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=video_path,
+        media_started_at_ms=event.timeline_timestamp_ms - 1_000,
+        media_duration_ms=4_000,
+        clock_source=DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="archive_segment",
+        race_id=event.race_id,
+    )
+
+    regular_ready, high_speed_ready, regular_detail, _high_speed_detail = (
+        window._preflight_evidence_status(event)
+    )
+
+    assert regular_ready
+    assert not high_speed_ready
+    assert regular_detail == "普通录像全部机位已覆盖测试时间点"
+    window.close()
+
+
 def test_formal_window_opens_point_playback_around_current_selected_time(
     qapp,
     tmp_path,

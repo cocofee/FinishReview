@@ -12,7 +12,10 @@ pyinstaller-hooks-contrib==2026.6
 pywin32-ctypes==0.2.3; sys_platform == "win32"
 setuptools==80.9.0
 pytest==9.0.2
+coverage==7.15.4
+ruff==0.16.4
 colorama==0.4.6; sys_platform == "win32"
 iniconfig==2.3.0
 pluggy==1.6.0
 Pygments==2.19.2
+tomli==2.2.1; python_version < "3.11"

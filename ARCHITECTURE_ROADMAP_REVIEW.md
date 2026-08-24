@@ -471,3 +471,29 @@ artifacts\dist\FinishReviewConsole\FinishReviewConsole.exe --smoke-test
 - `Hidden import "sip" not found!`：仍为已知非阻断告警。
 
 仍未覆盖真实 USB/RTSP 断线、网络抖动、磁盘不足和数小时录像；后台自动重连继续等待现场基线，不把单元测试中的 fake recorder 结果当作设备验收结论。
+
+## 十、静态检查与覆盖率基线（2026-08-24）
+
+### 本阶段范围
+
+在现场设备前置条件尚未满足时，先建立窄范围静态门禁和 coverage 报告。Ruff 只启用 `E9`、`F63`、`F7`、`F82`，用于阻断未定义名称、局部变量先引用以及明确的语法和控制流错误；不把无效导入、未使用变量或风格规则纳入当前阻断范围。coverage 记录分支覆盖率并显示缺失行，但不设置 `fail_under`，避免用缺少历史基线的门槛阻断交付。
+
+### 发现并修复
+
+1. **预检证据路径运行缺陷：** `realtime/review_window.py::_preflight_evidence_status()` 使用了未导入的 `DEFAULT_CLOCK_SOURCE`。已有测试未调用该分支，真实联调预检在找到普通录像证据后会触发 `NameError`。现已补充明确导入，并新增 `tests/realtime/test_review_window.py::test_preflight_evidence_accepts_default_clock_recording`；该测试在修复前稳定失败，修复后通过。
+2. **静态门禁范围：** 首次宽规则扫描还报告了无效导入、未使用变量和 lambda 风格问题；这些不属于当前必须阻断的正确性缺陷，因此没有为了启用工具而保留无关生产代码改写。
+3. **开发依赖与 CI：** `pyproject.toml` 和 `constraints-dev.txt` 增加 Ruff 0.16.4、coverage 7.15.4；CI 在 Python 3.10/3.12 上先运行窄范围 Ruff 门禁，再通过 coverage 执行现有 pytest 并输出报告。
+4. **发布边界：** Ruff、coverage 和 Python 3.10 所需的 tomli 仅属于开发依赖；`assert_clean_distribution.ps1` 和 packaging contract 测试持续禁止这些工具进入发布目录。
+
+### 验证结果
+
+- Ruff：`All checks passed!`。
+- 全量 pytest（coverage 下运行）：`322 passed in 10.18s`。
+- 分支覆盖率基线：总计 `78%`，仅用于观察趋势，当前不作为质量门槛。
+- `compileall`、`pip check`、`git diff --check`：通过。
+- PyInstaller clean build及发布边界检查：通过，209 个文件，460,387,081 bytes。
+- 发布目录开发工具扫描：Ruff、coverage、tomli 文件数为 0。
+- EXE smoke test：退出码 0。
+- `Hidden import "sip" not found!`：仍为已知非阻断告警。
+
+本阶段没有运行 Python 3.10 本地测试，跨版本结果仍由 GitHub Actions 验证；也没有因为首次 coverage 数据低于某个百分比而补写低价值测试或设置硬门槛。
