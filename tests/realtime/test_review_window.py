@@ -1,6 +1,7 @@
 import csv
 import os
 import time
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
@@ -465,7 +466,10 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     active_receiver.deliver(event)
     qapp.processEvents()
 
-    assert window.passage_store.get(event.event_id) == event
+    stored_event = window.passage_store.get(event.event_id)
+    assert stored_event is not None
+    assert stored_event.received_at_ms > 0
+    assert replace(stored_event, received_at_ms=0) == event
     assert window.passage_store.journal_path.parent == event_dir.resolve()
     snapshot = window._deployment_runtime_snapshot()
     assert snapshot["event_state"] == "赛事已加载"
@@ -481,7 +485,7 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     restored = _window(root)
     assert restored.output_dir == event_dir.resolve()
     assert restored.metadata_store.current() == metadata
-    assert restored.passage_store.get(event.event_id) == event
+    assert restored.passage_store.get(event.event_id) == stored_event
     restored.close()
 
 
@@ -826,6 +830,71 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     qapp.processEvents()
     assert recorder.stopped
     assert receiver.stopped
+
+
+def test_live_passage_shows_preview_before_full_post_roll_is_ready(
+    qapp,
+    tmp_path,
+):
+    class _PreviewRecorder(_FakeRecorder):
+        def start(self):
+            playlist = super().start()
+            self._complete_playlist = playlist.read_text(encoding="utf-8")
+            lines = self._complete_playlist.splitlines()
+            playlist.write_text(
+                "\n".join(lines[:-3]) + "\n",
+                encoding="utf-8",
+            )
+            self.playlist = playlist
+            return playlist
+
+        def seal_post_roll(self):
+            self.playlist.write_text(
+                self._complete_playlist,
+                encoding="utf-8",
+            )
+
+    _FakeRecorder.instances.clear()
+    _FakeReceiver.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        passage_batch_interval_ms=0,
+        recorder_factory=_PreviewRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start()
+    _FakeReceiver.instances[-1].deliver(_event())
+    qapp.processEvents()
+
+    preview_location = window.regular_pane.location
+    assert preview_location is not None
+    assert preview_location.status == "preview"
+    assert preview_location.segment.end_reason == "passage_review_preview"
+    assert preview_location.video_path.name.startswith("preview_")
+    assert window.regular_pane.status_label.text() == "录像处理中"
+    assert window.timeline_store.segments() == ()
+    group_index = window.group_combo.findData("men-open")
+    assert group_index >= 0
+    window.group_combo.setCurrentIndex(group_index)
+    qapp.processEvents()
+    assert window.regular_pane.location.status == "preview"
+
+    recorder = _FakeRecorder.instances[-1]
+    recorder.seal_post_roll()
+    window._refresh_capture_windows()
+    qapp.processEvents()
+
+    final_location = window.regular_pane.location
+    assert final_location is not None
+    assert final_location.status == "located"
+    assert final_location.segment.end_reason == "passage_review_window"
+    assert final_location.video_path.name.startswith("evidence_")
+    assert final_location.video_path != preview_location.video_path
+    assert len(window.timeline_store.segments()) == 1
+    window.close()
 
 
 def test_received_passage_uses_incremental_table_refresh(
@@ -1696,7 +1765,19 @@ def test_live_evidence_date_aligns_without_changing_formal_passage_time(
     event = _event(
         event_id="date-alignment-event",
         passage_timestamp_ms=formal_timestamp_ms,
-        emitted_at_ms=received_at_ms,
+        emitted_at_ms=int(
+            datetime(
+                2026,
+                8,
+                22,
+                18,
+                15,
+                24,
+                tzinfo=timezone(timedelta(hours=8)),
+            ).timestamp()
+            * 1000
+        ),
+        received_at_ms=received_at_ms,
     )
     window = _window(tmp_path)
 
@@ -1704,6 +1785,7 @@ def test_live_evidence_date_aligns_without_changing_formal_passage_time(
     window._passage_batch_timer.stop()
 
     assert event.timeline_timestamp_ms == formal_timestamp_ms
+    assert window.passage_store.get(event.event_id).received_at_ms == received_at_ms
     assert window._evidence_timestamp(event) == int(
         datetime(2026, 8, 23, 8, 41, 20, tzinfo=timezone(timedelta(hours=8))).timestamp()
         * 1000
@@ -1738,7 +1820,19 @@ def test_evidence_date_alignment_survives_reopening(qapp, tmp_path):
     event = _event(
         event_id="restart-date-alignment-event",
         passage_timestamp_ms=int(formal_time.timestamp() * 1000),
-        emitted_at_ms=int(evidence_time.timestamp() * 1000) + 1_000,
+        emitted_at_ms=int(
+            datetime(
+                2026,
+                8,
+                22,
+                18,
+                15,
+                24,
+                tzinfo=timezone(timedelta(hours=8)),
+            ).timestamp()
+            * 1000
+        ),
+        received_at_ms=int(evidence_time.timestamp() * 1000) + 1_000,
     )
     PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl").append(event)
     video_path = tmp_path / "videos" / "camera_01.mkv"

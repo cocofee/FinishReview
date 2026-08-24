@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -17,7 +18,11 @@ from realtime.passage_evidence import (
     PassageEvidenceAssociationStore,
 )
 from realtime.passage_receiver import PassageEvent, PassageEventStore
-from realtime.passage_review import PassageReviewDialog, lookup_status_text
+from realtime.passage_review import (
+    PassageEvidencePane,
+    PassageReviewDialog,
+    lookup_status_text,
+)
 from realtime.race_metadata import (
     RaceAthleteMetadata,
     RaceGroupMetadata,
@@ -486,9 +491,12 @@ def test_review_shows_missing_evidence_without_starting_workers(qapp, tmp_path):
     assert dialog.table.item(0, 8).text() == "未确认"
     assert dialog.regular_pane._worker is None
     assert dialog.high_speed_pane._worker is None
-    assert dialog.regular_pane.status_label.text() == "未确认"
-    assert dialog.high_speed_pane.status_label.text() == "未确认"
-    assert dialog.regular_pane.video_view._message_item.toPlainText() == "暂无普通录像"
+    assert dialog.regular_pane.status_label.text() == "无录像"
+    assert dialog.high_speed_pane.status_label.text() == "未提供"
+    assert (
+        dialog.regular_pane.video_view._message_item.toPlainText()
+        == "当前赛事没有普通录像"
+    )
     assert dialog.high_speed_pane.video_view._message_item.toPlainText() == "暂无高速画面"
     assert (
         dialog.regular_pane.video_view._message_item.defaultTextColor().name()
@@ -518,13 +526,88 @@ def test_review_shows_active_recording_as_waiting(qapp, tmp_path):
     assert dialog.table.item(0, 6).text() == "未确认"
     assert dialog.table.item(0, 6).foreground().color().name() == "#c0372b"
     assert dialog.table.item(0, 7).text() == "未确认"
-    assert dialog.regular_pane.status_label.text() == "未确认"
-    assert dialog.regular_pane.video_view._message_item.toPlainText() == "等待普通录像"
+    assert dialog.regular_pane.status_label.text() == "录像处理中"
+    assert (
+        dialog.regular_pane.video_view._message_item.toPlainText()
+        == "普通录像正在录制，等待片段封口"
+    )
     assert (
         dialog.regular_pane.video_view._message_item.defaultTextColor().name()
         == "#c9d2dc"
     )
     assert dialog.regular_pane._worker is None
+    dialog.close()
+
+
+def test_preview_is_playable_but_cannot_be_confirmed(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    event = _event(passage_time_ms=15_000)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "review_buffer" / "preview.m3u8",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    location = timeline_store.locate_passage(15_000).locations[0]
+    preview_location = replace(
+        location,
+        segment=replace(
+            location.segment,
+            end_reason="passage_review_preview",
+        ),
+        status="preview",
+    )
+    pane = PassageEvidencePane("普通录像", REGULAR_SOURCE)
+
+    pane.set_passage(event, preview_location, lookup_status="preview")
+    worker = fake_playback.instances[-1]
+    image = QImage(640, 360, QImage.Format_RGB888)
+    image.fill(0)
+    worker.frame_ready.emit(image, 5_000, 250)
+    qapp.processEvents()
+
+    assert pane.status_label.text() == "录像处理中"
+    assert "完整证据处理中" in pane.status_label.toolTip()
+    assert pane.play_btn.isEnabled()
+    assert not pane.mark_btn.isEnabled()
+    assert not pane.open_btn.isEnabled()
+    pane._pending_marker = (0.5, 0.5, 250, 5_000)
+    assert pane.pending_confirmation() is None
+    worker.playback_error.emit("preview decode failed")
+    qapp.processEvents()
+    assert not pane.open_btn.isEnabled()
+    pane.close()
+
+
+def test_review_distinguishes_unlocated_time_from_missing_recording(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=5_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+
+    assert dialog._lookups["passage-1"].status == "before_recording"
+    assert dialog.regular_pane.status_label.text() == "未定位"
+    assert (
+        dialog.regular_pane.video_view._message_item.toPlainText()
+        == "未定位到对应普通录像"
+    )
+    assert dialog.regular_pane.status_label.toolTip() == "早于录像"
     dialog.close()
 
 
@@ -1027,6 +1110,8 @@ def test_focus_athlete_without_passage_clears_stale_video_and_shows_roster(
     assert dialog.selected_time_value.text() == "尚无通过记录"
     assert dialog.regular_pane._event is None
     assert dialog.high_speed_pane._event is None
+    assert dialog.identity_search.text() == ""
+    assert dialog.table.rowCount() == 1
     dialog.close()
 
 
@@ -1171,6 +1256,58 @@ def test_zoom_requests_full_resolution_without_replacing_the_worker(
     assert worker.full_resolution_calls[-1] == 250
     assert dialog.regular_pane.video_view.zoom_percent == 100
     assert dialog.regular_pane.video_view.sceneRect().width() == 2560
+    dialog.close()
+
+
+def test_timeline_drag_seeks_video_before_mouse_release(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.resize(1_200, 800)
+    dialog.show()
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    worker = fake_playback.instances[0]
+    worker.seek_calls.clear()
+    timeline_y = pane.timeline.height() // 2
+
+    QTest.mousePress(
+        pane.timeline,
+        Qt.LeftButton,
+        pos=QPoint(pane.timeline.width() // 4, timeline_y),
+    )
+    QTest.mouseMove(
+        pane.timeline,
+        QPoint(pane.timeline.width() * 3 // 4, timeline_y),
+        delay=10,
+    )
+    qapp.processEvents()
+
+    assert pane._timeline_dragging
+    assert worker.seek_calls
+    assert worker.seek_calls[-1] == pane.timeline.value()
+    assert "Δ" in pane.time_label.text()
+
+    QTest.mouseRelease(
+        pane.timeline,
+        Qt.LeftButton,
+        pos=QPoint(pane.timeline.width() * 3 // 4, timeline_y),
+    )
+    qapp.processEvents()
+    assert not pane._timeline_dragging
     dialog.close()
 
 

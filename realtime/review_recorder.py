@@ -52,6 +52,7 @@ DEFAULT_REVIEW_RETENTION_SECONDS = 360
 DEFAULT_REVIEW_PRE_ROLL_SECONDS = 3
 DEFAULT_REVIEW_POST_ROLL_SECONDS = 3
 DEFAULT_ARCHIVE_TIMING_ERROR_MS = 3_000
+_HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS = 5
 ARCHIVE_SESSION_SCHEMA_VERSION = 1
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 _DIRECTSHOW_SCHEME = "dshow"
@@ -1036,13 +1037,29 @@ class PassageReviewCoordinator:
         segments: tuple[ReviewSegment, ...],
         *,
         started_at_ms: int,
+        passage_timestamp_ms: int,
         ended_at_ms: int,
     ) -> bool:
         cursor = started_at_ms
+        coverage_started = False
         for segment in segments:
             if segment.ended_at_ms < cursor:
                 continue
-            if segment.started_at_ms > cursor:
+            if not coverage_started:
+                # Recorder startup can make part of the requested pre-roll
+                # unavailable. The passage itself and the full post-roll are
+                # mandatory; missing only the leading pre-roll is acceptable.
+                if (
+                    segment.started_at_ms
+                    > passage_timestamp_ms
+                    + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS
+                ):
+                    return False
+                coverage_started = True
+            elif (
+                segment.started_at_ms
+                > cursor + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS
+            ):
                 return False
             cursor = max(cursor, segment.ended_at_ms)
             if cursor >= ended_at_ms:
@@ -1080,6 +1097,7 @@ class PassageReviewCoordinator:
         elif self._covers_window(
             current_segments,
             started_at_ms=window.started_at_ms,
+            passage_timestamp_ms=window.passage_timestamp_ms,
             ended_at_ms=window.ended_at_ms,
         ):
             state = PassageReviewState.READY
@@ -1120,7 +1138,7 @@ class PassageReviewCoordinator:
 
 
 class PassageReviewTimelinePublisher:
-    """Publish one sealed passage window as a short playable HLS timeline."""
+    """Publish preview and sealed passage windows as playable HLS timelines."""
 
     def __init__(
         self,
@@ -1132,11 +1150,17 @@ class PassageReviewTimelinePublisher:
         self.ring_buffer = ring_buffer
         self.timeline_store = timeline_store
         self.timing_error_ms = max(0, int(timing_error_ms))
+        self._preview_segments: dict[tuple[str, int], RecordingSegment] = {}
 
     @staticmethod
     def _playlist_name(window: PassageReviewWindow) -> str:
         digest = hashlib.sha256(window.event_id.encode("utf-8")).hexdigest()[:16]
         return f"evidence_{digest}_{window.passage_timestamp_ms}.m3u8"
+
+    @staticmethod
+    def _preview_playlist_name(window: PassageReviewWindow) -> str:
+        digest = hashlib.sha256(window.event_id.encode("utf-8")).hexdigest()[:16]
+        return f"preview_{digest}_{window.passage_timestamp_ms}.m3u8"
 
     @staticmethod
     def _published_pin_id(window: PassageReviewWindow) -> str:
@@ -1195,6 +1219,78 @@ class PassageReviewTimelinePublisher:
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary_path, path)
+
+    @staticmethod
+    def _segments_for_preview(
+        window: PassageReviewWindow,
+    ) -> tuple[ReviewSegment, ...]:
+        ordered = tuple(
+            sorted(
+                window.segments,
+                key=lambda item: (item.started_at_ms, item.segment_id),
+            )
+        )
+        covering_indexes = [
+            index
+            for index, segment in enumerate(ordered)
+            if segment.started_at_ms
+            <= window.passage_timestamp_ms
+            <= segment.ended_at_ms
+        ]
+        if not covering_indexes:
+            return ()
+        start_index = covering_indexes[-1]
+        while start_index > 0:
+            previous = ordered[start_index - 1]
+            current = ordered[start_index]
+            if (
+                previous.ended_at_ms + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS
+                < current.started_at_ms
+            ):
+                break
+            start_index -= 1
+        return ordered[start_index : covering_indexes[-1] + 1]
+
+    def preview(
+        self,
+        window: PassageReviewWindow,
+        *,
+        race_id: str,
+    ) -> RecordingSegment | None:
+        """Return a read-only preview once the passage segment is sealed."""
+
+        key = (window.event_id, window.passage_timestamp_ms)
+        existing = self._preview_segments.get(key)
+        if existing is not None:
+            return existing
+        segments = self._segments_for_preview(window)
+        if not segments:
+            return None
+        playlist_path = (
+            self.ring_buffer.buffer_dir / self._preview_playlist_name(window)
+        )
+        self._write_playlist(playlist_path, segments)
+        media_started_at_ms = segments[0].started_at_ms
+        media_duration_ms = segments[-1].ended_at_ms - media_started_at_ms
+        digest = hashlib.sha256(
+            f"{window.event_id}:{window.passage_timestamp_ms}".encode("utf-8")
+        ).hexdigest()[:20]
+        preview = RecordingSegment(
+            segment_id=f"preview-{digest}",
+            source_id=self.ring_buffer.source_id,
+            camera_index=self.ring_buffer.camera_index,
+            video_path=str(playlist_path.resolve()),
+            started_at_ms=media_started_at_ms,
+            ended_at_ms=media_started_at_ms + media_duration_ms,
+            media_duration_ms=media_duration_ms,
+            media_started_at_ms=media_started_at_ms,
+            clock_source=DEFAULT_CLOCK_SOURCE,
+            timing_error_ms=self.timing_error_ms,
+            end_reason="passage_review_preview",
+            race_id=str(race_id),
+        )
+        self._preview_segments[key] = preview
+        return preview
 
     def publish(
         self,

@@ -101,19 +101,22 @@ _STATUS_TEXT = {
     "race_mismatch": "录像属于其他赛事",
     "near_boundary": "位于时间误差边界，可打开核验",
     "recording": "对应机位仍在录像",
+    "preview": "预览可用，完整证据仍在处理中",
     "missing_file": "录像文件缺失",
     "unverified": "录像可打开，但时间范围未验证",
     "outside_media": "Passage 超出录像真实媒体范围",
 }
 
-_OPENABLE_STATUSES = {"located", "near_boundary", "unverified"}
+_CONFIRMABLE_STATUSES = {"located", "near_boundary", "unverified"}
+_OPENABLE_STATUSES = _CONFIRMABLE_STATUSES | {"preview"}
 _STATUS_PRIORITY = {
     "located": 0,
-    "near_boundary": 1,
-    "unverified": 2,
-    "recording": 3,
-    "missing_file": 4,
-    "outside_media": 5,
+    "preview": 1,
+    "near_boundary": 2,
+    "unverified": 3,
+    "recording": 4,
+    "missing_file": 5,
+    "outside_media": 6,
 }
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 UI_FONT_FAMILY = "Microsoft YaHei UI"
@@ -182,6 +185,8 @@ def location_status_text(location: PassageVideoLocation) -> str:
         return f"误差边界 · {position} · ±{location.timing_error_ms} ms"
     if location.status == "unverified":
         return f"可打开 · 时间范围未验证 · {position}"
+    if location.status == "preview":
+        return f"快速预览 · {position} · 完整证据处理中"
     return _STATUS_TEXT.get(location.status, location.status)
 
 
@@ -233,7 +238,7 @@ def combined_review_status(
     high_speed: Optional[PassageVideoLocation],
 ) -> str:
     if any(
-        location is not None and location.status in _OPENABLE_STATUSES
+        location is not None and location.status in _CONFIRMABLE_STATUSES
         for location in (regular, high_speed)
     ):
         return "待核对"
@@ -807,6 +812,11 @@ class PassageEvidencePane(QFrame):
     STATUS_COLORS = {
         "已确认": "#16845b",
         "未确认": "#c0372b",
+        "录像处理中": "#a56300",
+        "未定位": "#a56300",
+        "无录像": "#c0372b",
+        "文件缺失": "#c0372b",
+        "未提供": "#667085",
         "未选择": "#667085",
     }
 
@@ -817,6 +827,7 @@ class PassageEvidencePane(QFrame):
         self.source_kind = source_kind
         self._event: Optional[PassageEvent] = None
         self._location: Optional[PassageVideoLocation] = None
+        self._lookup_status = ""
         self._association: Optional[PassageEvidenceAssociation] = None
         self._pending_marker: Optional[tuple[float, float, int, int]] = None
         self._marking_enabled = False
@@ -895,6 +906,7 @@ class PassageEvidencePane(QFrame):
         self.timeline.setRange(0, 0)
         self.timeline.setEnabled(False)
         self.timeline.sliderPressed.connect(self._on_timeline_pressed)
+        self.timeline.sliderMoved.connect(self._on_timeline_moved)
         self.timeline.sliderReleased.connect(self._on_timeline_released)
         layout.addWidget(self.timeline)
 
@@ -981,7 +993,12 @@ class PassageEvidencePane(QFrame):
         )
 
     def begin_marking(self) -> None:
-        if self._worker is None or not self.video_view.has_frame:
+        if (
+            self._worker is None
+            or not self.video_view.has_frame
+            or self._location is None
+            or self._location.status not in _CONFIRMABLE_STATUSES
+        ):
             return
         self._marking_enabled = True
         self._playing = False
@@ -993,7 +1010,11 @@ class PassageEvidencePane(QFrame):
 
     def cancel_marker_edit(self) -> None:
         self._pending_marker = None
-        self._marking_enabled = self._association is None
+        self._marking_enabled = (
+            self._association is None
+            and self._location is not None
+            and self._location.status in _CONFIRMABLE_STATUSES
+        )
         self.mark_btn.setText("重标" if self._association is not None else "标线")
         self.video_view.set_marker_mode(
             self.video_view.has_frame and self._marking_enabled
@@ -1006,7 +1027,11 @@ class PassageEvidencePane(QFrame):
     ) -> None:
         self._association = association
         self._pending_marker = None
-        self._marking_enabled = association is None
+        self._marking_enabled = (
+            association is None
+            and self._location is not None
+            and self._location.status in _CONFIRMABLE_STATUSES
+        )
         self.video_view.set_marker_mode(
             self.video_view.has_frame and self._marking_enabled
         )
@@ -1017,7 +1042,11 @@ class PassageEvidencePane(QFrame):
     def pending_confirmation(self) -> Optional[dict[str, object]]:
         location = self._location
         marker = self._pending_marker
-        if location is None or marker is None:
+        if (
+            location is None
+            or location.status not in _CONFIRMABLE_STATUSES
+            or marker is None
+        ):
             return None
         x_normalized, y_normalized, frame_index, position_ms = marker
         return {
@@ -1062,13 +1091,31 @@ class PassageEvidencePane(QFrame):
         self._render_marker()
 
     def _update_status_label(self) -> None:
-        status = source_confirmation_status(self._location, self._association)
+        status = self._availability_status()
         detail = ""
         if self._location is not None:
             detail = location_status_text(self._location)
         if self._association is not None:
             detail = f"{detail} · 已标记 {self._identity}" if detail else "已标记"
         self._set_status_label(status, detail)
+
+    def _availability_status(self) -> str:
+        if self._association is not None:
+            return "已确认"
+        location = self._location
+        if location is not None and location.status == "preview":
+            return "录像处理中"
+        if location is not None and location.status in _OPENABLE_STATUSES:
+            return "未确认"
+        if location is not None and location.status == "recording":
+            return "录像处理中"
+        if location is not None and location.status == "missing_file":
+            return "文件缺失"
+        if self.source_kind == HIGH_SPEED_SOURCE and location is None:
+            return "未提供"
+        if self._lookup_status == "no_segments":
+            return "无录像"
+        return "未定位"
 
     def _set_status_label(self, status: str, tooltip: str = "") -> None:
         color = self.STATUS_COLORS.get(status, "#667085")
@@ -1084,7 +1131,20 @@ class PassageEvidencePane(QFrame):
     ) -> str:
         source = "普通录像" if self.source_kind == REGULAR_SOURCE else "高速画面"
         if location is not None and location.status == "recording":
-            return f"等待{source}"
+            return f"{source}正在录制，等待片段封口"
+        if location is not None and location.status == "missing_file":
+            return f"{source}文件缺失"
+        if self.source_kind == HIGH_SPEED_SOURCE and location is None:
+            return "暂无高速画面"
+        if self._lookup_status == "no_segments":
+            return "当前赛事没有普通录像"
+        if self._lookup_status in {
+            "before_recording",
+            "after_recording",
+            "recording_gap",
+            "race_mismatch",
+        } or (location is not None and location.status == "outside_media"):
+            return "未定位到对应普通录像"
         return f"暂无{source}"
 
     def _locating_message(self) -> str:
@@ -1161,12 +1221,16 @@ class PassageEvidencePane(QFrame):
         association: Optional[PassageEvidenceAssociation] = None,
         *,
         initial_delta_ms: int = 0,
+        lookup_status: str = "",
     ) -> None:
         previous_context = self._media_context(self._location)
         next_context = self._media_context(location)
         same_context = bool(previous_context) and previous_context == next_context
         self._event = event
         self._location = location
+        self._lookup_status = str(
+            lookup_status or (location.status if location is not None else "")
+        )
         self._identity = event.bib.strip() or "未知"
         if (
             association is not None
@@ -1176,7 +1240,11 @@ class PassageEvidencePane(QFrame):
             association = None
         self._association = association
         self._pending_marker = None
-        self._marking_enabled = association is None
+        self._marking_enabled = (
+            association is None
+            and location is not None
+            and location.status in _CONFIRMABLE_STATUSES
+        )
         self._playing = False
         self._current_frame_index = -1
         self._current_position_ms = 0
@@ -1201,7 +1269,9 @@ class PassageEvidencePane(QFrame):
             self.timeline.setEnabled(False)
             self._target_position_ms = 0
             detail = location_status_text(location) if location is not None else ""
-            self._set_status_label("未确认", detail)
+            if not detail and self._lookup_status:
+                detail = _STATUS_TEXT.get(self._lookup_status, self._lookup_status)
+            self._set_status_label(self._availability_status(), detail)
             self.video_label.clear_frame(self._empty_message(location))
             self.time_label.setText("--:--:--.---")
             self._set_transport_enabled(False)
@@ -1267,6 +1337,7 @@ class PassageEvidencePane(QFrame):
         self._stop_worker()
         self._event = None
         self._location = None
+        self._lookup_status = ""
         self._association = None
         self._pending_marker = None
         self._marking_enabled = False
@@ -1334,7 +1405,7 @@ class PassageEvidencePane(QFrame):
             source_height=self._source_height,
         )
         self._update_status_label()
-        self.mark_btn.setEnabled(True)
+        self._set_transport_enabled(True)
         self.video_view.set_marker_mode(self._marking_enabled)
         self._render_marker()
         if not self._timeline_dragging:
@@ -1391,6 +1462,16 @@ class PassageEvidencePane(QFrame):
 
     def _on_timeline_pressed(self) -> None:
         self._timeline_dragging = True
+        self.scrub_started.emit()
+
+    def _on_timeline_moved(self, position_ms: int) -> None:
+        if not self._timeline_dragging:
+            return
+        position_ms = int(position_ms)
+        self._update_time_label(position_ms)
+        self.passage_delta_requested.emit(
+            position_ms - self._target_position_ms
+        )
 
     def _on_timeline_released(self) -> None:
         self._timeline_dragging = False
@@ -1430,12 +1511,13 @@ class PassageEvidencePane(QFrame):
             return
         self._playing = False
         self.play_btn.setText("▶")
-        self._set_status_label("未确认", message)
+        self._set_status_label(self._availability_status(), message)
         self.video_label.clear_frame("画面读取失败")
         self._set_transport_enabled(False)
         self.open_btn.setEnabled(
             self.source_kind == REGULAR_SOURCE
             and self._location is not None
+            and self._location.status in _CONFIRMABLE_STATUSES
             and self._location.video_path.is_file()
         )
 
@@ -1505,12 +1587,17 @@ class PassageEvidencePane(QFrame):
         self.previous_frame_btn.setEnabled(enabled)
         self.play_btn.setEnabled(enabled)
         self.next_frame_btn.setEnabled(enabled)
-        self.mark_btn.setEnabled(enabled and self.video_view.has_frame)
+        self.mark_btn.setEnabled(
+            enabled
+            and self.video_view.has_frame
+            and self._location is not None
+            and self._location.status in _CONFIRMABLE_STATUSES
+        )
         self.open_btn.setEnabled(
             enabled
             and self.source_kind == REGULAR_SOURCE
             and self._location is not None
-            and self._location.status in _OPENABLE_STATUSES
+            and self._location.status in _CONFIRMABLE_STATUSES
             and self._location.segment.clock_source != AUYAT_CLOCK_SOURCE
         )
 
@@ -2044,6 +2131,12 @@ class PassageReviewDialog(QDialog):
             for segment in self.timeline_store.segments()
         )
 
+    @staticmethod
+    def _cache_survives_timeline_update(lookup: PassageVideoLookup) -> bool:
+        return bool(lookup.locations) and all(
+            location.status != "preview" for location in lookup.locations
+        )
+
     def _cached_lookup(self, event: PassageEvent) -> PassageVideoLookup:
         key = (
             event.revision,
@@ -2371,7 +2464,7 @@ class PassageReviewDialog(QDialog):
             self._lookup_cache = {
                 event_id: cached
                 for event_id, cached in self._lookup_cache.items()
-                if cached[1].locations
+                if self._cache_survives_timeline_update(cached[1])
             }
 
         self._update_group_combo(events)
@@ -2444,7 +2537,7 @@ class PassageReviewDialog(QDialog):
             self._lookup_cache = {
                 event_id: cached
                 for event_id, cached in self._lookup_cache.items()
-                if cached[1].locations
+                if self._cache_survives_timeline_update(cached[1])
             }
         for event_id in changed_event_ids:
             self._lookup_cache.pop(event_id, None)
@@ -2738,12 +2831,14 @@ class PassageReviewDialog(QDialog):
                 regular,
                 regular_association,
                 initial_delta_ms=self._shared_delta_ms,
+                lookup_status=regular.status if regular is not None else lookup.status,
             )
             self.high_speed_pane.set_passage(
                 event,
                 high_speed,
                 high_speed_association,
                 initial_delta_ms=self._shared_delta_ms,
+                lookup_status=high_speed.status if high_speed is not None else "",
             )
             self.play_both_btn.setText("▶")
         else:
@@ -2917,11 +3012,6 @@ class PassageReviewDialog(QDialog):
             self.group_value.setText(
                 metadata.group_label(target_group) if target_group else "--"
             )
-        self._search_refresh_timer.stop()
-        signals_were_blocked = self.identity_search.blockSignals(True)
-        self.identity_search.setText(identity)
-        self.identity_search.blockSignals(signals_were_blocked)
-        self.refresh()
         self.selected_identity_value.setText(identity or "--")
         self.athlete_value.setText(athlete_name or "--")
         self.team_value.setText(team_name or "--")

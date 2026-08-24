@@ -99,7 +99,13 @@ try:
         sanitize_recording_message,
         split_rtsp_credentials,
     )
-    from .video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
+    from .video_timeline import (
+        DEFAULT_CLOCK_SOURCE,
+        DEFAULT_TIMING_ERROR_MS,
+        PassageVideoLocation,
+        PassageVideoLookup,
+        VideoTimelineStore,
+    )
     from .video_playback import VideoPlaybackDialog
 except ImportError:
     from auyat_rgb import (
@@ -159,7 +165,13 @@ except ImportError:
         sanitize_recording_message,
         split_rtsp_credentials,
     )
-    from video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
+    from video_timeline import (
+        DEFAULT_CLOCK_SOURCE,
+        DEFAULT_TIMING_ERROR_MS,
+        PassageVideoLocation,
+        PassageVideoLookup,
+        VideoTimelineStore,
+    )
     from video_playback import VideoPlaybackDialog
 
 
@@ -259,14 +271,20 @@ def _historical_evidence_timestamp_overrides(
         timestamp_ms = int(event.timeline_timestamp_ms)
         if (
             not event.is_active
-            or event.emitted_at_ms <= 0
             or (event.passage_timestamp_ms is None and timestamp_ms < 86_400_000)
         ):
             continue
-        aligned_timestamp_ms = _align_live_evidence_timestamp(
-            timestamp_ms,
-            event.emitted_at_ms,
-        )
+        aligned_timestamp_ms = timestamp_ms
+        if event.received_at_ms > 0:
+            aligned_timestamp_ms = _align_live_evidence_timestamp(
+                timestamp_ms,
+                event.received_at_ms,
+            )
+        elif event.emitted_at_ms > 0:
+            aligned_timestamp_ms = _align_live_evidence_timestamp(
+                timestamp_ms,
+                event.emitted_at_ms,
+            )
         if aligned_timestamp_ms != timestamp_ms:
             overrides[event.event_id] = (timestamp_ms, aligned_timestamp_ms)
     return overrides
@@ -3717,6 +3735,8 @@ class FinishReviewWindow(PassageReviewDialog):
                 )
                 self._update_runtime_status()
                 return
+        if self.timing_provider == "cyclerace" and event.received_at_ms <= 0:
+            event = replace(event, received_at_ms=int(time.time() * 1000.0))
         try:
             self.passage_store.append(event)
         except Exception as exc:
@@ -3731,11 +3751,7 @@ class FinishReviewWindow(PassageReviewDialog):
         if not event.is_active:
             self._evidence_timestamp_overrides.pop(event.event_id, None)
         elif self.timing_provider == "cyclerace" and formal_timestamp_ms is not None:
-            alignment_reference_ms = (
-                event.emitted_at_ms
-                if event.emitted_at_ms > 0
-                else int(time.time() * 1000.0)
-            )
+            alignment_reference_ms = event.received_at_ms
             aligned_timestamp_ms = _align_live_evidence_timestamp(
                 formal_timestamp_ms,
                 alignment_reference_ms,
@@ -3925,13 +3941,89 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _lookup(self, event: PassageEvent):
         evidence_timestamp_ms = self._evidence_timestamp(event)
+        lookup_event = event
         if (
             evidence_timestamp_ms is None
             or evidence_timestamp_ms == event.timeline_timestamp_ms
         ):
-            return super()._lookup(event)
-        return super()._lookup(
-            replace(event, passage_timestamp_ms=evidence_timestamp_ms)
+            lookup = super()._lookup(event)
+        else:
+            lookup_event = replace(
+                event,
+                passage_timestamp_ms=evidence_timestamp_ms,
+            )
+            lookup = super()._lookup(lookup_event)
+
+        if not hasattr(self, "_capture_windows_by_camera"):
+            return lookup
+        locations = list(lookup.locations)
+        finalized_cameras = {
+            location.segment.camera_index
+            for location in locations
+            if location.segment.clock_source == DEFAULT_CLOCK_SOURCE
+            and location.status in {"located", "near_boundary", "unverified"}
+        }
+        for camera_index, windows in self._capture_windows_by_camera.items():
+            if camera_index in finalized_cameras:
+                continue
+            window = windows.get(event.event_id)
+            publisher = self._publishers.get(camera_index)
+            if (
+                window is None
+                or publisher is None
+                or window.state is PassageReviewState.READY
+            ):
+                continue
+            preview = publisher.preview(window, race_id=event.race_id)
+            if (
+                preview is None
+                or preview.media_started_at_ms is None
+                or preview.media_duration_ms is None
+            ):
+                continue
+            media_end_at_ms = (
+                preview.media_started_at_ms + preview.media_duration_ms
+            )
+            if not (
+                preview.media_started_at_ms
+                <= lookup.target_time_ms
+                <= media_end_at_ms
+            ):
+                continue
+            passage_position_ms = (
+                lookup.target_time_ms - preview.media_started_at_ms
+            )
+            locations.append(
+                PassageVideoLocation(
+                    segment=preview,
+                    video_path=Path(preview.video_path),
+                    passage_position_ms=passage_position_ms,
+                    playback_position_ms=max(
+                        0,
+                        passage_position_ms - self.pre_roll_ms,
+                    ),
+                    clock_offset_ms=self.clock_offset_ms,
+                    timing_error_ms=preview.timing_error_ms,
+                    status="preview",
+                    media_locator=preview.segment_id,
+                )
+            )
+        if not any(location.status == "preview" for location in locations):
+            return lookup
+        if any(location.status == "located" for location in locations):
+            status = "located"
+        elif any(location.status == "preview" for location in locations):
+            status = "preview"
+        elif any(location.status == "near_boundary" for location in locations):
+            status = "near_boundary"
+        elif any(location.status == "unverified" for location in locations):
+            status = "unverified"
+        else:
+            status = lookup.status
+        return PassageVideoLookup(
+            status,
+            lookup.target_time_ms,
+            tuple(locations),
         )
 
     def _refresh_capture_windows(self) -> None:
@@ -3967,6 +4059,8 @@ class FinishReviewWindow(PassageReviewDialog):
                     ):
                         changed_event_ids.add(window.event_id)
                     if previous is not None and previous.state is not window.state:
+                        changed_event_ids.add(window.event_id)
+                    elif previous is not None and previous.segments != window.segments:
                         changed_event_ids.add(window.event_id)
             now = time.monotonic()
             if now - self._last_cleanup_at >= 5.0:

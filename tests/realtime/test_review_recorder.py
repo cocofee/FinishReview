@@ -453,6 +453,113 @@ def test_passage_window_waits_for_tail_then_becomes_ready(tmp_path):
     assert buffer.pinned_event_ids("after.ts") == frozenset({"passage-15"})
 
 
+def test_passage_window_tolerates_hls_timestamp_rounding_gaps(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [
+            ("first.ts", "2026-08-24T22:50:24.151+08:00", 2.033),
+            ("second.ts", "2026-08-24T22:50:26.185+08:00", 2.0),
+            ("third.ts", "2026-08-24T22:50:28.185+08:00", 2.0),
+            ("fourth.ts", "2026-08-24T22:50:30.185+08:00", 2.0),
+        ],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    coordinator = PassageReviewCoordinator(buffer)
+
+    window = coordinator.register(
+        "passage-19",
+        passage_timestamp_ms=1_787_583_027_305,
+    )
+
+    assert window.state is PassageReviewState.READY
+    assert [segment.segment_id for segment in window.segments] == [
+        "first.ts",
+        "second.ts",
+        "third.ts",
+        "fourth.ts",
+    ]
+
+
+def test_passage_window_accepts_missing_pre_roll_at_recorder_start(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [
+            ("first.ts", "2026-08-24T22:56:31.409+08:00", 2.033),
+            ("second.ts", "2026-08-24T22:56:33.442+08:00", 2.0),
+            ("third.ts", "2026-08-24T22:56:35.442+08:00", 2.0),
+        ],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    coordinator = PassageReviewCoordinator(buffer)
+
+    window = coordinator.register(
+        "passage-20",
+        passage_timestamp_ms=1_787_583_393_919,
+    )
+
+    assert window.started_at_ms == 1_787_583_390_919
+    assert window.segments[0].started_at_ms == 1_787_583_391_409
+    assert window.state is PassageReviewState.READY
+
+
+def test_waiting_window_exposes_read_only_preview_without_formal_timeline(
+    tmp_path,
+    monkeypatch,
+):
+    buffer_dir = tmp_path / "review_buffer" / "camera_01"
+    buffer_dir.mkdir(parents=True)
+    playlist = _write_playlist(
+        buffer_dir,
+        [
+            ("before.ts", "2026-08-21T11:59:58.000+00:00", 2.0),
+            ("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0),
+        ],
+    )
+    ring_buffer = ReviewRingBuffer(playlist, camera_index=1)
+    window = PassageReviewCoordinator(ring_buffer).register(
+        "race-1-stage-1-passage-15",
+        passage_timestamp_ms=1_787_313_601_000,
+    )
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    publisher = PassageReviewTimelinePublisher(ring_buffer, timeline)
+
+    preview = publisher.preview(window, race_id="race-1")
+
+    assert window.state is PassageReviewState.WAITING
+    assert preview is not None
+    assert preview.end_reason == "passage_review_preview"
+    assert preview.media_started_at_ms == 1_787_313_598_000
+    assert preview.media_duration_ms == 4_000
+    assert timeline.segments() == ()
+    preview_playlist = Path(preview.video_path)
+    assert preview_playlist.is_file()
+    assert "finish.ts" in preview_playlist.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        "realtime.review_recorder.os.replace",
+        lambda *_args: pytest.fail("cached preview must not be rewritten"),
+    )
+    assert publisher.preview(window, race_id="race-1") == preview
+
+
+def test_waiting_window_has_no_preview_before_passage_segment_is_sealed(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("before.ts", "2026-08-21T11:59:58.000+00:00", 2.0)],
+    )
+    ring_buffer = ReviewRingBuffer(playlist, camera_index=1)
+    window = PassageReviewCoordinator(ring_buffer).register(
+        "race-1-stage-1-passage-15",
+        passage_timestamp_ms=1_787_313_601_000,
+    )
+    publisher = PassageReviewTimelinePublisher(
+        ring_buffer,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+
+    assert publisher.preview(window, race_id="race-1") is None
+
+
 def test_passage_window_reports_partial_after_timeline_crosses_a_gap(tmp_path):
     playlist = _write_playlist(
         tmp_path,
