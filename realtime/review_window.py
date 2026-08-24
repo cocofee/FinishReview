@@ -14,8 +14,8 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QPainter, QPen
+from PyQt5.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt5.QtGui import QColor, QDesktopServices, QPainter, QPen
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -509,14 +509,17 @@ class FinishReviewLaunchDialog(QDialog):
         layout.addWidget(title)
 
         self.tabs = QTabWidget(self)
+        self.event_page = QWidget(self.tabs)
         self.deployment_page = QWidget(self.tabs)
         self.devices_page = QWidget(self.tabs)
         self.preflight_page = QWidget(self.tabs)
+        self.tabs.addTab(self.event_page, "赛事与保存")
         self.tabs.addTab(self.deployment_page, "部署总览")
         self.tabs.addTab(self.devices_page, "设备设置")
         self.tabs.addTab(self.preflight_page, "赛前联调")
         layout.addWidget(self.tabs, 1)
 
+        self._init_event_page()
         device_layout = QVBoxLayout(self.devices_page)
         device_layout.setContentsMargins(12, 12, 12, 12)
         device_layout.setSpacing(10)
@@ -706,23 +709,6 @@ class FinishReviewLaunchDialog(QDialog):
             self.framerate_combo.addItem(f"{value:g} FPS", value)
         form.addRow("录像帧率", self.framerate_combo)
 
-        output_row = QHBoxLayout()
-        output_row.setSpacing(6)
-        self.output_edit = QLineEdit(str(self._output_dir), self)
-        self.output_edit.setReadOnly(True)
-        self.output_edit.setCursorPosition(0)
-        self.output_edit.setToolTip(
-            "CycleRace发送赛事信息后，将在此目录下自动创建赛事名称文件夹"
-        )
-        output_row.addWidget(self.output_edit, 1)
-        browse_button = QPushButton(self)
-        browse_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
-        browse_button.setToolTip("选择本机录像与证据保存目录")
-        browse_button.setFixedWidth(42)
-        browse_button.clicked.connect(self._browse_output_dir)
-        output_row.addWidget(browse_button)
-        form.addRow("赛事保存根目录", output_row)
-
         high_speed_row = QHBoxLayout()
         high_speed_row.setSpacing(6)
         self.high_speed_edit = QLineEdit(
@@ -788,6 +774,66 @@ class FinishReviewLaunchDialog(QDialog):
         self._dialog_timer.timeout.connect(self._refresh_live_pages)
         self._dialog_timer.start()
         self._refresh_live_pages()
+
+    def _init_event_page(self) -> None:
+        page_layout = QVBoxLayout(self.event_page)
+        page_layout.setContentsMargins(12, 12, 12, 12)
+        page_layout.setSpacing(12)
+        self._event_dir: Path | None = None
+
+        self.event_status_label = QLabel("等待 CycleRace 赛事信息", self)
+        self.event_status_label.setStyleSheet(
+            "color: #a56300; font-size: 11pt; font-weight: 700;"
+        )
+        page_layout.addWidget(self.event_status_label)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+
+        self.event_name_edit = QLineEdit(self)
+        self.event_name_edit.setReadOnly(True)
+        form.addRow("当前赛事", self.event_name_edit)
+
+        self.event_stage_edit = QLineEdit(self)
+        self.event_stage_edit.setReadOnly(True)
+        form.addRow("当前赛段", self.event_stage_edit)
+
+        event_dir_row = QHBoxLayout()
+        event_dir_row.setSpacing(6)
+        self.event_dir_edit = QLineEdit(self)
+        self.event_dir_edit.setReadOnly(True)
+        self.event_dir_edit.setCursorPosition(0)
+        event_dir_row.addWidget(self.event_dir_edit, 1)
+        self.open_event_dir_button = QPushButton(self)
+        self.open_event_dir_button.setIcon(
+            self.style().standardIcon(QStyle.SP_DirOpenIcon)
+        )
+        self.open_event_dir_button.setToolTip("打开当前赛事目录")
+        self.open_event_dir_button.setFixedWidth(42)
+        self.open_event_dir_button.clicked.connect(self._open_event_dir)
+        event_dir_row.addWidget(self.open_event_dir_button)
+        form.addRow("当前赛事目录", event_dir_row)
+
+        output_row = QHBoxLayout()
+        output_row.setSpacing(6)
+        self.output_edit = QLineEdit(str(self._output_dir), self)
+        self.output_edit.setReadOnly(True)
+        self.output_edit.setCursorPosition(0)
+        self.output_edit.setToolTip(
+            "CycleRace发送赛事信息后，将在此目录下自动创建赛事名称文件夹"
+        )
+        output_row.addWidget(self.output_edit, 1)
+        browse_button = QPushButton(self)
+        browse_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        browse_button.setToolTip("选择赛事保存根目录")
+        browse_button.setFixedWidth(42)
+        browse_button.clicked.connect(self._browse_output_dir)
+        output_row.addWidget(browse_button)
+        form.addRow("赛事保存根目录", output_row)
+
+        page_layout.addLayout(form)
+        page_layout.addStretch(1)
 
     def _init_deployment_page(self) -> None:
         page_layout = QVBoxLayout(self.deployment_page)
@@ -900,7 +946,9 @@ class FinishReviewLaunchDialog(QDialog):
         self._update_preflight_table()
 
     def _refresh_live_pages(self) -> None:
-        self._refresh_deployment_table()
+        snapshot = dict(self._runtime_snapshot_provider() or {})
+        self._refresh_event_page(snapshot)
+        self._refresh_deployment_table(snapshot)
         self._poll_preflight()
 
     def _request_recheck(self) -> None:
@@ -908,8 +956,72 @@ class FinishReviewLaunchDialog(QDialog):
             self._recheck_callback()
         self._refresh_live_pages()
 
-    def _refresh_deployment_table(self) -> None:
-        snapshot = dict(self._runtime_snapshot_provider() or {})
+    def _refresh_event_page(self, snapshot: dict[str, str] | None = None) -> None:
+        snapshot = dict(snapshot or self._runtime_snapshot_provider() or {})
+        timing_provider = str(
+            self.timing_provider_combo.currentData() or "cyclerace"
+        )
+        runtime_matches_selection = (
+            not snapshot.get("timing_provider")
+            or snapshot.get("timing_provider") == timing_provider
+        )
+        if timing_provider == "racetiger":
+            event_name = (
+                snapshot.get("event_name", "")
+                if runtime_matches_selection
+                else ""
+            ) or self.racetiger_rid_edit.text().strip()
+            event_stage = (
+                snapshot.get("event_stage", "")
+                if runtime_matches_selection
+                else ""
+            ) or "终点"
+            event_dir = (
+                snapshot.get("event_dir", "")
+                if runtime_matches_selection
+                else ""
+            ) or str(self._output_dir)
+            event_state = (
+                snapshot.get("event_state", "")
+                if runtime_matches_selection
+                else ""
+            ) or (
+                "已配置" if event_name else "等待赛虎赛事 RID"
+            )
+        else:
+            event_name = (
+                snapshot.get("event_name", "") if runtime_matches_selection else ""
+            )
+            event_stage = (
+                snapshot.get("event_stage", "") if runtime_matches_selection else ""
+            )
+            event_dir = (
+                snapshot.get("event_dir", "") if runtime_matches_selection else ""
+            )
+            event_state = (
+                snapshot.get("event_state", "") if runtime_matches_selection else ""
+            ) or "等待 CycleRace 赛事信息"
+
+        has_event = bool(event_name and event_dir)
+        self.event_status_label.setText(event_state)
+        self.event_status_label.setStyleSheet(
+            "color: #247a52; font-size: 11pt; font-weight: 700;"
+            if has_event
+            else "color: #a56300; font-size: 11pt; font-weight: 700;"
+        )
+        self.event_name_edit.setText(event_name or "--")
+        self.event_stage_edit.setText(event_stage or "--")
+        self.event_dir_edit.setText(event_dir or "等待赛事信息")
+        self.event_dir_edit.setToolTip(event_dir)
+        self.event_dir_edit.setCursorPosition(0)
+        self._event_dir = Path(event_dir) if event_dir else None
+        self.open_event_dir_button.setEnabled(self._event_dir is not None)
+
+    def _refresh_deployment_table(
+        self,
+        snapshot: dict[str, str] | None = None,
+    ) -> None:
+        snapshot = dict(snapshot or self._runtime_snapshot_provider() or {})
         expected_ip = self.finishreview_ip_edit.text().strip()
         local_addresses = tuple(self._local_address_provider())
         if expected_ip and expected_ip in local_addresses:
@@ -1450,6 +1562,14 @@ class FinishReviewLaunchDialog(QDialog):
         if selected:
             self._output_dir = Path(selected).resolve()
             self.output_edit.setText(str(self._output_dir))
+
+    def _open_event_dir(self) -> None:
+        event_dir = self._event_dir
+        if event_dir is None or not event_dir.is_dir():
+            QMessageBox.warning(self, "赛事目录不可用", "当前赛事目录尚未创建")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(event_dir))):
+            QMessageBox.warning(self, "无法打开赛事目录", str(event_dir))
 
     def _browse_high_speed_dir(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -2780,7 +2900,31 @@ class FinishReviewWindow(PassageReviewDialog):
         else:
             high_speed_state = "待检查"
             high_speed_detail = high_speed.message or "目录可读，等待高速画面"
+        metadata = self._current_metadata()
+        if self.timing_provider == "cyclerace":
+            event_name = (
+                (metadata.race_name.strip() or metadata.race_id)
+                if metadata is not None
+                else ""
+            )
+            event_stage = (
+                (metadata.stage_name.strip() or metadata.stage_id)
+                if metadata is not None
+                else ""
+            )
+            event_state = (
+                "赛事已加载"
+                if metadata is not None
+                else "等待 CycleRace 赛事信息"
+            )
+            event_dir = str(self.output_dir) if metadata is not None else ""
+        else:
+            event_name = self.racetiger_rid
+            event_stage = "终点" if event_name else ""
+            event_state = "赛事已配置" if event_name else "等待赛虎赛事 RID"
+            event_dir = str(self.output_dir) if event_name else ""
         return {
+            "timing_provider": self.timing_provider,
             "timing_state": timing_state,
             "timing_detail": timing_detail,
             "cycle_state": timing_state,
@@ -2789,6 +2933,11 @@ class FinishReviewWindow(PassageReviewDialog):
             "camera_detail": camera_detail,
             "high_speed_state": high_speed_state,
             "high_speed_detail": high_speed_detail,
+            "event_state": event_state,
+            "event_name": event_name,
+            "event_stage": event_stage,
+            "event_dir": event_dir,
+            "workspace_root": str(self.workspace_root),
         }
 
     def _preflight_evidence_status(

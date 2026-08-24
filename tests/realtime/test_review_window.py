@@ -461,6 +461,12 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
 
     assert window.passage_store.get(event.event_id) == event
     assert window.passage_store.journal_path.parent == event_dir.resolve()
+    snapshot = window._deployment_runtime_snapshot()
+    assert snapshot["event_state"] == "赛事已加载"
+    assert snapshot["event_name"] == metadata.race_name
+    assert snapshot["event_stage"] == metadata.stage_name
+    assert snapshot["event_dir"] == str(event_dir.resolve())
+    assert snapshot["workspace_root"] == str(root.resolve())
     assert window._current_settings().output_dir == root.resolve()
     assert window._apply_settings(window._current_settings())
     assert window.output_dir == event_dir.resolve()
@@ -767,6 +773,13 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
 
     assert dialog.camera_status_label.text() == "未检测到USB/Type-C摄像头"
     assert dialog.start_button.isEnabled()
+    assert dialog.tabs.count() == 4
+    assert dialog.tabs.tabText(dialog.tabs.indexOf(dialog.event_page)) == "赛事与保存"
+    assert dialog.event_name_edit.isReadOnly()
+    assert dialog.event_stage_edit.isReadOnly()
+    assert dialog.event_dir_edit.isReadOnly()
+    assert dialog.event_status_label.text() == "等待 CycleRace 赛事信息"
+    assert not dialog.open_event_dir_button.isEnabled()
     assert dialog.output_edit.isReadOnly()
     visible_text = " ".join(
         widget.text()
@@ -790,6 +803,49 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
     assert dialog.minimumSizeHint().height() <= 680
     for forbidden in ("0.0.0.0", "18765", "端口"):
         assert forbidden not in visible_text
+    dialog.close()
+
+
+def test_event_settings_show_and_open_active_cyclerace_workspace(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    event_dir = tmp_path / "2026 城市公路自行车赛"
+    event_dir.mkdir()
+    opened = []
+    monkeypatch.setattr(
+        review_window_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()) or True,
+    )
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (),
+        runtime_snapshot_provider=lambda: {
+            "timing_provider": "cyclerace",
+            "event_state": "赛事已加载",
+            "event_name": "2026 城市公路自行车赛",
+            "event_stage": "第 1 赛段",
+            "event_dir": str(event_dir),
+        },
+    )
+
+    assert dialog.event_status_label.text() == "赛事已加载"
+    assert dialog.event_name_edit.text() == "2026 城市公路自行车赛"
+    assert dialog.event_stage_edit.text() == "第 1 赛段"
+    assert dialog.event_dir_edit.text() == str(event_dir)
+    assert dialog.open_event_dir_button.isEnabled()
+
+    dialog._open_event_dir()
+
+    assert [Path(value) for value in opened] == [event_dir]
     dialog.close()
 
 
