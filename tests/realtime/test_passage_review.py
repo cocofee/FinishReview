@@ -749,6 +749,7 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
         dialog.table.horizontalHeaderItem(column).text()
         for column in visible_columns
     ] == [
+        "序号",
         "运动员编号",
         "姓名",
         "组别",
@@ -757,8 +758,13 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
         "高速摄像",
         "复核状态",
     ]
+    assert dialog.table.item(0, 0).text() == "1"
     assert dialog.table.item(0, 1).text() == "15"
     assert dialog.table.item(0, 2).text() == "张三"
+    assert (
+        "QTableWidget::item:selected { background: #dcecf8; color: #17212b; }"
+        in dialog.styleSheet()
+    )
     assert dialog.current_passage_label.text() == "15 张三"
     assert dialog.group_combo.itemText(1) == "男子公开组"
     assert dialog.group_combo.itemData(1) == "men-open"
@@ -1850,6 +1856,30 @@ def test_incremental_refresh_appends_only_the_new_passage_row(
     assert dialog._selected_event_id == "passage-12"
     assert worker.seek_calls == seek_calls_before
     assert dialog.next_passage_btn.isEnabled()
+    dialog.close()
+
+
+def test_incremental_refresh_renumbers_rows_after_inserting_earlier_passage(
+    qapp,
+    tmp_path,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-later", passage_time_ms=20_000, bib="20")
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+
+    passage_store.append(
+        _event(event_id="passage-earlier", passage_time_ms=10_000, bib="10")
+    )
+    dialog.refresh_events(("passage-earlier",))
+    qapp.processEvents()
+
+    assert [dialog.table.item(row, 0).text() for row in range(2)] == ["1", "2"]
+    assert [dialog.table.item(row, 1).text() for row in range(2)] == ["10", "20"]
     dialog.close()
 
 

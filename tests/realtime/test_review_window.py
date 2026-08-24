@@ -289,6 +289,11 @@ def test_runtime_status_reports_loaded_race_metadata_without_claiming_sync(
     assert window.receiver_status_label.text() == (
         "CycleRace: 监听中，已加载赛事 11 / 1"
     )
+    window.group_value.setText("男子精英组")
+    window._update_event_header()
+    assert window.event_path_label.text() == "第 1 赛段 · 男子精英组 · 终点"
+    assert "race-11" not in window.event_path_label.text()
+    assert "赛事ID：race-11" in window.event_path_label.toolTip()
     assert "已读取 1 个组别" in window.receiver_status_label.toolTip()
     assert "不能判断发送端持续在线" in window.receiver_status_label.toolTip()
     window.close()

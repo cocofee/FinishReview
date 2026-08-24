@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from realtime.auyat_rgb import discover_auyat_root
@@ -31,6 +31,7 @@ from realtime.review_window import (
 )
 from realtime.runtime_paths import (
     application_dir,
+    resource_dir,
     resolve_output_dir,
     resolve_runtime_path,
 )
@@ -45,6 +46,7 @@ from realtime.stream_recorder import (
 
 logger = logging.getLogger("FinishReview.Entry")
 _MANAGED_LOG_HANDLER = "_finish_review_managed_handler"
+APPLICATION_ICON_RESOURCE = "assets/finishreview.ico"
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -442,11 +444,21 @@ def configure_application_font(app: QApplication) -> None:
     app.setFont(application_font)
 
 
+def configure_application_icon(app: QApplication) -> None:
+    icon_path = resource_dir(APPLICATION_ICON_RESOURCE)
+    if not icon_path.is_file():
+        return
+    icon = QIcon(str(icon_path))
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+
+
 def run_packaged_smoke_test(app_argv: list[str]) -> int:
     """Create the packaged Qt window without starting external services."""
 
     app = QApplication.instance() or QApplication(app_argv)
     configure_application_font(app)
+    configure_application_icon(app)
     with tempfile.TemporaryDirectory(prefix="FinishReview-smoke-") as temp_dir:
         window = FinishReviewWindow(
             "",
@@ -536,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
 
     app = QApplication.instance() or QApplication(app_argv)
     configure_application_font(app)
+    configure_application_icon(app)
     settings = FinishReviewSettings(
         source=source_override or saved_settings.source,
         secondary_source=saved_settings.secondary_source,

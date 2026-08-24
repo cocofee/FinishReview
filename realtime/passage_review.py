@@ -1642,7 +1642,7 @@ class PassageReviewDialog(QDialog):
             "QHeaderView::section { background: #eef2f5; color: #526170; "
             "font-size: 10pt; font-weight: 600; padding: 5px; "
             "border: none; border-right: 1px solid #d5dce3; border-bottom: 1px solid #c8d1da; }"
-            "QTableWidget::item:selected { background: #dcecf8; }"
+            "QTableWidget::item:selected { background: #dcecf8; color: #17212b; }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1736,7 +1736,7 @@ class PassageReviewDialog(QDialog):
         self.table = _AutoFitTableWidget(0, 9, self)
         self.table.setHorizontalHeaderLabels(
             [
-                "",
+                "序号",
                 "运动员编号",
                 "姓名",
                 "组别",
@@ -1747,7 +1747,6 @@ class PassageReviewDialog(QDialog):
                 "复核状态",
             ]
         )
-        self.table.setColumnHidden(0, True)
         self.table.setColumnHidden(4, True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2248,6 +2247,16 @@ class PassageReviewDialog(QDialog):
                 self._apply_status_style(item, value)
             self.table.setItem(row, column, item)
 
+    def _renumber_visible_rows(self) -> None:
+        for row, event in enumerate(self._visible_events):
+            item = self.table.item(row, 0)
+            if item is None:
+                item = QTableWidgetItem()
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, 0, item)
+            item.setText(str(row + 1))
+            item.setData(Qt.UserRole, event.event_id)
+
     def _render_filtered_queue(
         self,
         events: tuple[PassageEvent, ...],
@@ -2459,6 +2468,8 @@ class PassageReviewDialog(QDialog):
             else:
                 self._visible_events[row] = event
             self._write_event_row(row, event, lookup)
+
+        self._renumber_visible_rows()
 
         selected_row = next(
             (

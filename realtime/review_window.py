@@ -2523,22 +2523,23 @@ class FinishReviewWindow(PassageReviewDialog):
             or (event.stage_name.strip() if event is not None else "")
             or "终点"
         )
+        stage_label = f"第 {stage_name} 赛段" if stage_name.isdigit() else stage_name
         group_name = self.group_value.text().strip()
         if not group_name or group_name == "--":
             group_name = "全部组别"
         detail_parts = []
-        if race_id:
-            detail_parts.append(f"赛事 {race_id}")
-        for value in (stage_name, group_name, "终点"):
+        for value in (stage_label, group_name, "终点"):
             if value and value not in detail_parts:
                 detail_parts.append(value)
+        detail_text = " · ".join(detail_parts)
+        identity_text = f"赛事ID：{race_id}\n" if race_id else ""
         self.event_name_label.setText(race_name)
-        self.event_path_label.setText(" · ".join(detail_parts))
+        self.event_path_label.setText(detail_text)
         self.event_name_label.setToolTip(
-            f"{race_name}\n赛事目录：{self.output_dir}"
+            f"{race_name}\n{identity_text}赛事目录：{self.output_dir}"
         )
         self.event_path_label.setToolTip(
-            f"{' · '.join(detail_parts)}\n赛事目录：{self.output_dir}"
+            f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
         )
 
     def _init_operator_controls(self) -> None:

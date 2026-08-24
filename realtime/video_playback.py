@@ -87,12 +87,24 @@ class PlaybackVideoLabel(QLabel):
         self._frame: Optional[QPixmap] = None
         self._drag_origin_x: Optional[int] = None
         self._last_drag_frames = 0
+        self._jog_frame_span = 1
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet("background: #090b0d; border: none;")
         self.setCursor(Qt.OpenHandCursor)
         self.setToolTip("左右拖动画面快速定位；滚轮逐帧前进或后退")
+
+    def set_jog_frame_span(self, frame_count: int) -> None:
+        self._jog_frame_span = max(1, int(frame_count))
+
+    def _frame_delta_for_position(self, position_x: int) -> int:
+        if self._drag_origin_x is None:
+            return 0
+        horizontal_delta = int(position_x) - self._drag_origin_x
+        return int(
+            round(horizontal_delta * self._jog_frame_span / max(1, self.width()))
+        )
 
     def set_frame(self, image: QImage) -> None:
         self._frame = QPixmap.fromImage(image)
@@ -120,7 +132,7 @@ class PlaybackVideoLabel(QLabel):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_origin_x is not None:
-            frame_delta = int((event.x() - self._drag_origin_x) / 4)
+            frame_delta = self._frame_delta_for_position(event.x())
             if frame_delta != self._last_drag_frames:
                 self._last_drag_frames = frame_delta
                 self.jog_delta_changed.emit(frame_delta)
@@ -264,7 +276,7 @@ class SpringShuttleSlider(QWidget):
 
 
 class TargetTimelineSlider(QSlider):
-    """Timeline slider with a non-interactive passage target marker."""
+    """Timeline slider with click-to-seek and a passage target marker."""
 
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
@@ -275,6 +287,54 @@ class TargetTimelineSlider(QSlider):
             None if position_ms is None else max(0, int(position_ms))
         )
         self.update()
+
+    def _value_from_position(self, position_x: int) -> int:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QStyle.CC_Slider,
+            option,
+            QStyle.SC_SliderGroove,
+            self,
+        )
+        span = max(1, groove.width())
+        position = max(0, min(int(position_x) - groove.left(), span))
+        return QStyle.sliderValueFromPosition(
+            self.minimum(),
+            self.maximum(),
+            position,
+            span,
+            option.upsideDown,
+        )
+
+    def _move_to_position(self, position_x: int) -> None:
+        value = self._value_from_position(position_x)
+        self.setValue(value)
+        self.sliderMoved.emit(value)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.setFocus()
+            self.setSliderDown(True)
+            self._move_to_position(event.x())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self.isSliderDown() and event.buttons() & Qt.LeftButton:
+            self._move_to_position(event.x())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self.isSliderDown():
+            self._move_to_position(event.x())
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -876,6 +936,7 @@ class VideoPlaybackDialog(QDialog):
         self._duration_ms = max(0, int(duration_ms))
         self._fps = max(0.1, float(fps))
         self._frame_count = max(0, int(frame_count))
+        self.video_label.set_jog_frame_span(self._frame_count)
         self.timeline.setRange(0, self._duration_ms)
         self.timeline.set_target_position(self._target_position_ms)
         self.duration_label.setText(f"总时长 {format_playback_time(self._duration_ms)}")
@@ -910,6 +971,7 @@ class VideoPlaybackDialog(QDialog):
     def _on_slider_moved(self, value: int) -> None:
         self.current_time_label.setText(format_playback_time(value))
         self._update_target_status(value)
+        self.worker.seek(value)
 
     def _update_target_status(self, current_position_ms: int) -> None:
         parts = []

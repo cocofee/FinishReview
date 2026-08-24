@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt5.QtCore import QTimer
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
 
 from realtime import review_main
@@ -140,6 +141,11 @@ def test_main_shows_window_before_receiver_failure_message(monkeypatch, tmp_path
     monkeypatch.setattr(review_main, "install_exception_logging", lambda: None)
     monkeypatch.setattr(
         review_main,
+        "configure_application_icon",
+        lambda _app: events.append("icon"),
+    )
+    monkeypatch.setattr(
+        review_main,
         "default_config_path",
         lambda: tmp_path / "config.json",
     )
@@ -152,12 +158,22 @@ def test_main_shows_window_before_receiver_failure_message(monkeypatch, tmp_path
     assert review_main.main(["--output", str(tmp_path / "race")]) == 0
     assert events == [
         "font",
+        "icon",
         "show",
         "process-events",
         "start-receiver",
         "warning",
         "event-loop",
     ]
+
+
+def test_application_icon_uses_finishreview_asset():
+    app = QApplication.instance() or QApplication([])
+    app.setWindowIcon(QIcon())
+
+    review_main.configure_application_icon(app)
+
+    assert not app.windowIcon().isNull()
 
 
 def test_packaged_smoke_test_creates_real_qt_window(monkeypatch):
