@@ -941,6 +941,241 @@ def test_preflight_does_not_require_group_metadata_and_starts_recording_first(
     dialog.close()
 
 
+def test_device_settings_can_disable_high_speed_for_preflight(
+    qapp,
+    tmp_path,
+):
+    calls = []
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://camera/live",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+            high_speed_dir=tmp_path / "auyat",
+        ),
+        device_provider=lambda: (),
+        passage_provider=lambda: calls.append("passages") or (),
+        recording_start_callback=lambda: calls.append("recording") or True,
+    )
+
+    assert dialog.high_speed_enabled_checkbox.isChecked()
+    dialog.high_speed_enabled_checkbox.setChecked(False)
+
+    assert not dialog.high_speed_edit.isEnabled()
+    assert not dialog.high_speed_browse_button.isEnabled()
+    assert dialog.settings.high_speed_dir is None
+
+    dialog._start_preflight()
+
+    assert calls[:2] == ["recording", "passages"]
+    assert dialog._preflight_run is not None
+    assert not dialog._preflight_run.require_high_speed
+    dialog.close()
+
+
+@pytest.mark.parametrize(
+    ("secondary_enabled", "high_speed_enabled", "expected_cameras"),
+    [
+        (False, False, (1,)),
+        (True, False, (1, 2)),
+        (False, True, (1,)),
+        (True, True, (1, 2)),
+    ],
+)
+def test_finish_review_window_layout_matches_active_sources(
+    qapp,
+    tmp_path,
+    secondary_enabled,
+    high_speed_enabled,
+    expected_cameras,
+):
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source=("rtsp://camera-two/live" if secondary_enabled else ""),
+        high_speed_dir=(tmp_path / "auyat" if high_speed_enabled else None),
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+
+    assert tuple(pane.camera_index for pane in window.regular_panes) == expected_cameras
+    assert len(window.evidence_panes) == len(expected_cameras) + int(
+        high_speed_enabled
+    )
+    assert window.high_speed_pane.isHidden() is (not high_speed_enabled)
+    window.close()
+
+
+def test_recheck_does_not_start_high_speed_scan_when_disabled(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    scan_calls = []
+    monkeypatch.setattr(window, "start_receiver", lambda: None)
+    monkeypatch.setattr(
+        type(window._high_speed_scan_worker),
+        "request_scan",
+        lambda _worker: scan_calls.append(True),
+    )
+
+    window._recheck_connections()
+
+    assert scan_calls == []
+    window.close()
+
+
+def test_apply_settings_updates_evidence_layout_immediately(
+    qapp,
+    tmp_path,
+):
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        high_speed_dir=tmp_path / "auyat",
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    settings = FinishReviewSettings(
+        source="rtsp://camera-one/live",
+        output_dir=tmp_path,
+        passage_host="0.0.0.0",
+        passage_port=18765,
+        camera_index=1,
+        high_speed_dir=None,
+    )
+
+    assert window._apply_settings(settings)
+
+    assert tuple(pane.camera_index for pane in window.regular_panes) == (1,)
+    assert len(window.evidence_panes) == 1
+    assert window.high_speed_dir is None
+    assert window.high_speed_pane.isHidden()
+    window.close()
+
+
+def test_running_high_speed_scan_requests_refresh_without_recursion(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.high_speed_dir = tmp_path / "auyat"
+    requests = []
+    worker_type = type(window._high_speed_scan_worker)
+    monkeypatch.setattr(worker_type, "isRunning", lambda _worker: True)
+    monkeypatch.setattr(
+        worker_type,
+        "request_scan",
+        lambda _worker: requests.append(True),
+    )
+
+    window._request_high_speed_scan()
+
+    assert requests == [True]
+    monkeypatch.undo()
+    window.close()
+
+
+def test_apply_settings_refreshes_lookup_after_camera_toggle(
+    qapp,
+    tmp_path,
+):
+    event = _event(passage_time_ms=43_201_000)
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    for camera_index in (1, 2):
+        video_path = tmp_path / f"camera_{camera_index}.mkv"
+        video_path.write_bytes(b"video")
+        window.timeline_store.add_completed_segment(
+            source_id=f"camera_{camera_index}",
+            camera_index=camera_index,
+            video_path=video_path,
+            media_started_at_ms=event.timeline_timestamp_ms - 1_000,
+            media_duration_ms=4_000,
+            clock_source=DEFAULT_CLOCK_SOURCE,
+            timing_error_ms=0,
+            end_reason="test",
+            race_id=event.race_id,
+        )
+    window.passage_store.append(event)
+    window.refresh()
+    qapp.processEvents()
+
+    assert window.regular_panes[1].location is not None
+
+    def settings(secondary_source):
+        return FinishReviewSettings(
+            source="rtsp://camera-one/live",
+            secondary_source=secondary_source,
+            output_dir=tmp_path,
+            passage_host=window.passage_host,
+            passage_port=window.passage_port,
+            camera_index=1,
+        )
+
+    assert window._apply_settings(settings(""))
+    assert tuple(pane.camera_index for pane in window.regular_panes) == (1,)
+    assert window._apply_settings(settings("rtsp://camera-two/live"))
+    assert tuple(pane.camera_index for pane in window.regular_panes) == (1, 2)
+    assert window.regular_panes[1].location is not None
+    window.close()
+
+
+def test_operator_regular_marking_uses_camera_with_a_frame(
+    qapp,
+    tmp_path,
+):
+    event = _event(passage_time_ms=43_201_000)
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    for camera_index in (1, 2):
+        video_path = tmp_path / f"camera_{camera_index}.mkv"
+        video_path.write_bytes(b"video")
+        window.timeline_store.add_completed_segment(
+            source_id=f"camera_{camera_index}",
+            camera_index=camera_index,
+            video_path=video_path,
+            media_started_at_ms=event.timeline_timestamp_ms - 1_000,
+            media_duration_ms=4_000,
+            clock_source=DEFAULT_CLOCK_SOURCE,
+            timing_error_ms=0,
+            end_reason="test",
+            race_id=event.race_id,
+        )
+    window.passage_store.append(event)
+    window.refresh()
+    qapp.processEvents()
+
+    second_pane = window.regular_panes[1]
+    frame = passage_review.QImage(640, 360, passage_review.QImage.Format_RGB888)
+    frame.fill(0)
+    second_pane._worker.frame_ready.emit(frame, 1_000, 25)
+    qapp.processEvents()
+    window._update_operator_controls()
+
+    assert window.mark_regular_button.isEnabled()
+    QTest.mouseClick(window.mark_regular_button, Qt.LeftButton)
+
+    assert not window.regular_panes[0].video_view._marker_mode
+    assert second_pane.video_view._marker_mode
+    window.close()
+
+
 def test_preflight_requires_changed_video_settings_to_be_saved(
     qapp,
     tmp_path,

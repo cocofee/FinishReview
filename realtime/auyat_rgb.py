@@ -485,6 +485,12 @@ class AuyatRgbScanWorker(QThread):
         self._stop_requested = False
         self._scan_requested = True
 
+    def start(self, priority=QThread.InheritPriority) -> None:
+        with self._condition:
+            self._stop_requested = False
+            self._scan_requested = True
+        super().start(priority)
+
     def request_scan(self) -> None:
         with self._condition:
             self._scan_requested = True

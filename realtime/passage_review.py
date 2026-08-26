@@ -444,9 +444,14 @@ class EvidenceImageView(QGraphicsView):
             return
         status = str(status).strip()
         confirmed = status == "已确认"
-        background_color = "#1bbf83" if confirmed else "#ffb020"
-        text_color = "#07120e" if confirmed else "#231703"
-        border_color = "#4dd6a5" if confirmed else "#ffcc66"
+        reference = status == "参考"
+        background_color = (
+            "#1bbf83" if confirmed else "#667085" if reference else "#ffb020"
+        )
+        text_color = "#07120e" if confirmed else "#ffffff" if reference else "#231703"
+        border_color = (
+            "#4dd6a5" if confirmed else "#98a2b3" if reference else "#ffcc66"
+        )
         self._identity_badge.setText(identity)
         self._identity_badge.setStyleSheet(
             "QLabel#evidenceIdentityBadge {"
@@ -779,14 +784,23 @@ class PassageEvidencePane(QFrame):
 
     MAX_SCRUB_SPAN_MS = 6_000
 
-    def __init__(self, title: str, source_kind: str, parent=None):
+    def __init__(
+        self,
+        title: str,
+        source_kind: str,
+        parent=None,
+        *,
+        camera_index: int = 0,
+    ):
         super().__init__(parent)
         if source_kind not in {REGULAR_SOURCE, HIGH_SPEED_SOURCE}:
             raise ValueError("source_kind must be regular or high_speed")
         self.source_kind = source_kind
+        self.camera_index = max(0, int(camera_index))
         self._event: Optional[PassageEvent] = None
         self._location: Optional[PassageVideoLocation] = None
         self._association: Optional[PassageEvidenceAssociation] = None
+        self._reference_only = False
         self._pending_marker: Optional[tuple[float, float, int, int]] = None
         self._marking_enabled = False
         self._identity = ""
@@ -868,6 +882,7 @@ class PassageEvidencePane(QFrame):
 
         controls = QHBoxLayout()
         controls.setSpacing(6)
+        self.controls_layout = controls
         self.previous_frame_btn = QPushButton("|◀")
         self.previous_frame_btn.setToolTip("上一帧")
         self.play_btn = QPushButton("▶")
@@ -917,6 +932,20 @@ class PassageEvidencePane(QFrame):
         self.mark_btn.clicked.connect(lambda: self.marking_requested.emit(self))
         self.open_btn.clicked.connect(self._request_open)
         self._set_transport_enabled(False)
+
+    def set_compact_controls(self, compact: bool) -> None:
+        compact = bool(compact)
+        for button in (
+            self.previous_frame_btn,
+            self.play_btn,
+            self.next_frame_btn,
+            self.zoom_out_btn,
+            self.actual_size_btn,
+            self.zoom_in_btn,
+        ):
+            button.setVisible(not compact)
+        self.open_btn.setText("回放" if compact else "定点回放")
+        self.controls_layout.setSpacing(4 if compact else 6)
 
     @property
     def location(self) -> Optional[PassageVideoLocation]:
@@ -975,6 +1004,8 @@ class PassageEvidencePane(QFrame):
         association: Optional[PassageEvidenceAssociation],
     ) -> None:
         self._association = association
+        if association is not None:
+            self._reference_only = False
         self._pending_marker = None
         self._marking_enabled = association is None
         self.video_view.set_marker_mode(
@@ -983,6 +1014,14 @@ class PassageEvidencePane(QFrame):
         self.mark_btn.setText(
             f"重标 {self._identity}" if association is not None else f"标线 {self._identity}"
         )
+        self._update_status_label()
+        self._render_marker()
+
+    def set_reference_only(self, reference_only: bool) -> None:
+        next_value = bool(reference_only) and self._association is None
+        if next_value == self._reference_only:
+            return
+        self._reference_only = next_value
         self._update_status_label()
         self._render_marker()
 
@@ -1039,6 +1078,8 @@ class PassageEvidencePane(QFrame):
             status = location_status_text(self._location)
         if self._association is not None:
             status = f"{status} · 已标记 {self._identity}"
+        elif self._reference_only:
+            status = f"{status} · 参考"
         self.status_label.setText(status)
 
     def _render_marker(self) -> None:
@@ -1050,6 +1091,8 @@ class PassageEvidencePane(QFrame):
                 cue_status = "待确认"
             elif self._association is not None:
                 cue_status = "已确认"
+            elif self._reference_only:
+                cue_status = "参考"
             else:
                 cue_status = "待判读"
             self.video_view.set_identity_cue(self._identity, cue_status)
@@ -1119,6 +1162,7 @@ class PassageEvidencePane(QFrame):
         same_context = bool(previous_context) and previous_context == next_context
         self._event = event
         self._location = location
+        self._reference_only = False
         self._identity = event.bib.strip() or "未知"
         if (
             association is not None
@@ -1222,6 +1266,7 @@ class PassageEvidencePane(QFrame):
         self._event = None
         self._location = None
         self._association = None
+        self._reference_only = False
         self._pending_marker = None
         self._marking_enabled = False
         self._identity = ""
@@ -1510,8 +1555,45 @@ class PassageEvidencePane(QFrame):
             self._retire_worker(worker, wait=wait)
 
 
+def _resolve_evidence_layout(
+    timeline_store: VideoTimelineStore,
+    *,
+    regular_camera_indexes: Optional[Iterable[int]] = None,
+    show_high_speed_pane: Optional[bool] = None,
+    include_recorded: bool = True,
+) -> tuple[tuple[int, ...], bool]:
+    configured_indexes = tuple(
+        dict.fromkeys(
+            max(1, int(camera_index))
+            for camera_index in (regular_camera_indexes or ())
+        )
+    )
+    recorded_regular_indexes: tuple[int, ...] = ()
+    recorded_high_speed = False
+    if include_recorded:
+        segments = timeline_store.segments()
+        recorded_regular_indexes = tuple(
+            sorted(
+                {
+                    segment.camera_index
+                    for segment in segments
+                    if segment.clock_source == DEFAULT_CLOCK_SOURCE
+                }
+            )
+        )
+        recorded_high_speed = any(
+            segment.clock_source != DEFAULT_CLOCK_SOURCE for segment in segments
+        )
+    regular_indexes = tuple(
+        dict.fromkeys((*configured_indexes, *recorded_regular_indexes))
+    ) or (1,)
+    show_high_speed = bool(show_high_speed_pane) or recorded_high_speed
+    return regular_indexes, show_high_speed
+
+
 class PassageReviewDialog(QDialog):
     clock_offset_changed = pyqtSignal(int)
+    evidence_pane_added = pyqtSignal(object)
 
     def __init__(
         self,
@@ -1529,6 +1611,9 @@ class PassageReviewDialog(QDialog):
         high_speed_locator: Optional[
             Callable[[PassageEvent, int, int], Optional[PassageVideoLocation]]
         ] = None,
+        regular_camera_indexes: Optional[Iterable[int]] = None,
+        show_high_speed_pane: Optional[bool] = None,
+        include_recorded_evidence: bool = True,
     ):
         super().__init__(parent)
         self.passage_store = passage_store
@@ -1541,14 +1626,30 @@ class PassageReviewDialog(QDialog):
         self.pre_roll_ms = max(0, int(pre_roll_ms))
         self._open_location = open_location
         self._high_speed_locator = high_speed_locator
+        requested_high_speed = (
+            bool(high_speed_locator)
+            if show_high_speed_pane is None
+            else bool(show_high_speed_pane)
+        )
+        (
+            self._configured_regular_camera_indexes,
+            self._show_high_speed_pane,
+        ) = _resolve_evidence_layout(
+            timeline_store,
+            regular_camera_indexes=regular_camera_indexes,
+            show_high_speed_pane=requested_high_speed,
+            include_recorded=include_recorded_evidence,
+        )
+        self._legacy_camera_selector = regular_camera_indexes is None
+        self._preferred_regular_camera_index = 0
+        self._include_recorded_evidence = bool(include_recorded_evidence)
+        self._regular_panes_by_camera: dict[int, PassageEvidencePane] = {}
         self._external_location_revision = 0
         self._visible_events: list[PassageEvent] = []
         self._lookups: dict[str, PassageVideoLookup] = {}
         self._lookup_cache: dict[str, tuple[tuple, PassageVideoLookup]] = {}
         self._timeline_signature: tuple = ()
         self._selected_event_id = ""
-        self._preferred_regular_camera_index = 0
-        self._regular_camera_choices: dict[str, int] = {}
         self._shared_delta_ms = 0
         self._sync_playing = False
         self._sync_origin_delta_ms = 0
@@ -1779,32 +1880,22 @@ class PassageReviewDialog(QDialog):
         self.evidence_splitter = QSplitter(Qt.Horizontal)
         self.evidence_splitter.setChildrenCollapsible(False)
         self.evidence_splitter.setHandleWidth(5)
-        self.regular_pane = PassageEvidencePane(
-            "普通录像", REGULAR_SOURCE, self
-        )
+        for camera_index in self._configured_regular_camera_indexes:
+            self._create_regular_pane(camera_index)
+        self.regular_pane = self.regular_panes[0]
         self.high_speed_pane = PassageEvidencePane(
             "高速摄像", HIGH_SPEED_SOURCE, self
         )
-        self.regular_pane.open_requested.connect(self._open_location_if_available)
-        self.regular_pane.camera_combo.currentIndexChanged.connect(
-            self._on_regular_camera_changed
-        )
-        for pane in (self.regular_pane, self.high_speed_pane):
-            pane.step_requested.connect(self._step_both)
-            pane.play_requested.connect(self._toggle_both)
-            pane.passage_delta_requested.connect(self._seek_both_delta)
-            pane.scrub_started.connect(lambda: self._set_sync_playing(False))
-            pane.selection_step_requested.connect(self._move_selection)
-            pane.maximize_requested.connect(self._toggle_maximized_pane)
-            pane.marking_requested.connect(self._begin_marking)
-            pane.confirmation_requested.connect(self._confirm_pending_marker)
-            pane.cancel_requested.connect(self._cancel_pending_marker)
-            pane.delete_requested.connect(self._delete_marker)
-        self.evidence_splitter.addWidget(self.regular_pane)
+        self._connect_evidence_pane(self.high_speed_pane)
         self.evidence_splitter.addWidget(self.high_speed_pane)
-        self.evidence_splitter.setStretchFactor(0, 1)
-        self.evidence_splitter.setStretchFactor(1, 1)
-        self.evidence_splitter.setSizes([680, 680])
+        self.configure_evidence_panes(
+            self._configured_regular_camera_indexes,
+            show_high_speed=self._show_high_speed_pane,
+        )
+        if self._legacy_camera_selector:
+            self.regular_pane.camera_combo.currentIndexChanged.connect(
+                self._on_legacy_regular_camera_changed
+            )
         layout.addWidget(self.evidence_splitter, 6)
 
         footer = QHBoxLayout()
@@ -1816,6 +1907,142 @@ class PassageReviewDialog(QDialog):
         footer.addStretch()
         footer.addWidget(close_btn)
         layout.addLayout(footer)
+
+    @property
+    def regular_panes(self) -> tuple[PassageEvidencePane, ...]:
+        return tuple(
+            self._regular_panes_by_camera[camera_index]
+            for camera_index in self._configured_regular_camera_indexes
+        )
+
+    @property
+    def evidence_panes(self) -> tuple[PassageEvidencePane, ...]:
+        panes = list(self.regular_panes)
+        if self._show_high_speed_pane:
+            panes.append(self.high_speed_pane)
+        return tuple(panes)
+
+    @property
+    def all_evidence_panes(self) -> tuple[PassageEvidencePane, ...]:
+        panes = list(self._regular_panes_by_camera.values())
+        if hasattr(self, "high_speed_pane"):
+            panes.append(self.high_speed_pane)
+        return tuple(panes)
+
+    def _connect_evidence_pane(self, pane: PassageEvidencePane) -> None:
+        if pane.source_kind == REGULAR_SOURCE:
+            pane.open_requested.connect(self._open_location_if_available)
+        pane.step_requested.connect(self._step_both)
+        pane.play_requested.connect(self._toggle_both)
+        pane.passage_delta_requested.connect(self._seek_both_delta)
+        pane.scrub_started.connect(lambda: self._set_sync_playing(False))
+        pane.selection_step_requested.connect(self._move_selection)
+        pane.maximize_requested.connect(self._toggle_maximized_pane)
+        pane.marking_requested.connect(self._begin_marking)
+        pane.confirmation_requested.connect(self._confirm_pending_marker)
+        pane.cancel_requested.connect(self._cancel_pending_marker)
+        pane.delete_requested.connect(self._delete_marker)
+
+    def _create_regular_pane(self, camera_index: int) -> PassageEvidencePane:
+        camera_index = max(1, int(camera_index))
+        existing = self._regular_panes_by_camera.get(camera_index)
+        if existing is not None:
+            return existing
+        pane = PassageEvidencePane(
+            f"机位 {camera_index}",
+            REGULAR_SOURCE,
+            self,
+            camera_index=camera_index,
+        )
+        pane.camera_combo.hide()
+        self._connect_evidence_pane(pane)
+        self._regular_panes_by_camera[camera_index] = pane
+        if hasattr(self, "high_speed_pane"):
+            high_speed_index = self.evidence_splitter.indexOf(self.high_speed_pane)
+            self.evidence_splitter.insertWidget(max(0, high_speed_index), pane)
+        else:
+            self.evidence_splitter.addWidget(pane)
+        self.evidence_pane_added.emit(pane)
+        return pane
+
+    def configure_evidence_panes(
+        self,
+        regular_camera_indexes: Iterable[int],
+        *,
+        show_high_speed: bool,
+        include_recorded: bool = False,
+    ) -> None:
+        normalized_indexes, resolved_high_speed = _resolve_evidence_layout(
+            self.timeline_store,
+            regular_camera_indexes=regular_camera_indexes,
+            show_high_speed_pane=show_high_speed,
+            include_recorded=include_recorded,
+        )
+        self._set_sync_playing(False)
+        self._maximized_pane = None
+        for camera_index in normalized_indexes:
+            self._create_regular_pane(camera_index)
+        self._configured_regular_camera_indexes = normalized_indexes
+        self._show_high_speed_pane = resolved_high_speed
+        self.regular_pane = self.regular_panes[0]
+
+        active_regular = set(normalized_indexes)
+        for camera_index, pane in self._regular_panes_by_camera.items():
+            active = camera_index in active_regular
+            if not active:
+                pane.clear_passage()
+            pane.setVisible(active)
+        if not self._show_high_speed_pane:
+            self.high_speed_pane.clear_passage()
+        self.high_speed_pane.setVisible(self._show_high_speed_pane)
+
+        compact = len(self.evidence_panes) >= 3
+        active_panes = set(self.evidence_panes)
+        for pane in self.all_evidence_panes:
+            pane.set_compact_controls(compact and pane in active_panes)
+            pane.maximize_btn.setText("□")
+        for index in range(self.evidence_splitter.count()):
+            self.evidence_splitter.setStretchFactor(index, 1)
+        self.evidence_splitter.setSizes([1] * self.evidence_splitter.count())
+
+    def _update_legacy_camera_selector(
+        self,
+        lookup: PassageVideoLookup,
+        selected: Optional[PassageVideoLocation],
+    ) -> None:
+        if not self._legacy_camera_selector:
+            return
+        combo = self.regular_pane.camera_combo
+        locations = self._regular_locations(lookup)
+        combo.blockSignals(True)
+        combo.clear()
+        for location in locations:
+            combo.addItem(f"机位 {location.segment.camera_index}", location.segment.camera_index)
+        if selected is not None:
+            combo.setCurrentIndex(
+                max(0, combo.findData(selected.segment.camera_index))
+            )
+        combo.setVisible(len(locations) > 1)
+        combo.blockSignals(False)
+
+    def _on_legacy_regular_camera_changed(self, _index: int) -> None:
+        if not self._selected_event_id:
+            return
+        event = self.passage_store.get(self._selected_event_id)
+        lookup = self._lookups.get(self._selected_event_id)
+        if event is None or lookup is None:
+            return
+        camera_index = int(self.regular_pane.camera_combo.currentData() or 0)
+        location = self._regular_location_for_camera(lookup, camera_index)
+        if location is None:
+            return
+        self._preferred_regular_camera_index = camera_index
+        self.regular_pane.set_passage(
+            event,
+            location,
+            self._source_association(event.event_id, REGULAR_SOURCE, location),
+            initial_delta_ms=self._shared_delta_ms,
+        )
 
     def _on_offset_changed(self, value: int) -> None:
         self.clock_offset_ms = int(value)
@@ -1833,11 +2060,37 @@ class PassageReviewDialog(QDialog):
             pre_roll_ms=self.pre_roll_ms,
             race_id=event.race_id,
         )
-        if self._high_speed_locator is None:
-            return lookup
-        locations = [
-            location for location in lookup.locations if not is_high_speed(location)
-        ]
+        locations = list(lookup.locations)
+        if not self._include_recorded_evidence:
+            configured = set(self._configured_regular_camera_indexes)
+            locations = [
+                location
+                for location in locations
+                if (
+                    is_high_speed(location)
+                    and self._show_high_speed_pane
+                )
+                or (
+                    not is_high_speed(location)
+                    and location.segment.camera_index in configured
+                )
+            ]
+        if self._high_speed_locator is None or not self._show_high_speed_pane:
+            if tuple(locations) == lookup.locations:
+                return lookup
+            status = (
+                "located"
+                if any(location.status == "located" for location in locations)
+                else "near_boundary"
+                if any(location.status == "near_boundary" for location in locations)
+                else lookup.status
+            )
+            return PassageVideoLookup(
+                status,
+                event.timeline_timestamp_ms + self.clock_offset_ms,
+                tuple(locations),
+            )
+        locations = [location for location in locations if not is_high_speed(location)]
         high_speed = self._high_speed_locator(
             event,
             self.clock_offset_ms,
@@ -1884,6 +2137,9 @@ class PassageReviewDialog(QDialog):
             self.clock_offset_ms,
             self.pre_roll_ms,
             self._external_location_revision,
+            tuple(self._configured_regular_camera_indexes),
+            self._show_high_speed_pane,
+            self._include_recorded_evidence,
         )
         cached = self._lookup_cache.get(event.event_id)
         if cached is not None and cached[0] == key:
@@ -2326,65 +2582,47 @@ class PassageReviewDialog(QDialog):
             )
         )
 
-    def _regular_location_for_event(
+    @staticmethod
+    def _regular_location_for_camera(
+        lookup: PassageVideoLookup,
+        camera_index: int,
+    ) -> Optional[PassageVideoLocation]:
+        return next(
+            (
+                location
+                for location in PassageReviewDialog._regular_locations(lookup)
+                if location.segment.camera_index == int(camera_index)
+            ),
+            None,
+        )
+
+    def _regular_summary_location(
         self,
         event_id: str,
         lookup: PassageVideoLookup,
     ) -> Optional[PassageVideoLocation]:
         locations = self._regular_locations(lookup)
-        if not locations:
-            return None
-        selected_camera = self._regular_camera_choices.get(event_id)
-        if selected_camera is None:
-            association = self.association_store.get(event_id, REGULAR_SOURCE)
-            if association is not None:
-                associated = next(
-                    (
-                        location
-                        for location in locations
-                        if location.segment.segment_id == association.segment_id
-                    ),
-                    None,
-                )
-                if associated is not None:
-                    return associated
-            selected_camera = self._preferred_regular_camera_index
+        association = self.association_store.get(event_id, REGULAR_SOURCE)
+        if association is not None:
+            associated = next(
+                (
+                    location
+                    for location in locations
+                    if location.segment.segment_id == association.segment_id
+                ),
+                None,
+            )
+            if associated is not None:
+                return associated
+        configured = set(self._configured_regular_camera_indexes)
         return next(
             (
                 location
                 for location in locations
-                if location.segment.camera_index == selected_camera
+                if location.segment.camera_index in configured
             ),
-            locations[0],
+            locations[0] if locations else None,
         )
-
-    def _update_regular_camera_selector(
-        self,
-        event_id: str,
-        lookup: PassageVideoLookup,
-        selected: Optional[PassageVideoLocation],
-    ) -> None:
-        combo = self.regular_pane.camera_combo
-        locations = self._regular_locations(lookup)
-        combo.blockSignals(True)
-        combo.clear()
-        for location in locations:
-            camera_index = location.segment.camera_index
-            combo.addItem(f"机位 {camera_index}", camera_index)
-        if selected is not None:
-            index = combo.findData(selected.segment.camera_index)
-            combo.setCurrentIndex(max(0, index))
-        combo.setVisible(len(locations) > 1)
-        combo.blockSignals(False)
-
-    def _on_regular_camera_changed(self, _index: int) -> None:
-        event_id = self._selected_event_id
-        camera_index = int(self.regular_pane.camera_combo.currentData() or 0)
-        if not event_id or camera_index <= 0:
-            return
-        self._preferred_regular_camera_index = camera_index
-        self._regular_camera_choices[event_id] = camera_index
-        self._select_event(event_id)
 
     def _select_event(self, event_id: str) -> None:
         event = self.passage_store.get(event_id)
@@ -2392,13 +2630,29 @@ class PassageReviewDialog(QDialog):
         if event is None or lookup is None:
             self.refresh()
             return
-        regular = self._regular_location_for_event(event.event_id, lookup)
-        self._update_regular_camera_selector(event.event_id, lookup, regular)
+        regular_locations = {
+            pane.camera_index: self._regular_location_for_camera(
+                lookup,
+                pane.camera_index,
+            )
+            for pane in self.regular_panes
+        }
+        regular = self._regular_summary_location(event.event_id, lookup)
+        self._update_legacy_camera_selector(lookup, regular)
         high_speed = source_location(lookup, high_speed=True)
         preserve_media = (
             self._selected_event_id == event.event_id
-            and self.regular_pane.matches_passage_context(event, regular)
-            and self.high_speed_pane.matches_passage_context(event, high_speed)
+            and all(
+                pane.matches_passage_context(
+                    event,
+                    regular_locations.get(pane.camera_index),
+                )
+                for pane in self.regular_panes
+            )
+            and (
+                not self._show_high_speed_pane
+                or self.high_speed_pane.matches_passage_context(event, high_speed)
+            )
         )
         regular_association = self._source_association(
             event.event_id, REGULAR_SOURCE, regular
@@ -2465,24 +2719,41 @@ class PassageReviewDialog(QDialog):
             self.current_time_label.setText(
                 format_passage_time(event.timeline_timestamp_ms + self._shared_delta_ms)
             )
-            self.regular_pane.set_passage(
-                event,
-                regular,
-                regular_association,
-                initial_delta_ms=self._shared_delta_ms,
-            )
-            self.high_speed_pane.set_passage(
-                event,
-                high_speed,
-                high_speed_association,
-                initial_delta_ms=self._shared_delta_ms,
-            )
+            for pane in self.regular_panes:
+                pane_location = regular_locations.get(pane.camera_index)
+                pane.set_passage(
+                    event,
+                    pane_location,
+                    self._source_association(
+                        event.event_id,
+                        REGULAR_SOURCE,
+                        pane_location,
+                    ),
+                    initial_delta_ms=self._shared_delta_ms,
+                )
+            if self._show_high_speed_pane:
+                self.high_speed_pane.set_passage(
+                    event,
+                    high_speed,
+                    high_speed_association,
+                    initial_delta_ms=self._shared_delta_ms,
+                )
             self.play_both_btn.setText("▶")
         else:
-            if self.regular_pane.association != regular_association:
-                self.regular_pane.set_association(regular_association)
-            if self.high_speed_pane.association != high_speed_association:
+            for pane in self.regular_panes:
+                pane_association = self._source_association(
+                    event.event_id,
+                    REGULAR_SOURCE,
+                    regular_locations.get(pane.camera_index),
+                )
+                if pane.association != pane_association:
+                    pane.set_association(pane_association)
+            if (
+                self._show_high_speed_pane
+                and self.high_speed_pane.association != high_speed_association
+            ):
                 self.high_speed_pane.set_association(high_speed_association)
+        self._update_reference_states(event.event_id)
         self._update_navigation_controls()
 
     def _update_navigation_controls(self) -> None:
@@ -2494,7 +2765,6 @@ class PassageReviewDialog(QDialog):
         self._set_sync_playing(False)
         self._shared_delta_ms = 0
         self._selected_event_id = ""
-        self.regular_pane.camera_combo.hide()
         metadata = self._current_metadata()
         self.race_value.setText(
             (metadata.race_name.strip() or metadata.race_id)
@@ -2522,8 +2792,8 @@ class PassageReviewDialog(QDialog):
             label.setText("--")
         self.current_passage_label.setText("未选择通过记录")
         self.current_time_label.setText("--:--:--.---")
-        self.regular_pane.clear_passage()
-        self.high_speed_pane.clear_passage()
+        for pane in self.evidence_panes:
+            pane.clear_passage()
         self._update_navigation_controls()
 
     def focus_athlete(
@@ -2662,10 +2932,18 @@ class PassageReviewDialog(QDialog):
 
     def _begin_marking(self, pane: PassageEvidencePane) -> None:
         self._set_sync_playing(False)
-        for candidate in (self.regular_pane, self.high_speed_pane):
+        for candidate in self.evidence_panes:
             if candidate is not pane:
                 candidate.cancel_marker_edit()
         pane.begin_marking()
+
+    def _update_reference_states(self, event_id: str) -> None:
+        confirmed = any(
+            self.association_store.get(event_id, source_kind) is not None
+            for source_kind in (REGULAR_SOURCE, HIGH_SPEED_SOURCE)
+        )
+        for pane in self.evidence_panes:
+            pane.set_reference_only(confirmed and pane.association is None)
 
     def _confirm_pending_marker(self, pane: PassageEvidencePane) -> bool:
         event = self.passage_store.get(self._selected_event_id)
@@ -2690,6 +2968,7 @@ class PassageReviewDialog(QDialog):
             return False
         confirmed_row = self.table.currentRow()
         pane.set_association(association)
+        self._update_reference_states(event.event_id)
         should_advance = (
             self.auto_advance_checkbox.isChecked()
             and self._all_available_sources_confirmed(event.event_id)
@@ -2804,13 +3083,10 @@ class PassageReviewDialog(QDialog):
         lookup = self._lookups.get(event_id)
         if lookup is None:
             return False
-        for high_speed, source_kind in (
-            (False, REGULAR_SOURCE),
-            (True, HIGH_SPEED_SOURCE),
-        ):
-            location = source_location(lookup, high_speed=high_speed)
-            if location is None or location.status not in _OPENABLE_STATUSES:
+        for location in lookup.locations:
+            if location.status not in _OPENABLE_STATUSES:
                 continue
+            source_kind = HIGH_SPEED_SOURCE if is_high_speed(location) else REGULAR_SOURCE
             if self._source_association(event_id, source_kind, location) is not None:
                 return True
         return False
@@ -2842,6 +3118,7 @@ class PassageReviewDialog(QDialog):
             QMessageBox.critical(self, "删除失败", f"无法删除证据标记：{error}")
             return
         pane.set_association(None)
+        self._update_reference_states(association.passage_event_id)
         self._update_event_confirmation_status(association.passage_event_id)
 
     def _find_identity(self) -> None:
@@ -2923,10 +3200,13 @@ class PassageReviewDialog(QDialog):
 
     def _step_both(self, frame_delta: int) -> None:
         self._set_sync_playing(False)
-        reference = (
-            self.high_speed_pane
-            if self.high_speed_pane.available_delta_bounds() is not None
-            else self.regular_pane
+        reference = next(
+            (
+                pane
+                for pane in reversed(self.evidence_panes)
+                if pane.available_delta_bounds() is not None
+            ),
+            self.regular_pane,
         )
         step_ms = reference.frame_duration_ms()
         self._seek_both_delta(
@@ -2938,12 +3218,9 @@ class PassageReviewDialog(QDialog):
 
     def _sync_delta_bounds(self) -> Optional[tuple[int, int]]:
         bounds = [
-            value
-            for value in (
-                self.regular_pane.available_delta_bounds(),
-                self.high_speed_pane.available_delta_bounds(),
-            )
-            if value is not None
+            pane_bounds
+            for pane in self.evidence_panes
+            if (pane_bounds := pane.available_delta_bounds()) is not None
         ]
         if not bounds:
             return None
@@ -2957,14 +3234,11 @@ class PassageReviewDialog(QDialog):
             return
         lower, upper = bounds
         self._shared_delta_ms = max(lower, min(int(delta_ms), upper))
-        self.regular_pane.seek_passage_delta(
-            self._shared_delta_ms,
-            linked_playing=self._sync_playing,
-        )
-        self.high_speed_pane.seek_passage_delta(
-            self._shared_delta_ms,
-            linked_playing=self._sync_playing,
-        )
+        for pane in self.evidence_panes:
+            pane.seek_passage_delta(
+                self._shared_delta_ms,
+                linked_playing=self._sync_playing,
+            )
         self._update_shared_time_label()
 
     def _set_sync_playing(self, playing: bool) -> None:
@@ -2982,8 +3256,8 @@ class PassageReviewDialog(QDialog):
                 self._shared_delta_ms = self._sync_origin_delta_ms + elapsed_ms
             self._sync_playing = False
             self._sync_timer.stop()
-        self.regular_pane.set_linked_playing(self._sync_playing)
-        self.high_speed_pane.set_linked_playing(self._sync_playing)
+        for pane in self.evidence_panes:
+            pane.set_linked_playing(self._sync_playing)
         self.play_both_btn.setText("Ⅱ" if self._sync_playing else "▶")
         if not self._sync_playing:
             self._seek_both_delta(self._shared_delta_ms)
@@ -3012,17 +3286,14 @@ class PassageReviewDialog(QDialog):
 
     def _toggle_maximized_pane(self, pane: PassageEvidencePane) -> None:
         if self._maximized_pane is pane:
-            self.regular_pane.show()
-            self.high_speed_pane.show()
-            self.regular_pane.maximize_btn.setText("□")
-            self.high_speed_pane.maximize_btn.setText("□")
+            for candidate in self.evidence_panes:
+                candidate.show()
+                candidate.maximize_btn.setText("□")
             self._maximized_pane = None
             return
-        other = self.high_speed_pane if pane is self.regular_pane else self.regular_pane
-        other.hide()
-        pane.show()
-        pane.maximize_btn.setText("▣")
-        other.maximize_btn.setText("□")
+        for candidate in self.evidence_panes:
+            candidate.setVisible(candidate is pane)
+            candidate.maximize_btn.setText("▣" if candidate is pane else "□")
         self._maximized_pane = pane
 
     def _open_preferred_source(self, row: int, _column: int) -> None:
@@ -3032,7 +3303,7 @@ class PassageReviewDialog(QDialog):
         lookup = self._lookups.get(event.event_id)
         if lookup is None:
             return
-        regular = source_location(lookup, high_speed=False)
+        regular = self._regular_summary_location(event.event_id, lookup)
         high_speed = source_location(lookup, high_speed=True)
         location = next(
             (
@@ -3093,8 +3364,8 @@ class PassageReviewDialog(QDialog):
     def closeEvent(self, event) -> None:
         self._sync_playing = False
         self._sync_timer.stop()
-        self.regular_pane.shutdown(wait=True)
-        self.high_speed_pane.shutdown(wait=True)
+        for pane in self.all_evidence_panes:
+            pane.shutdown(wait=True)
         super().closeEvent(event)
 
 
