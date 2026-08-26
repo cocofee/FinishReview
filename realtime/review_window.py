@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import logging
+import inspect
+import os
+import re
 import socket
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 
-from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt5.QtGui import QColor, QDesktopServices, QPainter, QPen
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -30,7 +32,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QShortcut,
+    QSizePolicy,
     QStyle,
     QTabWidget,
     QTableWidget,
@@ -41,95 +43,101 @@ from PyQt5.QtWidgets import (
 )
 
 from .auyat_rgb import (
-    AuyatRgbCatalog,
-    AuyatRgbScanWorker,
-    AuyatScanResult,
-    is_network_share,
-)
+        AuyatRgbCatalog,
+        AuyatRgbScanWorker,
+        AuyatScanResult,
+        is_network_share,
+    )
 from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
+from .event_workspace import (
+        EventWorkspaceDescriptor,
+        EventWorkspaceError,
+        EventWorkspaceSummary,
+        discover_event_workspaces,
+        summarize_event_workspace,
+        validate_event_workspace,
+    )
 from .passage_evidence import PassageEvidenceAssociationStore
 from .passage_receiver import (
-    DEFAULT_HOST,
-    DEFAULT_PORT,
-    PassageEvent,
-    PassageEventReceiver,
-    PassageEventStore,
-    RaceFocus,
-)
+        DEFAULT_HOST,
+        DEFAULT_PORT,
+        PassageEvent,
+        PassageEventReceiver,
+        PassageEventStore,
+        RaceFocus,
+    )
 from .passage_review import PassageReviewDialog, source_location
 from .point_playback import PointPlaybackUnavailable, prepare_point_playback
 from .preflight import (
-    PreflightJournal,
-    PreflightRun,
-    local_ipv4_addresses,
-    validate_event_network,
-)
+        PreflightJournal,
+        PreflightRun,
+        local_ipv4_addresses,
+        validate_event_network,
+    )
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
-from .receiver_controller import ReceiverController
-from .recording_controller import RecordingSessionController
+from .review_export import export_review_summary
 from .review_recorder import (
-    ArchiveTimelinePublisher,
-    FfmpegReviewRecorder,
-    PassageReviewCoordinator,
-    PassageReviewState,
-    PassageReviewTimelinePublisher,
-    PassageReviewWindow,
-    ReviewRingBuffer,
-    discover_directshow_video_devices,
-    is_supported_review_source,
-    load_archive_recording_sessions,
-    make_directshow_source,
-    parse_directshow_source,
-)
-from .settings import FinishReviewSettings
+        ArchiveTimelinePublisher,
+        DirectShowVideoDevice,
+        FfmpegReviewRecorder,
+        PassageReviewCoordinator,
+        PassageReviewState,
+        PassageReviewTimelinePublisher,
+        PassageReviewWindow,
+        ReviewRingBuffer,
+        discover_directshow_video_device_choices,
+        is_supported_review_source,
+        load_archive_recording_sessions,
+        make_directshow_source,
+        parse_directshow_source,
+    )
 from .stream_recorder import (
-    apply_rtsp_credentials,
-    find_ffmpeg_executable,
-    is_rtsp_source,
-    RecordingError,
-    sanitize_recording_message,
-    split_rtsp_credentials,
-)
+        apply_rtsp_credentials,
+        find_ffmpeg_executable,
+        is_rtsp_source,
+        RecordingError,
+        sanitize_recording_message,
+        split_rtsp_credentials,
+    )
 from .video_timeline import (
-    DEFAULT_CLOCK_SOURCE,
-    DEFAULT_TIMING_ERROR_MS,
-    VideoTimelineStore,
-)
+        DEFAULT_CLOCK_SOURCE,
+        DEFAULT_TIMING_ERROR_MS,
+        PassageVideoLocation,
+        PassageVideoLookup,
+        VideoTimelineStore,
+    )
 from .video_playback import VideoPlaybackDialog
 
 
 logger = logging.getLogger("FinishReview")
+IS_WINDOWS = os.name == "nt"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
-RACETIGER_BASE_URL = "https://rqs.racetigertiming.com"
-RACETIGER_INFO_PATH = "/Dif/info"
+CYCLERACE_INBOX_DIRNAME = ".finishreview"
+_TEST_GROUP_NAMES = frozenset({"test", "testgroup"})
+_TEST_GROUP_MARKERS = ("测试", "检测")
+_INVALID_EVENT_FOLDER_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
-def parse_racetiger_info_url(value: str) -> tuple[str, str, str, str]:
-    """Extract RaceTiger connection values from its copied info URL."""
-
-    parsed = urlsplit(str(value or "").strip())
-    if (
-        parsed.scheme.lower() != "https"
-        or (parsed.hostname or "").lower() != "rqs.racetigertiming.com"
-        or parsed.port not in {None, 443}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path.rstrip("/").lower() != RACETIGER_INFO_PATH.lower()
-        or parsed.fragment
-    ):
-        raise ValueError("请粘贴赛虎后台完整的‘赛事信息接口’链接")
-
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    values: dict[str, str] = {}
-    for name, label in (("pc", "PC"), ("rid", "RID"), ("token", "令牌")):
-        candidates = [item.strip() for item in query.get(name, ()) if item.strip()]
-        if len(candidates) != 1:
-            raise ValueError(f"赛事信息接口缺少有效的{label}")
-        values[name] = candidates[0]
-    return RACETIGER_BASE_URL, values["pc"], values["rid"], values["token"]
+def _open_event_directory(event_dir: Path) -> bool:
+    if IS_WINDOWS:
+        try:
+            subprocess.Popen(["explorer.exe", "/n,", str(event_dir)])
+        except OSError:
+            logger.exception("Failed to launch Windows Explorer")
+        else:
+            return True
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(event_dir)))
 
 
 def _format_point_playback_time(timestamp_ms: int) -> str:
@@ -192,6 +200,13 @@ def _align_live_evidence_timestamp(
     return int(timestamp_ms)
 
 
+def _is_test_group_name(value: str) -> bool:
+    normalized = re.sub(r"[\s_-]+", "", str(value or "")).casefold()
+    return normalized in _TEST_GROUP_NAMES or any(
+        marker in normalized for marker in _TEST_GROUP_MARKERS
+    )
+
+
 def _historical_evidence_timestamp_overrides(
     events: tuple[PassageEvent, ...],
 ) -> dict[str, tuple[int, int]]:
@@ -200,17 +215,82 @@ def _historical_evidence_timestamp_overrides(
         timestamp_ms = int(event.timeline_timestamp_ms)
         if (
             not event.is_active
-            or event.emitted_at_ms <= 0
             or (event.passage_timestamp_ms is None and timestamp_ms < 86_400_000)
         ):
             continue
-        aligned_timestamp_ms = _align_live_evidence_timestamp(
-            timestamp_ms,
-            event.emitted_at_ms,
-        )
+        aligned_timestamp_ms = timestamp_ms
+        if event.received_at_ms > 0:
+            aligned_timestamp_ms = _align_live_evidence_timestamp(
+                timestamp_ms,
+                event.received_at_ms,
+            )
+        elif event.emitted_at_ms > 0:
+            aligned_timestamp_ms = _align_live_evidence_timestamp(
+                timestamp_ms,
+                event.emitted_at_ms,
+            )
         if aligned_timestamp_ms != timestamp_ms:
             overrides[event.event_id] = (timestamp_ms, aligned_timestamp_ms)
     return overrides
+
+
+def _safe_event_folder_name(value: str, fallback: str) -> str:
+    name = _INVALID_EVENT_FOLDER_CHARS.sub("_", str(value).strip())
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        name = _INVALID_EVENT_FOLDER_CHARS.sub("_", str(fallback).strip())
+        name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        name = "赛事"
+    if name.upper() in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    return name[:80].rstrip(" .") or "赛事"
+
+
+def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
+    root = Path(root).expanduser().resolve()
+    folder_name = _safe_event_folder_name(metadata.race_name, metadata.race_id)
+    race_suffix = _safe_event_folder_name(metadata.race_id, "race")
+    candidates = [root / folder_name, root / f"{folder_name}_{race_suffix}"]
+    candidates.extend(root / f"{folder_name}_{race_suffix}_{index}" for index in range(2, 100))
+    for candidate in candidates:
+        metadata_path = candidate / "cyclerace_race_metadata.json"
+        if not candidate.exists():
+            return candidate
+        try:
+            existing = RaceMetadataStore(metadata_path).current()
+        except (OSError, RuntimeError, ValueError):
+            existing = None
+        if existing is not None and existing.race_id == metadata.race_id:
+            return candidate
+        try:
+            is_empty = not any(candidate.iterdir())
+        except OSError:
+            is_empty = False
+        if is_empty:
+            return candidate
+    raise RuntimeError("无法为赛事创建唯一保存目录")
+
+
+@dataclass(frozen=True, slots=True)
+class FinishReviewSettings:
+    source: str
+    output_dir: Path
+    passage_host: str
+    passage_port: int
+    camera_index: int
+    secondary_source: str = ""
+    high_speed_dir: Path | None = None
+    finishreview_ip: str = "192.168.50.10"
+    cyclerace_ip: str = "192.168.50.20"
+    high_speed_pc_ip: str = "192.168.50.30"
+    switch_ip: str = "192.168.50.2"
+    timing_provider: str = "cyclerace"
+    racetiger_base_url: str = ""
+    racetiger_pc: str = ""
+    racetiger_rid: str = ""
+    racetiger_token: str = ""
+    racetiger_poll_interval_seconds: float = 2.0
 
 
 class _RtspProbeWorker(QThread):
@@ -307,6 +387,166 @@ class _RtspProbeWorker(QThread):
             pass
 
 
+class EventWorkspacePickerDialog(QDialog):
+    """Compact picker for saved CycleRace event workspaces."""
+
+    def __init__(
+        self,
+        workspaces: tuple[EventWorkspaceDescriptor, ...],
+        parent=None,
+        *,
+        current_dir: Path | None = None,
+        summary_provider: Callable[
+            [EventWorkspaceDescriptor], EventWorkspaceSummary
+        ] = summarize_event_workspace,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("打开赛事")
+        self.setMinimumSize(720, 430)
+        self.resize(820, 500)
+        self._workspaces = tuple(workspaces)
+        self._summary_provider = summary_provider
+        self._selected_path: Path | None = None
+        self._summary_cache: dict[Path, EventWorkspaceSummary | str] = {}
+        current_path = current_dir.resolve() if current_dir is not None else None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("已保存赛事", self)
+        title.setStyleSheet("font-size: 14pt; font-weight: 700; color: #17212b;")
+        layout.addWidget(title)
+
+        self.search_edit = QLineEdit(self)
+        self.search_edit.setPlaceholderText("搜索赛事或赛段")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._filter_rows)
+        layout.addWidget(self.search_edit)
+
+        self.table = QTableWidget(len(self._workspaces), 4, self)
+        self.table.setHorizontalHeaderLabels(("赛事名称", "赛段", "最后更新", "状态"))
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self._update_selection)
+        self.table.cellDoubleClicked.connect(self._open_selected_row)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        selected_row = -1
+        for row, workspace in enumerate(self._workspaces):
+            modified = datetime.fromtimestamp(
+                workspace.modified_at_ms / 1000.0
+            ).strftime("%Y-%m-%d %H:%M") if workspace.modified_at_ms else "--"
+            is_current = current_path is not None and workspace.path == current_path
+            values = (
+                workspace.race_name,
+                workspace.stage_name,
+                modified,
+                "当前打开" if is_current else "已保存",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.UserRole, str(workspace.path))
+                    item.setToolTip(str(workspace.path))
+                if column in {2, 3}:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, column, item)
+            if is_current:
+                selected_row = row
+        layout.addWidget(self.table, 1)
+
+        self.summary_label = QLabel("选择一个赛事", self)
+        self.summary_label.setStyleSheet("color: #526170; font-weight: 600;")
+        layout.addWidget(self.summary_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Open | QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        self.open_button = buttons.button(QDialogButtonBox.Open)
+        self.open_button.setText("打开赛事")
+        self.open_button.setEnabled(False)
+        self.cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        self.cancel_button.setText("取消")
+        buttons.accepted.connect(self._accept_selected)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        if selected_row < 0 and self._workspaces:
+            selected_row = 0
+        if selected_row >= 0:
+            self.table.selectRow(selected_row)
+        elif not self._workspaces:
+            self.summary_label.setText("当前保存根目录中没有可打开的赛事")
+
+    @property
+    def selected_path(self) -> Path | None:
+        return self._selected_path
+
+    def _workspace_for_row(self, row: int) -> EventWorkspaceDescriptor | None:
+        if row < 0 or row >= len(self._workspaces):
+            return None
+        return self._workspaces[row]
+
+    def _filter_rows(self, text: str) -> None:
+        query = str(text).strip().casefold()
+        first_visible = -1
+        for row, workspace in enumerate(self._workspaces):
+            searchable = " ".join(
+                (workspace.race_name, workspace.stage_name, workspace.path.name)
+            ).casefold()
+            hidden = bool(query and query not in searchable)
+            self.table.setRowHidden(row, hidden)
+            if not hidden and first_visible < 0:
+                first_visible = row
+        if first_visible >= 0:
+            self.table.selectRow(first_visible)
+        else:
+            self.table.clearSelection()
+            self.summary_label.setText("没有匹配的赛事")
+
+    def _update_selection(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        workspace = self._workspace_for_row(rows[0].row()) if rows else None
+        self._selected_path = workspace.path if workspace is not None else None
+        self.open_button.setEnabled(workspace is not None)
+        if workspace is None:
+            return
+        summary = self._summary_cache.get(workspace.path)
+        if summary is None:
+            try:
+                summary = self._summary_provider(workspace)
+            except EventWorkspaceError as error:
+                summary = str(error)
+            self._summary_cache[workspace.path] = summary
+        if isinstance(summary, str):
+            self.summary_label.setText(summary)
+            self.summary_label.setStyleSheet("color: #b54747; font-weight: 600;")
+            self.open_button.setEnabled(False)
+            return
+        self.summary_label.setStyleSheet("color: #526170; font-weight: 600;")
+        self.summary_label.setText(
+            f"通过记录 {summary.passage_count:,} 条 · "
+            f"已确认 {summary.confirmed_count:,} 条"
+        )
+
+    def _open_selected_row(self, row: int, _column: int) -> None:
+        if self._workspace_for_row(row) is None:
+            return
+        self.table.selectRow(row)
+        self._accept_selected()
+
+    def _accept_selected(self) -> None:
+        if self._selected_path is not None and self.open_button.isEnabled():
+            self.accept()
+
+
 class FinishReviewLaunchDialog(QDialog):
     """Operator-facing device and race-directory settings."""
 
@@ -316,11 +556,25 @@ class FinishReviewLaunchDialog(QDialog):
         parent=None,
         *,
         ffmpeg_path: Path | None = None,
-        device_provider: Callable[[], tuple[str, ...]] | None = None,
+        device_provider: Callable[
+            [], tuple[str | DirectShowVideoDevice, ...]
+        ]
+        | None = None,
         passage_provider: Callable[[], tuple[PassageEvent, ...]] | None = None,
         evidence_provider: Callable[[PassageEvent], tuple[bool, bool, str, str]]
         | None = None,
         runtime_snapshot_provider: Callable[[], dict[str, str]] | None = None,
+        event_export_callback: Callable[[], object] | None = None,
+        event_workspace_provider: Callable[
+            [], tuple[EventWorkspaceDescriptor, ...]
+        ]
+        | None = None,
+        event_workspace_summary_provider: Callable[
+            [EventWorkspaceDescriptor], EventWorkspaceSummary
+        ]
+        | None = None,
+        event_open_callback: Callable[[Path], bool] | None = None,
+        return_live_event_callback: Callable[[], bool] | None = None,
         recheck_callback: Callable[[], None] | None = None,
         recording_start_callback: Callable[[], bool] | None = None,
         preflight_event_callback: Callable[[PreflightRun], None] | None = None,
@@ -358,7 +612,6 @@ class FinishReviewLaunchDialog(QDialog):
         self._racetiger_pc = str(settings.racetiger_pc or "").strip()
         self._racetiger_rid = str(settings.racetiger_rid or "").strip()
         self._racetiger_token = str(settings.racetiger_token or "").strip()
-        self._racetiger_config_pending_save = False
         self._racetiger_poll_interval = max(
             0.5,
             float(settings.racetiger_poll_interval_seconds or 2.0),
@@ -366,13 +619,20 @@ class FinishReviewLaunchDialog(QDialog):
         self._ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self._detected_device_names: set[str] = set()
         self._device_provider = device_provider or (
-            lambda: discover_directshow_video_devices(self._ffmpeg_path)
+            lambda: discover_directshow_video_device_choices(self._ffmpeg_path)
         )
         self._passage_provider = passage_provider or (lambda: ())
         self._evidence_provider = evidence_provider or (
             lambda _event: (False, False, "等待普通录像", "等待高速画面")
         )
         self._runtime_snapshot_provider = runtime_snapshot_provider or (lambda: {})
+        self._event_export_callback = event_export_callback
+        self._event_workspace_provider = event_workspace_provider
+        self._event_workspace_summary_provider = (
+            event_workspace_summary_provider or summarize_event_workspace
+        )
+        self._event_open_callback = event_open_callback
+        self._return_live_event_callback = return_live_event_callback
         self._recheck_callback = recheck_callback
         self._recording_start_callback = recording_start_callback or (lambda: True)
         self._preflight_event_callback = preflight_event_callback
@@ -423,14 +683,17 @@ class FinishReviewLaunchDialog(QDialog):
         layout.addWidget(title)
 
         self.tabs = QTabWidget(self)
+        self.event_page = QWidget(self.tabs)
         self.deployment_page = QWidget(self.tabs)
         self.devices_page = QWidget(self.tabs)
         self.preflight_page = QWidget(self.tabs)
+        self.tabs.addTab(self.event_page, "赛事与保存")
         self.tabs.addTab(self.deployment_page, "部署总览")
         self.tabs.addTab(self.devices_page, "设备设置")
         self.tabs.addTab(self.preflight_page, "赛前联调")
         layout.addWidget(self.tabs, 1)
 
+        self._init_event_page()
         device_layout = QVBoxLayout(self.devices_page)
         device_layout.setContentsMargins(12, 12, 12, 12)
         device_layout.setSpacing(10)
@@ -451,20 +714,24 @@ class FinishReviewLaunchDialog(QDialog):
         )
         form.addRow("计时源", self.timing_provider_combo)
 
-        self.racetiger_info_url_edit = QLineEdit(self)
-        self.racetiger_info_url_edit.setEchoMode(QLineEdit.Password)
-        self.racetiger_info_url_edit.setPlaceholderText(
-            "粘贴赛虎后台的‘赛事信息接口’完整链接"
+        self.racetiger_base_url_edit = QLineEdit(self._racetiger_base_url, self)
+        self.racetiger_base_url_edit.setPlaceholderText(
+            "https://rqs.racetigertiming.com"
         )
-        self.racetiger_info_url_edit.editingFinished.connect(
-            self._apply_racetiger_info_url
-        )
-        form.addRow("赛事信息接口", self.racetiger_info_url_edit)
+        form.addRow("赛虎接口地址", self.racetiger_base_url_edit)
 
-        self.racetiger_config_status = QLabel(self)
-        self.racetiger_config_status.setWordWrap(True)
-        form.addRow("", self.racetiger_config_status)
-        self._refresh_racetiger_config_status()
+        self.racetiger_pc_edit = QLineEdit(self._racetiger_pc, self)
+        self.racetiger_pc_edit.setPlaceholderText("赛事电脑标识 pc")
+        form.addRow("赛虎 PC", self.racetiger_pc_edit)
+
+        self.racetiger_rid_edit = QLineEdit(self._racetiger_rid, self)
+        self.racetiger_rid_edit.setPlaceholderText("赛事 RID")
+        form.addRow("赛虎赛事 RID", self.racetiger_rid_edit)
+
+        self.racetiger_token_edit = QLineEdit(self._racetiger_token, self)
+        self.racetiger_token_edit.setEchoMode(QLineEdit.Password)
+        self.racetiger_token_edit.setPlaceholderText("本机保存，不显示明文")
+        form.addRow("赛虎令牌", self.racetiger_token_edit)
 
         self.racetiger_poll_interval_spin = QDoubleSpinBox(self)
         self.racetiger_poll_interval_spin.setRange(0.5, 60.0)
@@ -483,8 +750,10 @@ class FinishReviewLaunchDialog(QDialog):
         racetiger_hint.setStyleSheet("color: #667085;")
         form.addRow("", racetiger_hint)
         self.racetiger_controls = (
-            self.racetiger_info_url_edit,
-            self.racetiger_config_status,
+            self.racetiger_base_url_edit,
+            self.racetiger_pc_edit,
+            self.racetiger_rid_edit,
+            self.racetiger_token_edit,
             self.racetiger_poll_interval_spin,
             racetiger_hint,
         )
@@ -498,7 +767,7 @@ class FinishReviewLaunchDialog(QDialog):
         self.source_type_combo.currentIndexChanged.connect(
             self._refresh_source_fields
         )
-        form.addRow("录像连接", self.source_type_combo)
+        form.addRow("机位1连接", self.source_type_combo)
 
         self.rtsp_address_edit = QLineEdit(
             self._clean_rtsp_source if is_rtsp_source(self._source) else "",
@@ -527,17 +796,36 @@ class FinishReviewLaunchDialog(QDialog):
         rtsp_credentials_row.addWidget(self.rtsp_test_button)
         form.addRow("RTSP凭据", rtsp_credentials_row)
 
-        self.secondary_rtsp_enabled_checkbox = QCheckBox(
-            "启用第二台RTSP普通摄像机",
-            self,
+        secondary_device_row = QHBoxLayout()
+        self.secondary_device_row = secondary_device_row
+        secondary_device_row.setSpacing(6)
+        self.secondary_enabled_checkbox = QCheckBox("启用", self)
+        self.secondary_enabled_checkbox.setChecked(
+            is_supported_review_source(self._secondary_source)
         )
-        self.secondary_rtsp_enabled_checkbox.setChecked(
-            is_rtsp_source(self._secondary_source)
+        self.secondary_enabled_checkbox.toggled.connect(self._refresh_source_fields)
+        self.secondary_rtsp_enabled_checkbox = self.secondary_enabled_checkbox
+        secondary_device_row.addWidget(self.secondary_enabled_checkbox)
+        self.secondary_source_type_combo = QComboBox(self)
+        self.secondary_source_type_combo.addItem("USB/Type-C", "usb")
+        self.secondary_source_type_combo.addItem("RTSP", "rtsp")
+        self.secondary_source_type_combo.setCurrentIndex(
+            1 if is_rtsp_source(self._secondary_source) else 0
         )
-        self.secondary_rtsp_enabled_checkbox.toggled.connect(
+        self.secondary_source_type_combo.currentIndexChanged.connect(
             self._refresh_source_fields
         )
-        form.addRow("普通机位2", self.secondary_rtsp_enabled_checkbox)
+        secondary_device_row.addWidget(self.secondary_source_type_combo)
+        self.secondary_device_combo = QComboBox(self)
+        self.secondary_device_combo.setMinimumWidth(280)
+        self.secondary_device_combo.currentIndexChanged.connect(
+            self._refresh_camera_status
+        )
+        secondary_device_row.addWidget(self.secondary_device_combo, 1)
+        self.secondary_detect_button = QPushButton("重新检测", self)
+        self.secondary_detect_button.clicked.connect(self._refresh_devices)
+        secondary_device_row.addWidget(self.secondary_detect_button)
+        form.addRow("普通机位2", secondary_device_row)
 
         self.secondary_rtsp_address_edit = QLineEdit(
             self._clean_secondary_rtsp_source,
@@ -600,33 +888,19 @@ class FinishReviewLaunchDialog(QDialog):
         self.detect_button = QPushButton("重新检测", self)
         self.detect_button.clicked.connect(self._refresh_devices)
         device_row.addWidget(self.detect_button)
-        form.addRow("本机录像设备", device_row)
+        form.addRow("机位1 USB设备", device_row)
 
         self.video_size_combo = QComboBox(self)
         self.video_size_combo.addItem("自动", None)
         for value in ("1920x1080", "2560x1440", "3840x2160"):
             self.video_size_combo.addItem(value, value)
-        form.addRow("录像分辨率", self.video_size_combo)
+        form.addRow("USB录像分辨率", self.video_size_combo)
 
         self.framerate_combo = QComboBox(self)
         self.framerate_combo.addItem("自动", None)
         for value in (25.0, 30.0, 50.0, 60.0):
             self.framerate_combo.addItem(f"{value:g} FPS", value)
-        form.addRow("录像帧率", self.framerate_combo)
-
-        output_row = QHBoxLayout()
-        output_row.setSpacing(6)
-        self.output_edit = QLineEdit(str(self._output_dir), self)
-        self.output_edit.setReadOnly(True)
-        self.output_edit.setCursorPosition(0)
-        output_row.addWidget(self.output_edit, 1)
-        browse_button = QPushButton(self)
-        browse_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
-        browse_button.setToolTip("选择本机录像与证据保存目录")
-        browse_button.setFixedWidth(42)
-        browse_button.clicked.connect(self._browse_output_dir)
-        output_row.addWidget(browse_button)
-        form.addRow("录像证据保存", output_row)
+        form.addRow("USB录像帧率", self.framerate_combo)
 
         high_speed_row = QHBoxLayout()
         high_speed_row.setSpacing(6)
@@ -698,6 +972,83 @@ class FinishReviewLaunchDialog(QDialog):
         self._dialog_timer.timeout.connect(self._refresh_live_pages)
         self._dialog_timer.start()
         self._refresh_live_pages()
+
+    def _init_event_page(self) -> None:
+        page_layout = QVBoxLayout(self.event_page)
+        page_layout.setContentsMargins(12, 12, 12, 12)
+        page_layout.setSpacing(12)
+        self._event_dir: Path | None = None
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        self.event_status_label = QLabel("等待 CycleRace 赛事信息", self)
+        self.event_status_label.setStyleSheet(
+            "color: #a56300; font-size: 11pt; font-weight: 700;"
+        )
+        status_row.addWidget(self.event_status_label)
+        status_row.addStretch(1)
+        self.return_live_event_button = QPushButton("返回当前赛事", self)
+        self.return_live_event_button.clicked.connect(self._return_to_live_event)
+        self.return_live_event_button.setVisible(False)
+        status_row.addWidget(self.return_live_event_button)
+        page_layout.addLayout(status_row)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+
+        self.event_name_edit = QLineEdit(self)
+        self.event_name_edit.setReadOnly(True)
+        event_name_row = QHBoxLayout()
+        event_name_row.setSpacing(6)
+        event_name_row.addWidget(self.event_name_edit, 1)
+        self.open_saved_event_button = QPushButton("打开赛事", self)
+        self.open_saved_event_button.setIcon(
+            self.style().standardIcon(QStyle.SP_DialogOpenButton)
+        )
+        self.open_saved_event_button.clicked.connect(self._open_saved_event)
+        event_name_row.addWidget(self.open_saved_event_button)
+        form.addRow("当前赛事", event_name_row)
+
+        self.event_stage_edit = QLineEdit(self)
+        self.event_stage_edit.setReadOnly(True)
+        form.addRow("当前赛段", self.event_stage_edit)
+
+        event_dir_row = QHBoxLayout()
+        event_dir_row.setSpacing(6)
+        self.event_dir_edit = QLineEdit(self)
+        self.event_dir_edit.setReadOnly(True)
+        self.event_dir_edit.setCursorPosition(0)
+        event_dir_row.addWidget(self.event_dir_edit, 1)
+        self.open_event_dir_button = QPushButton(self)
+        self.open_event_dir_button.setIcon(
+            self.style().standardIcon(QStyle.SP_DirOpenIcon)
+        )
+        self.open_event_dir_button.setToolTip("打开当前赛事目录")
+        self.open_event_dir_button.setFixedWidth(42)
+        self.open_event_dir_button.clicked.connect(self._open_event_dir)
+        event_dir_row.addWidget(self.open_event_dir_button)
+        form.addRow("当前赛事目录", event_dir_row)
+
+        output_row = QHBoxLayout()
+        output_row.setSpacing(6)
+        self.output_edit = QLineEdit(str(self._output_dir), self)
+        self.output_edit.setReadOnly(True)
+        self.output_edit.setCursorPosition(0)
+        self.output_edit.setToolTip(
+            "CycleRace发送赛事信息后，将在此目录下自动创建赛事名称文件夹"
+        )
+        output_row.addWidget(self.output_edit, 1)
+        browse_button = QPushButton(self)
+        browse_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        browse_button.setToolTip("选择赛事保存根目录")
+        browse_button.setFixedWidth(42)
+        browse_button.clicked.connect(self._browse_output_dir)
+        output_row.addWidget(browse_button)
+        form.addRow("赛事保存根目录", output_row)
+
+        page_layout.addLayout(form)
+        page_layout.addStretch(1)
 
     def _init_deployment_page(self) -> None:
         page_layout = QVBoxLayout(self.deployment_page)
@@ -810,7 +1161,9 @@ class FinishReviewLaunchDialog(QDialog):
         self._update_preflight_table()
 
     def _refresh_live_pages(self) -> None:
-        self._refresh_deployment_table()
+        snapshot = dict(self._runtime_snapshot_provider() or {})
+        self._refresh_event_page(snapshot)
+        self._refresh_deployment_table(snapshot)
         self._poll_preflight()
 
     def _request_recheck(self) -> None:
@@ -818,8 +1171,92 @@ class FinishReviewLaunchDialog(QDialog):
             self._recheck_callback()
         self._refresh_live_pages()
 
-    def _refresh_deployment_table(self) -> None:
-        snapshot = dict(self._runtime_snapshot_provider() or {})
+    def _refresh_event_page(self, snapshot: dict[str, str] | None = None) -> None:
+        snapshot = dict(snapshot or self._runtime_snapshot_provider() or {})
+        timing_provider = str(
+            self.timing_provider_combo.currentData() or "cyclerace"
+        )
+        runtime_matches_selection = (
+            not snapshot.get("timing_provider")
+            or snapshot.get("timing_provider") == timing_provider
+        )
+        if timing_provider == "racetiger":
+            event_name = (
+                snapshot.get("event_name", "")
+                if runtime_matches_selection
+                else ""
+            ) or self.racetiger_rid_edit.text().strip()
+            event_stage = (
+                snapshot.get("event_stage", "")
+                if runtime_matches_selection
+                else ""
+            ) or "终点"
+            event_dir = (
+                snapshot.get("event_dir", "")
+                if runtime_matches_selection
+                else ""
+            ) or str(self._output_dir)
+            event_state = (
+                snapshot.get("event_state", "")
+                if runtime_matches_selection
+                else ""
+            ) or (
+                "已配置" if event_name else "等待赛虎赛事 RID"
+            )
+        else:
+            event_name = (
+                snapshot.get("event_name", "") if runtime_matches_selection else ""
+            )
+            event_stage = (
+                snapshot.get("event_stage", "") if runtime_matches_selection else ""
+            )
+            event_dir = (
+                snapshot.get("event_dir", "") if runtime_matches_selection else ""
+            )
+            event_state = (
+                snapshot.get("event_state", "") if runtime_matches_selection else ""
+            ) or "等待 CycleRace 赛事信息"
+
+        has_event = bool(event_name and event_dir)
+        workspace_mode = snapshot.get("workspace_mode", "live")
+        is_archive = workspace_mode == "archive"
+        recording_active = snapshot.get("recording_active", "") == "1"
+        self.event_status_label.setText(event_state)
+        self.event_status_label.setStyleSheet(
+            "color: #a56300; font-size: 11pt; font-weight: 700;"
+            if is_archive
+            else "color: #247a52; font-size: 11pt; font-weight: 700;"
+            if has_event
+            else "color: #a56300; font-size: 11pt; font-weight: 700;"
+        )
+        self.event_name_edit.setText(event_name or "--")
+        self.event_stage_edit.setText(event_stage or "--")
+        self.event_dir_edit.setText(event_dir or "等待赛事信息")
+        self.event_dir_edit.setToolTip(event_dir)
+        self.event_dir_edit.setCursorPosition(0)
+        self._event_dir = Path(event_dir) if event_dir else None
+        self.open_event_dir_button.setEnabled(self._event_dir is not None)
+        can_open_saved = bool(
+            timing_provider == "cyclerace"
+            and self._event_workspace_provider is not None
+            and self._event_open_callback is not None
+            and not recording_active
+        )
+        self.open_saved_event_button.setEnabled(can_open_saved)
+        self.open_saved_event_button.setToolTip(
+            "停止录像后可打开历史赛事"
+            if recording_active
+            else "打开已保存的 CycleRace 赛事"
+        )
+        self.return_live_event_button.setVisible(
+            is_archive and timing_provider == "cyclerace"
+        )
+
+    def _refresh_deployment_table(
+        self,
+        snapshot: dict[str, str] | None = None,
+    ) -> None:
+        snapshot = dict(snapshot or self._runtime_snapshot_provider() or {})
         expected_ip = self.finishreview_ip_edit.text().strip()
         local_addresses = tuple(self._local_address_provider())
         if expected_ip and expected_ip in local_addresses:
@@ -831,30 +1268,25 @@ class FinishReviewLaunchDialog(QDialog):
         else:
             local_state = "异常"
             local_detail = "未检测到本机IPv4地址"
-        camera_address = (
+        camera_addresses = [
             self.rtsp_address_edit.text().strip()
             if self.source_type_combo.currentData() == "rtsp"
             else self.device_combo.currentText()
-        )
-        if (
-            self.source_type_combo.currentData() == "rtsp"
-            and self.secondary_rtsp_enabled_checkbox.isChecked()
-        ):
-            camera_address = " / ".join(
-                value
-                for value in (
-                    camera_address,
-                    self.secondary_rtsp_address_edit.text().strip(),
-                )
-                if value
+        ]
+        if self.secondary_enabled_checkbox.isChecked():
+            camera_addresses.append(
+                self.secondary_rtsp_address_edit.text().strip()
+                if self.secondary_source_type_combo.currentData() == "rtsp"
+                else self.secondary_device_combo.currentText()
             )
+        camera_address = " / ".join(value for value in camera_addresses if value)
         timing_provider = str(
             self.timing_provider_combo.currentData() or "cyclerace"
         )
         timing_label = "赛虎计时" if timing_provider == "racetiger" else "CycleRace"
         timing_location = "云端接口" if timing_provider == "racetiger" else "计时电脑"
         timing_address = (
-            self._racetiger_base_url
+            self.racetiger_base_url_edit.text().strip()
             if timing_provider == "racetiger"
             else self.cyclerace_ip_edit.text().strip()
         )
@@ -1119,51 +1551,6 @@ class FinishReviewLaunchDialog(QDialog):
         for control in self.racetiger_controls:
             self._set_form_row_visible(control, enabled)
 
-    def _refresh_racetiger_config_status(self, error: str = "") -> None:
-        if error:
-            self.racetiger_config_status.setText(error)
-            self.racetiger_config_status.setStyleSheet(
-                "color: #b54747; font-weight: 600;"
-            )
-            return
-        if all((self._racetiger_pc, self._racetiger_rid, self._racetiger_token)):
-            suffix = (
-                "点击保存设置后生效"
-                if self._racetiger_config_pending_save
-                else "令牌已保存"
-            )
-            self.racetiger_config_status.setText(
-                f"已配置：PC {self._racetiger_pc} / RID {self._racetiger_rid}；{suffix}"
-            )
-            self.racetiger_config_status.setStyleSheet(
-                "color: #247a52; font-weight: 600;"
-            )
-            return
-        self.racetiger_config_status.setText(
-            "复制赛虎后台的‘赛事信息接口’整行并粘贴，其他参数自动读取"
-        )
-        self.racetiger_config_status.setStyleSheet("color: #667085;")
-
-    def _apply_racetiger_info_url(self) -> bool:
-        value = self.racetiger_info_url_edit.text().strip()
-        if not value:
-            self._refresh_racetiger_config_status()
-            return True
-        try:
-            (
-                self._racetiger_base_url,
-                self._racetiger_pc,
-                self._racetiger_rid,
-                self._racetiger_token,
-            ) = parse_racetiger_info_url(value)
-        except ValueError as error:
-            self._refresh_racetiger_config_status(str(error))
-            return False
-        self._racetiger_config_pending_save = True
-        self.racetiger_info_url_edit.clear()
-        self._refresh_racetiger_config_status()
-        return True
-
     def _set_form_row_visible(self, field, visible: bool) -> None:
         label = self._device_form.labelForField(field)
         if label is not None:
@@ -1184,19 +1571,25 @@ class FinishReviewLaunchDialog(QDialog):
             self.rtsp_password_row,
         ):
             self._set_form_row_visible(field, is_rtsp)
-        self._set_form_row_visible(self.secondary_rtsp_enabled_checkbox, is_rtsp)
-        secondary_visible = (
-            is_rtsp and self.secondary_rtsp_enabled_checkbox.isChecked()
+        secondary_enabled = self.secondary_enabled_checkbox.isChecked()
+        secondary_is_rtsp = (
+            secondary_enabled
+            and self.secondary_source_type_combo.currentData() == "rtsp"
         )
+        secondary_is_usb = secondary_enabled and not secondary_is_rtsp
+        self.secondary_source_type_combo.setVisible(secondary_enabled)
+        self.secondary_device_combo.setVisible(secondary_is_usb)
+        self.secondary_detect_button.setVisible(secondary_is_usb)
         for field in (
             self.secondary_rtsp_address_edit,
             self.secondary_rtsp_username_edit,
             self.secondary_rtsp_password_row,
         ):
-            self._set_form_row_visible(field, secondary_visible)
+            self._set_form_row_visible(field, secondary_is_rtsp)
         self._set_form_row_visible(self.device_row, not is_rtsp)
-        self._set_form_row_visible(self.video_size_combo, not is_rtsp)
-        self._set_form_row_visible(self.framerate_combo, not is_rtsp)
+        usb_settings_visible = not is_rtsp or secondary_is_usb
+        self._set_form_row_visible(self.video_size_combo, usb_settings_visible)
+        self._set_form_row_visible(self.framerate_combo, usb_settings_visible)
         high_speed_enabled = self.high_speed_enabled_checkbox.isChecked()
         self.high_speed_edit.setEnabled(high_speed_enabled)
         self.high_speed_browse_button.setEnabled(high_speed_enabled)
@@ -1222,13 +1615,35 @@ class FinishReviewLaunchDialog(QDialog):
         )
 
     def _current_secondary_rtsp_source(self) -> str:
-        if not self.secondary_rtsp_enabled_checkbox.isChecked():
+        if (
+            not self.secondary_enabled_checkbox.isChecked()
+            or self.secondary_source_type_combo.currentData() != "rtsp"
+        ):
             return ""
         return apply_rtsp_credentials(
             self.secondary_rtsp_address_edit.text().strip(),
             self.secondary_rtsp_username_edit.text(),
             self.secondary_rtsp_password_edit.text(),
         )
+
+    def _selected_usb_source(self, combo: QComboBox) -> str:
+        selected = str(combo.currentData() or "").strip()
+        if is_supported_review_source(selected):
+            return selected
+        if not selected:
+            return ""
+        return make_directshow_source(
+            selected,
+            video_size=self.video_size_combo.currentData(),
+            framerate=self.framerate_combo.currentData(),
+        )
+
+    def _selected_secondary_recording_source(self) -> str:
+        if not self.secondary_enabled_checkbox.isChecked():
+            return ""
+        if self.secondary_source_type_combo.currentData() == "rtsp":
+            return self._current_secondary_rtsp_source()
+        return self._selected_usb_source(self.secondary_device_combo)
 
     def _test_rtsp_source(self) -> None:
         source = self._current_rtsp_source()
@@ -1305,30 +1720,68 @@ class FinishReviewLaunchDialog(QDialog):
         QDialog.done(self, pending_result)
 
     def _refresh_devices(self) -> None:
-        current_source = self._source
-        parsed_source = parse_directshow_source(current_source)
-        selected_name = parsed_source.device_name if parsed_source is not None else ""
-        self.device_combo.blockSignals(True)
-        self.device_combo.clear()
-        if is_supported_review_source(current_source) and parsed_source is None:
-            self.device_combo.addItem("网络摄像机（已配置）", current_source)
+        parsed_source = parse_directshow_source(self._source)
+        parsed_secondary_source = parse_directshow_source(self._secondary_source)
         try:
-            devices = tuple(self._device_provider())
+            discovered = tuple(self._device_provider())
         except Exception:  # noqa: BLE001 - device discovery is best effort.
-            devices = ()
-        self._detected_device_names = set(devices)
-        for device_name in devices:
-            self.device_combo.addItem(device_name, device_name)
-        if selected_name and self.device_combo.findData(selected_name) < 0:
-            self.device_combo.addItem(f"{selected_name}（当前未检测到）", selected_name)
-        selected_index = self.device_combo.findData(
-            current_source if parsed_source is None else selected_name
+            discovered = ()
+        devices: list[DirectShowVideoDevice] = []
+        seen_inputs: set[str] = set()
+        for item in discovered:
+            if isinstance(item, DirectShowVideoDevice):
+                choice = item
+            else:
+                name = str(item).strip()
+                if not name:
+                    continue
+                choice = DirectShowVideoDevice(name, name, name)
+            if not choice.input_name or choice.input_name in seen_inputs:
+                continue
+            seen_inputs.add(choice.input_name)
+            devices.append(choice)
+        self._detected_device_names = {device.input_name for device in devices}
+
+        def resolved_device_name(selected_name: str) -> str:
+            if not selected_name or selected_name in self._detected_device_names:
+                return selected_name
+            normalized = selected_name.strip().casefold()
+            friendly_matches = [
+                device.input_name
+                for device in devices
+                if (device.friendly_name or device.display_name).strip().casefold()
+                == normalized
+            ]
+            return friendly_matches[0] if len(friendly_matches) == 1 else selected_name
+
+        def populate(combo: QComboBox, selected_name: str) -> None:
+            selected_name = resolved_device_name(selected_name)
+            combo.blockSignals(True)
+            combo.clear()
+            for device in devices:
+                combo.addItem(device.display_name, device.input_name)
+            if selected_name and combo.findData(selected_name) < 0:
+                combo.addItem(f"{selected_name}（当前未检测到）", selected_name)
+            selected_index = combo.findData(selected_name)
+            combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+            combo.blockSignals(False)
+
+        populate(
+            self.device_combo,
+            parsed_source.device_name if parsed_source is not None else "",
         )
-        self.device_combo.setCurrentIndex(max(0, selected_index))
-        self.device_combo.blockSignals(False)
-        if parsed_source is not None:
-            size_index = self.video_size_combo.findData(parsed_source.video_size)
-            fps_index = self.framerate_combo.findData(parsed_source.framerate)
+        populate(
+            self.secondary_device_combo,
+            (
+                parsed_secondary_source.device_name
+                if parsed_secondary_source is not None
+                else ""
+            ),
+        )
+        usb_source = parsed_source or parsed_secondary_source
+        if usb_source is not None:
+            size_index = self.video_size_combo.findData(usb_source.video_size)
+            fps_index = self.framerate_combo.findData(usb_source.framerate)
             self.video_size_combo.setCurrentIndex(max(0, size_index))
             self.framerate_combo.setCurrentIndex(max(0, fps_index))
         self._refresh_camera_status()
@@ -1345,73 +1798,89 @@ class FinishReviewLaunchDialog(QDialog):
             else:
                 text = self._rtsp_probe_message or "机位1已配置，尚未测试实际画面"
                 color = "#a56300"
-            secondary_source = self._current_secondary_rtsp_source()
-            if self.secondary_rtsp_enabled_checkbox.isChecked():
+        else:
+            selected = str(self.device_combo.currentData() or "")
+            if not selected:
+                text = "未检测到USB/Type-C摄像头"
+                color = "#b54747"
+            elif selected not in self._detected_device_names:
+                text = "录像设备已配置，但当前未检测到"
+                color = "#b54747"
+            else:
+                text = "已检测到摄像头，开始录像后验证画面"
+                color = "#247a52"
+
+        if self.secondary_enabled_checkbox.isChecked():
+            if self.source_type_combo.currentData() == "usb":
+                text = {
+                    "未检测到USB/Type-C摄像头": "机位1未检测到USB/Type-C摄像头",
+                    "录像设备已配置，但当前未检测到": "机位1已配置，但当前未检测到",
+                    "已检测到摄像头，开始录像后验证画面": (
+                        "机位1已检测到，开始录像后验证画面"
+                    ),
+                }.get(text, text)
+            if self.secondary_source_type_combo.currentData() == "rtsp":
+                secondary_source = self._current_secondary_rtsp_source()
                 if not is_rtsp_source(secondary_source):
                     secondary_text = "机位2地址无效"
-                    color = "#b54747"
+                    secondary_color = "#b54747"
                 elif (
                     self._secondary_rtsp_probe_ok
                     and secondary_source == self._secondary_rtsp_probe_source
                 ):
                     secondary_text = "机位2已读取到画面"
+                    secondary_color = "#247a52"
                 else:
                     secondary_text = (
                         self._secondary_rtsp_probe_message
                         or "机位2尚未测试实际画面"
                     )
-                    if color != "#b54747":
-                        color = "#a56300"
-                text = f"{text}；{secondary_text}"
-            self.camera_status_label.setText(text)
-            self.camera_status_label.setStyleSheet(
-                f"color: {color}; font-weight: 600;"
-            )
-            return
-        configured = self.device_combo.currentIndex() >= 0
-        selected = str(self.device_combo.currentData() or "")
-        if not configured:
-            text = "未检测到USB/Type-C摄像头"
-        elif is_supported_review_source(selected):
-            text = "网络摄像机配置已保留，开始录像后验证画面"
-        elif selected not in self._detected_device_names:
-            text = "录像设备已配置，但当前未检测到"
-        else:
-            text = "已检测到摄像头，开始录像后验证画面"
-        ready = configured and (
-            is_supported_review_source(selected)
-            or selected in self._detected_device_names
-        )
+                    secondary_color = "#a56300"
+            else:
+                secondary_selected = str(
+                    self.secondary_device_combo.currentData() or ""
+                )
+                primary_selected = str(self.device_combo.currentData() or "")
+                if not secondary_selected:
+                    secondary_text = "机位2未检测到USB/Type-C摄像头"
+                    secondary_color = "#b54747"
+                elif (
+                    self.source_type_combo.currentData() == "usb"
+                    and secondary_selected == primary_selected
+                ):
+                    secondary_text = "机位1和机位2选择了同一设备"
+                    secondary_color = "#b54747"
+                elif secondary_selected not in self._detected_device_names:
+                    secondary_text = "机位2已配置，但当前未检测到"
+                    secondary_color = "#b54747"
+                else:
+                    secondary_text = "机位2已检测到，开始录像后验证画面"
+                    secondary_color = "#247a52"
+            text = f"{text}；{secondary_text}"
+            if secondary_color == "#b54747" or color == "#b54747":
+                color = "#b54747"
+            elif secondary_color == "#a56300" or color == "#a56300":
+                color = "#a56300"
+            else:
+                color = "#247a52"
         self.camera_status_label.setText(text)
-        self.camera_status_label.setStyleSheet(
-            "color: #247a52; font-weight: 600;"
-            if ready
-            else "color: #b54747; font-weight: 600;"
-        )
+        self.camera_status_label.setStyleSheet(f"color: {color}; font-weight: 600;")
 
     def _accept_settings(self) -> None:
         try:
-            if (
-                self.timing_provider_combo.currentData() == "racetiger"
-                and not self._apply_racetiger_info_url()
-            ):
-                raise ValueError("请粘贴赛虎后台完整的‘赛事信息接口’链接")
             settings = self.settings
-            if settings.timing_provider == "racetiger" and not all(
-                (
-                    settings.racetiger_base_url,
-                    settings.racetiger_pc,
-                    settings.racetiger_rid,
-                    settings.racetiger_token,
-                )
-            ):
-                raise ValueError(
-                    "赛虎配置不完整，请粘贴完整的‘赛事信息接口’链接"
-                )
-            if settings.secondary_source and not is_rtsp_source(
+            if settings.secondary_source and not is_supported_review_source(
                 settings.secondary_source
             ):
-                raise ValueError("机位2必须填写有效的RTSP地址")
+                raise ValueError("机位2必须选择有效的录像设备")
+            primary_usb = parse_directshow_source(settings.source)
+            secondary_usb = parse_directshow_source(settings.secondary_source)
+            if (
+                primary_usb is not None
+                and secondary_usb is not None
+                and primary_usb.device_name == secondary_usb.device_name
+            ):
+                raise ValueError("机位1和机位2不能选择同一台USB/Type-C摄像头")
             validate_event_network(
                 (
                     settings.finishreview_ip,
@@ -1435,6 +1904,49 @@ class FinishReviewLaunchDialog(QDialog):
             self._output_dir = Path(selected).resolve()
             self.output_edit.setText(str(self._output_dir))
 
+    def _open_event_dir(self) -> None:
+        event_dir = self._event_dir
+        if event_dir is None or not event_dir.is_dir():
+            QMessageBox.warning(self, "赛事目录不可用", "当前赛事目录尚未创建")
+            return
+        if self._event_export_callback is not None:
+            try:
+                self._event_export_callback()
+            except Exception as error:  # noqa: BLE001 - opening the directory must continue.
+                logger.exception("Failed to update the event review summary")
+                QMessageBox.warning(
+                    self,
+                    "复核清单未更新",
+                    f"无法更新终点复核清单：{error}\n仍将打开赛事目录。",
+                )
+        if not _open_event_directory(event_dir):
+            QMessageBox.warning(self, "无法打开赛事目录", str(event_dir))
+
+    def _open_saved_event(self) -> None:
+        if self._event_workspace_provider is None or self._event_open_callback is None:
+            return
+        try:
+            workspaces = self._event_workspace_provider()
+        except EventWorkspaceError as error:
+            QMessageBox.warning(self, "无法读取赛事列表", str(error))
+            return
+        picker = EventWorkspacePickerDialog(
+            workspaces,
+            self,
+            current_dir=self._event_dir,
+            summary_provider=self._event_workspace_summary_provider,
+        )
+        if picker.exec_() != QDialog.Accepted or picker.selected_path is None:
+            return
+        if self._event_open_callback(picker.selected_path):
+            self.reject()
+
+    def _return_to_live_event(self) -> None:
+        if self._return_live_event_callback is None:
+            return
+        if self._return_live_event_callback():
+            self.reject()
+
     def _browse_high_speed_dir(self) -> None:
         selected = QFileDialog.getExistingDirectory(
             self,
@@ -1456,11 +1968,7 @@ class FinishReviewLaunchDialog(QDialog):
         timing_provider = str(self.timing_provider_combo.currentData() or "cyclerace")
         return FinishReviewSettings(
             source=source,
-            secondary_source=(
-                self._current_secondary_rtsp_source()
-                if self.source_type_combo.currentData() == "rtsp"
-                else ""
-            ),
+            secondary_source=self._selected_secondary_recording_source(),
             output_dir=self._output_dir,
             passage_host=self._passage_host,
             passage_port=self._passage_port,
@@ -1475,10 +1983,10 @@ class FinishReviewLaunchDialog(QDialog):
                 else None
             ),
             timing_provider=timing_provider,
-            racetiger_base_url=self._racetiger_base_url,
-            racetiger_pc=self._racetiger_pc,
-            racetiger_rid=self._racetiger_rid,
-            racetiger_token=self._racetiger_token,
+            racetiger_base_url=self.racetiger_base_url_edit.text().strip(),
+            racetiger_pc=self.racetiger_pc_edit.text().strip(),
+            racetiger_rid=self.racetiger_rid_edit.text().strip(),
+            racetiger_token=self.racetiger_token_edit.text(),
             racetiger_poll_interval_seconds=(
                 self.racetiger_poll_interval_spin.value()
             ),
@@ -1487,16 +1995,7 @@ class FinishReviewLaunchDialog(QDialog):
     def _selected_recording_source(self) -> str:
         if self.source_type_combo.currentData() == "rtsp":
             return self._current_rtsp_source()
-        selected = str(self.device_combo.currentData() or "").strip()
-        if is_supported_review_source(selected):
-            return selected
-        if not selected:
-            return ""
-        return make_directshow_source(
-            selected,
-            video_size=self.video_size_combo.currentData(),
-            framerate=self.framerate_combo.currentData(),
-        )
+        return self._selected_usb_source(self.device_combo)
 
     def done(self, result: int) -> None:
         self._dialog_timer.stop()
@@ -1519,8 +2018,181 @@ class _PassageSignalBridge(QObject):
     accepted = pyqtSignal(object)
     metadata_accepted = pyqtSignal(object)
     focus_accepted = pyqtSignal(object)
-    racetiger_event = pyqtSignal(object, int)
-    timing_status = pyqtSignal(object, int)
+    timing_status = pyqtSignal(object)
+
+
+class _ElidedLabel(QLabel):
+    """Keep the full value available while eliding long display text."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setText(text)
+
+    def text(self) -> str:
+        return self._full_text
+
+    def setText(self, value: str) -> None:
+        self._full_text = str(value)
+        self._refresh_display_text()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_display_text()
+
+    def _refresh_display_text(self) -> None:
+        width = max(0, self.contentsRect().width())
+        rendered = self.fontMetrics().elidedText(
+            self._full_text,
+            Qt.ElideRight,
+            width,
+        )
+        QLabel.setText(self, rendered)
+
+
+class _FinishReviewLogo(QWidget):
+    """Small scalable brand mark that does not require packaged image assets."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(34, 34)
+        self.setToolTip("FinishReview 终点多源复核")
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.scale(self.width() / 64.0, self.height() / 64.0)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#14232c"))
+        painter.drawRoundedRect(2, 2, 60, 60, 12, 12)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#31505a"), 1.5))
+        painter.drawRoundedRect(3, 3, 58, 58, 11, 11)
+
+        painter.setPen(QPen(QColor("#79a7ad"), 3, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(10, 24, 23, 24)
+        painter.setPen(QPen(QColor("#268e73"), 4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(10, 34, 28, 34)
+        painter.setPen(QPen(QColor("#34bd83"), 7, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(10, 45, 18, 45)
+        painter.drawLine(18, 45, 34, 32)
+        painter.drawLine(34, 32, 41, 32)
+
+        painter.setPen(QPen(QColor("#14232c"), 3))
+        painter.setBrush(QColor("#ffd15c"))
+        painter.drawEllipse(33, 26, 12, 12)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#edf4f4"))
+        painter.drawRoundedRect(47, 9, 9, 46, 2, 2)
+        painter.setBrush(QColor("#16866d"))
+        for rectangle in (
+            (47, 9, 5, 8),
+            (52, 17, 4, 7),
+            (47, 24, 5, 8),
+            (52, 32, 4, 8),
+            (47, 40, 5, 7),
+            (52, 47, 4, 8),
+        ):
+            painter.drawRect(*rectangle)
+
+
+class _CompactStatusIndicator(QFrame):
+    """Compact one-line runtime status with details kept in the tooltip."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._base_title = title
+        self._raw_text = ""
+        self._status_style = ""
+        self._surface_style = ""
+        self._state = "waiting"
+        self.setMinimumWidth(150)
+        self.setMaximumWidth(220)
+        self.setMinimumHeight(30)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(6)
+        self._dot = QLabel(self)
+        self._dot.setFixedSize(8, 8)
+        layout.addWidget(self._dot, 0, Qt.AlignVCenter)
+        self._title_label = QLabel(title, self)
+        self._title_label.setStyleSheet(
+            "color: #344054; font-size: 9pt; font-weight: 600;"
+        )
+        layout.addWidget(self._title_label)
+        self._detail_label = QLabel("待机", self)
+        self._detail_label.setStyleSheet(
+            "color: #667085; font-size: 9pt; font-weight: 700;"
+        )
+        layout.addWidget(self._detail_label)
+        layout.addStretch(1)
+        self._apply_color("#667085")
+
+    def text(self) -> str:
+        return self._raw_text
+
+    def setText(self, value: str) -> None:
+        self._raw_text = str(value)
+        self._title_label.setText(self._display_title())
+        self._detail_label.setText(self._display_state())
+
+    def setStatus(self, value: str, state: str) -> None:
+        if state not in {"waiting", "busy", "ready", "error"}:
+            raise ValueError(f"unsupported status state: {state}")
+        self._state = state
+        self.setText(value)
+
+    def styleSheet(self) -> str:
+        return self._status_style
+
+    def setStyleSheet(self, style: str) -> None:
+        self._status_style = str(style)
+        match = re.search(r"color\s*:\s*(#[0-9a-fA-F]{6})", self._status_style)
+        if match:
+            self._apply_color(match.group(1))
+
+    def _display_title(self) -> str:
+        return self._base_title
+
+    def _display_state(self) -> str:
+        if self._state == "error":
+            return "异常"
+        if self._state == "busy":
+            return "处理中"
+        if self._state == "ready" and self._base_title == "高速摄像":
+            return "就绪"
+        if self._state == "ready":
+            return "正常"
+        if self._base_title == "计时源":
+            return "待数据"
+        return "待机"
+
+    def _apply_color(self, color: str) -> None:
+        normalized = color.lower()
+        detail_color = {
+            "#247a52": "#176b49",
+            "#16845b": "#176b49",
+            "#a56300": "#8a5700",
+            "#b54747": "#a43b3b",
+        }.get(
+            normalized,
+            "#667085",
+        )
+        self._surface_style = "QFrame { background: transparent; border: none; }"
+        QFrame.setStyleSheet(self, self._surface_style)
+        self._title_label.setStyleSheet(
+            "color: #344054; font-size: 9pt; font-weight: 600;"
+        )
+        self._detail_label.setStyleSheet(
+            f"color: {detail_color}; font-size: 9pt; font-weight: 700;"
+        )
+        self._dot.setStyleSheet(
+            f"background: {color}; border: none; border-radius: 4px;"
+        )
 
 
 class FinishReviewWindow(PassageReviewDialog):
@@ -1557,8 +2229,9 @@ class FinishReviewWindow(PassageReviewDialog):
         settings_saver: Callable[[FinishReviewSettings], None] | None = None,
     ):
         self.source = str(source).strip()
-        self.output_dir = Path(output_dir).expanduser().resolve()
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.workspace_root = Path(output_dir).expanduser().resolve()
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self.output_dir = self.workspace_root
         self.passage_host = str(passage_host).strip()
         self.passage_port = int(passage_port)
         self.camera_index = max(1, int(camera_index))
@@ -1589,7 +2262,28 @@ class FinishReviewWindow(PassageReviewDialog):
         self.ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self.review_retention_seconds = max(6, int(review_retention_seconds))
         self.timing_error_ms = max(0, int(timing_error_ms))
+        self._recorder_factory = recorder_factory
+        self._receiver_factory = receiver_factory
         self._settings_saver = settings_saver
+        self._workspace_mode = "live"
+        self._archive_background_passage_count = 0
+
+        inbox_dir = self.workspace_root / CYCLERACE_INBOX_DIRNAME
+        self._receiver_passage_store = PassageEventStore(
+            inbox_dir / "cyclerace_passage_inbox.jsonl"
+        )
+        self._receiver_metadata_store = RaceMetadataStore(
+            inbox_dir / "cyclerace_metadata_inbox.json"
+        )
+        if self.timing_provider == "cyclerace":
+            inbox_metadata = self._receiver_metadata_store.current()
+            if inbox_metadata is not None:
+                restored_output_dir = _event_workspace_dir(
+                    self.workspace_root,
+                    inbox_metadata,
+                )
+                if restored_output_dir.exists():
+                    self.output_dir = restored_output_dir.resolve()
 
         passage_store = PassageEventStore(
             self.output_dir
@@ -1624,6 +2318,14 @@ class FinishReviewWindow(PassageReviewDialog):
             self.output_dir / "preflight_tests.jsonl"
         )
         self._preflight_event_keys = set(self._preflight_journal.event_keys())
+        regular_camera_indexes = tuple(
+            camera_index
+            for camera_index, source_value in (
+                (self.camera_index, self.source),
+                (self.camera_index + 1, self.secondary_source),
+            )
+            if is_supported_review_source(source_value)
+        ) or (self.camera_index,)
         super().__init__(
             passage_store,
             timeline_store,
@@ -1631,34 +2333,17 @@ class FinishReviewWindow(PassageReviewDialog):
             metadata_store=metadata_store,
             high_speed_locator=self._locate_high_speed,
             open_location=self._open_point_playback,
-            regular_camera_indexes=tuple(
-                camera
-                for camera, _source in (
-                    (self.camera_index, self.source),
-                    (self.camera_index + 1, self.secondary_source),
-                )
-                if is_supported_review_source(_source)
-            ),
+            regular_camera_indexes=regular_camera_indexes,
             show_high_speed_pane=self.high_speed_dir is not None,
             include_recorded_evidence=False,
         )
 
-        self.setWindowTitle("终点复核系统")
+        self.setWindowTitle("FinishReview · 终点多源复核")
         self.setMinimumSize(1180, 760)
-        self._recording_controller = RecordingSessionController(
-            recorder_factory=recorder_factory,
-            ring_buffer_factory=ReviewRingBuffer,
-            coordinator_factory=PassageReviewCoordinator,
-            timeline_publisher_factory=PassageReviewTimelinePublisher,
-            archive_publisher_factory=ArchiveTimelinePublisher,
-        )
         self._recorder: FfmpegReviewRecorder | None = None
         self._recorders: dict[int, FfmpegReviewRecorder] = {}
-        self._receiver_controller = ReceiverController(
-            receiver_factory=receiver_factory,
-            racetiger_client_factory=RaceTigerClient,
-            racetiger_source_factory=RaceTigerSource,
-        )
+        self._receiver: PassageEventReceiver | None = None
+        self._racetiger_source: RaceTigerSource | None = None
         self._ring_buffer: ReviewRingBuffer | None = None
         self._ring_buffers: dict[int, ReviewRingBuffer] = {}
         self._coordinator: PassageReviewCoordinator | None = None
@@ -1676,10 +2361,12 @@ class FinishReviewWindow(PassageReviewDialog):
         self._published_keys: set[tuple[int, str, int]] = set()
         self._unsupported_event_ids: set[str] = set()
         self._runtime_error = ""
-        self._recording_stop_error = ""
+        self._auto_recording_error = ""
         self._capture_error = ""
+        self._workspace_notice = ""
         self._receiver_error = ""
         self._racetiger_status: RaceTigerStatus | None = None
+        self._racetiger_generation = 0
         self._started = False
         self._last_cleanup_at = 0.0
         self._recording_started_at = 0.0
@@ -1695,7 +2382,6 @@ class FinishReviewWindow(PassageReviewDialog):
         self._signal_bridge.accepted.connect(self._on_passage_received)
         self._signal_bridge.metadata_accepted.connect(self._on_metadata_received)
         self._signal_bridge.focus_accepted.connect(self._on_focus_received)
-        self._signal_bridge.racetiger_event.connect(self._on_racetiger_event)
         self._signal_bridge.timing_status.connect(self._on_racetiger_status)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(max(100, int(refresh_interval_ms)))
@@ -1740,7 +2426,7 @@ class FinishReviewWindow(PassageReviewDialog):
         sources = []
         if is_supported_review_source(self.source):
             sources.append((self.camera_index, self.source))
-        if is_rtsp_source(self.secondary_source):
+        if is_supported_review_source(self.secondary_source):
             sources.append((self.camera_index + 1, self.secondary_source))
         return tuple(sources)
 
@@ -1750,42 +2436,33 @@ class FinishReviewWindow(PassageReviewDialog):
             show_high_speed=self.high_speed_dir is not None,
             include_recorded=include_recorded,
         )
+        if hasattr(self, "mark_regular_button"):
+            try:
+                self.mark_regular_button.clicked.disconnect()
+            except TypeError:
+                pass
+            self.mark_regular_button = self.regular_pane.mark_btn
+            self.mark_regular_button.clicked.connect(
+                lambda: self._begin_marking(self._regular_pane_for_operator_marking())
+            )
+        if hasattr(self, "mark_high_speed_button"):
+            self.mark_high_speed_button.setVisible(self.high_speed_dir is not None)
         self._update_operator_controls()
 
-    def _sync_recording_components(self) -> None:
-        self._recorders = self._recording_controller.recorders
-        self._ring_buffers = self._recording_controller.ring_buffers
-        self._coordinators = self._recording_controller.coordinators
-        self._publishers = self._recording_controller.timeline_publishers
-        self._recorder = self._recorders.get(self.camera_index)
-        self._ring_buffer = self._ring_buffers.get(self.camera_index)
-        self._coordinator = self._coordinators.get(self.camera_index)
-        self._publisher = self._publishers.get(self.camera_index)
-
     def _recording_any_active(self) -> bool:
-        return self._recording_controller.any_active
+        return any(recorder.is_running for recorder in self._recorders.values())
 
     def _recording_all_active(self) -> bool:
-        return self._recording_controller.all_active(
-            self._configured_recording_sources()
-        )
-
-    def _recording_needs_recovery(self) -> bool:
-        return bool(self._recording_controller.recorders) and not (
-            self._recording_all_active()
+        configured = self._configured_recording_sources()
+        return bool(configured) and len(self._recorders) == len(configured) and all(
+            self._recorders.get(camera_index) is not None
+            and self._recorders[camera_index].is_running
+            for camera_index, _source in configured
         )
 
     @property
     def receiver(self) -> PassageEventReceiver | None:
         return self._receiver
-
-    @property
-    def _receiver(self) -> PassageEventReceiver | None:
-        return self._receiver_controller.receiver
-
-    @property
-    def _racetiger_source(self) -> RaceTigerSource | None:
-        return self._receiver_controller.racetiger_source
 
     def _locate_high_speed(
         self,
@@ -1827,7 +2504,7 @@ class FinishReviewWindow(PassageReviewDialog):
             QMessageBox.information(self, "无法定点回放", str(error))
             return
 
-        identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        identity = event.bib.strip() or "未知"
         available_before_ms = max(
             0,
             anchor_time_ms - session.available_started_at_ms,
@@ -1906,61 +2583,77 @@ class FinishReviewWindow(PassageReviewDialog):
             self._update_runtime_status()
 
     def _update_operator_controls(self) -> None:
-        label = getattr(self, "operator_identity_label", None)
-        if label is None:
+        if not hasattr(self, "operator_identity_label"):
             return
         event = self.passage_store.get(self._selected_event_id)
         identity = ""
-        athlete_name = ""
         if event is not None:
             identity = event.bib.strip()
-            athlete_name = event.athlete_name.strip()
         else:
             identity = self.selected_identity_value.text().strip()
-            athlete_name = self.athlete_value.text().strip()
             if identity == "--":
                 identity = ""
-            if athlete_name == "--":
-                athlete_name = ""
-        athlete_summary = f"{identity} {athlete_name}".strip()
-        label.setText(
-            f"当前运动员：{athlete_summary}"
-            if athlete_summary
-            else "当前运动员：未选择"
-        )
-        regular_ready = bool(
-            identity
-            and any(
-                getattr(pane.video_view, "has_frame", False)
-                for pane in self.regular_panes
+        if identity:
+            row = self.table.currentRow()
+            position_text = (
+                f"{row + 1:,} / {len(self._visible_events):,}"
+                if 0 <= row < len(self._visible_events)
+                else "未进入终点记录"
             )
-        )
-        high_speed_ready = bool(
-            self.high_speed_dir is not None
-            and identity
-            and getattr(self.high_speed_pane.video_view, "has_frame", False)
-        )
-        self.mark_regular_button.setText(
-            f"标线普通录像 {identity}" if identity else "标线普通录像"
-        )
-        self.mark_high_speed_button.setText(
-            f"标线高速摄像 {identity}" if identity else "标线高速摄像"
-        )
-        self.mark_regular_button.setEnabled(regular_ready)
-        self.mark_high_speed_button.setEnabled(high_speed_ready)
-        self.mark_high_speed_button.setVisible(self.high_speed_dir is not None)
-        has_pending_marker = bool(
-            any(pane.has_pending_marker for pane in self.evidence_panes)
+            group_label = self.group_value.text().strip()
+            review_status = (
+                self._display_confirmation_status(
+                    self._event_review_statuses.get(self._selected_event_id, "")
+                )
+                if event is not None
+                else "尚无通过记录"
+            )
+            self.operator_identity_label.setText(
+                " · ".join(
+                    value
+                    for value in (group_label, position_text, review_status)
+                    if value and value != "--"
+                )
+            )
+        else:
+            self.operator_identity_label.clear()
+        active_panes = set(self.evidence_panes)
+        for pane in self.all_evidence_panes:
+            pane.mark_btn.setEnabled(
+                bool(
+                    pane in active_panes
+                    and identity
+                    and getattr(pane.video_view, "has_frame", False)
+                )
+            )
+        if hasattr(self, "mark_regular_button"):
+            self.mark_regular_button.setEnabled(
+                bool(
+                    identity
+                    and any(
+                        getattr(pane.video_view, "has_frame", False)
+                        for pane in self.regular_panes
+                    )
+                )
+            )
+        if hasattr(self, "mark_high_speed_button"):
+            self.mark_high_speed_button.setEnabled(
+                bool(
+                    self.high_speed_dir is not None
+                    and identity
+                    and getattr(self.high_speed_pane.video_view, "has_frame", False)
+                )
+            )
+        has_pending_marker = any(
+            pane.has_pending_marker for pane in self.evidence_panes
         )
         self.confirm_next_button.setEnabled(bool(identity and has_pending_marker))
-        for shortcut in getattr(self, "confirm_marker_shortcuts", ()):
-            shortcut.setEnabled(bool(identity and has_pending_marker))
 
     def _pending_marker_pane(self):
-        for pane in self.evidence_panes:
-            if pane.has_pending_marker:
-                return pane
-        return None
+        return next(
+            (pane for pane in self.evidence_panes if pane.has_pending_marker),
+            None,
+        )
 
     def _regular_pane_for_operator_marking(self):
         return next(
@@ -1994,7 +2687,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self._move_selection(1)
 
     def _toggle_recording(self) -> None:
-        if self._recording_all_active():
+        if self._recording_any_active():
             self.stop_recording()
             return
         if not is_supported_review_source(self.source):
@@ -2008,10 +2701,10 @@ class FinishReviewWindow(PassageReviewDialog):
             QMessageBox.critical(self, "无法开始录像", self._runtime_error)
             self._update_runtime_status()
 
-    def _current_settings(self) -> FinishReviewSettings:
+    def _current_settings(self, *, output_dir: Path | None = None) -> FinishReviewSettings:
         return FinishReviewSettings(
             source=self.source,
-            output_dir=self.output_dir,
+            output_dir=output_dir or self.workspace_root,
             passage_host=self.passage_host,
             passage_port=self.passage_port,
             camera_index=self.camera_index,
@@ -2029,6 +2722,82 @@ class FinishReviewWindow(PassageReviewDialog):
             racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
         )
 
+    def _saved_event_workspaces(self) -> tuple[EventWorkspaceDescriptor, ...]:
+        return discover_event_workspaces(self.workspace_root)
+
+    @staticmethod
+    def _saved_event_summary(
+        workspace: EventWorkspaceDescriptor,
+    ) -> EventWorkspaceSummary:
+        return summarize_event_workspace(workspace)
+
+    def _open_saved_event_workspace(self, path: Path) -> bool:
+        if self.timing_provider != "cyclerace":
+            QMessageBox.warning(self, "无法打开赛事", "打开赛事仅支持 CycleRace。")
+            return False
+        if self._recording_any_active():
+            QMessageBox.warning(self, "无法打开赛事", "请先停止普通录像。")
+            return False
+        try:
+            workspace = validate_event_workspace(path, self.workspace_root)
+        except EventWorkspaceError as error:
+            QMessageBox.warning(self, "无法打开赛事", str(error))
+            return False
+        if workspace.path == self.output_dir.resolve() and self._workspace_mode == "live":
+            return True
+
+        self._export_review_summary()
+        applied = self._apply_settings(
+            self._current_settings(output_dir=workspace.path),
+            persist_settings=False,
+            update_workspace_root=False,
+            preserve_cyclerace_receiver=True,
+        )
+        if not applied:
+            return False
+        self._workspace_mode = "archive"
+        self._archive_background_passage_count = 0
+        self._workspace_notice = ""
+        self._capture_error = ""
+        self.refresh()
+        self._update_runtime_status()
+        return True
+
+    def _return_to_live_event(self) -> bool:
+        if self._workspace_mode != "archive":
+            return True
+        metadata = self._receiver_metadata_store.current()
+        if metadata is None:
+            QMessageBox.warning(
+                self,
+                "无法返回当前赛事",
+                "尚未收到 CycleRace 当前赛事信息。",
+            )
+            return False
+        try:
+            applied = self._activate_cyclerace_workspace(
+                metadata,
+                force=True,
+                preserve_cyclerace_receiver=True,
+            )
+        except Exception as error:  # noqa: BLE001 - keep the archive open on failure.
+            QMessageBox.warning(
+                self,
+                "无法返回当前赛事",
+                sanitize_recording_message(error),
+            )
+            return False
+        if not applied:
+            return False
+        self._workspace_mode = "live"
+        self._archive_background_passage_count = 0
+        self._workspace_notice = ""
+        self._capture_error = ""
+        self.refresh()
+        self._apply_pending_focus()
+        self._update_runtime_status()
+        return True
+
     def _configure_devices(self) -> None:
         dialog = FinishReviewLaunchDialog(
             self._current_settings(),
@@ -2037,6 +2806,13 @@ class FinishReviewWindow(PassageReviewDialog):
             passage_provider=lambda: self.passage_store.events(),
             evidence_provider=self._preflight_evidence_status,
             runtime_snapshot_provider=self._deployment_runtime_snapshot,
+            event_export_callback=lambda: self._export_review_summary(
+                show_warning=True
+            ),
+            event_workspace_provider=self._saved_event_workspaces,
+            event_workspace_summary_provider=self._saved_event_summary,
+            event_open_callback=self._open_saved_event_workspace,
+            return_live_event_callback=self._return_to_live_event,
             recheck_callback=self._recheck_connections,
             recording_start_callback=self._start_preflight_recording,
             preflight_event_callback=self._record_preflight_event,
@@ -2053,7 +2829,8 @@ class FinishReviewWindow(PassageReviewDialog):
             and (
                 str(settings.source).strip() != self.source
                 or str(settings.secondary_source).strip() != self.secondary_source
-                or Path(settings.output_dir).expanduser().resolve() != self.output_dir
+                or Path(settings.output_dir).expanduser().resolve()
+                != self.workspace_root
             )
         )
         if disruptive_change:
@@ -2073,19 +2850,22 @@ class FinishReviewWindow(PassageReviewDialog):
         settings: FinishReviewSettings,
         *,
         stop_recording: bool = False,
+        persist_settings: bool = True,
+        update_workspace_root: bool = True,
+        preserve_cyclerace_receiver: bool = False,
+        reload_data_source: bool = False,
     ) -> bool:
         self._runtime_error = ""
-        self._recording_stop_error = ""
-        next_source = str(settings.source).strip()
-        next_secondary_source = str(settings.secondary_source).strip()
-        next_camera_index = max(1, int(settings.camera_index))
-        recording_layout_changed = (
-            next_source != self.source
-            or next_secondary_source != self.secondary_source
-            or next_camera_index != self.camera_index
+        self._auto_recording_error = ""
+        requested_output_dir = Path(settings.output_dir).expanduser().resolve()
+        workspace_root_changed = bool(
+            update_workspace_root and requested_output_dir != self.workspace_root
         )
-        previous_settings = self._current_settings()
-        output_dir = Path(settings.output_dir).expanduser().resolve()
+        output_dir = (
+            requested_output_dir
+            if not update_workspace_root or workspace_root_changed
+            else self.output_dir
+        )
         output_changed = output_dir != self.output_dir
         next_timing_provider = str(settings.timing_provider or "cyclerace").strip().lower()
         if next_timing_provider not in {"cyclerace", "racetiger"}:
@@ -2105,10 +2885,24 @@ class FinishReviewWindow(PassageReviewDialog):
             self.racetiger_token,
             self.racetiger_poll_interval_seconds,
         )
-        data_source_changed = output_changed or timing_changed
-        receiver_restart_needed = data_source_changed or (
-            self.timing_provider == "racetiger" and racetiger_changed
+        data_source_changed = bool(
+            reload_data_source
+            or output_changed
+            or timing_changed
+            or workspace_root_changed
         )
+        preserve_running_receiver = bool(
+            preserve_cyclerace_receiver
+            and self.timing_provider == "cyclerace"
+            and next_timing_provider == "cyclerace"
+            and not workspace_root_changed
+            and self._receiver is not None
+            and self._receiver.is_running
+        )
+        receiver_restart_needed = (
+            data_source_changed
+            or (self.timing_provider == "racetiger" and racetiger_changed)
+        ) and not preserve_running_receiver
         prepared_data_source = None
         if data_source_changed:
             try:
@@ -2147,6 +2941,16 @@ class FinishReviewWindow(PassageReviewDialog):
                     ArchiveTimelinePublisher(session, timeline_store)
                     for session in load_archive_recording_sessions(output_dir)
                 ]
+                receiver_passage_store = self._receiver_passage_store
+                receiver_metadata_store = self._receiver_metadata_store
+                if workspace_root_changed:
+                    inbox_dir = requested_output_dir / CYCLERACE_INBOX_DIRNAME
+                    receiver_passage_store = PassageEventStore(
+                        inbox_dir / "cyclerace_passage_inbox.jsonl"
+                    )
+                    receiver_metadata_store = RaceMetadataStore(
+                        inbox_dir / "cyclerace_metadata_inbox.json"
+                    )
                 prepared_data_source = (
                     passage_store,
                     metadata_store,
@@ -2156,63 +2960,32 @@ class FinishReviewWindow(PassageReviewDialog):
                     historical_events,
                     evidence_timestamp_overrides,
                     archive_publishers,
+                    receiver_passage_store,
+                    receiver_metadata_store,
                 )
             except Exception as exc:  # noqa: BLE001 - validate before runtime mutation.
                 self._runtime_error = sanitize_recording_message(exc)
                 QMessageBox.warning(self, "设置无法应用", self._runtime_error)
                 self._update_runtime_status()
                 return False
-        if self._settings_saver is not None:
+        if persist_settings and self._settings_saver is not None:
             try:
                 self._settings_saver(settings)
             except Exception as exc:  # noqa: BLE001 - keep current runtime unchanged.
                 QMessageBox.warning(self, "设置未保存", str(exc))
                 return False
+        if stop_recording:
+            self.stop_recording()
         if receiver_restart_needed:
-            if not self.stop_receiver():
-                stop_error = self._receiver_error or "Timing source did not stop"
-                recovery_errors = []
-                if self._settings_saver is not None:
-                    try:
-                        self._settings_saver(previous_settings)
-                    except Exception as exc:  # noqa: BLE001 - report rollback failure.
-                        recovery_errors.append(f"settings rollback: {exc}")
-                try:
-                    self.start_receiver()
-                except Exception as exc:  # noqa: BLE001 - restore current runtime.
-                    recovery_errors.append(
-                        "receiver restart: " + sanitize_recording_message(exc)
-                    )
-                detail = "; ".join((stop_error, *recovery_errors))
-                QMessageBox.warning(self, "计时源未停止", detail)
-                self._update_runtime_status()
-                return False
+            self.stop_receiver()
+        if data_source_changed:
             self._passage_batch_timer.stop()
             self._pending_passages.clear()
-        if stop_recording and not self.stop_recording():
-            stop_error = self._runtime_error or "Recording session did not stop"
-            recovery_errors = []
-            if self._settings_saver is not None:
-                try:
-                    self._settings_saver(previous_settings)
-                except Exception as exc:  # noqa: BLE001 - report rollback failure.
-                    recovery_errors.append(f"settings rollback: {exc}")
-            if receiver_restart_needed:
-                try:
-                    self.start_receiver()
-                except Exception as exc:  # noqa: BLE001 - restore current runtime.
-                    recovery_errors.append(
-                        "receiver restart: " + sanitize_recording_message(exc)
-                    )
-            detail = "; ".join((stop_error, *recovery_errors))
-            QMessageBox.warning(self, "录像未停止", detail)
-            self._update_runtime_status()
-            return False
-        self.source = next_source
-        self.secondary_source = next_secondary_source
+        self.source = str(settings.source).strip()
+        self.secondary_source = str(settings.secondary_source).strip()
         self.passage_host = str(settings.passage_host).strip()
         self.passage_port = int(settings.passage_port)
-        self.camera_index = next_camera_index
+        self.camera_index = max(1, int(settings.camera_index))
         self.finishreview_ip = str(settings.finishreview_ip).strip()
         self.cyclerace_ip = str(settings.cyclerace_ip).strip()
         self.high_speed_pc_ip = str(settings.high_speed_pc_ip).strip()
@@ -2235,6 +3008,16 @@ class FinishReviewWindow(PassageReviewDialog):
         if high_speed_changed:
             self.high_speed_dir = next_high_speed_dir
             self._high_speed_catalog.set_root(next_high_speed_dir)
+        configured_camera_indexes = tuple(
+            camera_index
+            for camera_index, _source in self._configured_recording_sources()
+        ) or (self.camera_index,)
+        evidence_layout_changed = bool(
+            configured_camera_indexes != self._configured_regular_camera_indexes
+            or (self.high_speed_dir is not None) != self._show_high_speed_pane
+        )
+        if evidence_layout_changed:
+            self._sync_evidence_pane_layout(include_recorded=False)
         if data_source_changed:
             assert prepared_data_source is not None
             (
@@ -2246,7 +3029,13 @@ class FinishReviewWindow(PassageReviewDialog):
                 historical_events,
                 evidence_timestamp_overrides,
                 archive_publishers,
+                receiver_passage_store,
+                receiver_metadata_store,
             ) = prepared_data_source
+            if workspace_root_changed:
+                self.workspace_root = requested_output_dir
+                self._receiver_passage_store = receiver_passage_store
+                self._receiver_metadata_store = receiver_metadata_store
             self.output_dir = output_dir
             self.passage_store = passage_store
             self.metadata_store = metadata_store
@@ -2271,19 +3060,20 @@ class FinishReviewWindow(PassageReviewDialog):
             self._received_event_order.clear()
             self._capture_error = ""
             self.refresh()
-            try:
-                self.start_receiver()
-            except Exception as exc:  # noqa: BLE001 - settings remain applied.
-                self._runtime_error = sanitize_recording_message(exc)
-                QMessageBox.warning(
-                    self,
-                    (
-                        "赛虎读取未启动"
-                        if self.timing_provider == "racetiger"
-                        else "CycleRace监听未启动"
-                    ),
-                    self._runtime_error,
-                )
+            if not preserve_running_receiver:
+                try:
+                    self.start_receiver()
+                except Exception as exc:  # noqa: BLE001 - settings remain applied.
+                    self._runtime_error = sanitize_recording_message(exc)
+                    QMessageBox.warning(
+                        self,
+                        (
+                            "赛虎读取未启动"
+                            if self.timing_provider == "racetiger"
+                            else "CycleRace监听未启动"
+                        ),
+                        self._runtime_error,
+                    )
             self._high_speed_catalog.set_cache_path(
                 output_dir / HIGH_SPEED_INDEX_FILENAME
             )
@@ -2296,6 +3086,8 @@ class FinishReviewWindow(PassageReviewDialog):
         if high_speed_changed or data_source_changed:
             self.invalidate_external_locations()
             self._request_high_speed_scan()
+        elif evidence_layout_changed:
+            self.refresh()
         if receiver_restart_needed and not data_source_changed:
             try:
                 self.start_receiver()
@@ -2307,138 +3099,216 @@ class FinishReviewWindow(PassageReviewDialog):
                     self._runtime_error,
                 )
         self._update_runtime_status()
-        self._sync_evidence_pane_layout(include_recorded=False)
-        if recording_layout_changed:
-            self._lookup_cache.clear()
-            self.refresh()
         return True
 
     def _init_runtime_status(self) -> None:
         panel = QFrame(self)
         panel.setObjectName("finishConsoleHeader")
+        panel.setMinimumHeight(78)
         panel.setStyleSheet(
-            "QFrame#finishConsoleHeader { background: #f7f9fb; "
+            "QFrame#finishConsoleHeader { background: #ffffff; "
             "border: 1px solid #cfd7df; border-radius: 4px; }"
-            "QLabel { color: #44515d; font-size: 9pt; font-weight: 600; }"
-            "QLabel[statusChip='true'] { background: #ffffff; border: 1px solid #c7d0d9; "
-            "border-radius: 4px; padding: 6px 9px; }"
-            "QPushButton { min-height: 32px; padding: 0 12px; "
+            "QPushButton { min-height: 32px; padding: 0 10px; "
             "font-size: 10pt; font-weight: 600; }"
         )
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(10, 8, 10, 8)
-        panel_layout.setSpacing(7)
+        panel_layout.setContentsMargins(10, 5, 10, 5)
+        panel_layout.setSpacing(4)
 
-        title_row = QHBoxLayout()
-        title_row.setSpacing(10)
-        title = QLabel("终点多源核对", panel)
-        title.setStyleSheet("font-size: 13pt; font-weight: 700; color: #17212b;")
-        self.race_dir_label = QLabel(panel)
-        self.race_dir_label.setStyleSheet("color: #667085; font-weight: 500;")
+        top_layout = QHBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(8)
+
+        top_layout.addWidget(_FinishReviewLogo(panel))
+        self.product_title_label = QLabel("FinishReview", panel)
+        self.product_title_label.setStyleSheet(
+            "font-size: 12pt; font-weight: 700; color: #17212b;"
+        )
+        self.product_subtitle_label = QLabel("终点多源复核", panel)
+        self.product_subtitle_label.hide()
+        top_layout.addWidget(self.product_title_label)
+
+        brand_separator = QFrame(panel)
+        brand_separator.setFrameShape(QFrame.VLine)
+        brand_separator.setStyleSheet("color: #dce2e6;")
+        top_layout.addWidget(brand_separator)
+
+        event_layout = QHBoxLayout()
+        event_layout.setContentsMargins(0, 0, 0, 0)
+        event_layout.setSpacing(10)
+        self.event_name_label = _ElidedLabel("未加载赛事", panel)
+        self.event_name_label.setStyleSheet(
+            "font-size: 11pt; font-weight: 700; color: #17212b;"
+        )
+        self.event_name_label.setMinimumWidth(180)
+        self.event_name_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        self.event_path_label = _ElidedLabel(
+            "等待计时源赛事信息 · 终点",
+            panel,
+        )
+        self.event_path_label.setStyleSheet(
+            "font-size: 10pt; font-weight: 600; color: #667085;"
+        )
+        self.event_path_label.setMinimumWidth(150)
+        self.event_path_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        event_layout.addWidget(self.event_name_label, 3)
+        event_layout.addWidget(self.event_path_label, 2)
+        top_layout.addLayout(event_layout, 1)
+
+        self.runtime_alert_label = QLabel(panel)
+        self.runtime_alert_label.setStyleSheet(
+            "color: #b54747; font-size: 9pt; font-weight: 700;"
+        )
+        self.runtime_alert_label.setMaximumWidth(180)
+        self.runtime_alert_label.hide()
+        top_layout.addWidget(self.runtime_alert_label)
+
+        clock_layout = QHBoxLayout()
+        clock_layout.setContentsMargins(0, 0, 0, 0)
+        clock_layout.setSpacing(4)
         self.beijing_clock_label = QLabel(panel)
         self.beijing_clock_label.setStyleSheet(
-            "font-family: Consolas; color: #17212b; font-size: 10pt;"
+            "font-family: Consolas; color: #17212b; font-size: 11pt; font-weight: 700;"
         )
-        title_row.addWidget(title)
-        title_row.addWidget(self.race_dir_label)
-        title_row.addStretch()
-        title_row.addWidget(self.beijing_clock_label)
-        panel_layout.addLayout(title_row)
+        self.beijing_zone_label = QLabel("北京时间", panel)
+        self.beijing_zone_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.beijing_zone_label.setStyleSheet(
+            "color: #667085; font-size: 9pt; font-weight: 500;"
+        )
+        clock_layout.addWidget(self.beijing_clock_label)
+        clock_layout.addWidget(self.beijing_zone_label)
+        top_layout.addLayout(clock_layout)
 
-        layout = QHBoxLayout()
-        layout.setSpacing(8)
-        self.camera_status_label = self._status_chip(panel)
-        self.recording_status_label = self._status_chip(panel)
-        self.receiver_status_label = self._status_chip(panel)
-        self.high_speed_status_label = self._status_chip(panel)
-        self.storage_status_label = self._status_chip(panel)
+        self.race_dir_label = QLabel(panel)
+        self.race_dir_label.hide()
+        self.recording_status_label = QLabel(panel)
+        self.recording_status_label.hide()
+        self.storage_status_label = QLabel(panel)
+        self.storage_status_label.hide()
         self.capture_status_label = QLabel(panel)
-        self.capture_status_label.setStyleSheet("color: #667085; font-weight: 500;")
-        layout.addWidget(self.camera_status_label)
-        layout.addWidget(self.recording_status_label)
-        layout.addWidget(self.receiver_status_label)
-        layout.addWidget(self.high_speed_status_label)
-        layout.addWidget(self.storage_status_label)
-        layout.addStretch(1)
+        self.capture_status_label.hide()
 
-        self.recheck_button = QPushButton("重新检查", panel)
+        self.recheck_button = QPushButton("刷新", panel)
+        self.recheck_button.setObjectName("finishRecheckButton")
+        self.recheck_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.recheck_button.setFixedHeight(32)
+        self.recheck_button.setToolTip("重新检查连接")
         self.recheck_button.clicked.connect(self._recheck_connections)
-        layout.addWidget(self.recheck_button)
-        self.settings_button = QPushButton("设备设置", panel)
+        top_layout.addWidget(self.recheck_button)
+        self.settings_button = QPushButton("设置", panel)
+        self.settings_button.setObjectName("finishSettingsButton")
+        self.settings_button.setFixedHeight(32)
+        self.settings_button.setToolTip("设备与赛事设置")
         self.settings_button.clicked.connect(self._configure_devices)
-        layout.addWidget(self.settings_button)
+        top_layout.addWidget(self.settings_button)
+        tool_button_style = (
+            "QPushButton { background: #eef3f5; color: #17212b; "
+            "border: 1px solid #aab6bf; border-radius: 4px; "
+            "font-size: 10pt; font-weight: 600; }"
+            "QPushButton:hover { background: #dfe9ed; border-color: #617783; }"
+            "QPushButton:pressed { background: #cfdde2; }"
+        )
+        self.recheck_button.setStyleSheet(tool_button_style)
+        self.settings_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
+        self.record_button.setMinimumWidth(88)
         self.record_button.clicked.connect(self._toggle_recording)
-        layout.addWidget(self.record_button)
-        panel_layout.addLayout(layout)
-        panel_layout.addWidget(self.capture_status_label)
+        top_layout.addWidget(self.record_button)
+        panel_layout.addLayout(top_layout)
+
+        status_strip = QFrame(panel)
+        status_strip.setObjectName("finishStatusStrip")
+        status_strip.setStyleSheet(
+            "QFrame#finishStatusStrip { background: #f5f7f8; "
+            "border: none; border-radius: 3px; }"
+        )
+        status_layout = QHBoxLayout(status_strip)
+        status_layout.setContentsMargins(2, 0, 2, 0)
+        status_layout.setSpacing(2)
+        self.receiver_status_label = self._status_chip("计时源", status_strip)
+        self.camera_status_label = self._status_chip("普通摄像", status_strip)
+        self.high_speed_status_label = self._status_chip("高速摄像", status_strip)
+        status_layout.addWidget(self.receiver_status_label)
+        status_layout.addWidget(self.camera_status_label)
+        status_layout.addWidget(self.high_speed_status_label)
+        status_layout.addStretch(1)
+        panel_layout.addWidget(status_strip)
+        self.runtime_status_strip = status_strip
+        self.runtime_header = panel
         root_layout = self.layout()
         if root_layout is not None:
             root_layout.insertWidget(0, panel)
+        self._update_event_header()
 
     @staticmethod
-    def _status_chip(parent) -> QLabel:
-        label = QLabel(parent)
-        label.setProperty("statusChip", True)
-        return label
+    def _status_chip(title: str, parent) -> _CompactStatusIndicator:
+        return _CompactStatusIndicator(title, parent)
+
+    def _update_event_header(self) -> None:
+        metadata = self._current_metadata()
+        event = self.passage_store.get(self._selected_event_id)
+        race_name = (
+            (metadata.race_name.strip() if metadata is not None else "")
+            or (event.race_name.strip() if event is not None else "")
+            or "未加载赛事"
+        )
+        race_id = (
+            (metadata.race_id if metadata is not None else "")
+            or (event.race_id if event is not None else "")
+        )
+        stage_name = (
+            (metadata.stage_name.strip() if metadata is not None else "")
+            or (event.stage_name.strip() if event is not None else "")
+            or "终点"
+        )
+        stage_label = f"第 {stage_name} 赛段" if stage_name.isdigit() else stage_name
+        group_name = self.group_value.text().strip()
+        if not group_name or group_name == "--":
+            group_name = "全部组别"
+        detail_parts = []
+        context_values = (
+            ("历史复核", stage_label, group_name, "终点")
+            if self._workspace_mode == "archive"
+            else (stage_label, group_name, "终点")
+        )
+        for value in context_values:
+            if value and value not in detail_parts:
+                detail_parts.append(value)
+        detail_text = " · ".join(detail_parts)
+        identity_text = f"赛事ID：{race_id}\n" if race_id else ""
+        self.event_name_label.setText(race_name)
+        self.event_path_label.setText(detail_text)
+        self.event_name_label.setToolTip(
+            f"{race_name}\n{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
+        )
+        self.event_path_label.setToolTip(
+            f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
+        )
 
     def _init_operator_controls(self) -> None:
-        panel = QFrame(self)
-        panel.setObjectName("finishOperatorBar")
-        panel.setStyleSheet(
-            "QFrame#finishOperatorBar { background: #ffffff; border: 1px solid #cfd7df; "
-            "border-radius: 4px; }"
-            "QPushButton { min-height: 32px; padding: 0 12px; "
-            "font-size: 10pt; font-weight: 600; }"
-        )
-        layout = QHBoxLayout(panel)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(8)
-        self.operator_identity_label = QLabel("当前运动员：未选择", panel)
-        self.operator_identity_label.setStyleSheet(
-            "font-size: 11pt; font-weight: 700; color: #17212b;"
-        )
-        layout.addWidget(self.operator_identity_label)
-        layout.addStretch()
-        self.mark_regular_button = QPushButton("标线普通录像", panel)
+        self.operator_identity_label = self.current_context_label
+        self.mark_regular_button = self.regular_pane.mark_btn
+        self.mark_regular_button.clicked.disconnect()
         self.mark_regular_button.clicked.connect(
             lambda: self._begin_marking(self._regular_pane_for_operator_marking())
         )
-        layout.addWidget(self.mark_regular_button)
-        self.mark_high_speed_button = QPushButton("标线高速摄像", panel)
-        self.mark_high_speed_button.clicked.connect(
-            lambda: self._begin_marking(self.high_speed_pane)
-        )
-        layout.addWidget(self.mark_high_speed_button)
-        self.confirm_next_button = QPushButton("确认并下一条", panel)
+        self.mark_high_speed_button = self.high_speed_pane.mark_btn
+        self.mark_high_speed_button.setVisible(self.high_speed_dir is not None)
+        self.confirm_next_button = QPushButton("确认并下一条", self.transport)
         self.confirm_next_button.setShortcut("Ctrl+Return")
+        self.confirm_next_button.setToolTip("确认当前标线并选择下一条")
         self.confirm_next_button.clicked.connect(self._confirm_and_next)
-        layout.addWidget(self.confirm_next_button)
-        self.confirm_marker_shortcuts = []
-        for key in (Qt.Key_Return, Qt.Key_Enter):
-            shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.setContext(Qt.WindowShortcut)
-            shortcut.activated.connect(self._confirm_current_marker)
-            shortcut.setEnabled(False)
-            self.confirm_marker_shortcuts.append(shortcut)
-        for pane in self.all_evidence_panes:
-            pane.video_view.marker_position_selected.connect(
-                lambda _x, _y: QTimer.singleShot(0, self._update_operator_controls)
-            )
-            pane.confirmation_requested.connect(
-                lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
-            )
-            pane.cancel_requested.connect(
-                lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
-            )
-            pane.delete_requested.connect(
-                lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
-            )
+        self.transport_layout.addWidget(self.confirm_next_button)
         self.evidence_pane_added.connect(self._bind_operator_pane)
-        root_layout = self.layout()
-        if root_layout is not None:
-            root_layout.insertWidget(max(0, root_layout.count() - 1), panel)
+        for pane in self.all_evidence_panes:
+            self._bind_operator_pane(pane)
         self._update_operator_controls()
 
     def _bind_operator_pane(self, pane) -> None:
@@ -2458,10 +3328,7 @@ class FinishReviewWindow(PassageReviewDialog):
     def start_receiver(self) -> None:
         if self.timing_provider == "racetiger":
             if self._receiver is not None:
-                if not self.stop_receiver():
-                    raise RuntimeError(
-                        self._receiver_error or "CycleRace receiver did not stop"
-                    )
+                self.stop_receiver()
             if self._racetiger_source is not None and self._racetiger_source.is_running:
                 return
             try:
@@ -2476,41 +3343,103 @@ class FinishReviewWindow(PassageReviewDialog):
                 raise
             return
         if self._racetiger_source is not None:
-            if not self.stop_receiver():
-                raise RuntimeError(
-                    self._receiver_error or "RaceTiger source did not stop"
-                )
+            self.stop_receiver()
         if self._receiver is not None and self._receiver.is_running:
             return
-        try:
-            self._receiver_controller.start_cyclerace(
-                self.passage_host,
-                self.passage_port,
-                self.passage_store,
-                on_accepted=self._signal_bridge.accepted.emit,
-                metadata_store=self.metadata_store,
+        receiver_kwargs = {
+            "on_accepted": self._signal_bridge.accepted.emit,
+        }
+        parameters = inspect.signature(self._receiver_factory).parameters.values()
+        supports_metadata = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ) or "metadata_store" in {
+            parameter.name for parameter in parameters
+        }
+        if supports_metadata:
+            receiver_kwargs.update(
+                metadata_store=self._receiver_metadata_store,
                 on_metadata_accepted=self._signal_bridge.metadata_accepted.emit,
-                on_focus_accepted=self._signal_bridge.focus_accepted.emit,
             )
+        parameters = inspect.signature(self._receiver_factory).parameters.values()
+        supports_focus = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ) or "on_focus_accepted" in {
+            parameter.name for parameter in parameters
+        }
+        if supports_focus:
+            receiver_kwargs["on_focus_accepted"] = (
+                self._signal_bridge.focus_accepted.emit
+            )
+        receiver = self._receiver_factory(
+            self.passage_host,
+            self.passage_port,
+            self._receiver_passage_store,
+            **receiver_kwargs,
+        )
+        try:
+            receiver.start()
         except Exception as exc:
             self._receiver_error = sanitize_recording_message(exc)
+            try:
+                receiver.stop()
+            except Exception as exc:  # noqa: BLE001 - rollback is best effort.
+                logger.warning("Failed to stop CycleRace receiver: %s", exc)
             self._update_runtime_status()
             raise
+        self._receiver = receiver
         self._receiver_error = ""
         self._refresh_timer.start()
         self._update_runtime_status()
 
     def _start_racetiger_source(self) -> None:
-        self._receiver_controller.start_racetiger(
+        missing = [
+            label
+            for label, value in (
+                ("接口地址", self.racetiger_base_url),
+                ("PC", self.racetiger_pc),
+                ("RID", self.racetiger_rid),
+                ("令牌", self.racetiger_token),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError("赛虎配置不完整，请填写：" + "、".join(missing))
+        client = RaceTigerClient(
             self.racetiger_base_url,
             self.racetiger_token,
             pc=self.racetiger_pc,
             rid=self.racetiger_rid,
-            store=self.passage_store,
-            poll_interval_seconds=self.racetiger_poll_interval_seconds,
-            on_event=self._signal_bridge.racetiger_event.emit,
-            on_status=self._signal_bridge.timing_status.emit,
         )
+        generation = self._racetiger_generation
+
+        def emit_event(event: PassageEvent) -> None:
+            if generation == self._racetiger_generation:
+                self._signal_bridge.accepted.emit(event)
+
+        def emit_status(status: RaceTigerStatus) -> None:
+            if generation == self._racetiger_generation:
+                self._signal_bridge.timing_status.emit(status)
+
+        source = RaceTigerSource(
+            client,
+            self.passage_store,
+            race_id=self.racetiger_rid,
+            stage_id="finish",
+            poll_interval_seconds=self.racetiger_poll_interval_seconds,
+            on_event=emit_event,
+            on_status=emit_status,
+        )
+        try:
+            source.start()
+        except Exception:
+            try:
+                source.stop()
+            except Exception:  # noqa: BLE001 - startup rollback is best effort.
+                logger.exception("Failed to stop RaceTiger source after startup error")
+            raise
+        self._racetiger_source = source
         self._receiver_error = ""
         self._racetiger_status = RaceTigerStatus(
             "starting",
@@ -2607,7 +3536,33 @@ class FinishReviewWindow(PassageReviewDialog):
         else:
             high_speed_state = "待检查"
             high_speed_detail = high_speed.message or "目录可读，等待高速画面"
+        metadata = self._current_metadata()
+        if self.timing_provider == "cyclerace":
+            event_name = (
+                (metadata.race_name.strip() or metadata.race_id)
+                if metadata is not None
+                else ""
+            )
+            event_stage = (
+                (metadata.stage_name.strip() or metadata.stage_id)
+                if metadata is not None
+                else ""
+            )
+            event_state = (
+                "历史赛事已打开"
+                if metadata is not None and self._workspace_mode == "archive"
+                else "赛事已加载"
+                if metadata is not None
+                else "等待 CycleRace 赛事信息"
+            )
+            event_dir = str(self.output_dir) if metadata is not None else ""
+        else:
+            event_name = self.racetiger_rid
+            event_stage = "终点" if event_name else ""
+            event_state = "赛事已配置" if event_name else "等待赛虎赛事 RID"
+            event_dir = str(self.output_dir) if event_name else ""
         return {
+            "timing_provider": self.timing_provider,
             "timing_state": timing_state,
             "timing_detail": timing_detail,
             "cycle_state": timing_state,
@@ -2616,6 +3571,13 @@ class FinishReviewWindow(PassageReviewDialog):
             "camera_detail": camera_detail,
             "high_speed_state": high_speed_state,
             "high_speed_detail": high_speed_detail,
+            "event_state": event_state,
+            "event_name": event_name,
+            "event_stage": event_stage,
+            "event_dir": event_dir,
+            "workspace_root": str(self.workspace_root),
+            "workspace_mode": self._workspace_mode,
+            "recording_active": "1" if self._recording_any_active() else "0",
         }
 
     def _preflight_evidence_status(
@@ -2724,7 +3686,7 @@ class FinishReviewWindow(PassageReviewDialog):
                         "赛虎读取未启动",
                         sanitize_recording_message(exc),
                     )
-            self._request_high_speed_scan()
+            self._high_speed_scan_worker.request_scan()
             self._update_runtime_status()
             return
         receiver = self._receiver
@@ -2741,10 +3703,12 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_runtime_status()
 
     def start_recording(self) -> None:
+        if self._workspace_mode == "archive":
+            raise RecordingError("历史赛事模式不能开始录像，请先返回当前赛事")
         if self._recording_all_active():
             return
-        if self._recording_controller.recorders and not self.stop_recording():
-            raise RecordingError("现有录像会话未能完全停止，请重试")
+        if self._recorders:
+            self.stop_recording()
         configured_sources = self._configured_recording_sources()
         if not configured_sources:
             raise RecordingError("请先在设备设置中选择录像摄像头")
@@ -2754,22 +3718,48 @@ class FinishReviewWindow(PassageReviewDialog):
             raise RecordingError(f"无法检查赛事存储空间: {exc}") from exc
         if free_bytes < 1024**3:
             raise RecordingError("赛事存储空间不足 1 GB，无法开始录像")
+        recorders: dict[int, FfmpegReviewRecorder] = {}
+        ring_buffers: dict[int, ReviewRingBuffer] = {}
+        coordinators: dict[int, PassageReviewCoordinator] = {}
+        publishers: dict[int, PassageReviewTimelinePublisher] = {}
         archive_publishers = []
         try:
-            pipelines = self._recording_controller.start(
-                sources=configured_sources,
-                output_dir=self.output_dir,
-                ffmpeg_path=self.ffmpeg_path,
-                review_retention_seconds=self.review_retention_seconds,
-                timeline_store=self.timeline_store,
-                timing_error_ms=self.timing_error_ms,
-            )
-            self._sync_recording_components()
-            archive_publishers = [
-                pipeline.archive_publisher for pipeline in pipelines
-            ]
+            for camera_index, source in configured_sources:
+                recorder = self._recorder_factory(
+                    source,
+                    self.output_dir,
+                    camera_index=camera_index,
+                    ffmpeg_path=self.ffmpeg_path,
+                    review_retention_seconds=self.review_retention_seconds,
+                )
+                playlist_path = recorder.start()
+                recorders[camera_index] = recorder
+                ring_buffer = ReviewRingBuffer(
+                    playlist_path,
+                    camera_index=camera_index,
+                    retention_seconds=self.review_retention_seconds,
+                )
+                ring_buffer.scan()
+                ring_buffers[camera_index] = ring_buffer
+                coordinators[camera_index] = PassageReviewCoordinator(ring_buffer)
+                publishers[camera_index] = PassageReviewTimelinePublisher(
+                    ring_buffer,
+                    self.timeline_store,
+                    timing_error_ms=self.timing_error_ms,
+                )
+                archive_publishers.append(
+                    ArchiveTimelinePublisher(recorder, self.timeline_store)
+                )
+            self._recorders = recorders
+            self._ring_buffers = ring_buffers
+            self._coordinators = coordinators
+            self._publishers = publishers
+            self._recorder = recorders.get(self.camera_index)
+            self._ring_buffer = ring_buffers.get(self.camera_index)
+            self._coordinator = coordinators.get(self.camera_index)
+            self._publisher = publishers.get(self.camera_index)
             self._capture_windows_by_camera = {
-                camera_index: {} for camera_index in self._coordinators
+                camera_index: {} for camera_index in coordinators
             }
             self._capture_windows = self._capture_windows_by_camera.setdefault(
                 self.camera_index,
@@ -2783,28 +3773,33 @@ class FinishReviewWindow(PassageReviewDialog):
             self._started = True
             self._recording_started_at = time.monotonic()
             self._runtime_error = ""
-            self._recording_stop_error = ""
+            self._auto_recording_error = ""
             self._capture_error = ""
+            self._workspace_notice = ""
             self._refresh_timer.start()
             self._refresh_capture_windows()
             self._lookup_cache.clear()
             self.refresh()
         except Exception:
-            rollback_failures = self._recording_controller.stop()
-            for failure in rollback_failures:
-                logger.warning(
-                    "Failed to stop camera %s during window startup rollback: %s",
-                    failure.camera_index,
-                    failure.error,
-                )
-            self._sync_recording_components()
+            for recorder in recorders.values():
+                try:
+                    recorder.stop()
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to stop recorder during startup rollback: %s",
+                        cleanup_error,
+                    )
+            self._recorders = {}
+            self._ring_buffers = {}
+            self._coordinators = {}
+            self._publishers = {}
+            self._recorder = None
+            self._ring_buffer = None
+            self._coordinator = None
+            self._publisher = None
             for archive_publisher in archive_publishers:
                 if archive_publisher in self._archive_publishers:
                     self._archive_publishers.remove(archive_publisher)
-            self._started = self._recording_controller.any_active
-            if not self._started:
-                self._recording_started_at = 0.0
-                self._refresh_timer.stop()
             raise
         finally:
             self._update_runtime_status()
@@ -2879,7 +3874,188 @@ class FinishReviewWindow(PassageReviewDialog):
         self._published_keys.add(key)
         return True
 
+    def _activate_cyclerace_workspace(
+        self,
+        metadata: RaceMetadata,
+        *,
+        force: bool = False,
+        preserve_cyclerace_receiver: bool = False,
+    ) -> bool:
+        if self.timing_provider != "cyclerace" or self.metadata_store is None:
+            return False
+        current_metadata = self.metadata_store.current()
+        if (
+            not force
+            and current_metadata is not None
+            and current_metadata.race_id == metadata.race_id
+        ):
+            self.metadata_store.store(metadata)
+            return False
+
+        self._export_review_summary()
+        target_dir = _event_workspace_dir(self.workspace_root, metadata)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_metadata_store = RaceMetadataStore(
+            target_dir / "cyclerace_race_metadata.json"
+        )
+        target_metadata_store.store(metadata)
+        target_passage_store = PassageEventStore(
+            target_dir / "cyclerace_passage_events.jsonl"
+        )
+        events_by_id: dict[str, PassageEvent] = {}
+        for store in (self.passage_store, self._receiver_passage_store):
+            for event in store.events():
+                if event.race_id != metadata.race_id:
+                    continue
+                current = events_by_id.get(event.event_id)
+                if current is None or event.revision > current.revision:
+                    events_by_id[event.event_id] = event
+        for event in events_by_id.values():
+            target_passage_store.append(event)
+
+        recording_was_active = self._recording_any_active()
+        applied = self._apply_settings(
+            self._current_settings(output_dir=target_dir),
+            stop_recording=recording_was_active,
+            persist_settings=False,
+            update_workspace_root=False,
+            preserve_cyclerace_receiver=preserve_cyclerace_receiver,
+            reload_data_source=force,
+        )
+        if applied:
+            self._workspace_mode = "live"
+            self._archive_background_passage_count = 0
+        if applied and recording_was_active:
+            self._workspace_notice = "已切换新赛事，录像待重新开始"
+        return applied
+
+    def _is_test_passage(self, event: PassageEvent) -> bool:
+        event_key = (event.race_id, event.stage_id, event.event_id)
+        if event_key in self._preflight_event_keys:
+            return True
+        group_names = [event.group_id, event.group_name]
+        metadata = self._current_metadata()
+        if metadata is not None and (
+            metadata.race_id == event.race_id
+            and metadata.stage_id == event.stage_id
+        ):
+            group_names.append(metadata.group_label(event.group_id))
+        return any(_is_test_group_name(name) for name in group_names)
+
+    def _is_live_passage(self, event: PassageEvent) -> bool:
+        timestamp_ms = self._evidence_timestamp(event)
+        if timestamp_ms is None:
+            return False
+        received_at_ms = (
+            event.received_at_ms
+            if event.received_at_ms > 0
+            else int(time.time() * 1000.0)
+        )
+        return (
+            abs(int(timestamp_ms) - int(received_at_ms))
+            <= LIVE_EVIDENCE_DATE_TOLERANCE_MS
+        )
+
+    def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
+        if (
+            self._workspace_mode != "live"
+            or not event.is_active
+            or self._recording_any_active()
+            or self._is_test_passage(event)
+            or not self._is_live_passage(event)
+        ):
+            return False
+        try:
+            self.start_recording()
+        except Exception as error:  # noqa: BLE001 - passage storage must survive.
+            self._runtime_error = sanitize_recording_message(error)
+            self._auto_recording_error = self._runtime_error
+            logger.exception(
+                "Failed to auto-start recording for live passage %s",
+                event.event_id,
+            )
+            return False
+        logger.info(
+            "Recording auto-started for live passage %s in group %s",
+            event.event_id,
+            event.group_id,
+        )
+        return True
+
+    def _auto_start_recording_for_metadata(self, metadata: RaceMetadata) -> bool:
+        if (
+            self._workspace_mode != "live"
+            or self._recording_any_active()
+            or not any(
+                not _is_test_group_name(group.name)
+                and not _is_test_group_name(group.group_id)
+                for group in metadata.groups
+            )
+        ):
+            return False
+        try:
+            self.start_recording()
+        except Exception as error:  # noqa: BLE001 - metadata handling must survive.
+            self._runtime_error = sanitize_recording_message(error)
+            self._auto_recording_error = self._runtime_error
+            logger.exception(
+                "Failed to auto-start recording for live metadata %s/%s",
+                metadata.race_id,
+                metadata.stage_id,
+            )
+            return False
+        logger.info(
+            "Recording auto-started for live metadata %s/%s",
+            metadata.race_id,
+            metadata.stage_id,
+        )
+        return True
+
     def _on_passage_received(self, event: PassageEvent) -> None:
+        if self.timing_provider == "cyclerace":
+            if self._workspace_mode == "archive":
+                self._archive_background_passage_count += 1
+                self._last_passage_monotonic = time.monotonic()
+                self._update_runtime_status()
+                return
+            inbox_metadata = self._receiver_metadata_store.current()
+            active_metadata = (
+                self.metadata_store.current()
+                if self.metadata_store is not None
+                else None
+            )
+            if (
+                inbox_metadata is not None
+                and inbox_metadata.race_id == event.race_id
+                and (
+                    active_metadata is None
+                    or active_metadata.race_id != event.race_id
+                )
+            ):
+                self._activate_cyclerace_workspace(inbox_metadata)
+                active_metadata = (
+                    self.metadata_store.current()
+                    if self.metadata_store is not None
+                    else None
+                )
+            if (
+                active_metadata is not None
+                and active_metadata.race_id != event.race_id
+            ):
+                self._capture_error = (
+                    f"收到赛事 {event.race_id} 的通过记录，等待CycleRace赛事信息"
+                )
+                self._update_runtime_status()
+                return
+        if self.timing_provider == "cyclerace" and event.received_at_ms <= 0:
+            event = replace(event, received_at_ms=int(time.time() * 1000.0))
+        try:
+            self.passage_store.append(event)
+        except Exception as exc:
+            self._capture_error = sanitize_recording_message(exc)
+            logger.exception("Failed to store passage in active event workspace")
+            self._update_runtime_status()
+            return
         self._received_passage_sequence += 1
         event_key = (event.race_id, event.stage_id, event.event_id)
         self._received_event_order[event_key] = self._received_passage_sequence
@@ -2887,11 +4063,7 @@ class FinishReviewWindow(PassageReviewDialog):
         if not event.is_active:
             self._evidence_timestamp_overrides.pop(event.event_id, None)
         elif self.timing_provider == "cyclerace" and formal_timestamp_ms is not None:
-            alignment_reference_ms = (
-                event.emitted_at_ms
-                if event.emitted_at_ms > 0
-                else int(time.time() * 1000.0)
-            )
+            alignment_reference_ms = event.received_at_ms
             aligned_timestamp_ms = _align_live_evidence_timestamp(
                 formal_timestamp_ms,
                 alignment_reference_ms,
@@ -2911,6 +4083,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._historical_passage_count = len(self.passage_store)
         self._last_passage_monotonic = time.monotonic()
         self._include_high_speed_event_date(event)
+        self._auto_start_recording_for_passage(event)
         self._pending_passages[event.event_id] = event
         if not self._passage_batch_timer.isActive():
             self._passage_batch_timer.start()
@@ -2968,6 +4141,18 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_runtime_status()
 
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
+        if self._workspace_mode == "archive":
+            self._update_runtime_status()
+            return
+        try:
+            self._activate_cyclerace_workspace(metadata)
+            self._capture_error = ""
+        except Exception as exc:
+            self._capture_error = sanitize_recording_message(exc)
+            logger.exception("Failed to activate CycleRace event workspace")
+            self._update_runtime_status()
+            return
+        self._auto_start_recording_for_metadata(metadata)
         pending_focus = self._pending_focus
         if pending_focus is not None and (
             pending_focus.race_id != metadata.race_id
@@ -2992,18 +4177,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._apply_pending_focus()
         self._update_runtime_status()
 
-    def _on_racetiger_event(self, event: PassageEvent, generation: int) -> None:
-        if not self._receiver_controller.is_racetiger_generation_current(generation):
-            return
-        self._on_passage_received(event)
-
-    def _on_racetiger_status(
-        self,
-        status: RaceTigerStatus,
-        generation: int,
-    ) -> None:
-        if not self._receiver_controller.is_racetiger_generation_current(generation):
-            return
+    def _on_racetiger_status(self, status: RaceTigerStatus) -> None:
         self._racetiger_status = status
         if status.state == "error":
             self._receiver_error = status.message
@@ -3013,6 +4187,8 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _on_focus_received(self, focus: RaceFocus) -> None:
         self._pending_focus = focus
+        if self._workspace_mode == "archive":
+            return
         self._apply_pending_focus()
 
     def _apply_pending_focus(self) -> bool:
@@ -3038,6 +4214,29 @@ class FinishReviewWindow(PassageReviewDialog):
             return metadata.race_id
         return race_id_from_passage_store(self.passage_store)
 
+    def _export_review_summary(self, *, show_warning: bool = False) -> Path | None:
+        metadata = self._current_metadata()
+        if self.timing_provider == "cyclerace" and metadata is None:
+            return None
+        if self.timing_provider == "racetiger" and not self.racetiger_rid:
+            return None
+        try:
+            return export_review_summary(
+                self.output_dir,
+                self._events_for_current_metadata(self.passage_store.events()),
+                self.association_store,
+                metadata,
+            )
+        except Exception as error:  # noqa: BLE001 - review operation must not be blocked.
+            logger.exception("Failed to export the event review summary")
+            if show_warning:
+                QMessageBox.warning(
+                    self,
+                    "复核清单未更新",
+                    f"无法更新终点复核清单：{error}",
+                )
+            return None
+
     def _events_for_current_metadata(
         self,
         events: tuple[PassageEvent, ...],
@@ -3056,13 +4255,89 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _lookup(self, event: PassageEvent):
         evidence_timestamp_ms = self._evidence_timestamp(event)
+        lookup_event = event
         if (
             evidence_timestamp_ms is None
             or evidence_timestamp_ms == event.timeline_timestamp_ms
         ):
-            return super()._lookup(event)
-        return super()._lookup(
-            replace(event, passage_timestamp_ms=evidence_timestamp_ms)
+            lookup = super()._lookup(event)
+        else:
+            lookup_event = replace(
+                event,
+                passage_timestamp_ms=evidence_timestamp_ms,
+            )
+            lookup = super()._lookup(lookup_event)
+
+        if not hasattr(self, "_capture_windows_by_camera"):
+            return lookup
+        locations = list(lookup.locations)
+        finalized_cameras = {
+            location.segment.camera_index
+            for location in locations
+            if location.segment.clock_source == DEFAULT_CLOCK_SOURCE
+            and location.status in {"located", "near_boundary", "unverified"}
+        }
+        for camera_index, windows in self._capture_windows_by_camera.items():
+            if camera_index in finalized_cameras:
+                continue
+            window = windows.get(event.event_id)
+            publisher = self._publishers.get(camera_index)
+            if (
+                window is None
+                or publisher is None
+                or window.state is PassageReviewState.READY
+            ):
+                continue
+            preview = publisher.preview(window, race_id=event.race_id)
+            if (
+                preview is None
+                or preview.media_started_at_ms is None
+                or preview.media_duration_ms is None
+            ):
+                continue
+            media_end_at_ms = (
+                preview.media_started_at_ms + preview.media_duration_ms
+            )
+            if not (
+                preview.media_started_at_ms
+                <= lookup.target_time_ms
+                <= media_end_at_ms
+            ):
+                continue
+            passage_position_ms = (
+                lookup.target_time_ms - preview.media_started_at_ms
+            )
+            locations.append(
+                PassageVideoLocation(
+                    segment=preview,
+                    video_path=Path(preview.video_path),
+                    passage_position_ms=passage_position_ms,
+                    playback_position_ms=max(
+                        0,
+                        passage_position_ms - self.pre_roll_ms,
+                    ),
+                    clock_offset_ms=self.clock_offset_ms,
+                    timing_error_ms=preview.timing_error_ms,
+                    status="preview",
+                    media_locator=preview.segment_id,
+                )
+            )
+        if not any(location.status == "preview" for location in locations):
+            return lookup
+        if any(location.status == "located" for location in locations):
+            status = "located"
+        elif any(location.status == "preview" for location in locations):
+            status = "preview"
+        elif any(location.status == "near_boundary" for location in locations):
+            status = "near_boundary"
+        elif any(location.status == "unverified" for location in locations):
+            status = "unverified"
+        else:
+            status = lookup.status
+        return PassageVideoLookup(
+            status,
+            lookup.target_time_ms,
+            tuple(locations),
         )
 
     def _refresh_capture_windows(self) -> None:
@@ -3098,6 +4373,8 @@ class FinishReviewWindow(PassageReviewDialog):
                     ):
                         changed_event_ids.add(window.event_id)
                     if previous is not None and previous.state is not window.state:
+                        changed_event_ids.add(window.event_id)
+                    elif previous is not None and previous.segments != window.segments:
                         changed_event_ids.add(window.event_id)
             now = time.monotonic()
             if now - self._last_cleanup_at >= 5.0:
@@ -3155,16 +4432,14 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _update_runtime_status(self) -> None:
         beijing_now = datetime.now(timezone(timedelta(hours=8)))
-        self.beijing_clock_label.setText(
-            beijing_now.strftime("北京时间 %Y-%m-%d %H:%M:%S")
-        )
+        self.beijing_clock_label.setText(beijing_now.strftime("%H:%M:%S"))
         self.race_dir_label.setText(f"证据目录：{self.output_dir.name}")
         self.race_dir_label.setToolTip(str(self.output_dir))
+        self._update_event_header()
 
         configured_sources = self._configured_recording_sources()
         recording_active = self._recording_any_active()
         recording_all_active = self._recording_all_active()
-        recording_needs_recovery = self._recording_needs_recovery()
         segments_by_camera = {
             camera_index: ring_buffer.segments()
             for camera_index, ring_buffer in self._ring_buffers.items()
@@ -3188,33 +4463,46 @@ class FinishReviewWindow(PassageReviewDialog):
                     stale.append(camera_index)
             if missing:
                 camera_text, camera_color = "录像设备: 机位异常", "#b54747"
+                camera_state = "error"
                 camera_tooltip = "未运行：" + "、".join(
                     f"机位{camera_index}" for camera_index in missing
                 )
             elif stale:
                 camera_text, camera_color = "录像设备: 无新画面", "#b54747"
+                camera_state = "error"
                 camera_tooltip = "超过8秒无新画面：" + "、".join(
                     f"机位{camera_index}" for camera_index in stale
                 )
             elif waiting:
                 camera_text, camera_color = "录像设备: 正在检查", "#a56300"
+                camera_state = "busy"
                 camera_tooltip = "等待首个2秒片段：" + "、".join(
                     f"机位{camera_index}" for camera_index in waiting
                 )
             else:
                 camera_text, camera_color = "录像设备: 全部已连接", "#247a52"
+                camera_state = "ready"
                 camera_tooltip = f"{len(configured_sources)} 个普通机位持续生成可判读画面"
+        elif self._auto_recording_error and configured_sources:
+            camera_text, camera_color = "录像设备: 自动启动失败", "#b54747"
+            camera_state = "error"
+            camera_tooltip = self._auto_recording_error
         elif configured_sources:
             camera_text, camera_color = "录像设备: 已配置", "#526170"
+            camera_state = "waiting"
             camera_tooltip = f"已配置 {len(configured_sources)} 个普通机位，开始录像后验证画面"
         else:
             camera_text, camera_color = "录像设备: 未配置", "#b54747"
+            camera_state = "error"
             camera_tooltip = "请打开设备设置并选择USB/Type-C摄像头"
-        self.camera_status_label.setText(camera_text)
+        self.camera_status_label.setStatus(camera_text, camera_state)
         self.camera_status_label.setToolTip(camera_tooltip)
         self.camera_status_label.setStyleSheet(f"color: {camera_color};")
 
-        if self._runtime_error and not recording_all_active:
+        if self._workspace_mode == "archive" and not recording_active:
+            recording_text, recording_color = "普通录像: 历史查看", "#667085"
+            recording_tooltip = "返回当前赛事后可开始录像"
+        elif self._runtime_error and not recording_all_active:
             recording_text, recording_color = "普通录像: 异常", "#b54747"
             recording_tooltip = self._runtime_error
         elif recording_all_active:
@@ -3224,9 +4512,6 @@ class FinishReviewWindow(PassageReviewDialog):
             recording_text = f"普通录像: {hours:02d}:{minutes:02d}:{seconds:02d}"
             recording_color = "#247a52"
             recording_tooltip = f"{len(configured_sources)} 个机位：5分钟赛事存档 + 2秒判读时间片"
-        elif recording_needs_recovery:
-            recording_text, recording_color = "普通录像: 需要恢复", "#a56300"
-            recording_tooltip = "点击恢复录像将停止残余进程并重新启动全部普通机位"
         elif recording_active:
             recording_text, recording_color = "普通录像: 部分机位异常", "#b54747"
             recording_tooltip = "请停止录像并检查异常机位后重新开始"
@@ -3236,21 +4521,23 @@ class FinishReviewWindow(PassageReviewDialog):
         self.recording_status_label.setText(recording_text)
         self.recording_status_label.setToolTip(recording_tooltip)
         self.recording_status_label.setStyleSheet(f"color: {recording_color};")
-        if recording_needs_recovery:
-            self.record_button.setText("恢复录像")
-            self.record_button.setStyleSheet(
-                "background: #a56300; color: white; border: 1px solid #a56300;"
-            )
-        elif recording_active:
-            self.record_button.setText("停止录像")
-            self.record_button.setStyleSheet(
-                "background: #a33d4b; color: white; border: 1px solid #a33d4b;"
-            )
-        else:
-            self.record_button.setText("开始录像")
-            self.record_button.setStyleSheet(
-                "background: #247a52; color: white; border: 1px solid #247a52;"
-            )
+        self.record_button.setText(
+            "停止录像"
+            if recording_active
+            else "历史查看中"
+            if self._workspace_mode == "archive"
+            else "开始录像"
+        )
+        self.record_button.setEnabled(
+            recording_active or self._workspace_mode != "archive"
+        )
+        self.record_button.setStyleSheet(
+            "background: #a33d4b; color: white; border: 1px solid #a33d4b;"
+            if recording_active
+            else "background: #eef1f4; color: #667085; border: 1px solid #cfd7df;"
+            if self._workspace_mode == "archive"
+            else "background: #247a52; color: white; border: 1px solid #247a52;"
+        )
 
         receiver = self._receiver
         if receiver is not None and receiver.is_running:
@@ -3260,10 +4547,28 @@ class FinishReviewWindow(PassageReviewDialog):
                 else None
             )
             pending_count = len(self._pending_passages)
-            if pending_count:
-                self.receiver_status_label.setText(
+            if self._workspace_mode == "archive":
+                background_count = self._archive_background_passage_count
+                self.receiver_status_label.setStatus(
+                    "CycleRace: 后台监听，"
+                    + (
+                        f"已收到 {background_count} 条"
+                        if background_count
+                        else "当前查看历史赛事"
+                    ),
+                    "ready" if background_count else "waiting",
+                )
+                self.receiver_status_label.setStyleSheet(
+                    "color: #247a52;" if background_count else "color: #a56300;"
+                )
+                self.receiver_status_label.setToolTip(
+                    "实时数据继续保存到独立收件箱，不会写入当前历史赛事目录。"
+                )
+            elif pending_count:
+                self.receiver_status_label.setStatus(
                     "CycleRace: 监听中，正在处理；"
-                    f"本次收到 {self._received_passage_count} 条，待处理 {pending_count}"
+                    f"本次收到 {self._received_passage_count} 条，待处理 {pending_count}",
+                    "busy",
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
@@ -3271,8 +4576,9 @@ class FinishReviewWindow(PassageReviewDialog):
                     "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
                 )
             elif self._received_passage_count:
-                self.receiver_status_label.setText(
-                    f"CycleRace: 监听中，本次收到 {self._received_passage_count} 条"
+                self.receiver_status_label.setStatus(
+                    f"CycleRace: 监听中，本次收到 {self._received_passage_count} 条",
+                    "ready",
                 )
                 self.receiver_status_label.setStyleSheet("color: #247a52;")
                 self.receiver_status_label.setToolTip(
@@ -3282,8 +4588,9 @@ class FinishReviewWindow(PassageReviewDialog):
             elif metadata is not None:
                 race_label = metadata.race_name.strip() or metadata.race_id
                 stage_label = metadata.stage_name.strip() or metadata.stage_id
-                self.receiver_status_label.setText(
-                    f"CycleRace: 监听中，已加载赛事 {race_label} / {stage_label}"
+                self.receiver_status_label.setStatus(
+                    f"CycleRace: 监听中，已加载赛事 {race_label} / {stage_label}",
+                    "waiting",
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
@@ -3292,9 +4599,10 @@ class FinishReviewWindow(PassageReviewDialog):
                     "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
                 )
             elif self._historical_passage_count:
-                self.receiver_status_label.setText(
+                self.receiver_status_label.setStatus(
                     "CycleRace: 监听中，"
-                    f"已加载历史 {self._historical_passage_count} 条"
+                    f"已加载历史 {self._historical_passage_count} 条",
+                    "waiting",
                 )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
@@ -3302,15 +4610,18 @@ class FinishReviewWindow(PassageReviewDialog):
                     "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
                 )
             else:
-                self.receiver_status_label.setText("CycleRace: 监听中，等待数据")
+                self.receiver_status_label.setStatus(
+                    "CycleRace: 监听中，等待数据", "waiting"
+                )
                 self.receiver_status_label.setStyleSheet("color: #a56300;")
                 self.receiver_status_label.setToolTip(
                     "本机接收服务已启动，等待CycleRace主动发送数据。"
                     "当前协议没有持续心跳，不能判断发送端是否在线。"
                 )
         else:
-            self.receiver_status_label.setText(
-                "CycleRace: 异常" if self._receiver_error else "CycleRace: 未监听"
+            self.receiver_status_label.setStatus(
+                "CycleRace: 异常" if self._receiver_error else "CycleRace: 未监听",
+                "error",
             )
             self.receiver_status_label.setStyleSheet("color: #b54747;")
             self.receiver_status_label.setToolTip(
@@ -3323,24 +4634,27 @@ class FinishReviewWindow(PassageReviewDialog):
             if source is not None and source.is_running:
                 pending_count = len(self._pending_passages)
                 if status is not None and status.state == "error":
-                    self.receiver_status_label.setText("赛虎: API 错误")
+                    self.receiver_status_label.setStatus("赛虎: API 错误", "error")
                     self.receiver_status_label.setStyleSheet("color: #b54747;")
                     self.receiver_status_label.setToolTip(status.message)
                 elif pending_count:
-                    self.receiver_status_label.setText(
+                    self.receiver_status_label.setStatus(
                         "赛虎: 正在处理，"
-                        f"已读取 {self._received_passage_count}，待处理 {pending_count}"
+                        f"已读取 {self._received_passage_count}，待处理 {pending_count}",
+                        "busy",
                     )
                     self.receiver_status_label.setStyleSheet("color: #a56300;")
                     self.receiver_status_label.setToolTip(
                         "赛虎终点记录已写入本地只读日志，正在准备视频定位"
                     )
                 elif status is not None and status.state == "ok":
-                    self.receiver_status_label.setText(f"赛虎: 已读取 {status.count} 条")
+                    self.receiver_status_label.setStatus(
+                        f"赛虎: 已读取 {status.count} 条", "ready"
+                    )
                     self.receiver_status_label.setStyleSheet("color: #247a52;")
                     self.receiver_status_label.setToolTip(status.message)
                 else:
-                    self.receiver_status_label.setText("赛虎: 正在读取")
+                    self.receiver_status_label.setStatus("赛虎: 正在读取", "busy")
                     self.receiver_status_label.setStyleSheet("color: #a56300;")
                     self.receiver_status_label.setToolTip("正在轮询赛虎 FINISH 记录")
             else:
@@ -3352,10 +4666,11 @@ class FinishReviewWindow(PassageReviewDialog):
                         self.racetiger_token,
                     )
                 )
-                self.receiver_status_label.setText(
+                self.receiver_status_label.setStatus(
                     "赛虎: 异常"
                     if self._receiver_error
-                    else ("赛虎: 未启动" if configured else "赛虎: 未配置")
+                    else ("赛虎: 未启动" if configured else "赛虎: 未配置"),
+                    "error",
                 )
                 self.receiver_status_label.setStyleSheet("color: #b54747;")
                 self.receiver_status_label.setToolTip(
@@ -3365,45 +4680,56 @@ class FinishReviewWindow(PassageReviewDialog):
         high_speed_result = self._high_speed_scan_result
         high_speed_root = self._high_speed_catalog.root
         high_speed_remote = is_network_share(high_speed_root)
-        if self.high_speed_dir is None:
-            self.high_speed_status_label.setText("高速摄像: 已关闭")
-            self.high_speed_status_label.setStyleSheet("color: #667085;")
-            self.high_speed_status_label.setToolTip("当前配置未启用高速摄像")
-        elif high_speed_root is None:
-            self.high_speed_status_label.setText("高速摄像: 未配置共享目录")
+        if high_speed_root is None:
+            self.high_speed_status_label.setStatus(
+                "高速摄像: 未配置共享目录", "error"
+            )
             self.high_speed_status_label.setStyleSheet("color: #b54747;")
         elif high_speed_result.status == "checking":
-            self.high_speed_status_label.setText(
-                "高速摄像: 正在连接共享目录"
-                if high_speed_remote
-                else "高速摄像: 正在检查本机测试目录"
+            self.high_speed_status_label.setStatus(
+                (
+                    "高速摄像: 正在连接共享目录"
+                    if high_speed_remote
+                    else "高速摄像: 正在检查本机测试目录"
+                ),
+                "busy",
             )
             self.high_speed_status_label.setStyleSheet("color: #a56300;")
         elif high_speed_result.status == "unavailable":
-            self.high_speed_status_label.setText(
-                "高速摄像: 共享目录未连接"
-                if high_speed_remote
-                else "高速摄像: 本机测试目录不可用"
+            self.high_speed_status_label.setStatus(
+                (
+                    "高速摄像: 共享目录未连接"
+                    if high_speed_remote
+                    else "高速摄像: 本机测试目录不可用"
+                ),
+                "error",
             )
             self.high_speed_status_label.setStyleSheet("color: #b54747;")
         elif high_speed_result.waiting_file_count:
-            self.high_speed_status_label.setText(
-                "高速摄像: 共享目录可访问，等待原厂软件完成判读"
-                if high_speed_remote
-                else "高速摄像: 本机测试目录可读，等待原厂软件完成判读"
+            self.high_speed_status_label.setStatus(
+                (
+                    "高速摄像: 共享目录可访问，等待原厂软件完成判读"
+                    if high_speed_remote
+                    else "高速摄像: 本机测试目录可读，等待原厂软件完成判读"
+                ),
+                "waiting",
             )
             self.high_speed_status_label.setStyleSheet("color: #a56300;")
         elif high_speed_result.status == "waiting":
-            self.high_speed_status_label.setText(
-                "高速摄像: 共享目录可访问，等待高速画面"
-                if high_speed_remote
-                else "高速摄像: 本机测试目录可读，等待测试数据"
+            self.high_speed_status_label.setStatus(
+                (
+                    "高速摄像: 共享目录可访问，等待高速画面"
+                    if high_speed_remote
+                    else "高速摄像: 本机测试目录可读，等待测试数据"
+                ),
+                "waiting",
             )
             self.high_speed_status_label.setStyleSheet("color: #a56300;")
         else:
-            self.high_speed_status_label.setText(
+            self.high_speed_status_label.setStatus(
                 f"高速摄像: {'共享目录可访问' if high_speed_remote else '本机测试数据可读'}，"
-                f"{len(high_speed_result.captures)} 段"
+                f"{len(high_speed_result.captures)} 段",
+                "ready",
             )
             self.high_speed_status_label.setStyleSheet("color: #247a52;")
         self.high_speed_status_label.setToolTip(
@@ -3417,16 +4743,32 @@ class FinishReviewWindow(PassageReviewDialog):
             )
         )
 
+        storage_alert = ""
+        storage_alert_tooltip = ""
+        storage_alert_color = "#b54747"
         try:
             free_gb = shutil.disk_usage(self.output_dir).free / (1024**3)
             storage_color = "#b54747" if free_gb < 5 else "#a56300" if free_gb < 20 else "#247a52"
             self.storage_status_label.setText(f"存储: {free_gb:.1f} GB")
             self.storage_status_label.setStyleSheet(f"color: {storage_color};")
             self.storage_status_label.setToolTip(str(self.output_dir))
+            if free_gb < 5:
+                storage_alert = "磁盘空间严重不足"
+                storage_alert_tooltip = (
+                    f"证据目录仅剩 {free_gb:.1f} GB：{self.output_dir}"
+                )
+            elif free_gb < 20:
+                storage_alert = "磁盘空间不足"
+                storage_alert_tooltip = (
+                    f"证据目录剩余 {free_gb:.1f} GB：{self.output_dir}"
+                )
+                storage_alert_color = "#a56300"
         except OSError as exc:
             self.storage_status_label.setText("存储: 不可用")
             self.storage_status_label.setStyleSheet("color: #b54747;")
             self.storage_status_label.setToolTip(str(exc))
+            storage_alert = "存储不可用"
+            storage_alert_tooltip = f"无法读取证据目录磁盘状态：{exc}"
 
         counts = {state: 0 for state in PassageReviewState}
         event_states: dict[str, list[PassageReviewState]] = {}
@@ -3470,48 +4812,99 @@ class FinishReviewWindow(PassageReviewDialog):
             self.capture_status_label.setStyleSheet(
                 "color: #667085; font-weight: 500;"
             )
+        alert_entries = []
+        if self._capture_error:
+            alert_entries.append(
+                ("证据处理异常", self._capture_error, "#b54747")
+            )
+        if storage_alert:
+            alert_entries.append(
+                (storage_alert, storage_alert_tooltip, storage_alert_color)
+            )
+        if self._workspace_notice:
+            alert_entries.append(
+                (
+                    self._workspace_notice,
+                    f"当前赛事目录：{self.output_dir}",
+                    "#a56300",
+                )
+            )
+        if len(alert_entries) > 1:
+            self.runtime_alert_label.setText("多项运行异常")
+            self.runtime_alert_label.setToolTip(
+                "\n".join(
+                    f"{title}：{detail}" if detail else title
+                    for title, detail, _color in alert_entries
+                )
+            )
+            alert_color = (
+                "#b54747"
+                if any(color == "#b54747" for _title, _detail, color in alert_entries)
+                else "#a56300"
+            )
+        elif alert_entries:
+            title, detail, alert_color = alert_entries[0]
+            self.runtime_alert_label.setText(title)
+            self.runtime_alert_label.setToolTip(detail)
+        else:
+            self.runtime_alert_label.clear()
+            self.runtime_alert_label.setToolTip("")
+            self.runtime_alert_label.hide()
+            alert_color = ""
+        if alert_color:
+            self.runtime_alert_label.setStyleSheet(
+                f"color: {alert_color}; font-size: 9pt; font-weight: 700;"
+            )
+            self.runtime_alert_label.show()
         self._update_operator_controls()
 
-    def stop_recording(self) -> bool:
+    def stop_recording(self) -> None:
         recorders = tuple(self._recorders.items())
         if recorders:
-            failures = self._recording_controller.stop()
+            errors = []
+            for camera_index, recorder in recorders:
+                try:
+                    recorder.stop()
+                except RecordingError as exc:
+                    errors.append(
+                        f"机位{camera_index}: {sanitize_recording_message(exc)}"
+                    )
             try:
-                self._publish_archive_segments()
+                self._publish_archive_segments(recording=False)
                 self._refresh_capture_windows()
             except Exception:
                 logger.exception("Failed to publish final review segments")
-            if failures:
-                self._recording_stop_error = "; ".join(
-                    f"机位{failure.camera_index}: "
-                    f"{sanitize_recording_message(failure.error)}"
-                    for failure in failures
-                )
-                self._runtime_error = self._recording_stop_error
-        else:
-            failures = self._recording_controller.stop()
-        if not failures:
-            if self._runtime_error == self._recording_stop_error:
-                self._runtime_error = ""
-            self._recording_stop_error = ""
-        self._sync_recording_components()
-        self._started = self._recording_controller.any_active
-        if not self._started:
-            self._recording_started_at = 0.0
+            if errors:
+                self._runtime_error = "; ".join(errors)
+        self._recorders = {}
+        self._ring_buffers = {}
+        self._coordinators = {}
+        self._publishers = {}
+        self._recorder = None
+        self._ring_buffer = None
+        self._coordinator = None
+        self._publisher = None
+        self._started = False
+        self._recording_started_at = 0.0
         self._update_runtime_status()
-        return (
-            not any(failure.still_running for failure in failures)
-            and not self._recording_controller.any_active
-        )
 
-    def stop_receiver(self) -> bool:
-        errors = self._receiver_controller.stop()
-        if errors:
-            self._receiver_error = "; ".join(errors)
-        else:
-            self._receiver_error = ""
+    def stop_receiver(self) -> None:
+        self._racetiger_generation += 1
+        receiver = self._receiver
+        self._receiver = None
+        if receiver is not None:
+            try:
+                receiver.stop()
+            except Exception as exc:  # noqa: BLE001 - receiver factories may vary.
+                logger.warning("Failed to stop CycleRace receiver: %s", exc)
+        racetiger_source = self._racetiger_source
+        self._racetiger_source = None
+        if racetiger_source is not None:
+            try:
+                racetiger_source.stop()
+            except Exception as exc:  # noqa: BLE001 - shutdown is best effort.
+                logger.warning("Failed to stop RaceTiger source: %s", exc)
         self._update_runtime_status()
-        return not errors
 
     def stop(self) -> bool:
         self._refresh_timer.stop()
@@ -3522,23 +4915,25 @@ class FinishReviewWindow(PassageReviewDialog):
             worker.stop()
             if not worker.wait(1_000):
                 return False
-        recording_stopped = self.stop_recording()
-        receiver_stopped = self.stop_receiver()
+        self.stop_recording()
+        self.stop_receiver()
         self._update_runtime_status()
-        return recording_stopped and receiver_stopped
+        return True
 
     def closeEvent(self, event) -> None:
         self._clock_timer.stop()
         if not self.stop():
             event.ignore()
             self.setEnabled(False)
-            self.setWindowTitle("终点复核系统 - 正在停止高速目录扫描")
+            self.setWindowTitle("FinishReview · 终点多源复核 - 正在停止高速目录扫描")
             QTimer.singleShot(100, self.close)
             return
+        self._export_review_summary()
         super().closeEvent(event)
 
 
 __all__ = [
+    "EventWorkspacePickerDialog",
     "FinishReviewLaunchDialog",
     "FinishReviewSettings",
     "FinishReviewWindow",
