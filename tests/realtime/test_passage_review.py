@@ -339,6 +339,139 @@ def test_confirming_either_regular_camera_confirms_passage_and_marks_others_refe
     dialog.close()
 
 
+@pytest.mark.parametrize(
+    ("regular_camera_indexes", "show_high_speed", "expected_count"),
+    [
+        ((1,), False, 1),
+        ((1,), True, 2),
+        ((1, 2), False, 2),
+        ((1, 2), True, 3),
+    ],
+)
+def test_review_evidence_layout_follows_current_configuration(
+    qapp,
+    tmp_path,
+    regular_camera_indexes,
+    show_high_speed,
+    expected_count,
+):
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        regular_camera_indexes=regular_camera_indexes,
+        show_high_speed_pane=show_high_speed,
+        include_recorded_evidence=False,
+    )
+
+    assert tuple(pane.camera_index for pane in dialog.regular_panes) == (
+        *regular_camera_indexes,
+    )
+    assert len(dialog.evidence_panes) == expected_count
+    assert dialog.high_speed_pane.isHidden() is (not show_high_speed)
+    dialog.close()
+
+
+def test_realtime_review_does_not_restore_unconfigured_recorded_evidence(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = _event(passage_time_ms=15_000)
+    passage_store.append(event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_02.mkv",
+        source_id="camera_02",
+        camera_index=2,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "high_speed_01.mp4",
+        source_id="high_speed_01",
+        camera_index=3,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        clock_source="external_clip_sidecar_beijing",
+        timing_error_ms=100,
+    )
+
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        regular_camera_indexes=(1,),
+        show_high_speed_pane=False,
+        include_recorded_evidence=False,
+    )
+
+    lookup = dialog._lookup(event)
+    assert len(dialog.evidence_panes) == 1
+    assert [location.segment.camera_index for location in lookup.locations] == [1]
+    assert dialog.high_speed_pane.isHidden()
+    dialog.close()
+
+
+def test_historical_review_can_restore_recorded_evidence_panes(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = _event(passage_time_ms=15_000)
+    passage_store.append(event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_02.mkv",
+        source_id="camera_02",
+        camera_index=2,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "high_speed_01.mp4",
+        source_id="high_speed_01",
+        camera_index=3,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        clock_source="external_clip_sidecar_beijing",
+        timing_error_ms=100,
+    )
+
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        regular_camera_indexes=(1,),
+        show_high_speed_pane=False,
+        include_recorded_evidence=True,
+    )
+
+    assert tuple(pane.camera_index for pane in dialog.regular_panes) == (1, 2)
+    assert len(dialog.evidence_panes) == 3
+    assert not dialog.high_speed_pane.isHidden()
+    dialog.close()
+
+
 def test_review_uses_consistent_laptop_typography(qapp, tmp_path):
     passage_store = PassageEventStore(tmp_path / "passages.jsonl")
     passage_store.append(_event())

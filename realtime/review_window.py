@@ -976,6 +976,10 @@ class FinishReviewLaunchDialog(QDialog):
             str(self._high_speed_dir) if self._high_speed_dir is not None else "",
             self,
         )
+        self.high_speed_enabled_checkbox = QCheckBox("启用高速摄像", self)
+        self.high_speed_enabled_checkbox.setChecked(self._high_speed_dir is not None)
+        self.high_speed_enabled_checkbox.toggled.connect(self._refresh_source_fields)
+        form.addRow("高速摄像", self.high_speed_enabled_checkbox)
         self.high_speed_edit.setPlaceholderText(r"\\高速摄像电脑\AuyatData")
         self.high_speed_edit.setToolTip(
             "正式比赛请填写另一台高速摄像电脑的只读共享目录，"
@@ -983,6 +987,7 @@ class FinishReviewLaunchDialog(QDialog):
         )
         high_speed_row.addWidget(self.high_speed_edit, 1)
         high_speed_browse_button = QPushButton(self)
+        self.high_speed_browse_button = high_speed_browse_button
         high_speed_browse_button.setIcon(
             self.style().standardIcon(QStyle.SP_DirOpenIcon)
         )
@@ -1384,9 +1389,15 @@ class FinishReviewLaunchDialog(QDialog):
             (
                 "Auyat高速",
                 "高速电脑",
-                self.high_speed_edit.text().strip() or "未配置",
-                snapshot.get("high_speed_state", "待检查"),
-                snapshot.get("high_speed_detail", "等待共享目录检查"),
+                self.high_speed_edit.text().strip() or "已关闭"
+                if not self.high_speed_enabled_checkbox.isChecked()
+                else self.high_speed_edit.text().strip() or "未配置",
+                "已关闭"
+                if not self.high_speed_enabled_checkbox.isChecked()
+                else snapshot.get("high_speed_state", "待检查"),
+                "高速摄像未启用"
+                if not self.high_speed_enabled_checkbox.isChecked()
+                else snapshot.get("high_speed_detail", "等待共享目录检查"),
             ),
             (
                 "PoE交换机",
@@ -1415,14 +1426,18 @@ class FinishReviewLaunchDialog(QDialog):
     def _start_preflight(self) -> None:
         selected_source = self._selected_recording_source()
         selected_secondary_source = self._current_secondary_rtsp_source()
-        selected_high_speed = self.high_speed_edit.text().strip()
+        high_speed_enabled = self.high_speed_enabled_checkbox.isChecked()
+        selected_high_speed = (
+            self.high_speed_edit.text().strip() if high_speed_enabled else ""
+        )
         if not selected_source:
             QMessageBox.warning(self, "无法开始联调", "请先配置普通录像源")
             return
-        if not selected_high_speed:
+        if high_speed_enabled and not selected_high_speed:
             QMessageBox.warning(self, "无法开始联调", "请先配置Auyat高速共享目录")
             return
         current_high_speed = str(self._high_speed_dir or "")
+        current_high_speed = current_high_speed if high_speed_enabled else ""
         if (
             selected_source != self._source
             or selected_secondary_source != self._secondary_source
@@ -1460,7 +1475,7 @@ class FinishReviewLaunchDialog(QDialog):
             events,
             started_at_ms=self._clock_ms(),
             require_regular=True,
-            require_high_speed=True,
+            require_high_speed=high_speed_enabled,
             started_receive_sequence=max(
                 reception_order.values(),
                 default=0,
@@ -1643,6 +1658,9 @@ class FinishReviewLaunchDialog(QDialog):
         usb_settings_visible = not is_rtsp or secondary_is_usb
         self._set_form_row_visible(self.video_size_combo, usb_settings_visible)
         self._set_form_row_visible(self.framerate_combo, usb_settings_visible)
+        high_speed_enabled = self.high_speed_enabled_checkbox.isChecked()
+        self.high_speed_edit.setEnabled(high_speed_enabled)
+        self.high_speed_browse_button.setEnabled(high_speed_enabled)
         self._refresh_camera_status()
 
     def _invalidate_rtsp_probe(self) -> None:
@@ -2010,7 +2028,11 @@ class FinishReviewLaunchDialog(QDialog):
     @property
     def settings(self) -> FinishReviewSettings:
         source = self._selected_recording_source()
-        high_speed_value = self.high_speed_edit.text().strip()
+        high_speed_value = (
+            self.high_speed_edit.text().strip()
+            if self.high_speed_enabled_checkbox.isChecked()
+            else ""
+        )
         timing_provider = str(self.timing_provider_combo.currentData() or "cyclerace")
         return FinishReviewSettings(
             source=source,
@@ -2381,6 +2403,7 @@ class FinishReviewWindow(PassageReviewDialog):
             open_location=self._open_point_playback,
             regular_camera_indexes=regular_camera_indexes,
             show_high_speed_pane=self.high_speed_dir is not None,
+            include_recorded_evidence=False,
         )
 
         self.setWindowTitle("FinishReview · 终点多源复核")
@@ -2474,6 +2497,25 @@ class FinishReviewWindow(PassageReviewDialog):
         if is_supported_review_source(self.secondary_source):
             sources.append((self.camera_index + 1, self.secondary_source))
         return tuple(sources)
+
+    def _sync_evidence_pane_layout(self, *, include_recorded: bool = False) -> None:
+        self.configure_evidence_panes(
+            (camera_index for camera_index, _source in self._configured_recording_sources()),
+            show_high_speed=self.high_speed_dir is not None,
+            include_recorded=include_recorded,
+        )
+        if hasattr(self, "mark_regular_button"):
+            try:
+                self.mark_regular_button.clicked.disconnect()
+            except TypeError:
+                pass
+            self.mark_regular_button = self.regular_pane.mark_btn
+            self.mark_regular_button.clicked.connect(
+                lambda: self._begin_marking(self._regular_pane_for_operator_marking())
+            )
+        if hasattr(self, "mark_high_speed_button"):
+            self.mark_high_speed_button.setVisible(self.high_speed_dir is not None)
+        self._update_operator_controls()
 
     def _recording_any_active(self) -> bool:
         return any(recorder.is_running for recorder in self._recorders.values())
@@ -2569,6 +2611,11 @@ class FinishReviewWindow(PassageReviewDialog):
     def _request_high_speed_scan(self) -> None:
         self._high_speed_scan_result = self._high_speed_catalog.snapshot()
         if self.high_speed_dir is None:
+            worker = self._high_speed_scan_worker
+            if worker.isRunning():
+                worker.stop()
+                if not worker.wait(1_000):
+                    logger.warning("High-speed scan worker did not stop promptly")
             self._update_runtime_status()
             return
         if not self._high_speed_scan_worker.isRunning():
@@ -2647,6 +2694,24 @@ class FinishReviewWindow(PassageReviewDialog):
                     and getattr(pane.video_view, "has_frame", False)
                 )
             )
+        if hasattr(self, "mark_regular_button"):
+            self.mark_regular_button.setEnabled(
+                bool(
+                    identity
+                    and any(
+                        getattr(pane.video_view, "has_frame", False)
+                        for pane in self.regular_panes
+                    )
+                )
+            )
+        if hasattr(self, "mark_high_speed_button"):
+            self.mark_high_speed_button.setEnabled(
+                bool(
+                    self.high_speed_dir is not None
+                    and identity
+                    and getattr(self.high_speed_pane.video_view, "has_frame", False)
+                )
+            )
         has_pending_marker = any(
             pane.has_pending_marker for pane in self.evidence_panes
         )
@@ -2656,6 +2721,16 @@ class FinishReviewWindow(PassageReviewDialog):
         return next(
             (pane for pane in self.evidence_panes if pane.has_pending_marker),
             None,
+        )
+
+    def _regular_pane_for_operator_marking(self):
+        return next(
+            (
+                pane
+                for pane in self.regular_panes
+                if getattr(pane.video_view, "has_frame", False)
+            ),
+            self.regular_pane,
         )
 
     def _confirm_current_marker(self) -> None:
@@ -3010,13 +3085,7 @@ class FinishReviewWindow(PassageReviewDialog):
             or (self.high_speed_dir is not None) != self._show_high_speed_pane
         )
         if evidence_layout_changed:
-            self.configure_evidence_panes(
-                configured_camera_indexes,
-                show_high_speed=self.high_speed_dir is not None,
-            )
-            if hasattr(self, "mark_regular_button"):
-                self.mark_regular_button = self.regular_pane.mark_btn
-                self._update_operator_controls()
+            self._sync_evidence_pane_layout(include_recorded=False)
         if data_source_changed:
             assert prepared_data_source is not None
             (
@@ -3294,7 +3363,12 @@ class FinishReviewWindow(PassageReviewDialog):
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label
         self.mark_regular_button = self.regular_pane.mark_btn
+        self.mark_regular_button.clicked.disconnect()
+        self.mark_regular_button.clicked.connect(
+            lambda: self._begin_marking(self._regular_pane_for_operator_marking())
+        )
         self.mark_high_speed_button = self.high_speed_pane.mark_btn
+        self.mark_high_speed_button.setVisible(self.high_speed_dir is not None)
         self.confirm_next_button = QPushButton("确认并下一条", self.transport)
         self.confirm_next_button.setShortcut("Ctrl+Return")
         self.confirm_next_button.setToolTip("确认当前标线并选择下一条")
@@ -3693,7 +3767,7 @@ class FinishReviewWindow(PassageReviewDialog):
                     "CycleRace监听未启动",
                     sanitize_recording_message(exc),
                 )
-        self._high_speed_scan_worker.request_scan()
+        self._request_high_speed_scan()
         self._update_runtime_status()
 
     def start_recording(self) -> None:

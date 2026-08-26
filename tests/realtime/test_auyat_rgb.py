@@ -373,6 +373,25 @@ def test_scan_worker_stops_a_cooperative_directory_scan(qapp):
     assert worker.wait(1_000)
 
 
+def test_scan_worker_can_restart_after_a_cooperative_stop(qapp):
+    class SlowCatalog:
+        def scan(self, *, cancel_requested=None):
+            while cancel_requested is None or not cancel_requested():
+                time.sleep(0.01)
+            raise AuyatScanCancelled()
+
+    worker = AuyatRgbScanWorker(SlowCatalog(), interval_seconds=0.5)
+    worker.start()
+    assert _wait_until(qapp, worker.isRunning)
+    worker.stop()
+    assert worker.wait(1_000)
+
+    worker.start()
+    assert _wait_until(qapp, worker.isRunning)
+    worker.stop()
+    assert worker.wait(1_000)
+
+
 def test_capture_uses_each_column_tick_and_color_order(tmp_path):
     root = tmp_path / "vendor"
     rgb_path = root / "Photo" / "01_group.RGB"

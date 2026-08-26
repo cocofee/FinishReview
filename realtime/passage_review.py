@@ -1673,6 +1673,42 @@ class PassageEvidencePane(QFrame):
             self._retire_worker(worker, wait=wait)
 
 
+def _resolve_evidence_layout(
+    timeline_store: VideoTimelineStore,
+    *,
+    regular_camera_indexes: Optional[Iterable[int]] = None,
+    show_high_speed_pane: Optional[bool] = None,
+    include_recorded: bool = True,
+) -> tuple[tuple[int, ...], bool]:
+    configured_indexes = tuple(
+        dict.fromkeys(
+            max(1, int(camera_index))
+            for camera_index in (regular_camera_indexes or ())
+        )
+    )
+    recorded_regular_indexes: tuple[int, ...] = ()
+    recorded_high_speed = False
+    if include_recorded:
+        segments = timeline_store.segments()
+        recorded_regular_indexes = tuple(
+            sorted(
+                {
+                    segment.camera_index
+                    for segment in segments
+                    if segment.clock_source == DEFAULT_CLOCK_SOURCE
+                }
+            )
+        )
+        recorded_high_speed = any(
+            segment.clock_source != DEFAULT_CLOCK_SOURCE for segment in segments
+        )
+    regular_indexes = tuple(
+        dict.fromkeys((*configured_indexes, *recorded_regular_indexes))
+    ) or (1,)
+    show_high_speed = bool(show_high_speed_pane) or recorded_high_speed
+    return regular_indexes, show_high_speed
+
+
 class PassageReviewDialog(QDialog):
     clock_offset_changed = pyqtSignal(int)
     evidence_pane_added = pyqtSignal(object)
@@ -1695,6 +1731,7 @@ class PassageReviewDialog(QDialog):
         ] = None,
         regular_camera_indexes: Optional[Iterable[int]] = None,
         show_high_speed_pane: Optional[bool] = None,
+        include_recorded_evidence: bool = True,
     ):
         super().__init__(parent)
         self.passage_store = passage_store
@@ -1707,32 +1744,21 @@ class PassageReviewDialog(QDialog):
         self.pre_roll_ms = max(0, int(pre_roll_ms))
         self._open_location = open_location
         self._high_speed_locator = high_speed_locator
-        requested_camera_indexes = tuple(
-            dict.fromkeys(
-                max(1, int(camera_index))
-                for camera_index in (regular_camera_indexes or ())
-            )
+        requested_high_speed = (
+            bool(high_speed_locator)
+            if show_high_speed_pane is None
+            else bool(show_high_speed_pane)
         )
-        if not requested_camera_indexes:
-            requested_camera_indexes = tuple(
-                sorted(
-                    {
-                        segment.camera_index
-                        for segment in self.timeline_store.segments()
-                        if segment.clock_source == DEFAULT_CLOCK_SOURCE
-                    }
-                )
-            )
-        self._configured_regular_camera_indexes = requested_camera_indexes or (1,)
-        if show_high_speed_pane is None:
-            show_high_speed_pane = bool(
-                high_speed_locator
-                or any(
-                    segment.clock_source != DEFAULT_CLOCK_SOURCE
-                    for segment in self.timeline_store.segments()
-                )
-            )
-        self._show_high_speed_pane = bool(show_high_speed_pane)
+        (
+            self._configured_regular_camera_indexes,
+            self._show_high_speed_pane,
+        ) = _resolve_evidence_layout(
+            timeline_store,
+            regular_camera_indexes=regular_camera_indexes,
+            show_high_speed_pane=requested_high_speed,
+            include_recorded=include_recorded_evidence,
+        )
+        self._include_recorded_evidence = bool(include_recorded_evidence)
         self._regular_panes_by_camera: dict[int, PassageEvidencePane] = {}
         self._external_location_revision = 0
         self._visible_events: list[PassageEvent] = []
@@ -2097,16 +2123,20 @@ class PassageReviewDialog(QDialog):
         regular_camera_indexes: Iterable[int],
         *,
         show_high_speed: bool,
+        include_recorded: bool = False,
     ) -> None:
-        normalized_indexes = tuple(
-            dict.fromkeys(max(1, int(index)) for index in regular_camera_indexes)
-        ) or (1,)
+        normalized_indexes, resolved_high_speed = _resolve_evidence_layout(
+            self.timeline_store,
+            regular_camera_indexes=regular_camera_indexes,
+            show_high_speed_pane=show_high_speed,
+            include_recorded=include_recorded,
+        )
         self._set_sync_playing(False)
         self._maximized_pane = None
         for camera_index in normalized_indexes:
             self._create_regular_pane(camera_index)
         self._configured_regular_camera_indexes = normalized_indexes
-        self._show_high_speed_pane = bool(show_high_speed)
+        self._show_high_speed_pane = resolved_high_speed
         self.regular_pane = self.regular_panes[0]
 
         active_regular = set(normalized_indexes)
@@ -2230,11 +2260,37 @@ class PassageReviewDialog(QDialog):
             pre_roll_ms=self.pre_roll_ms,
             race_id=event.race_id,
         )
-        if self._high_speed_locator is None:
-            return lookup
-        locations = [
-            location for location in lookup.locations if not is_high_speed(location)
-        ]
+        locations = list(lookup.locations)
+        if not self._include_recorded_evidence:
+            configured = set(self._configured_regular_camera_indexes)
+            locations = [
+                location
+                for location in locations
+                if (
+                    is_high_speed(location)
+                    and self._show_high_speed_pane
+                )
+                or (
+                    not is_high_speed(location)
+                    and location.segment.camera_index in configured
+                )
+            ]
+        if self._high_speed_locator is None or not self._show_high_speed_pane:
+            if tuple(locations) == lookup.locations:
+                return lookup
+            status = (
+                "located"
+                if any(location.status == "located" for location in locations)
+                else "near_boundary"
+                if any(location.status == "near_boundary" for location in locations)
+                else lookup.status
+            )
+            return PassageVideoLookup(
+                status,
+                event.timeline_timestamp_ms + self.clock_offset_ms,
+                tuple(locations),
+            )
+        locations = [location for location in locations if not is_high_speed(location)]
         high_speed = self._high_speed_locator(
             event,
             self.clock_offset_ms,
@@ -2287,6 +2343,9 @@ class PassageReviewDialog(QDialog):
             self.clock_offset_ms,
             self.pre_roll_ms,
             self._external_location_revision,
+            tuple(self._configured_regular_camera_indexes),
+            self._show_high_speed_pane,
+            self._include_recorded_evidence,
         )
         cached = self._lookup_cache.get(event.event_id)
         if cached is not None and cached[0] == key:
