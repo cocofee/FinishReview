@@ -6,6 +6,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+import realtime.passage_receiver as passage_receiver_module
 from realtime.passage_receiver import (
     DISCOVERY_REQUEST,
     DISCOVERY_SERVICE,
@@ -401,6 +402,7 @@ def test_optional_field_preserves_positional_constructor_contract():
     assert event.lap == 2
     assert event.message_type == "passage"
     assert event.passage_timestamp_ms is None
+    assert event.received_at_ms == 0
     assert event.timeline_timestamp_ms == 123_456
 
 
@@ -423,6 +425,37 @@ def test_optional_absolute_passage_timestamp_is_preserved(running_receiver):
     assert event.passage_timestamp_ms == absolute_timestamp_ms
     assert event.timeline_timestamp_ms == absolute_timestamp_ms
     assert accepted == [event]
+
+
+def test_receiver_persists_trusted_local_receipt_time(
+    running_receiver,
+    monkeypatch,
+):
+    receiver, store, accepted = running_receiver
+    received_at_ms = 1_787_578_789_623
+    monkeypatch.setattr(
+        passage_receiver_module.time,
+        "time",
+        lambda: received_at_ms / 1000.0,
+    )
+
+    status, ack = post_json(
+        receiver,
+        passage_payload(
+            emitted_at_ms=1_787_393_724_380,
+            received_at_ms=1,
+        ),
+    )
+
+    assert status == 201
+    assert ack["status"] == "accepted"
+    event = store.get("race-1-stage-1-passage-7")
+    assert event is not None
+    assert event.received_at_ms == received_at_ms
+    assert accepted == [event]
+    restored = PassageEventStore(store.journal_path).get(event.event_id)
+    assert restored is not None
+    assert restored.received_at_ms == received_at_ms
 
 
 def test_cyclerace_display_metadata_is_persisted(running_receiver):
@@ -725,12 +758,18 @@ def test_store_recovers_incomplete_tail_and_restores_latest_revision(tmp_path):
     assert len(journal.read_text(encoding="utf-8").splitlines()) == 2
 
 
-def test_restart_duplicate_notifies_new_review_workspace(tmp_path):
+def test_restart_duplicate_notifies_new_review_workspace(tmp_path, monkeypatch):
     journal = tmp_path / "passage-events.jsonl"
     first_store = PassageEventStore(journal)
     first_store.append(PassageEvent.from_payload(passage_payload()))
     restored_store = PassageEventStore(journal)
     delivered = []
+    received_at_ms = 1_787_578_789_623
+    monkeypatch.setattr(
+        passage_receiver_module.time,
+        "time",
+        lambda: received_at_ms / 1000.0,
+    )
     receiver = PassageEventReceiver(
         "127.0.0.1",
         0,
@@ -748,6 +787,9 @@ def test_restart_duplicate_notifies_new_review_workspace(tmp_path):
     assert [event.event_id for event in delivered] == [
         "race-1-stage-1-passage-7"
     ]
+    assert delivered[0].received_at_ms == received_at_ms
+    assert restored_store.get(delivered[0].event_id).received_at_ms == received_at_ms
+    assert len(journal.read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_stop_is_idempotent(tmp_path):

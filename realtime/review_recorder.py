@@ -37,11 +37,15 @@ DEFAULT_REVIEW_RETENTION_SECONDS = 360
 DEFAULT_REVIEW_PRE_ROLL_SECONDS = 3
 DEFAULT_REVIEW_POST_ROLL_SECONDS = 3
 DEFAULT_ARCHIVE_TIMING_ERROR_MS = 3_000
+_HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS = 5
 ARCHIVE_SESSION_SCHEMA_VERSION = 1
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 _DIRECTSHOW_SCHEME = "dshow"
 _VIDEO_SIZE_PATTERN = re.compile(r"^[1-9]\d{1,4}x[1-9]\d{1,4}$")
 _DIRECTSHOW_VIDEO_DEVICE_PATTERN = re.compile(r'"(?P<name>[^"]+)"\s+\(video\)')
+_DIRECTSHOW_ALTERNATIVE_DEVICE_PATTERN = re.compile(
+    r'Alternative name "(?P<name>[^"]+)"'
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +55,15 @@ class DirectShowReviewSource:
     device_name: str
     video_size: str | None = None
     framerate: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectShowVideoDevice:
+    """One selectable DirectShow input with a stable FFmpeg identity."""
+
+    display_name: str
+    input_name: str
+    friendly_name: str = ""
 
 
 def make_directshow_source(
@@ -129,12 +142,12 @@ def is_supported_review_source(source: object) -> bool:
     return is_rtsp_source(source) or parse_directshow_source(source) is not None
 
 
-def discover_directshow_video_devices(
+def discover_directshow_video_device_choices(
     ffmpeg_path: Path | None = None,
     *,
     run_factory: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> tuple[str, ...]:
-    """List Windows DirectShow video inputs without exposing FFmpeg details."""
+) -> tuple[DirectShowVideoDevice, ...]:
+    """List DirectShow inputs while retaining each device's unique identity."""
 
     executable = Path(ffmpeg_path).resolve() if ffmpeg_path else find_ffmpeg_executable()
     if executable is None or not executable.is_file():
@@ -169,11 +182,70 @@ def discover_directshow_video_devices(
         str(value or "")
         for value in (getattr(result, "stdout", ""), getattr(result, "stderr", ""))
     )
+    discovered: list[tuple[str, str]] = []
+    pending_index: int | None = None
+    for line in output.splitlines():
+        video_match = _DIRECTSHOW_VIDEO_DEVICE_PATTERN.search(line)
+        if video_match is not None:
+            friendly_name = video_match.group("name").strip()
+            if friendly_name:
+                discovered.append((friendly_name, friendly_name))
+                pending_index = len(discovered) - 1
+            continue
+        if "(audio)" in line:
+            pending_index = None
+            continue
+        alternative_match = _DIRECTSHOW_ALTERNATIVE_DEVICE_PATTERN.search(line)
+        if alternative_match is not None and pending_index is not None:
+            input_name = alternative_match.group("name").strip()
+            if input_name:
+                friendly_name, _current_input = discovered[pending_index]
+                discovered[pending_index] = (friendly_name, input_name)
+            pending_index = None
+
+    unique_devices: list[tuple[str, str]] = []
+    seen_inputs: set[str] = set()
+    for friendly_name, input_name in discovered:
+        if input_name in seen_inputs:
+            continue
+        seen_inputs.add(input_name)
+        unique_devices.append((friendly_name, input_name))
+
+    totals: dict[str, int] = {}
+    for friendly_name, _input_name in unique_devices:
+        totals[friendly_name] = totals.get(friendly_name, 0) + 1
+    indexes: dict[str, int] = {}
+    choices = []
+    for friendly_name, input_name in unique_devices:
+        indexes[friendly_name] = indexes.get(friendly_name, 0) + 1
+        display_name = (
+            f"{friendly_name}（{indexes[friendly_name]}）"
+            if totals[friendly_name] > 1
+            else friendly_name
+        )
+        choices.append(
+            DirectShowVideoDevice(display_name, input_name, friendly_name)
+        )
+    return tuple(choices)
+
+
+def discover_directshow_video_devices(
+    ffmpeg_path: Path | None = None,
+    *,
+    run_factory: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> tuple[str, ...]:
+    """Compatibility helper returning unique friendly device names."""
+
     devices = []
-    for match in _DIRECTSHOW_VIDEO_DEVICE_PATTERN.finditer(output):
-        name = match.group("name").strip()
-        if name and name not in devices:
-            devices.append(name)
+    for choice in discover_directshow_video_device_choices(
+        ffmpeg_path,
+        run_factory=run_factory,
+    ):
+        friendly_name = choice.friendly_name or re.sub(
+            r"（\d+）$", "", choice.display_name
+        )
+        if friendly_name not in devices:
+            devices.append(friendly_name)
     return tuple(devices)
 
 
@@ -1030,13 +1102,29 @@ class PassageReviewCoordinator:
         segments: tuple[ReviewSegment, ...],
         *,
         started_at_ms: int,
+        passage_timestamp_ms: int,
         ended_at_ms: int,
     ) -> bool:
         cursor = started_at_ms
+        coverage_started = False
         for segment in segments:
             if segment.ended_at_ms < cursor:
                 continue
-            if segment.started_at_ms > cursor:
+            if not coverage_started:
+                # Recorder startup can make part of the requested pre-roll
+                # unavailable. The passage itself and the full post-roll are
+                # mandatory; missing only the leading pre-roll is acceptable.
+                if (
+                    segment.started_at_ms
+                    > passage_timestamp_ms
+                    + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS
+                ):
+                    return False
+                coverage_started = True
+            elif (
+                segment.started_at_ms
+                > cursor + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS
+            ):
                 return False
             cursor = max(cursor, segment.ended_at_ms)
             if cursor >= ended_at_ms:
@@ -1074,6 +1162,7 @@ class PassageReviewCoordinator:
         elif self._covers_window(
             current_segments,
             started_at_ms=window.started_at_ms,
+            passage_timestamp_ms=window.passage_timestamp_ms,
             ended_at_ms=window.ended_at_ms,
         ):
             state = PassageReviewState.READY
@@ -1114,7 +1203,7 @@ class PassageReviewCoordinator:
 
 
 class PassageReviewTimelinePublisher:
-    """Publish one sealed passage window as a short playable HLS timeline."""
+    """Publish preview and sealed passage windows as playable HLS timelines."""
 
     def __init__(
         self,
@@ -1126,11 +1215,17 @@ class PassageReviewTimelinePublisher:
         self.ring_buffer = ring_buffer
         self.timeline_store = timeline_store
         self.timing_error_ms = max(0, int(timing_error_ms))
+        self._preview_segments: dict[tuple[str, int], RecordingSegment] = {}
 
     @staticmethod
     def _playlist_name(window: PassageReviewWindow) -> str:
         digest = hashlib.sha256(window.event_id.encode("utf-8")).hexdigest()[:16]
         return f"evidence_{digest}_{window.passage_timestamp_ms}.m3u8"
+
+    @staticmethod
+    def _preview_playlist_name(window: PassageReviewWindow) -> str:
+        digest = hashlib.sha256(window.event_id.encode("utf-8")).hexdigest()[:16]
+        return f"preview_{digest}_{window.passage_timestamp_ms}.m3u8"
 
     @staticmethod
     def _published_pin_id(window: PassageReviewWindow) -> str:
@@ -1190,6 +1285,78 @@ class PassageReviewTimelinePublisher:
             os.fsync(output.fileno())
         os.replace(temporary_path, path)
 
+    @staticmethod
+    def _segments_for_preview(
+        window: PassageReviewWindow,
+    ) -> tuple[ReviewSegment, ...]:
+        ordered = tuple(
+            sorted(
+                window.segments,
+                key=lambda item: (item.started_at_ms, item.segment_id),
+            )
+        )
+        covering_indexes = [
+            index
+            for index, segment in enumerate(ordered)
+            if segment.started_at_ms
+            <= window.passage_timestamp_ms
+            <= segment.ended_at_ms
+        ]
+        if not covering_indexes:
+            return ()
+        start_index = covering_indexes[-1]
+        while start_index > 0:
+            previous = ordered[start_index - 1]
+            current = ordered[start_index]
+            if (
+                previous.ended_at_ms + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS
+                < current.started_at_ms
+            ):
+                break
+            start_index -= 1
+        return ordered[start_index : covering_indexes[-1] + 1]
+
+    def preview(
+        self,
+        window: PassageReviewWindow,
+        *,
+        race_id: str,
+    ) -> RecordingSegment | None:
+        """Return a read-only preview once the passage segment is sealed."""
+
+        key = (window.event_id, window.passage_timestamp_ms)
+        existing = self._preview_segments.get(key)
+        if existing is not None:
+            return existing
+        segments = self._segments_for_preview(window)
+        if not segments:
+            return None
+        playlist_path = (
+            self.ring_buffer.buffer_dir / self._preview_playlist_name(window)
+        )
+        self._write_playlist(playlist_path, segments)
+        media_started_at_ms = segments[0].started_at_ms
+        media_duration_ms = segments[-1].ended_at_ms - media_started_at_ms
+        digest = hashlib.sha256(
+            f"{window.event_id}:{window.passage_timestamp_ms}".encode("utf-8")
+        ).hexdigest()[:20]
+        preview = RecordingSegment(
+            segment_id=f"preview-{digest}",
+            source_id=self.ring_buffer.source_id,
+            camera_index=self.ring_buffer.camera_index,
+            video_path=str(playlist_path.resolve()),
+            started_at_ms=media_started_at_ms,
+            ended_at_ms=media_started_at_ms + media_duration_ms,
+            media_duration_ms=media_duration_ms,
+            media_started_at_ms=media_started_at_ms,
+            clock_source=DEFAULT_CLOCK_SOURCE,
+            timing_error_ms=self.timing_error_ms,
+            end_reason="passage_review_preview",
+            race_id=str(race_id),
+        )
+        self._preview_segments[key] = preview
+        return preview
+
     def publish(
         self,
         window: PassageReviewWindow,
@@ -1239,6 +1406,7 @@ __all__ = [
     "DEFAULT_REVIEW_RETENTION_SECONDS",
     "DEFAULT_REVIEW_SEGMENT_SECONDS",
     "DirectShowReviewSource",
+    "DirectShowVideoDevice",
     "FfmpegReviewRecorder",
     "PassageReviewCoordinator",
     "PassageReviewState",
@@ -1246,6 +1414,7 @@ __all__ = [
     "PassageReviewWindow",
     "ReviewRingBuffer",
     "ReviewSegment",
+    "discover_directshow_video_device_choices",
     "discover_directshow_video_devices",
     "is_supported_review_source",
     "load_archive_recording_sessions",
