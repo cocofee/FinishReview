@@ -42,15 +42,14 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-try:
-    from .auyat_rgb import (
+from .auyat_rgb import (
         AuyatRgbCatalog,
         AuyatRgbScanWorker,
         AuyatScanResult,
         is_network_share,
     )
-    from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
-    from .event_workspace import (
+from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
+from .event_workspace import (
         EventWorkspaceDescriptor,
         EventWorkspaceError,
         EventWorkspaceSummary,
@@ -58,8 +57,8 @@ try:
         summarize_event_workspace,
         validate_event_workspace,
     )
-    from .passage_evidence import PassageEvidenceAssociationStore
-    from .passage_receiver import (
+from .passage_evidence import PassageEvidenceAssociationStore
+from .passage_receiver import (
         DEFAULT_HOST,
         DEFAULT_PORT,
         PassageEvent,
@@ -67,18 +66,18 @@ try:
         PassageEventStore,
         RaceFocus,
     )
-    from .passage_review import PassageReviewDialog, source_location
-    from .point_playback import PointPlaybackUnavailable, prepare_point_playback
-    from .preflight import (
+from .passage_review import PassageReviewDialog, source_location
+from .point_playback import PointPlaybackUnavailable, prepare_point_playback
+from .preflight import (
         PreflightJournal,
         PreflightRun,
         local_ipv4_addresses,
         validate_event_network,
     )
-    from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
-    from .race_metadata import RaceMetadata, RaceMetadataStore
-    from .review_export import export_review_summary
-    from .review_recorder import (
+from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
+from .race_metadata import RaceMetadata, RaceMetadataStore
+from .review_export import export_review_summary
+from .review_recorder import (
         ArchiveTimelinePublisher,
         DirectShowVideoDevice,
         FfmpegReviewRecorder,
@@ -93,7 +92,7 @@ try:
         make_directshow_source,
         parse_directshow_source,
     )
-    from .stream_recorder import (
+from .stream_recorder import (
         apply_rtsp_credentials,
         find_ffmpeg_executable,
         is_rtsp_source,
@@ -101,81 +100,14 @@ try:
         sanitize_recording_message,
         split_rtsp_credentials,
     )
-    from .video_timeline import (
+from .video_timeline import (
         DEFAULT_CLOCK_SOURCE,
         DEFAULT_TIMING_ERROR_MS,
         PassageVideoLocation,
         PassageVideoLookup,
         VideoTimelineStore,
     )
-    from .video_playback import VideoPlaybackDialog
-except ImportError:
-    from auyat_rgb import (
-        AuyatRgbCatalog,
-        AuyatRgbScanWorker,
-        AuyatScanResult,
-        is_network_share,
-    )
-    from external_clip_import import ExternalClipImportError, race_id_from_passage_store
-    from event_workspace import (
-        EventWorkspaceDescriptor,
-        EventWorkspaceError,
-        EventWorkspaceSummary,
-        discover_event_workspaces,
-        summarize_event_workspace,
-        validate_event_workspace,
-    )
-    from passage_evidence import PassageEvidenceAssociationStore
-    from passage_receiver import (
-        DEFAULT_HOST,
-        DEFAULT_PORT,
-        PassageEvent,
-        PassageEventReceiver,
-        PassageEventStore,
-        RaceFocus,
-    )
-    from passage_review import PassageReviewDialog, source_location
-    from point_playback import PointPlaybackUnavailable, prepare_point_playback
-    from preflight import (
-        PreflightJournal,
-        PreflightRun,
-        local_ipv4_addresses,
-        validate_event_network,
-    )
-    from racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
-    from race_metadata import RaceMetadata, RaceMetadataStore
-    from review_export import export_review_summary
-    from review_recorder import (
-        ArchiveTimelinePublisher,
-        DirectShowVideoDevice,
-        FfmpegReviewRecorder,
-        PassageReviewCoordinator,
-        PassageReviewState,
-        PassageReviewTimelinePublisher,
-        PassageReviewWindow,
-        ReviewRingBuffer,
-        discover_directshow_video_device_choices,
-        is_supported_review_source,
-        load_archive_recording_sessions,
-        make_directshow_source,
-        parse_directshow_source,
-    )
-    from stream_recorder import (
-        apply_rtsp_credentials,
-        find_ffmpeg_executable,
-        is_rtsp_source,
-        RecordingError,
-        sanitize_recording_message,
-        split_rtsp_credentials,
-    )
-    from video_timeline import (
-        DEFAULT_CLOCK_SOURCE,
-        DEFAULT_TIMING_ERROR_MS,
-        PassageVideoLocation,
-        PassageVideoLookup,
-        VideoTimelineStore,
-    )
-    from video_playback import VideoPlaybackDialog
+from .video_playback import VideoPlaybackDialog
 
 
 logger = logging.getLogger("FinishReview")
