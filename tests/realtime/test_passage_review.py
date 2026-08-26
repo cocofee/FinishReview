@@ -217,7 +217,7 @@ def test_review_uses_one_row_per_passage_and_opens_regular_video(
     dialog.close()
 
 
-def test_review_can_switch_between_two_regular_camera_locations(
+def test_review_shows_two_regular_camera_locations_side_by_side(
     qapp,
     tmp_path,
     fake_playback,
@@ -247,20 +247,95 @@ def test_review_can_switch_between_two_regular_camera_locations(
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
 
-    assert dialog.regular_pane.camera_combo.isVisible() is False
+    assert len(dialog.regular_panes) == 2
+    first_pane, second_pane = dialog.regular_panes
+    assert first_pane.title_label.text() == "机位 1"
+    assert second_pane.title_label.text() == "机位 2"
+    assert first_pane.camera_combo.isVisible() is False
+    assert second_pane.camera_combo.isVisible() is False
+    assert first_pane.location.video_path == first_path.absolute()
+    assert second_pane.location.video_path == second_path.absolute()
     dialog.show()
     qapp.processEvents()
-    assert dialog.regular_pane.camera_combo.isVisible()
-    assert dialog.regular_pane.camera_combo.count() == 2
-    assert dialog.regular_pane.location.video_path == first_path.absolute()
+    assert first_pane.isVisible()
+    assert second_pane.isVisible()
+    assert dialog.high_speed_pane.isHidden()
+    dialog.close()
 
-    dialog.regular_pane.camera_combo.setCurrentIndex(
-        dialog.regular_pane.camera_combo.findData(2)
+
+def test_confirming_either_regular_camera_confirms_passage_and_marks_others_reference(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000, bib="23"))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first_segment = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
     )
+    second_segment = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_02.mkv",
+        source_id="camera_02",
+        camera_index=2,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    association_store = PassageEvidenceAssociationStore(
+        tmp_path / "passage_evidence_associations.jsonl"
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        association_store=association_store,
+    )
+    dialog.show()
+    qapp.processEvents()
+    first_pane, second_pane = dialog.regular_panes
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    fake_playback.instances[1].frame_ready.emit(frame, 5_000, 250)
     qapp.processEvents()
 
-    assert dialog.regular_pane.location.segment.camera_index == 2
-    assert dialog.regular_pane.location.video_path == second_path.absolute()
+    QTest.mouseClick(
+        second_pane.video_view.viewport(),
+        Qt.LeftButton,
+        pos=second_pane.video_view.viewport().rect().center(),
+    )
+    QTest.keyClick(second_pane.video_view, Qt.Key_Return)
+    qapp.processEvents()
+
+    association = association_store.get("passage-1", REGULAR_SOURCE)
+    assert association is not None
+    assert association.segment_id == second_segment.segment_id
+    assert association.segment_id != first_segment.segment_id
+    assert dialog.table.item(0, 8).text() == "已确认"
+    assert second_pane.status_label.text() == "已确认"
+    assert first_pane.status_label.text() == "参考"
+    assert first_pane.association is None
+
+    fake_playback.instances[0].frame_ready.emit(frame, 5_000, 250)
+    qapp.processEvents()
+    QTest.mouseClick(
+        first_pane.video_view.viewport(),
+        Qt.LeftButton,
+        pos=first_pane.video_view.viewport().rect().center(),
+    )
+    QTest.keyClick(first_pane.video_view, Qt.Key_Return)
+    qapp.processEvents()
+
+    association = association_store.get("passage-1", REGULAR_SOURCE)
+    assert association is not None
+    assert association.segment_id == first_segment.segment_id
+    assert first_pane.status_label.text() == "已确认"
+    assert second_pane.status_label.text() == "参考"
+    assert second_pane.association is None
     dialog.close()
 
 
@@ -499,12 +574,11 @@ def test_review_shows_missing_evidence_without_starting_workers(qapp, tmp_path):
     assert dialog.regular_pane._worker is None
     assert dialog.high_speed_pane._worker is None
     assert dialog.regular_pane.status_label.text() == "无录像"
-    assert dialog.high_speed_pane.status_label.text() == "未提供"
+    assert dialog.high_speed_pane.isHidden()
     assert (
         dialog.regular_pane.video_view._message_item.toPlainText()
         == "当前赛事没有普通录像"
     )
-    assert dialog.high_speed_pane.video_view._message_item.toPlainText() == "暂无高速画面"
     assert (
         dialog.regular_pane.video_view._message_item.defaultTextColor().name()
         == "#c9d2dc"

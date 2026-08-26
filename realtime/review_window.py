@@ -2364,6 +2364,14 @@ class FinishReviewWindow(PassageReviewDialog):
             self.output_dir / "preflight_tests.jsonl"
         )
         self._preflight_event_keys = set(self._preflight_journal.event_keys())
+        regular_camera_indexes = tuple(
+            camera_index
+            for camera_index, source_value in (
+                (self.camera_index, self.source),
+                (self.camera_index + 1, self.secondary_source),
+            )
+            if is_supported_review_source(source_value)
+        ) or (self.camera_index,)
         super().__init__(
             passage_store,
             timeline_store,
@@ -2371,6 +2379,8 @@ class FinishReviewWindow(PassageReviewDialog):
             metadata_store=metadata_store,
             high_speed_locator=self._locate_high_speed,
             open_location=self._open_point_playback,
+            regular_camera_indexes=regular_camera_indexes,
+            show_high_speed_pane=self.high_speed_dir is not None,
         )
 
         self.setWindowTitle("FinishReview · 终点多源复核")
@@ -2628,28 +2638,25 @@ class FinishReviewWindow(PassageReviewDialog):
             )
         else:
             self.operator_identity_label.clear()
-        regular_ready = bool(
-            identity
-            and getattr(self.regular_pane.video_view, "has_frame", False)
-        )
-        high_speed_ready = bool(
-            identity
-            and getattr(self.high_speed_pane.video_view, "has_frame", False)
-        )
-        self.mark_regular_button.setEnabled(regular_ready)
-        self.mark_high_speed_button.setEnabled(high_speed_ready)
-        has_pending_marker = bool(
-            self.regular_pane.has_pending_marker
-            or self.high_speed_pane.has_pending_marker
+        active_panes = set(self.evidence_panes)
+        for pane in self.all_evidence_panes:
+            pane.mark_btn.setEnabled(
+                bool(
+                    pane in active_panes
+                    and identity
+                    and getattr(pane.video_view, "has_frame", False)
+                )
+            )
+        has_pending_marker = any(
+            pane.has_pending_marker for pane in self.evidence_panes
         )
         self.confirm_next_button.setEnabled(bool(identity and has_pending_marker))
 
     def _pending_marker_pane(self):
-        if self.regular_pane.has_pending_marker:
-            return self.regular_pane
-        if self.high_speed_pane.has_pending_marker:
-            return self.high_speed_pane
-        return None
+        return next(
+            (pane for pane in self.evidence_panes if pane.has_pending_marker),
+            None,
+        )
 
     def _confirm_current_marker(self) -> None:
         pane = self._pending_marker_pane()
@@ -2994,6 +3001,22 @@ class FinishReviewWindow(PassageReviewDialog):
         if high_speed_changed:
             self.high_speed_dir = next_high_speed_dir
             self._high_speed_catalog.set_root(next_high_speed_dir)
+        configured_camera_indexes = tuple(
+            camera_index
+            for camera_index, _source in self._configured_recording_sources()
+        ) or (self.camera_index,)
+        evidence_layout_changed = bool(
+            configured_camera_indexes != self._configured_regular_camera_indexes
+            or (self.high_speed_dir is not None) != self._show_high_speed_pane
+        )
+        if evidence_layout_changed:
+            self.configure_evidence_panes(
+                configured_camera_indexes,
+                show_high_speed=self.high_speed_dir is not None,
+            )
+            if hasattr(self, "mark_regular_button"):
+                self.mark_regular_button = self.regular_pane.mark_btn
+                self._update_operator_controls()
         if data_source_changed:
             assert prepared_data_source is not None
             (
@@ -3062,6 +3085,8 @@ class FinishReviewWindow(PassageReviewDialog):
         if high_speed_changed or data_source_changed:
             self.invalidate_external_locations()
             self._request_high_speed_scan()
+        elif evidence_layout_changed:
+            self.refresh()
         if receiver_restart_needed and not data_source_changed:
             try:
                 self.start_receiver()
@@ -3275,20 +3300,24 @@ class FinishReviewWindow(PassageReviewDialog):
         self.confirm_next_button.setToolTip("确认当前标线并选择下一条")
         self.confirm_next_button.clicked.connect(self._confirm_and_next)
         self.transport_layout.addWidget(self.confirm_next_button)
-        for pane in (self.regular_pane, self.high_speed_pane):
-            pane.video_view.marker_position_selected.connect(
-                lambda _x, _y: QTimer.singleShot(0, self._update_operator_controls)
-            )
-            pane.confirmation_requested.connect(
-                lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
-            )
-            pane.cancel_requested.connect(
-                lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
-            )
-            pane.delete_requested.connect(
-                lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
-            )
+        self.evidence_pane_added.connect(self._bind_operator_pane)
+        for pane in self.all_evidence_panes:
+            self._bind_operator_pane(pane)
         self._update_operator_controls()
+
+    def _bind_operator_pane(self, pane) -> None:
+        pane.video_view.marker_position_selected.connect(
+            lambda _x, _y: QTimer.singleShot(0, self._update_operator_controls)
+        )
+        pane.confirmation_requested.connect(
+            lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
+        )
+        pane.cancel_requested.connect(
+            lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
+        )
+        pane.delete_requested.connect(
+            lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
+        )
 
     def start_receiver(self) -> None:
         if self.timing_provider == "racetiger":

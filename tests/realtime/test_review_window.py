@@ -1766,6 +1766,109 @@ def test_two_rtsp_sources_start_independent_review_pipelines(qapp, tmp_path):
     window.close()
 
 
+def test_two_regular_sources_show_two_panes_without_high_speed(qapp, tmp_path):
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.resize(window.minimumSize())
+    window.show()
+    qapp.processEvents()
+
+    assert [pane.title_label.text() for pane in window.regular_panes] == [
+        "机位 1",
+        "机位 2",
+    ]
+    assert len(window.evidence_panes) == 2
+    assert all(pane.isVisible() for pane in window.regular_panes)
+    assert window.high_speed_pane.isHidden()
+    assert all(
+        pane.previous_frame_btn.isVisible() for pane in window.regular_panes
+    )
+    window.close()
+
+
+def test_two_regular_sources_and_high_speed_show_three_compact_panes(qapp, tmp_path):
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        high_speed_dir=tmp_path / "auyat",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.resize(window.minimumSize())
+    window.show()
+    qapp.processEvents()
+
+    assert len(window.evidence_panes) == 3
+    assert all(pane.isVisible() for pane in window.evidence_panes)
+    assert all(
+        pane.previous_frame_btn.isHidden() for pane in window.evidence_panes
+    )
+    assert [pane.open_btn.text() for pane in window.regular_panes] == [
+        "回放",
+        "回放",
+    ]
+    assert window.high_speed_pane.open_btn.isHidden()
+    for pane in window.evidence_panes:
+        visible_controls = [
+            widget
+            for widget in (
+                pane.time_label,
+                pane.fit_btn,
+                pane.maximize_btn,
+                pane.mark_btn,
+                pane.open_btn,
+            )
+            if not widget.isHidden()
+        ]
+        assert visible_controls[-1].geometry().right() <= pane.contentsRect().right()
+        assert all(
+            left.geometry().right() < right.geometry().left()
+            for left, right in zip(visible_controls, visible_controls[1:])
+        )
+    window.close()
+
+
+def test_applying_video_settings_updates_evidence_pane_layout(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.show()
+    qapp.processEvents()
+
+    assert len(window.evidence_panes) == 1
+    settings = replace(
+        window._current_settings(),
+        secondary_source="rtsp://camera-two/live",
+        high_speed_dir=tmp_path / "auyat",
+    )
+    assert window._apply_settings(settings)
+    qapp.processEvents()
+
+    assert len(window.evidence_panes) == 3
+    assert all(pane.isVisible() for pane in window.evidence_panes)
+
+    settings = replace(
+        window._current_settings(),
+        secondary_source="",
+        high_speed_dir=None,
+    )
+    assert window._apply_settings(settings)
+    qapp.processEvents()
+
+    assert len(window.evidence_panes) == 1
+    assert len(window.regular_panes) == 1
+    assert window.high_speed_pane.isHidden()
+    window.close()
+
+
 def test_two_usb_sources_start_independent_review_pipelines(qapp, tmp_path):
     _FakeRecorder.instances.clear()
     window = FinishReviewWindow(
