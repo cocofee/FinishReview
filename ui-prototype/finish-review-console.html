@@ -1,0 +1,2492 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FinishReview · 终点多源复核</title>
+  <link rel="icon" href="./finish-review-logo.svg" type="image/svg+xml">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+      font-size: 14px;
+      --bg: #e8edf1;
+      --surface: #ffffff;
+      --surface-soft: #f6f8fa;
+      --surface-strong: #edf1f4;
+      --border: #c8d0d7;
+      --border-strong: #a9b4bd;
+      --text: #17212b;
+      --muted: #586673;
+      --subtle: #74818d;
+      --blue: #176a9b;
+      --blue-soft: #e2f0f8;
+      --green: #176b48;
+      --green-strong: #117246;
+      --green-soft: #e6f4ed;
+      --amber: #8a5a08;
+      --amber-soft: #fff4d9;
+      --red: #a73535;
+      --red-soft: #fbe8e6;
+      --shadow: 0 12px 32px rgba(36, 48, 59, 0.18);
+      --radius: 6px;
+      --queue-height: clamp(174px, 26vh, 320px);
+      --queue-row-height: 36px;
+      --queue-header-height: 34px;
+    }
+
+    * {
+      box-sizing: border-box;
+      letter-spacing: 0;
+    }
+
+    html,
+    body {
+      min-width: 980px;
+      min-height: 700px;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    button:hover:not(:disabled) {
+      border-color: #6e8798;
+      background: #f0f5f8;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible {
+      outline: 3px solid rgba(23, 106, 155, 0.28);
+      outline-offset: 1px;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      color: #87939d;
+      background: #eef1f3;
+      border-color: #d4dade;
+    }
+
+    .app-shell {
+      display: grid;
+      grid-template-rows: auto auto var(--queue-height) 6px auto minmax(170px, 1fr);
+      height: 100vh;
+      min-height: 700px;
+      padding: 8px;
+      gap: 7px;
+    }
+
+    .app-shell.queue-expanded {
+      --queue-height: clamp(270px, 42vh, 460px);
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(330px, 1fr) auto auto;
+      align-items: center;
+      min-height: 56px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      padding: 6px 9px;
+      gap: 12px;
+    }
+
+    .event-identity {
+      display: grid;
+      grid-template-columns: 38px auto minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .app-logo {
+      display: block;
+      width: 38px;
+      height: 38px;
+    }
+
+    .event-title-row {
+      display: grid;
+      align-content: center;
+      gap: 1px;
+      min-width: 0;
+    }
+
+    .event-title-row h1 {
+      margin: 0;
+      font-size: 17px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+
+    .product-subtitle {
+      color: var(--subtle);
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    .event-inline {
+      min-width: 0;
+      padding-left: 12px;
+      border-left: 1px solid #dce2e6;
+    }
+
+    .event-name {
+      display: block;
+      overflow: hidden;
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event-path {
+      overflow: hidden;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .system-health {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(132px, auto));
+      justify-self: center;
+      min-width: 0;
+      border-left: 1px solid #dce2e6;
+      border-right: 1px solid #dce2e6;
+    }
+
+    .health-item {
+      display: grid;
+      grid-template-columns: 10px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      min-width: 132px;
+      padding: 2px 12px;
+    }
+
+    .health-item + .health-item {
+      border-left: 1px solid #e4e8eb;
+    }
+
+    .health-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 0 3px var(--green-soft);
+    }
+
+    .health-dot.waiting {
+      background: var(--amber);
+      box-shadow: 0 0 0 3px var(--amber-soft);
+    }
+
+    .health-label {
+      overflow: hidden;
+      font-size: 12px;
+      font-weight: 700;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .health-detail {
+      overflow: hidden;
+      margin-top: 1px;
+      color: var(--muted);
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+    }
+
+    .clock {
+      min-width: 72px;
+      padding-right: 4px;
+      text-align: right;
+    }
+
+    .clock strong {
+      display: block;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+    }
+
+    .clock span {
+      color: var(--subtle);
+      font-size: 10px;
+    }
+
+    .icon-button {
+      display: inline-grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      font-size: 17px;
+    }
+
+    .primary-button {
+      min-width: 92px;
+      height: 34px;
+      padding: 0 15px;
+      border-color: var(--green-strong);
+      background: var(--green-strong);
+      color: #ffffff;
+      font-weight: 700;
+    }
+
+    .primary-button:hover:not(:disabled) {
+      border-color: #0b5b37;
+      background: #0b5b37;
+    }
+
+    .queue-toolbar {
+      display: grid;
+      grid-template-columns: auto auto minmax(280px, 1fr) auto auto;
+      align-items: center;
+      min-height: 42px;
+      gap: 8px;
+      padding: 4px 7px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .section-heading {
+      margin: 0 6px 0 2px;
+      font-size: 15px;
+      white-space: nowrap;
+    }
+
+    .filter-group {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 7px;
+    }
+
+    .queue-filter-tabs {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: var(--surface-strong);
+    }
+
+    .queue-filter-tabs button {
+      height: 28px;
+      padding: 0 9px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .queue-filter-tabs button.active {
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 1px 2px rgba(36, 48, 59, 0.14);
+    }
+
+    .filter-count {
+      margin-left: 3px;
+      color: var(--subtle);
+      font-family: Consolas, monospace;
+      font-size: 11px;
+    }
+
+    .control {
+      height: 32px;
+      min-width: 0;
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      background: var(--surface);
+      color: var(--text);
+      padding: 0 9px;
+    }
+
+    select.control {
+      width: 142px;
+    }
+
+    select.time-range-control {
+      width: 122px;
+    }
+
+    .search-wrap {
+      position: relative;
+      flex: 1;
+      min-width: 160px;
+    }
+
+    .search-wrap::before {
+      position: absolute;
+      left: 10px;
+      top: 7px;
+      color: var(--subtle);
+      content: "⌕";
+      font-size: 18px;
+      line-height: 1;
+      pointer-events: none;
+    }
+
+    .search-wrap input {
+      width: 100%;
+      padding-left: 31px;
+    }
+
+    .queue-summary {
+      justify-self: end;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .clock-offset-button {
+      height: 32px;
+      padding: 0 9px;
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .queue-toolbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .queue-toolbar-actions .icon-button {
+      width: 32px;
+      height: 32px;
+      font-size: 15px;
+    }
+
+    .new-records-button {
+      height: 32px;
+      padding: 0 10px;
+      border-color: #7aa6bf;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .queue-panel {
+      min-height: 0;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    th,
+    td {
+      height: var(--queue-row-height);
+      overflow: hidden;
+      padding: 0 10px;
+      border-right: 1px solid #e2e6e9;
+      border-bottom: 1px solid #d9dfe3;
+      text-align: left;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      height: var(--queue-header-height);
+      background: var(--surface-strong);
+      color: #465461;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    th:last-child,
+    td:last-child {
+      border-right: 0;
+    }
+
+    tbody tr {
+      cursor: pointer;
+    }
+
+    tbody tr:hover {
+      background: #f2f7fa;
+    }
+
+    tbody tr.selected {
+      background: var(--blue-soft);
+      box-shadow: inset 3px 0 0 var(--blue);
+    }
+
+    tbody tr:focus-visible {
+      position: relative;
+      z-index: 2;
+      outline: 3px solid rgba(23, 106, 155, 0.34);
+      outline-offset: -3px;
+    }
+
+    tbody tr.virtual-spacer,
+    tbody tr.virtual-spacer:hover {
+      background: transparent;
+      cursor: default;
+    }
+
+    tbody tr.virtual-spacer td {
+      height: 0;
+      padding: 0;
+      border: 0;
+    }
+
+    .empty-row td {
+      height: 72px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .evidence-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .evidence-source {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .evidence-source::after {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #87939d;
+      content: "";
+    }
+
+    .evidence-source.ready::after {
+      background: var(--green);
+    }
+
+    .evidence-source.waiting::after {
+      background: #b47a12;
+    }
+
+    .evidence-source.missing::after {
+      background: var(--red);
+    }
+
+    .queue-splitter {
+      position: relative;
+      min-height: 6px;
+      border-radius: 3px;
+      cursor: row-resize;
+      touch-action: none;
+    }
+
+    .queue-splitter::after {
+      position: absolute;
+      left: 50%;
+      top: 1px;
+      width: 42px;
+      height: 4px;
+      transform: translateX(-50%);
+      border-radius: 2px;
+      background: #aeb9c1;
+      content: "";
+    }
+
+    .queue-splitter:hover::after,
+    .queue-splitter.dragging::after {
+      background: var(--blue);
+    }
+
+    td.numeric,
+    th.numeric {
+      text-align: center;
+    }
+
+    .state {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .state::before {
+      width: 7px;
+      height: 7px;
+      flex: none;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+    }
+
+    .state.ready {
+      color: var(--green);
+    }
+
+    .state.missing {
+      color: var(--red);
+    }
+
+    .state.waiting {
+      color: var(--amber);
+    }
+
+    .state.neutral {
+      color: var(--muted);
+    }
+
+    .review-state {
+      justify-content: center;
+      min-width: 72px;
+      padding: 4px 8px;
+      border: 1px solid #cfd6dc;
+      border-radius: 4px;
+      background: var(--surface-strong);
+      white-space: nowrap;
+    }
+
+    .review-state.ready {
+      border-color: #b8d9c8;
+      background: var(--green-soft);
+    }
+
+    .review-state.waiting {
+      border-color: #ead39e;
+      background: var(--amber-soft);
+    }
+
+    .review-state.missing {
+      border-color: #e2b5b1;
+      background: var(--red-soft);
+    }
+
+    .selection-bar {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) auto auto;
+      align-items: center;
+      min-height: 44px;
+      gap: 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      padding: 4px 7px 4px 11px;
+    }
+
+    .queue-position {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 9px;
+    }
+
+    .queue-position strong {
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    .selection-meta {
+      overflow: hidden;
+      color: var(--muted);
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .transport {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .transport .icon-button {
+      width: 32px;
+      height: 32px;
+      font-size: 14px;
+    }
+
+    .time-readout {
+      min-width: 105px;
+      margin-right: 4px;
+      color: var(--text);
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      font-weight: 700;
+      text-align: right;
+    }
+
+    .record-navigation {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 5px;
+    }
+
+    .record-navigation::before {
+      width: 1px;
+      height: 24px;
+      margin: 0 5px 0 2px;
+      background: var(--border);
+      content: "";
+    }
+
+    .record-navigation .confirm-button {
+      min-height: 32px;
+      margin-left: 7px;
+    }
+
+    .record-navigation .undo-button {
+      width: 32px;
+      height: 32px;
+    }
+
+    .evidence-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      min-height: 0;
+      gap: 7px;
+    }
+
+    .evidence-grid.maximized {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .evidence-pane.hidden-by-maximize {
+      display: none;
+    }
+
+    .evidence-pane {
+      display: grid;
+      grid-template-rows: 38px minmax(0, 1fr) 30px 38px;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .pane-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 9px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-soft);
+    }
+
+    .pane-header h2 {
+      margin: 0;
+      font-size: 14px;
+    }
+
+    .pane-source {
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .pane-header .state {
+      margin-left: auto;
+    }
+
+    .pane-header .state[hidden] {
+      display: none;
+    }
+
+    .video-stage {
+      position: relative;
+      min-height: 0;
+      overflow: hidden;
+      background: #10161a;
+      outline: none;
+    }
+
+    .video-stage canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .video-stage.marking {
+      cursor: crosshair;
+      box-shadow: inset 0 0 0 3px #ffcf5a;
+    }
+
+    .video-message {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      padding: 7px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      border-radius: 4px;
+      background: rgba(10, 17, 21, 0.72);
+      color: #e4edf2;
+      font-size: 12px;
+      pointer-events: none;
+    }
+
+    .stage-feedback {
+      position: absolute;
+      left: 9px;
+      bottom: 9px;
+      max-width: calc(100% - 18px);
+      padding: 5px 8px;
+      border: 1px solid rgba(255, 207, 90, 0.72);
+      border-radius: 4px;
+      background: rgba(17, 24, 29, 0.86);
+      color: #fff0b8;
+      font-size: 12px;
+      font-weight: 700;
+      pointer-events: none;
+    }
+
+    .timeline {
+      position: relative;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      background: #f8fafb;
+    }
+
+    .timeline-track {
+      position: relative;
+      width: 100%;
+      height: 5px;
+      border-radius: 2px;
+      background: #cdd5db;
+      cursor: pointer;
+    }
+
+    .timeline-progress {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 52%;
+      border-radius: inherit;
+      background: var(--blue);
+    }
+
+    .timeline-target {
+      position: absolute;
+      left: 50%;
+      top: -5px;
+      width: 2px;
+      height: 15px;
+      background: #d14a3b;
+    }
+
+    .pane-tools {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      overflow: hidden;
+      gap: 5px;
+      padding: 3px 7px;
+      border-top: 1px solid #e2e7ea;
+    }
+
+    .pane-tools .icon-button {
+      width: 30px;
+      height: 30px;
+      font-size: 13px;
+    }
+
+    .zoom-label {
+      min-width: 43px;
+      color: var(--muted);
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      text-align: center;
+    }
+
+    .pane-time {
+      flex: 1 1 72px;
+      min-width: 48px;
+      overflow: hidden;
+      color: var(--muted);
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .pane-tools .spacer {
+      flex: 1;
+    }
+
+    .text-button {
+      flex: 0 0 auto;
+      height: 30px;
+      min-width: 50px;
+      padding: 0 10px;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .confirm-button {
+      min-width: 122px;
+      border-color: var(--blue);
+      background: var(--blue);
+      color: #ffffff;
+    }
+
+    .confirm-button:hover:not(:disabled) {
+      border-color: #10567f;
+      background: #10567f;
+    }
+
+    .recording-button {
+      border-color: #a73535;
+      background: #a73535;
+    }
+
+    .recording-button:hover:not(:disabled) {
+      border-color: #8b2929;
+      background: #8b2929;
+    }
+
+    .recording-button.stop-armed {
+      border-color: #701f1f;
+      background: #701f1f;
+    }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: none;
+      place-items: center;
+      background: rgba(18, 28, 35, 0.42);
+    }
+
+    .modal-backdrop.open {
+      display: grid;
+    }
+
+    .modal {
+      width: min(860px, calc(100vw - 40px));
+      max-height: calc(100vh - 40px);
+      overflow: hidden;
+      border: 1px solid #9ca9b3;
+      border-radius: 7px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .modal-header {
+      display: flex;
+      align-items: center;
+      min-height: 50px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .modal-header h2 {
+      margin: 0;
+      font-size: 17px;
+    }
+
+    .modal-header .icon-button {
+      margin-left: auto;
+      border: 0;
+      background: transparent;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 2px;
+      padding: 8px 12px 0;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-soft);
+    }
+
+    .tab-button {
+      height: 34px;
+      padding: 0 15px;
+      border-color: transparent;
+      border-bottom: 3px solid transparent;
+      border-radius: 3px 3px 0 0;
+      background: transparent;
+      font-weight: 700;
+    }
+
+    .tab-button.active {
+      border-bottom-color: var(--blue);
+      background: var(--surface);
+      color: var(--blue);
+    }
+
+    .modal-body {
+      min-height: 390px;
+      max-height: calc(100vh - 180px);
+      overflow: auto;
+      padding: 14px;
+    }
+
+    .tab-panel {
+      display: none;
+    }
+
+    .tab-panel.active {
+      display: block;
+    }
+
+    .status-list {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .status-row {
+      display: grid;
+      grid-template-columns: 160px 110px minmax(0, 1fr);
+      align-items: center;
+      min-height: 52px;
+      gap: 12px;
+      padding: 7px 10px;
+    }
+
+    .status-row + .status-row {
+      border-top: 1px solid #e0e5e8;
+    }
+
+    .status-row strong {
+      font-size: 13px;
+    }
+
+    .status-row p {
+      margin: 0;
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      align-items: center;
+      gap: 9px 12px;
+    }
+
+    .form-grid label {
+      font-weight: 600;
+    }
+
+    .form-grid .control {
+      width: 100%;
+    }
+
+    .form-section {
+      margin: 0 0 15px;
+      padding: 0 0 14px;
+      border-bottom: 1px solid #e0e5e8;
+    }
+
+    .form-section h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+    }
+
+    details {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface-soft);
+      padding: 9px 11px;
+    }
+
+    details summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    details .form-grid {
+      margin-top: 12px;
+    }
+
+    .preflight-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 10px;
+    }
+
+    .preflight-table th,
+    .preflight-table td {
+      height: 43px;
+    }
+
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      min-height: 54px;
+      gap: 7px;
+      padding: 9px 14px;
+      border-top: 1px solid var(--border);
+      background: var(--surface-soft);
+    }
+
+    .modal-footer button {
+      min-width: 82px;
+      height: 34px;
+      padding: 0 12px;
+      font-weight: 700;
+    }
+
+    .offset-panel {
+      position: fixed;
+      z-index: 30;
+      display: none;
+      width: 300px;
+      padding: 11px;
+      border: 1px solid #98a8b4;
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .offset-panel.open {
+      display: block;
+    }
+
+    .offset-panel h3 {
+      margin: 0 0 9px;
+      font-size: 14px;
+    }
+
+    .offset-controls {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 6px;
+    }
+
+    .offset-controls input {
+      width: 100%;
+    }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 62px;
+      z-index: 40;
+      display: none;
+      transform: translateX(-50%);
+      padding: 9px 13px;
+      border-radius: 4px;
+      background: #17212b;
+      color: #ffffff;
+      box-shadow: var(--shadow);
+      font-size: 12px;
+    }
+
+    .toast.show {
+      display: block;
+    }
+
+    @media (max-width: 1320px) {
+      .queue-toolbar {
+        grid-template-columns: auto minmax(0, 1fr) auto;
+      }
+
+      .section-heading {
+        display: none;
+      }
+
+      .queue-filter-tabs {
+        grid-column: 1;
+      }
+
+      .filter-group {
+        grid-column: 2;
+      }
+
+      .queue-toolbar-actions {
+        grid-column: 3;
+      }
+
+      .queue-summary {
+        display: none;
+      }
+
+      .app-shell {
+        --queue-height: clamp(164px, 24vh, 286px);
+      }
+
+      .app-shell.queue-expanded {
+        --queue-height: clamp(250px, 39vh, 400px);
+      }
+
+      .selection-bar {
+        grid-template-columns: minmax(220px, 1fr) auto auto;
+        gap: 8px;
+      }
+    }
+
+    @media (max-height: 820px) {
+      :root {
+        --queue-row-height: 32px;
+        --queue-header-height: 32px;
+      }
+
+      .app-shell {
+        --queue-height: clamp(148px, 22vh, 230px);
+      }
+
+      .app-shell.queue-expanded {
+        --queue-height: clamp(220px, 36vh, 320px);
+      }
+
+      .health-detail { display: none; }
+    }
+
+    @media (max-width: 1100px) {
+      .health-detail { display: none; }
+      .product-subtitle { display: none; }
+      .event-inline { padding-left: 9px; }
+      .system-health { grid-template-columns: repeat(3, minmax(98px, auto)); }
+      .health-item {
+        min-width: 98px;
+        padding-inline: 9px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell" aria-label="FinishReview 终点多源复核工作台">
+    <header class="topbar">
+      <section class="event-identity" aria-label="当前赛事">
+        <img class="app-logo" src="./finish-review-logo.svg" alt="">
+        <div class="event-title-row">
+          <h1>FinishReview</h1>
+          <span class="product-subtitle">终点多源复核</span>
+        </div>
+        <div class="event-inline">
+          <strong class="event-name" id="eventName">2026 宁夏公路自行车公开赛</strong>
+          <div class="event-path" id="eventPath">赛事 105752 · 男子公路赛 · 男子甲组 · 终点</div>
+        </div>
+      </section>
+
+      <section class="system-health" aria-label="系统状态">
+        <div class="health-item" title="计时源读取正常">
+          <span class="health-dot"></span>
+          <div>
+            <div class="health-label">计时源正常</div>
+            <div class="health-detail">赛虎已读取 3 条</div>
+          </div>
+        </div>
+        <div class="health-item" title="普通摄像头已配置">
+          <span class="health-dot waiting" id="recordHealthDot"></span>
+          <div>
+            <div class="health-label" id="recordHealthLabel">普通摄像待机</div>
+            <div class="health-detail" id="recordHealthDetail">1 个机位已配置</div>
+          </div>
+        </div>
+        <div class="health-item" title="高速摄像证据已就绪">
+          <span class="health-dot"></span>
+          <div>
+            <div class="health-label">高速摄像就绪</div>
+            <div class="health-detail">已索引 20 段</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="top-actions" aria-label="全局操作">
+        <div class="clock">
+          <strong id="clockValue">07:03:58</strong>
+          <span>北京时间</span>
+        </div>
+        <button class="icon-button" id="healthButton" title="重新检查连接" aria-label="重新检查连接">↻</button>
+        <button class="icon-button" id="settingsButton" title="设备与赛事设置" aria-label="设备与赛事设置">⚙</button>
+        <button class="primary-button" id="recordButton">开始录像</button>
+      </section>
+    </header>
+
+    <section class="queue-toolbar" aria-label="通过记录筛选">
+      <h2 class="section-heading">通过记录</h2>
+      <div class="queue-filter-tabs" role="group" aria-label="核对状态筛选">
+        <button class="active" data-queue-filter="pending">待核对 <span class="filter-count" id="pendingCount">0</span></button>
+        <button data-queue-filter="blocked">受阻 <span class="filter-count" id="blockedCount">0</span></button>
+        <button data-queue-filter="confirmed">已确认 <span class="filter-count" id="confirmedCount">0</span></button>
+        <button data-queue-filter="all">全部 <span class="filter-count" id="allCount">0</span></button>
+      </div>
+      <div class="filter-group">
+        <select class="control" id="groupFilter" aria-label="组别筛选">
+          <option value="全部组别">全部组别</option>
+          <option value="男子甲组">男子甲组</option>
+          <option value="女子甲组">女子甲组</option>
+        </select>
+        <select class="control time-range-control" id="timeRangeFilter" aria-label="到达时段筛选" hidden>
+          <option value="all">全部时段</option>
+          <option value="10">最近 10 分钟</option>
+          <option value="30">最近 30 分钟</option>
+          <option value="60">最近 1 小时</option>
+        </select>
+        <label class="search-wrap">
+          <input class="control" id="searchInput" type="search" placeholder="运动员编号 / 姓名" aria-label="搜索运动员编号或姓名">
+        </label>
+      </div>
+      <div class="queue-summary" id="queueSummary">当前显示 1–21 / 725 条 · 赛事共 1,000 条</div>
+      <div class="queue-toolbar-actions">
+        <button class="new-records-button" id="newRecordsButton" hidden>新增 0 条</button>
+        <button class="icon-button" id="expandQueueButton" title="展开运动员列表" aria-label="展开运动员列表" aria-pressed="false">↕</button>
+        <button class="clock-offset-button" id="offsetButton" title="证据校时偏移 +0 毫秒" aria-label="证据校时偏移 +0 毫秒" aria-haspopup="dialog">校时 +0 ms</button>
+      </div>
+    </section>
+
+    <section class="queue-panel" aria-label="通过记录列表">
+      <table>
+        <colgroup>
+          <col style="width: 10%">
+          <col style="width: 15%">
+          <col style="width: 14%">
+          <col style="width: 18%">
+          <col style="width: 14%">
+          <col style="width: 14%">
+          <col style="width: 15%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th class="numeric">运动员编号</th>
+            <th>姓名</th>
+            <th>组别</th>
+            <th class="numeric">通过时间</th>
+            <th>普通录像</th>
+            <th>高速摄像</th>
+            <th class="numeric">复核状态</th>
+          </tr>
+        </thead>
+        <tbody id="recordsBody"></tbody>
+      </table>
+    </section>
+
+    <div class="queue-splitter" id="queueSplitter" role="separator" aria-label="调整运动员列表高度" aria-orientation="horizontal" tabindex="0"></div>
+
+    <section class="selection-bar" aria-label="队列位置与同步播放">
+      <div class="queue-position">
+        <strong id="selectionIdentity">7 马浩宇</strong>
+        <span class="selection-meta" id="selectionGroup">男子甲组</span>
+        <span class="selection-meta" id="queuePosition">3 / 5</span>
+        <span class="state neutral" id="selectionState">待核对</span>
+      </div>
+      <div class="transport">
+        <span class="time-readout" id="timeReadout">22:22:25.221</span>
+        <button class="icon-button" id="previousFrame" title="上一帧" aria-label="上一帧">|◀</button>
+        <button class="icon-button" id="playButton" title="播放或暂停（Space）" aria-label="播放或暂停">▶</button>
+        <button class="icon-button" id="nextFrame" title="下一帧" aria-label="下一帧">▶|</button>
+      </div>
+      <div class="record-navigation">
+        <button class="icon-button undo-button" id="undoConfirmButton" title="撤销上次确认" aria-label="撤销上次确认" disabled>↶</button>
+        <button class="icon-button" id="previousRecord" title="上一条（Page Up）" aria-label="上一条">▲</button>
+        <button class="icon-button" id="nextRecord" title="下一条（Page Down）" aria-label="下一条">▼</button>
+        <button class="confirm-button" id="confirmButton" disabled>确认并下一条</button>
+      </div>
+    </section>
+
+    <section class="evidence-grid" aria-label="双源证据">
+      <article class="evidence-pane" data-source="regular">
+        <header class="pane-header">
+          <h2>普通录像</h2>
+          <span class="pane-source">机位 1 · 50 FPS</span>
+          <span class="state ready" id="regularPaneState">可查看</span>
+        </header>
+        <div class="video-stage" id="regularStage" tabindex="0" aria-label="普通录像画面，标线时可点击">
+          <canvas id="regularCanvas"></canvas>
+          <div class="video-message" id="regularMessage" hidden>未找到普通录像</div>
+          <div class="stage-feedback" id="regularStageFeedback" hidden></div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-track" data-source="regular">
+            <div class="timeline-progress" id="regularProgress"></div>
+            <div class="timeline-target"></div>
+          </div>
+        </div>
+        <footer class="pane-tools">
+          <span class="pane-time" id="regularTime">第 12610 帧</span>
+          <button class="icon-button zoom-out" data-source="regular" title="缩小" aria-label="普通录像缩小">−</button>
+          <span class="zoom-label" id="regularZoom">100%</span>
+          <button class="icon-button zoom-in" data-source="regular" title="放大" aria-label="普通录像放大">＋</button>
+          <button class="icon-button fit-view" data-source="regular" title="适应窗口" aria-label="普通录像适应窗口">↙</button>
+          <button class="icon-button maximize-pane" data-source="regular" title="最大化普通录像" aria-label="最大化普通录像" aria-pressed="false">□</button>
+          <button class="icon-button" id="pointPlaybackButton" title="普通摄像头定点回放" aria-label="普通摄像头定点回放">↺</button>
+          <button class="text-button" id="markRegularButton">标线</button>
+        </footer>
+      </article>
+
+      <article class="evidence-pane" data-source="high">
+        <header class="pane-header">
+          <h2>高速摄像</h2>
+          <span class="pane-source">Auyat · 250 FPS</span>
+          <span class="state ready" id="highPaneState">可查看</span>
+        </header>
+        <div class="video-stage" id="highStage" tabindex="0" aria-label="高速摄像画面，标线时可点击">
+          <canvas id="highCanvas"></canvas>
+          <div class="video-message" id="highMessage" hidden>未找到高速画面</div>
+          <div class="stage-feedback" id="highStageFeedback" hidden></div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-track" data-source="high">
+            <div class="timeline-progress" id="highProgress"></div>
+            <div class="timeline-target"></div>
+          </div>
+        </div>
+        <footer class="pane-tools">
+          <span class="pane-time" id="highTime">第 63050 帧</span>
+          <button class="icon-button zoom-out" data-source="high" title="缩小" aria-label="高速摄像缩小">−</button>
+          <span class="zoom-label" id="highZoom">100%</span>
+          <button class="icon-button zoom-in" data-source="high" title="放大" aria-label="高速摄像放大">＋</button>
+          <button class="icon-button fit-view" data-source="high" title="适应窗口" aria-label="高速摄像适应窗口">↙</button>
+          <button class="icon-button maximize-pane" data-source="high" title="最大化高速摄像" aria-label="最大化高速摄像" aria-pressed="false">□</button>
+          <button class="text-button" id="markHighButton">标线</button>
+        </footer>
+      </article>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="settingsBackdrop" role="presentation">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <header class="modal-header">
+          <h2 id="settingsTitle">FinishReview 设置</h2>
+        <button class="icon-button" data-close-modal title="关闭" aria-label="关闭设置">×</button>
+      </header>
+      <nav class="tabs" aria-label="设置分类">
+        <button class="tab-button active" data-tab="status">运行状态</button>
+        <button class="tab-button" data-tab="devices">设备与来源</button>
+        <button class="tab-button" data-tab="preflight">赛前联调</button>
+      </nav>
+      <div class="modal-body">
+        <section class="tab-panel active" data-panel="status">
+          <div class="status-list">
+            <div class="status-row">
+              <strong>赛虎计时</strong>
+              <span class="state ready">正常</span>
+              <p>云端接口已读取 3 条 FINISH 记录</p>
+            </div>
+            <div class="status-row">
+              <strong>普通录像</strong>
+              <span class="state waiting">待机</span>
+              <p>机位 1 已配置，开始录像后检查持续画面</p>
+            </div>
+            <div class="status-row">
+              <strong>Auyat 高速摄像</strong>
+              <span class="state ready">正常</span>
+              <p>目录可读，已索引 20 段原厂数据</p>
+            </div>
+            <div class="status-row">
+              <strong>赛事存储</strong>
+              <span class="state ready">正常</span>
+              <p>C:\Users\Administrator\Desktop\race · 可用 69.5 GB</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="tab-panel" data-panel="devices">
+          <div class="form-section">
+            <h3>计时接入</h3>
+            <div class="form-grid">
+              <label for="timingSource">计时源</label>
+              <select class="control" id="timingSource">
+                <option>赛虎计时</option>
+                <option>CycleRace</option>
+              </select>
+              <label for="raceApi">赛事信息接口</label>
+              <input class="control" id="raceApi" value="已配置：PC 000001 / RID 105752 / 令牌已保存" readonly>
+            </div>
+          </div>
+          <div class="form-section">
+            <h3>录像与证据</h3>
+            <div class="form-grid">
+              <label for="cameraSource">普通录像设备</label>
+              <select class="control" id="cameraSource">
+                <option>OsmoAction5pro</option>
+                <option>ToDesk Camera</option>
+                <option>RTSP 网络摄像头</option>
+              </select>
+              <label for="videoMode">录像规格</label>
+              <select class="control" id="videoMode">
+                <option>1920 × 1080 · 30 FPS</option>
+                <option>2560 × 1440 · 50 FPS</option>
+                <option>3840 × 2160 · 60 FPS</option>
+              </select>
+              <label for="evidencePath">证据保存目录</label>
+              <input class="control" id="evidencePath" value="C:\Users\Administrator\Desktop\race">
+              <label for="highSpeedPath">高速共享目录</label>
+              <input class="control" id="highSpeedPath" value="C:\Users\Administrator\Desktop\电动计时软件20230309">
+            </div>
+          </div>
+          <details>
+            <summary>高级网络设置</summary>
+            <div class="form-grid">
+              <label for="localIp">FinishReview 主机</label>
+              <input class="control" id="localIp" value="192.168.50.10">
+              <label for="cycleIp">CycleRace 电脑</label>
+              <input class="control" id="cycleIp" value="192.168.50.20">
+              <label for="highIp">Auyat 高速电脑</label>
+              <input class="control" id="highIp" value="192.168.50.30">
+              <label for="switchIp">PoE 交换机</label>
+              <input class="control" id="switchIp" value="192.168.50.2">
+            </div>
+          </details>
+        </section>
+
+        <section class="tab-panel" data-panel="preflight">
+          <div class="preflight-actions">
+            <button class="primary-button" id="preflightButton">启动普通录像并联调</button>
+          </div>
+          <table class="preflight-table">
+            <thead>
+              <tr>
+                <th>检查项</th>
+                <th style="width: 110px">状态</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>计时通过记录</td><td><span class="state waiting">等待</span></td><td>尚未开始</td></tr>
+              <tr><td>普通录像</td><td><span class="state waiting">等待</span></td><td>尚未开始</td></tr>
+              <tr><td>高速摄像</td><td><span class="state waiting">等待</span></td><td>尚未开始</td></tr>
+              <tr><td>联调结果</td><td><span class="state neutral">未开始</span></td><td>请启动普通录像联调</td></tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+      <footer class="modal-footer">
+        <button data-close-modal>关闭</button>
+        <button class="confirm-button" id="saveSettingsButton" style="display: none">保存设置</button>
+      </footer>
+    </section>
+  </div>
+
+  <section class="offset-panel" id="offsetPanel" role="dialog" aria-labelledby="offsetTitle">
+    <h3 id="offsetTitle">证据校时</h3>
+    <div class="offset-controls">
+      <input class="control" id="offsetInput" type="number" step="100" value="0" aria-label="证据偏移毫秒">
+      <button id="resetOffsetButton">归零</button>
+      <button class="confirm-button" id="applyOffsetButton">应用</button>
+    </div>
+  </section>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const baseRecords = [
+      { id: "passage-000001", bib: "1", name: "陈伟", group: "男子甲组", time: "22:13:26.160", team: "兴庆区", regular: "可查看", high: "可查看", review: "待标线" },
+      { id: "passage-000002", bib: "4", name: "高文鑫", group: "男子甲组", time: "22:17:34.812", team: "西夏区", regular: "可查看", high: "无画面", review: "证据缺口" },
+      { id: "passage-000003", bib: "7", name: "马浩宇", group: "男子甲组", time: "22:22:25.221", team: "原州区", regular: "可查看", high: "可查看", review: "待核对" },
+      { id: "passage-000004", bib: "12", name: "张晨", group: "女子甲组", time: "22:26:08.905", team: "金凤区", regular: "等待封口", high: "可查看", review: "等待录像" },
+      { id: "passage-000005", bib: "16", name: "李悦", group: "女子甲组", time: "22:29:44.037", team: "灵武队", regular: "可查看", high: "可查看", review: "双源标记" }
+    ];
+
+    const mockNames = ["王磊", "刘洋", "赵凯", "孙悦", "周宁", "吴昊", "郑杰", "冯宇", "陈晨", "徐涛", "韩雪", "杨帆"];
+    const mockTeams = ["兴庆区", "西夏区", "金凤区", "原州区", "灵武队", "银川车队"];
+
+    const query = new URLSearchParams(window.location.search);
+    const eventType = query.get("event") || "cycling";
+    const isMarathonEvent = eventType === "marathon";
+    const demoIncoming = query.get("demoIncoming") === "1";
+    const requestedRecordCount = Number(query.get("records"));
+    const demoRecordCount = Number.isFinite(requestedRecordCount)
+      ? Math.max(baseRecords.length, Math.min(10000, Math.floor(requestedRecordCount)))
+      : 440;
+
+    function formatTime(totalMilliseconds) {
+      const milliseconds = totalMilliseconds % 1000;
+      const totalSeconds = Math.floor(totalMilliseconds / 1000);
+      const seconds = totalSeconds % 60;
+      const minutes = Math.floor(totalSeconds / 60) % 60;
+      const hours = Math.floor(totalSeconds / 3600) % 24;
+      return [hours, minutes, seconds].map(value => String(value).padStart(2, "0")).join(":")
+        + "." + String(milliseconds).padStart(3, "0");
+    }
+
+    function parseTime(value) {
+      const [clock, milliseconds] = value.split(".");
+      const [hours, minutes, seconds] = clock.split(":").map(Number);
+      return ((hours * 60 + minutes) * 60 + seconds) * 1000 + Number(milliseconds);
+    }
+
+    baseRecords.forEach(record => {
+      record.timelineMs = parseTime(record.time);
+    });
+
+    const generatedRecords = Array.from({ length: demoRecordCount - baseRecords.length }, (_, index) => {
+      const bib = String(index + 18);
+      const hasMissingEvidence = index % 29 === 0;
+      const isWaitingForVideo = !hasMissingEvidence && index % 17 === 0;
+      const isConfirmed = !hasMissingEvidence && !isWaitingForVideo && index % 5 === 0;
+      const timelineMs = (22 * 3600 + 31 * 60) * 1000 + index * 7300 + (index * 37) % 1000;
+      return {
+        id: `passage-${String(index + baseRecords.length + 1).padStart(6, "0")}`,
+        bib,
+        name: mockNames[index % mockNames.length],
+        group: index % 4 === 0 ? "女子甲组" : "男子甲组",
+        time: formatTime(timelineMs),
+        timelineMs,
+        team: mockTeams[index % mockTeams.length],
+        regular: isWaitingForVideo ? "等待封口" : "可查看",
+        high: hasMissingEvidence ? "无画面" : "可查看",
+        review: hasMissingEvidence ? "证据缺口" : isWaitingForVideo ? "等待录像" : isConfirmed ? "双源标记" : index % 3 === 0 ? "待标线" : "待核对"
+      };
+    });
+
+    const records = baseRecords.concat(generatedRecords);
+    const recordById = new Map(records.map(record => [record.id, record]));
+    let latestTimelineMs = Math.max(...records.map(record => record.timelineMs));
+
+    let selectedRecordId = "passage-000003";
+    let filteredRecords = [];
+    let currentQueueFilter = "pending";
+    let isExactIdentitySearch = false;
+    let isPlaying = false;
+    let recording = false;
+    let stopArmTimer = null;
+    let frameDelta = 0;
+    let regularReplayDelta = 0;
+    let regularReplayTimer = null;
+    let clockOffset = 0;
+    let playTimer = null;
+    let markingSource = null;
+    let lastConfirmation = null;
+    let incomingRecords = [];
+    let maximizedSource = null;
+    const zoom = { regular: 100, high: 100 };
+    const marker = { regular: null, high: null };
+    let queueRowHeight = 36;
+    let queueHeaderHeight = 34;
+    const VIRTUAL_OVERSCAN = 8;
+
+    const body = document.getElementById("recordsBody");
+    const shell = document.querySelector(".app-shell");
+    const queuePanel = document.querySelector(".queue-panel");
+    const queueSplitter = document.getElementById("queueSplitter");
+    const newRecordsButton = document.getElementById("newRecordsButton");
+    const searchInput = document.getElementById("searchInput");
+    const groupFilter = document.getElementById("groupFilter");
+    const timeRangeFilter = document.getElementById("timeRangeFilter");
+    timeRangeFilter.hidden = !isMarathonEvent;
+    document.getElementById("eventName").textContent = isMarathonEvent
+      ? "2026 城市马拉松"
+      : "2026 宁夏公路自行车公开赛";
+    document.getElementById("eventPath").textContent = isMarathonEvent
+      ? "全程马拉松 · 全部组别 · 终点"
+      : "赛事 105752 · 男子公路赛 · 男子甲组 · 终点";
+    const playButton = document.getElementById("playButton");
+    const confirmButton = document.getElementById("confirmButton");
+    const undoConfirmButton = document.getElementById("undoConfirmButton");
+    const toast = document.getElementById("toast");
+    const numberFormatter = new Intl.NumberFormat("zh-CN");
+
+    function syncQueueMetrics() {
+      const styles = getComputedStyle(document.documentElement);
+      queueRowHeight = Number.parseFloat(styles.getPropertyValue("--queue-row-height")) || 36;
+      queueHeaderHeight = Number.parseFloat(styles.getPropertyValue("--queue-header-height")) || 34;
+    }
+
+    syncQueueMetrics();
+
+    function stateClass(value) {
+      if (["可查看", "双源标记", "录像标记", "高速标记"].includes(value)) return "ready";
+      if (["无画面", "证据缺口"].includes(value)) return "missing";
+      if (["等待封口", "等待录像", "待标线"].includes(value)) return "waiting";
+      return "neutral";
+    }
+
+    function reviewBucket(record) {
+      if (["证据缺口", "等待录像"].includes(record.review)) return "blocked";
+      if (["双源标记", "录像标记", "高速标记"].includes(record.review)) return "confirmed";
+      return "pending";
+    }
+
+    function visibleColumnCount() {
+      return 7;
+    }
+
+    function updateConfirmAvailability() {
+      confirmButton.disabled = !selectedRecordId || (marker.regular === null && marker.high === null);
+    }
+
+    function updateRecordNavigation() {
+      const selectedIndex = filteredRecords.findIndex(record => record.id === selectedRecordId);
+      document.getElementById("previousRecord").disabled = selectedIndex <= 0;
+      document.getElementById("nextRecord").disabled = selectedIndex < 0 || selectedIndex >= filteredRecords.length - 1;
+    }
+
+    function clearSelection() {
+      selectedRecordId = null;
+      marker.regular = null;
+      marker.high = null;
+      markingSource = null;
+      document.getElementById("timeReadout").textContent = "--:--:--.---";
+      document.getElementById("selectionIdentity").textContent = "未选择";
+      document.getElementById("selectionGroup").textContent = "";
+      document.getElementById("selectionState").textContent = "无匹配";
+      document.getElementById("selectionState").className = "state neutral";
+      updateRecordNavigation();
+      updateConfirmAvailability();
+      drawAll();
+    }
+
+    function renderRows() {
+      if (!filteredRecords.length) {
+        body.innerHTML = `<tr class="empty-row"><td colspan="${visibleColumnCount()}">没有符合当前条件的记录</td></tr>`;
+        document.getElementById("queuePosition").textContent = "0 条匹配记录";
+        document.getElementById("queueSummary").textContent = `当前显示 0 / 0 条 · 赛事共 ${numberFormatter.format(records.length)} 条`;
+        updateRecordNavigation();
+        return;
+      }
+
+      const firstVisible = Math.max(0, Math.floor(Math.max(0, queuePanel.scrollTop - queueHeaderHeight) / queueRowHeight));
+      const start = Math.max(0, firstVisible - VIRTUAL_OVERSCAN);
+      const visibleCount = Math.ceil(queuePanel.clientHeight / queueRowHeight) + VIRTUAL_OVERSCAN * 2;
+      const end = Math.min(filteredRecords.length, start + visibleCount);
+      const topHeight = start * queueRowHeight;
+      const bottomHeight = (filteredRecords.length - end) * queueRowHeight;
+      const topSpacer = topHeight
+        ? `<tr class="virtual-spacer" aria-hidden="true"><td colspan="${visibleColumnCount()}" style="height: ${topHeight}px"></td></tr>`
+        : "";
+      const bottomSpacer = bottomHeight
+        ? `<tr class="virtual-spacer" aria-hidden="true"><td colspan="${visibleColumnCount()}" style="height: ${bottomHeight}px"></td></tr>`
+        : "";
+      const rows = filteredRecords.slice(start, end).map(record => {
+        const isSelected = record.id === selectedRecordId;
+        return `
+        <tr data-record-id="${record.id}" class="${isSelected ? "selected" : ""}" tabindex="${isSelected ? "0" : "-1"}" aria-selected="${isSelected}">
+          <td class="numeric"><strong>${record.bib}</strong></td>
+          <td><strong>${record.name}</strong></td>
+          <td>${record.group}</td>
+          <td class="numeric" style="font-family: Consolas, monospace">${record.time}</td>
+          <td><span class="state ${stateClass(record.regular)}">${record.regular}</span></td>
+          <td><span class="state ${stateClass(record.high)}">${record.high}</span></td>
+          <td class="numeric"><span class="state review-state ${stateClass(record.review)}">${record.review}</span></td>
+        </tr>
+      `;
+      }).join("");
+      body.innerHTML = topSpacer + rows + bottomSpacer;
+      document.getElementById("queueSummary").textContent =
+        `当前显示 ${numberFormatter.format(start + 1)}–${numberFormatter.format(end)} / ${numberFormatter.format(filteredRecords.length)} 条 · 赛事共 ${numberFormatter.format(records.length)} 条`;
+
+      const selectedIndex = filteredRecords.findIndex(record => record.id === selectedRecordId);
+      document.getElementById("queuePosition").textContent = selectedIndex >= 0
+        ? `${numberFormatter.format(selectedIndex + 1)} / ${numberFormatter.format(filteredRecords.length)}`
+        : `${numberFormatter.format(filteredRecords.length)} 条匹配记录`;
+      updateRecordNavigation();
+    }
+
+    function ensureRecordVisible(index) {
+      if (index < 0) return;
+      const rowTop = queueHeaderHeight + index * queueRowHeight;
+      const rowBottom = rowTop + queueRowHeight;
+      if (rowTop < queuePanel.scrollTop + queueHeaderHeight) {
+        queuePanel.scrollTop = Math.max(0, rowTop - queueHeaderHeight);
+      } else if (rowBottom > queuePanel.scrollTop + queuePanel.clientHeight) {
+        queuePanel.scrollTop = rowBottom - queuePanel.clientHeight;
+      }
+    }
+
+    function focusSelectedRow() {
+      requestAnimationFrame(() => {
+        body.querySelector(`tr[data-record-id="${selectedRecordId}"]`)?.focus({ preventScroll: true });
+      });
+    }
+
+    function selectRecord(recordId, ensureVisible = false, focusRow = false) {
+      const record = recordById.get(recordId);
+      if (!record) return;
+      stopPointReplay();
+      selectedRecordId = recordId;
+      frameDelta = 0;
+      marker.regular = null;
+      marker.high = null;
+      markingSource = null;
+      if (ensureVisible) ensureRecordVisible(filteredRecords.findIndex(item => item.id === recordId));
+      renderRows();
+      updateSelection(record);
+      drawAll();
+      if (focusRow) focusSelectedRow();
+    }
+
+    function updateSelection(record) {
+      document.getElementById("timeReadout").textContent = record.time;
+      document.getElementById("selectionIdentity").textContent = `${record.bib} ${record.name}`;
+      document.getElementById("selectionGroup").textContent = record.group;
+      const selectionState = document.getElementById("selectionState");
+      selectionState.textContent = record.review;
+      selectionState.className = `state ${stateClass(record.review)}`;
+      document.querySelectorAll(".stage-feedback").forEach(item => {
+        item.hidden = true;
+        item.textContent = "";
+      });
+      const regularAvailable = record.regular === "可查看";
+      const highAvailable = record.high === "可查看";
+      updatePaneAvailability("regular", regularAvailable, record.regular);
+      updatePaneAvailability("high", highAvailable, record.high);
+      document.getElementById("markRegularButton").disabled = !regularAvailable;
+      document.getElementById("pointPlaybackButton").disabled = !regularAvailable;
+      document.getElementById("markHighButton").disabled = !highAvailable;
+      updateConfirmAvailability();
+      updateFrameText();
+    }
+
+    function updatePaneAvailability(source, available, label) {
+      const state = document.getElementById(source === "regular" ? "regularPaneState" : "highPaneState");
+      const message = document.getElementById(source === "regular" ? "regularMessage" : "highMessage");
+      state.textContent = label;
+      state.className = `state ${stateClass(label)}`;
+      message.hidden = available;
+      message.textContent = label === "等待封口"
+        ? "等待录像完成并封口"
+        : `未找到${source === "regular" ? "普通录像" : "高速画面"}`;
+    }
+
+    function filterRecords(options = {}) {
+      const group = groupFilter.value;
+      const rangeMinutes = Number(timeRangeFilter.value);
+      const term = searchInput.value.trim().toLowerCase();
+      const exactMatches = term ? records.filter(record =>
+        record.bib.toLowerCase() === term
+      ) : [];
+      isExactIdentitySearch = exactMatches.length > 0;
+      const baseMatches = isExactIdentitySearch ? exactMatches : records.filter(record => {
+        const groupMatch = group === "全部组别" || record.group === group;
+        const timeMatch = !rangeMinutes || latestTimelineMs - record.timelineMs <= rangeMinutes * 60 * 1000;
+        const termMatch = !term
+          || record.bib.toLowerCase().includes(term) || record.name.toLowerCase().includes(term);
+        return groupMatch && timeMatch && termMatch;
+      });
+
+      const counts = { pending: 0, blocked: 0, confirmed: 0 };
+      baseMatches.forEach(record => {
+        counts[reviewBucket(record)] += 1;
+      });
+      document.getElementById("pendingCount").textContent = numberFormatter.format(counts.pending);
+      document.getElementById("blockedCount").textContent = numberFormatter.format(counts.blocked);
+      document.getElementById("confirmedCount").textContent = numberFormatter.format(counts.confirmed);
+      document.getElementById("allCount").textContent = numberFormatter.format(baseMatches.length);
+
+      filteredRecords = isExactIdentitySearch || currentQueueFilter === "all"
+        ? baseMatches
+        : baseMatches.filter(record => reviewBucket(record) === currentQueueFilter);
+      if (!options.preserveScroll) queuePanel.scrollTop = 0;
+      if (Number.isInteger(options.preferredIndex) && filteredRecords.length) {
+        const nextIndex = Math.max(0, Math.min(filteredRecords.length - 1, options.preferredIndex));
+        selectedRecordId = filteredRecords[nextIndex].id;
+      } else if (!filteredRecords.some(record => record.id === selectedRecordId) && filteredRecords.length) {
+        selectedRecordId = filteredRecords[0].id;
+      }
+
+      renderRows();
+      const selectedRecord = recordById.get(selectedRecordId);
+      if (selectedRecord && filteredRecords.some(record => record.id === selectedRecordId)) {
+        ensureRecordVisible(filteredRecords.findIndex(record => record.id === selectedRecordId));
+        updateSelection(selectedRecord);
+        drawAll();
+      } else {
+        clearSelection();
+      }
+    }
+
+    function moveSelection(delta, focusRow = false) {
+      if (!filteredRecords.length) return;
+      let index = filteredRecords.findIndex(record => record.id === selectedRecordId);
+      if (index < 0) index = 0;
+      index = Math.max(0, Math.min(filteredRecords.length - 1, index + delta));
+      selectRecord(filteredRecords[index].id, true, focusRow);
+    }
+
+    function moveSelectionByPage(direction, focusRow = false) {
+      const visibleRows = Math.max(1, Math.floor((queuePanel.clientHeight - queueHeaderHeight) / queueRowHeight));
+      moveSelection(direction * visibleRows, focusRow);
+    }
+
+    function stepFrame(delta) {
+      frameDelta += delta;
+      updateFrameText();
+      drawAll();
+    }
+
+    function updateFrameText() {
+      const record = recordById.get(selectedRecordId);
+      if (!record) return;
+      const time = formatTime(parseTime(record.time) + frameDelta * 4 + clockOffset);
+      const regularDelta = frameDelta + regularReplayDelta;
+      document.getElementById("timeReadout").textContent = time;
+      document.getElementById("regularTime").textContent = `第 ${12610 + regularDelta} 帧`;
+      document.getElementById("highTime").textContent = `第 ${63050 + frameDelta * 5} 帧`;
+      const regularProgress = Math.max(10, Math.min(90, 52 + regularDelta * 0.6));
+      const highProgress = Math.max(10, Math.min(90, 52 + frameDelta * 0.6));
+      document.getElementById("regularProgress").style.width = `${regularProgress}%`;
+      document.getElementById("highProgress").style.width = `${highProgress}%`;
+    }
+
+    function stopPointReplay() {
+      clearInterval(regularReplayTimer);
+      regularReplayTimer = null;
+      regularReplayDelta = 0;
+      const button = document.getElementById("pointPlaybackButton");
+      if (button) button.disabled = false;
+    }
+
+    function playPointReplay() {
+      const record = recordById.get(selectedRecordId);
+      if (!record || record.regular !== "可查看") return;
+      if (isPlaying) togglePlayback();
+      stopPointReplay();
+      const button = document.getElementById("pointPlaybackButton");
+      button.disabled = true;
+      regularReplayDelta = -12;
+      updateFrameText();
+      drawAll();
+      regularReplayTimer = setInterval(() => {
+        regularReplayDelta += 1;
+        if (regularReplayDelta >= 0) {
+          stopPointReplay();
+        }
+        updateFrameText();
+        drawAll();
+      }, 90);
+    }
+
+    function togglePlayback() {
+      isPlaying = !isPlaying;
+      playButton.textContent = isPlaying ? "Ⅱ" : "▶";
+      playButton.setAttribute("aria-label", isPlaying ? "暂停" : "播放");
+      if (isPlaying) {
+        playTimer = setInterval(() => stepFrame(1), 120);
+      } else {
+        clearInterval(playTimer);
+        playTimer = null;
+      }
+    }
+
+    function drawFrame(canvas, source) {
+      const stage = canvas.parentElement;
+      const rect = stage.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(rect.width * ratio));
+      canvas.height = Math.max(1, Math.round(rect.height * ratio));
+      const context = canvas.getContext("2d");
+      context.scale(ratio, ratio);
+      const width = rect.width;
+      const height = rect.height;
+      const record = recordById.get(selectedRecordId);
+
+      context.fillStyle = "#b9c6cc";
+      context.fillRect(0, 0, width, height * 0.30);
+      context.fillStyle = "#607b56";
+      context.fillRect(0, height * 0.30, width, height * 0.16);
+      context.fillStyle = "#39434a";
+      context.fillRect(0, height * 0.46, width, height * 0.54);
+
+      context.strokeStyle = "rgba(255,255,255,0.45)";
+      context.lineWidth = 2;
+      context.setLineDash([16, 14]);
+      context.beginPath();
+      context.moveTo(0, height * 0.77);
+      context.lineTo(width, height * 0.77);
+      context.stroke();
+      context.setLineDash([]);
+
+      const finishX = width * 0.57;
+      context.fillStyle = "#f1f3f4";
+      context.fillRect(finishX - 4, height * 0.46, 8, height * 0.54);
+      context.fillStyle = "#242a2e";
+      for (let y = height * 0.46; y < height; y += 16) {
+        context.fillRect(finishX - 4, y, 4, 8);
+        context.fillRect(finishX, y + 8, 4, 8);
+      }
+
+      const sourceShift = source === "high" ? 10 : -4;
+      const sourceDelta = source === "regular" ? frameDelta + regularReplayDelta : frameDelta;
+      const motion = sourceDelta * (source === "high" ? 1.1 : 1.8);
+      const riderX = finishX - 34 + motion + sourceShift;
+      const riderY = height * 0.64;
+
+      context.save();
+      context.globalAlpha = source === "regular" ? 0.22 : 0.10;
+      context.strokeStyle = "#d7eef7";
+      context.lineWidth = 7;
+      for (let blur = 1; blur <= 5; blur += 1) {
+        context.beginPath();
+        context.moveTo(riderX - blur * 14, riderY - 30);
+        context.lineTo(riderX - blur * 19 - 35, riderY - 30);
+        context.stroke();
+      }
+      context.restore();
+
+      context.strokeStyle = "#15191c";
+      context.lineWidth = 4;
+      context.fillStyle = "#dfe6ea";
+      [[riderX - 28, riderY + 24], [riderX + 32, riderY + 24]].forEach(([x, y]) => {
+        context.beginPath();
+        context.arc(x, y, 24, 0, Math.PI * 2);
+        context.fill();
+        context.stroke();
+      });
+
+      context.strokeStyle = "#e1b52e";
+      context.lineWidth = 6;
+      context.beginPath();
+      context.moveTo(riderX - 28, riderY + 24);
+      context.lineTo(riderX, riderY - 2);
+      context.lineTo(riderX + 32, riderY + 24);
+      context.lineTo(riderX - 2, riderY + 24);
+      context.closePath();
+      context.stroke();
+
+      context.strokeStyle = "#1b252b";
+      context.lineWidth = 8;
+      context.beginPath();
+      context.moveTo(riderX - 2, riderY - 4);
+      context.lineTo(riderX + 16, riderY - 48);
+      context.lineTo(riderX + 38, riderY - 65);
+      context.stroke();
+
+      context.fillStyle = "#d33f3f";
+      context.beginPath();
+      context.arc(riderX + 12, riderY - 49, 17, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = "#f2c5a2";
+      context.beginPath();
+      context.arc(riderX + 32, riderY - 74, 10, 0, Math.PI * 2);
+      context.fill();
+
+      context.fillStyle = "rgba(11, 17, 21, 0.68)";
+      context.fillRect(width - 102, 10, 91, 31);
+      context.fillStyle = "#ffffff";
+      context.font = "700 14px Consolas";
+      context.textAlign = "center";
+      context.fillText(record ? record.time : "--:--:--.---", width - 56, 31);
+
+      if (marker[source] !== null) {
+        const markerX = marker[source] * width;
+        context.strokeStyle = "#ffcf5a";
+        context.lineWidth = 3;
+        context.beginPath();
+        context.moveTo(markerX, 0);
+        context.lineTo(markerX, height);
+        context.stroke();
+        context.fillStyle = "#ffcf5a";
+        context.fillRect(markerX - 18, 45, 36, 20);
+        context.fillStyle = "#17212b";
+        context.font = "700 12px Microsoft YaHei UI";
+        context.fillText(record?.bib || "", markerX, 60);
+      }
+    }
+
+    function drawAll() {
+      drawFrame(document.getElementById("regularCanvas"), "regular");
+      drawFrame(document.getElementById("highCanvas"), "high");
+    }
+
+    function beginMarking(source) {
+      markingSource = source;
+      document.querySelectorAll(".video-stage").forEach(stage => stage.classList.remove("marking"));
+      document.getElementById(source === "regular" ? "regularStage" : "highStage").classList.add("marking");
+      document.querySelectorAll(".stage-feedback").forEach(item => {
+        item.hidden = true;
+      });
+      const feedback = document.getElementById(source === "regular" ? "regularStageFeedback" : "highStageFeedback");
+      feedback.textContent = "标线中";
+      feedback.hidden = false;
+    }
+
+    function setMarker(source, event) {
+      if (markingSource !== source) return;
+      const rect = event.currentTarget.getBoundingClientRect();
+      marker[source] = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+      markingSource = null;
+      event.currentTarget.classList.remove("marking");
+      drawAll();
+      const feedback = document.getElementById(source === "regular" ? "regularStageFeedback" : "highStageFeedback");
+      feedback.textContent = "已标线";
+      feedback.hidden = false;
+      updateConfirmAvailability();
+    }
+
+    function confirmAndNext() {
+      const record = recordById.get(selectedRecordId);
+      if (!record || confirmButton.disabled) return;
+      const currentIndex = filteredRecords.findIndex(item => item.id === selectedRecordId);
+      lastConfirmation = { recordId: record.id, previousReview: record.review };
+      if (marker.regular !== null && marker.high !== null) record.review = "双源标记";
+      else if (marker.regular !== null) record.review = "录像标记";
+      else record.review = "高速标记";
+      undoConfirmButton.disabled = false;
+      const confirmedRecordRemainsVisible = isExactIdentitySearch || ["all", "confirmed"].includes(currentQueueFilter);
+      filterRecords({
+        preferredIndex: currentIndex + (confirmedRecordRemainsVisible ? 1 : 0),
+        preserveScroll: true
+      });
+    }
+
+    function undoLastConfirmation() {
+      if (!lastConfirmation) return;
+      const record = recordById.get(lastConfirmation.recordId);
+      if (record) record.review = lastConfirmation.previousReview;
+      lastConfirmation = null;
+      undoConfirmButton.disabled = true;
+      filterRecords({ preserveScroll: true });
+    }
+
+    function showToast(message) {
+      toast.textContent = message;
+      toast.classList.add("show");
+      clearTimeout(showToast.timer);
+      showToast.timer = setTimeout(() => toast.classList.remove("show"), 1800);
+    }
+
+    function openSettings() {
+      closeOffsetPanel();
+      document.getElementById("settingsBackdrop").classList.add("open");
+    }
+
+    function closeSettings() {
+      document.getElementById("settingsBackdrop").classList.remove("open");
+    }
+
+    function updateClock() {
+      document.getElementById("clockValue").textContent = new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23"
+      }).format(new Date());
+    }
+
+    function closeOffsetPanel() {
+      document.getElementById("offsetPanel").classList.remove("open");
+    }
+
+    function openOffsetPanel() {
+      const panel = document.getElementById("offsetPanel");
+      const button = document.getElementById("offsetButton");
+      if (panel.classList.contains("open")) {
+        closeOffsetPanel();
+        return;
+      }
+      document.getElementById("offsetInput").value = String(clockOffset);
+      panel.classList.add("open");
+      const buttonRect = button.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const left = Math.max(8, Math.min(window.innerWidth - panelRect.width - 8, buttonRect.right - panelRect.width));
+      const preferredTop = buttonRect.bottom + 6;
+      const top = preferredTop + panelRect.height <= window.innerHeight - 8
+        ? preferredTop
+        : Math.max(8, buttonRect.top - panelRect.height - 6);
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+      document.getElementById("offsetInput").select();
+    }
+
+    function applyClockOffset(value) {
+      const nextOffset = Number(value);
+      if (!Number.isFinite(nextOffset)) return;
+      clockOffset = Math.round(nextOffset);
+      const signedOffset = `${clockOffset >= 0 ? "+" : ""}${clockOffset}`;
+      const button = document.getElementById("offsetButton");
+      button.textContent = `校时 ${signedOffset} ms`;
+      button.title = `证据校时偏移 ${signedOffset} 毫秒`;
+      button.setAttribute("aria-label", button.title);
+      document.getElementById("offsetInput").value = String(clockOffset);
+      updateFrameText();
+      drawAll();
+    }
+
+    function setZoom(source, nextZoom) {
+      zoom[source] = Math.max(40, Math.min(200, nextZoom));
+      document.getElementById(source === "regular" ? "regularZoom" : "highZoom").textContent = `${zoom[source]}%`;
+      document.getElementById(source === "regular" ? "regularCanvas" : "highCanvas").style.transform = `scale(${zoom[source] / 100})`;
+    }
+
+    function togglePaneMaximize(source) {
+      maximizedSource = maximizedSource === source ? null : source;
+      const grid = document.querySelector(".evidence-grid");
+      grid.classList.toggle("maximized", Boolean(maximizedSource));
+      document.querySelectorAll(".evidence-pane").forEach(pane => {
+        pane.classList.toggle("hidden-by-maximize", Boolean(maximizedSource) && pane.dataset.source !== maximizedSource);
+      });
+      document.querySelectorAll(".maximize-pane").forEach(button => {
+        const isActive = button.dataset.source === maximizedSource;
+        const sourceLabel = button.dataset.source === "regular" ? "普通录像" : "高速摄像";
+        button.setAttribute("aria-pressed", String(isActive));
+        button.textContent = isActive ? "▣" : "□";
+        button.title = isActive ? "还原双画面" : `最大化${sourceLabel}`;
+        button.setAttribute("aria-label", button.title);
+      });
+      requestAnimationFrame(drawAll);
+    }
+
+    let searchTimer = null;
+    let scrollFrame = null;
+    let splitterStartY = 0;
+    let splitterStartHeight = 0;
+    let compactQueueHeight = 0;
+
+    function queueHeightBounds() {
+      return {
+        min: window.innerHeight <= 820 ? 148 : 164,
+        max: Math.max(220, Math.min(480, Math.round(window.innerHeight * 0.48)))
+      };
+    }
+
+    function updateSplitterValue(height, bounds = queueHeightBounds()) {
+      queueSplitter.setAttribute("aria-valuemin", String(bounds.min));
+      queueSplitter.setAttribute("aria-valuemax", String(bounds.max));
+      queueSplitter.setAttribute("aria-valuenow", String(Math.round(height)));
+      queueSplitter.setAttribute("aria-valuetext", `${Math.round(height)} 像素`);
+    }
+
+    function setQueueHeight(height, persist = false) {
+      const bounds = queueHeightBounds();
+      const nextHeight = Math.max(bounds.min, Math.min(bounds.max, Math.round(height)));
+      shell.classList.remove("queue-expanded");
+      shell.style.setProperty("--queue-height", `${nextHeight}px`);
+      updateSplitterValue(nextHeight, bounds);
+      if (persist) {
+        try {
+          localStorage.setItem("finish-review-queue-height", String(nextHeight));
+        } catch (error) {
+          // Local file storage may be unavailable in hardened browser profiles.
+        }
+      }
+      requestAnimationFrame(() => {
+        renderRows();
+        drawAll();
+      });
+      return nextHeight;
+    }
+
+    function updateExpandButton(expanded) {
+      const button = document.getElementById("expandQueueButton");
+      button.setAttribute("aria-pressed", String(expanded));
+      button.setAttribute("aria-label", expanded ? "收起运动员列表" : "展开运动员列表");
+      button.title = expanded ? "收起运动员列表" : "展开运动员列表";
+    }
+
+    function createIncomingRecords(count) {
+      const startIndex = records.length + incomingRecords.length;
+      return Array.from({ length: count }, (_, index) => {
+        const sequence = startIndex + index + 1;
+        const bib = String(sequence);
+        const timelineMs = latestTimelineMs + (index + 1) * 920;
+        return {
+          id: `passage-live-${String(sequence).padStart(6, "0")}`,
+          bib,
+          name: mockNames[sequence % mockNames.length],
+          group: sequence % 4 === 0 ? "女子甲组" : "男子甲组",
+          time: formatTime(timelineMs),
+          timelineMs,
+          team: mockTeams[sequence % mockTeams.length],
+          regular: "可查看",
+          high: "可查看",
+          review: "待核对"
+        };
+      });
+    }
+
+    function queueIncomingRecords(count) {
+      incomingRecords = incomingRecords.concat(createIncomingRecords(count));
+      newRecordsButton.textContent = `新增 ${numberFormatter.format(incomingRecords.length)} 条`;
+      newRecordsButton.hidden = false;
+    }
+
+    try {
+      const savedQueueHeight = Number(localStorage.getItem("finish-review-queue-height"));
+      if (Number.isFinite(savedQueueHeight) && savedQueueHeight > 0) {
+        compactQueueHeight = setQueueHeight(savedQueueHeight);
+      }
+    } catch (error) {
+      compactQueueHeight = 0;
+    }
+
+    queueSplitter.addEventListener("pointerdown", event => {
+      splitterStartY = event.clientY;
+      splitterStartHeight = queuePanel.getBoundingClientRect().height;
+      compactQueueHeight = splitterStartHeight;
+      queueSplitter.classList.add("dragging");
+      queueSplitter.setPointerCapture(event.pointerId);
+    });
+    queueSplitter.addEventListener("pointermove", event => {
+      if (!queueSplitter.hasPointerCapture(event.pointerId)) return;
+      setQueueHeight(splitterStartHeight + event.clientY - splitterStartY);
+    });
+    queueSplitter.addEventListener("pointerup", event => {
+      if (!queueSplitter.hasPointerCapture(event.pointerId)) return;
+      queueSplitter.releasePointerCapture(event.pointerId);
+      queueSplitter.classList.remove("dragging");
+      compactQueueHeight = setQueueHeight(queuePanel.getBoundingClientRect().height, true);
+      updateExpandButton(false);
+    });
+    queueSplitter.addEventListener("keydown", event => {
+      if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      const direction = event.key === "ArrowUp" ? -1 : 1;
+      compactQueueHeight = setQueueHeight(queuePanel.getBoundingClientRect().height + direction * 24, true);
+      updateExpandButton(false);
+    });
+
+    searchInput.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => filterRecords(), 120);
+    });
+    groupFilter.addEventListener("change", filterRecords);
+    timeRangeFilter.addEventListener("change", filterRecords);
+    document.querySelectorAll("[data-queue-filter]").forEach(button => {
+      button.addEventListener("click", () => {
+        currentQueueFilter = button.dataset.queueFilter;
+        document.querySelectorAll("[data-queue-filter]").forEach(item => item.classList.toggle("active", item === button));
+        filterRecords();
+      });
+    });
+    body.addEventListener("click", event => {
+      const row = event.target.closest("tr[data-record-id]");
+      if (row) selectRecord(row.dataset.recordId);
+    });
+    body.addEventListener("keydown", event => {
+      const row = event.target.closest("tr[data-record-id]");
+      if (row && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        selectRecord(row.dataset.recordId, false, true);
+      }
+    });
+    queuePanel.addEventListener("scroll", () => {
+      if (scrollFrame) return;
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = null;
+        renderRows();
+      });
+    });
+    document.getElementById("expandQueueButton").addEventListener("click", () => {
+      const button = document.getElementById("expandQueueButton");
+      const expanded = button.getAttribute("aria-pressed") !== "true";
+      if (expanded) {
+        compactQueueHeight = queuePanel.getBoundingClientRect().height;
+        shell.classList.add("queue-expanded");
+        shell.style.removeProperty("--queue-height");
+        requestAnimationFrame(() => {
+          updateSplitterValue(queuePanel.getBoundingClientRect().height);
+          renderRows();
+          drawAll();
+        });
+      } else {
+        setQueueHeight(compactQueueHeight || window.innerHeight * 0.26, true);
+      }
+      updateExpandButton(expanded);
+    });
+    document.getElementById("previousFrame").addEventListener("click", () => stepFrame(-1));
+    document.getElementById("nextFrame").addEventListener("click", () => stepFrame(1));
+    document.getElementById("previousRecord").addEventListener("click", () => moveSelection(-1, true));
+    document.getElementById("nextRecord").addEventListener("click", () => moveSelection(1, true));
+    playButton.addEventListener("click", togglePlayback);
+    document.getElementById("pointPlaybackButton").addEventListener("click", playPointReplay);
+    document.getElementById("markRegularButton").addEventListener("click", () => beginMarking("regular"));
+    document.getElementById("markHighButton").addEventListener("click", () => beginMarking("high"));
+    document.getElementById("regularStage").addEventListener("click", event => setMarker("regular", event));
+    document.getElementById("highStage").addEventListener("click", event => setMarker("high", event));
+    document.getElementById("confirmButton").addEventListener("click", confirmAndNext);
+    undoConfirmButton.addEventListener("click", undoLastConfirmation);
+
+    newRecordsButton.addEventListener("click", () => {
+      const wasNearEnd = queuePanel.scrollTop + queuePanel.clientHeight >= queuePanel.scrollHeight - queueRowHeight * 2;
+      incomingRecords.forEach(record => {
+        records.push(record);
+        recordById.set(record.id, record);
+        latestTimelineMs = Math.max(latestTimelineMs, record.timelineMs);
+      });
+      incomingRecords = [];
+      newRecordsButton.hidden = true;
+      filterRecords({ preserveScroll: !wasNearEnd });
+      if (wasNearEnd) queuePanel.scrollTop = queuePanel.scrollHeight;
+    });
+
+    document.getElementById("recordButton").addEventListener("click", () => {
+      const button = document.getElementById("recordButton");
+      if (!recording) {
+        recording = true;
+        button.classList.add("recording-button");
+        button.textContent = "■ 停止录像";
+      } else if (!button.classList.contains("stop-armed")) {
+        button.classList.add("stop-armed");
+        button.textContent = "确认停止";
+        clearTimeout(stopArmTimer);
+        stopArmTimer = setTimeout(() => {
+          button.classList.remove("stop-armed");
+          button.textContent = "■ 停止录像";
+        }, 3000);
+        return;
+      } else {
+        recording = false;
+        clearTimeout(stopArmTimer);
+        button.classList.remove("recording-button", "stop-armed");
+        button.textContent = "开始录像";
+      }
+      document.getElementById("recordHealthDot").classList.toggle("waiting", !recording);
+      document.getElementById("recordHealthLabel").textContent = recording ? "录像中" : "录像待机";
+      document.getElementById("recordHealthDetail").textContent = recording ? "机位 1 · 正在写入" : "1 个机位已配置";
+    });
+
+    document.getElementById("healthButton").addEventListener("click", event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = "…";
+      setTimeout(() => {
+        button.disabled = false;
+        button.textContent = "↻";
+        showToast("3 路设备连接正常");
+      }, 520);
+    });
+    document.getElementById("offsetButton").addEventListener("click", openOffsetPanel);
+    document.getElementById("resetOffsetButton").addEventListener("click", () => {
+      applyClockOffset(0);
+      showToast("校时偏移已归零");
+    });
+    document.getElementById("applyOffsetButton").addEventListener("click", () => {
+      applyClockOffset(document.getElementById("offsetInput").value);
+      closeOffsetPanel();
+      showToast("校时偏移已应用");
+    });
+    document.getElementById("settingsButton").addEventListener("click", openSettings);
+    document.querySelectorAll("[data-close-modal]").forEach(button => button.addEventListener("click", closeSettings));
+    document.getElementById("settingsBackdrop").addEventListener("click", event => {
+      if (event.target.id === "settingsBackdrop") closeSettings();
+    });
+
+    document.querySelectorAll(".tab-button").forEach(button => {
+      button.addEventListener("click", () => {
+        document.querySelectorAll(".tab-button").forEach(item => item.classList.toggle("active", item === button));
+        document.querySelectorAll(".tab-panel").forEach(panel => panel.classList.toggle("active", panel.dataset.panel === button.dataset.tab));
+        document.getElementById("saveSettingsButton").style.display = button.dataset.tab === "devices" ? "inline-block" : "none";
+      });
+    });
+
+    document.getElementById("saveSettingsButton").addEventListener("click", () => {
+      closeSettings();
+      showToast("设置已保存");
+    });
+    document.getElementById("preflightButton").addEventListener("click", () => showToast("联调已启动，等待测试通过记录"));
+    document.querySelectorAll(".zoom-in").forEach(button => button.addEventListener("click", () => {
+      const source = button.dataset.source;
+      setZoom(source, zoom[source] + 20);
+    }));
+    document.querySelectorAll(".zoom-out").forEach(button => button.addEventListener("click", () => {
+      const source = button.dataset.source;
+      setZoom(source, zoom[source] - 20);
+    }));
+    document.querySelectorAll(".fit-view").forEach(button => button.addEventListener("click", () => setZoom(button.dataset.source, 100)));
+    document.querySelectorAll(".maximize-pane").forEach(button => button.addEventListener("click", () => togglePaneMaximize(button.dataset.source)));
+    document.querySelectorAll(".timeline-track").forEach(track => track.addEventListener("click", event => {
+      const rect = track.getBoundingClientRect();
+      frameDelta = Math.round(((event.clientX - rect.left) / rect.width - 0.5) * 80);
+      updateFrameText();
+      drawAll();
+    }));
+
+    document.addEventListener("keydown", event => {
+      const interactive = ["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(document.activeElement.tagName);
+      if (event.key === "Escape") {
+        closeSettings();
+        closeOffsetPanel();
+        if (maximizedSource) togglePaneMaximize(maximizedSource);
+        markingSource = null;
+        document.querySelectorAll(".video-stage").forEach(stage => stage.classList.remove("marking"));
+        document.querySelectorAll(".stage-feedback").forEach(item => {
+          item.hidden = true;
+        });
+      } else if (!interactive && event.code === "Space") {
+        event.preventDefault();
+        togglePlayback();
+      } else if (!interactive && event.key === "PageUp") {
+        moveSelectionByPage(-1, true);
+      } else if (!interactive && event.key === "PageDown") {
+        moveSelectionByPage(1, true);
+      } else if (!interactive && event.key === "ArrowUp") {
+        event.preventDefault();
+        moveSelection(-1, true);
+      } else if (!interactive && event.key === "ArrowDown") {
+        event.preventDefault();
+        moveSelection(1, true);
+      } else if (!interactive && event.key === "Home") {
+        selectRecord(filteredRecords[0]?.id, true, true);
+      } else if (!interactive && event.key === "End") {
+        selectRecord(filteredRecords[filteredRecords.length - 1]?.id, true, true);
+      } else if (!interactive && event.key === "/") {
+        event.preventDefault();
+        searchInput.focus();
+      } else if (!interactive && event.ctrlKey && event.key === "Enter") {
+        confirmAndNext();
+      } else if (!interactive && event.ctrlKey && event.key.toLowerCase() === "z") {
+        undoLastConfirmation();
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      syncQueueMetrics();
+      closeOffsetPanel();
+      if (shell.style.getPropertyValue("--queue-height")) {
+        setQueueHeight(queuePanel.getBoundingClientRect().height);
+      }
+      drawAll();
+    });
+    filterRecords();
+    updateClock();
+    setInterval(updateClock, 1000);
+    requestAnimationFrame(() => {
+      updateSplitterValue(queuePanel.getBoundingClientRect().height);
+      drawAll();
+    });
+    if (demoIncoming) setTimeout(() => queueIncomingRecords(12), 2200);
+  </script>
+</body>
+</html>

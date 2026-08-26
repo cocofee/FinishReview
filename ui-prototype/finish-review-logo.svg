@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">FinishReview 终点多源复核</title>
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="#14232c"/>
+  <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="11.25" fill="none" stroke="#31505a" stroke-width="1.5"/>
+  <path d="M10 24h13" fill="none" stroke="#79a7ad" stroke-linecap="round" stroke-width="3"/>
+  <path d="M10 34h18" fill="none" stroke="#268e73" stroke-linecap="round" stroke-width="4"/>
+  <path d="M10 45c10 0 14-13 24-13h7" fill="none" stroke="#34bd83" stroke-linecap="round" stroke-width="7"/>
+  <circle cx="39" cy="32" r="6" fill="#ffd15c" stroke="#14232c" stroke-width="3"/>
+  <rect x="47" y="9" width="9" height="46" rx="2" fill="#edf4f4"/>
+  <path d="M47 9h4.5v7.67H47zm4.5 7.67H56v7.66h-4.5zM47 24.33h4.5V32H47zm4.5 7.67H56v7.67h-4.5zM47 39.67h4.5v7.66H47zM51.5 47.33H56V55h-4.5z" fill="#16866d"/>
+</svg>

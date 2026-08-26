@@ -7,12 +7,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 import pytest
-from PyQt5.QtCore import QEventLoop, QObject, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEventLoop, QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
 from realtime.video_playback import (
+    PlaybackVideoLabel,
     SpringShuttleSlider,
+    TargetTimelineSlider,
     VideoPlaybackDialog,
     VideoPlaybackWorker,
     _open_video_capture,
@@ -86,6 +88,28 @@ def test_speed_selector_shows_only_common_forward_speeds(qapp):
     assert emitted == [0.25, 2.0]
     assert fast_forward_button.isChecked()
     shuttle.close()
+
+
+def test_video_drag_maps_screen_distance_to_the_recording_span(qapp):
+    label = PlaybackVideoLabel()
+    label.resize(1_000, 600)
+    label.set_jog_frame_span(1_800)
+    label._drag_origin_x = 100
+
+    assert label._frame_delta_for_position(600) == 900
+    assert label._frame_delta_for_position(-400) == -900
+    label.close()
+
+
+def test_timeline_position_maps_clicks_across_the_full_duration(qapp):
+    timeline = TargetTimelineSlider(Qt.Horizontal)
+    timeline.resize(1_000, 26)
+    timeline.setRange(0, 60_000)
+
+    midpoint = timeline._value_from_position(timeline.width() // 2)
+
+    assert 29_000 <= midpoint <= 31_000
+    timeline.close()
 
 
 class _FakeCapture:
@@ -211,6 +235,30 @@ def test_dialog_starts_paused_at_requested_passage_position(qapp):
     assert dialog.worker.seek_calls == [4_250]
     assert dialog.timeline.value() == 4_250
     assert dialog.current_time_label.text() == "00:00:04.250"
+    assert dialog.video_label._jog_frame_span == 500
+    dialog.close()
+
+
+def test_dialog_timeline_click_jumps_and_previews_immediately(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        autoplay=False,
+    )
+    dialog.resize(1_000, 700)
+    dialog.show()
+    qapp.processEvents()
+    dialog.worker.seek_calls.clear()
+
+    QTest.mouseClick(
+        dialog.timeline,
+        Qt.LeftButton,
+        pos=QPoint(dialog.timeline.width() * 3 // 4, dialog.timeline.height() // 2),
+    )
+    qapp.processEvents()
+
+    assert 7_000 <= dialog.timeline.value() <= 8_000
+    assert dialog.worker.seek_calls[-1] == dialog.timeline.value()
     dialog.close()
 
 

@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt5.QtCore import QTimer
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
 
 from realtime import review_main
@@ -21,7 +22,7 @@ from realtime.review_main import (
     requested_source,
     save_review_settings,
 )
-from realtime.review_recorder import parse_directshow_source
+from realtime.review_recorder import make_directshow_source, parse_directshow_source
 from realtime.review_window import FinishReviewSettings
 from realtime.secure_storage import (
     SecretProtectionError,
@@ -140,6 +141,11 @@ def test_main_shows_window_before_receiver_failure_message(monkeypatch, tmp_path
     monkeypatch.setattr(review_main, "install_exception_logging", lambda: None)
     monkeypatch.setattr(
         review_main,
+        "configure_application_icon",
+        lambda _app: events.append("icon"),
+    )
+    monkeypatch.setattr(
+        review_main,
         "default_config_path",
         lambda: tmp_path / "config.json",
     )
@@ -152,12 +158,22 @@ def test_main_shows_window_before_receiver_failure_message(monkeypatch, tmp_path
     assert review_main.main(["--output", str(tmp_path / "race")]) == 0
     assert events == [
         "font",
+        "icon",
         "show",
         "process-events",
         "start-receiver",
         "warning",
         "event-loop",
     ]
+
+
+def test_application_icon_uses_finishreview_asset():
+    app = QApplication.instance() or QApplication([])
+    app.setWindowIcon(QIcon())
+
+    review_main.configure_application_icon(app)
+
+    assert not app.windowIcon().isNull()
 
 
 def test_packaged_smoke_test_creates_real_qt_window(monkeypatch):
@@ -416,6 +432,30 @@ def test_review_settings_round_trip_two_encrypted_rtsp_sources(tmp_path):
     )
     assert "secret-one" not in config_path.read_text(encoding="utf-8")
     assert "secret-two" not in config_path.read_text(encoding="utf-8")
+
+
+def test_review_settings_round_trip_secondary_usb_camera(tmp_path):
+    config_path = tmp_path / "finish_review_config.json"
+    settings = FinishReviewSettings(
+        source=make_directshow_source("@device_pnp_dji_one"),
+        secondary_source=make_directshow_source("@device_pnp_dji_two"),
+        output_dir=tmp_path / "race",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    save_review_settings(config_path, settings)
+    loaded = load_review_settings(
+        config_path,
+        output_dir=None,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+    )
+
+    assert loaded.source == settings.source
+    assert loaded.secondary_source == settings.secondary_source
 
 
 def test_legacy_plaintext_token_is_migrated_on_next_save(tmp_path):

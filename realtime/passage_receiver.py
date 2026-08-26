@@ -9,7 +9,8 @@ import math
 import os
 import socket
 import threading
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -191,6 +192,7 @@ class PassageEvent:
     athlete_name: str = ""
     team_name: str = ""
     is_active: bool = True
+    received_at_ms: int = 0
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -219,6 +221,8 @@ class PassageEvent:
             raise PassageEventError("source is required")
         if self.emitted_at_ms < 0:
             raise PassageEventError("emitted_at_ms must be non-negative")
+        if self.received_at_ms < 0:
+            raise PassageEventError("received_at_ms must be non-negative")
         if self.revision <= 0:
             raise PassageEventError("revision must be positive")
         if not isinstance(self.is_active, bool):
@@ -260,11 +264,12 @@ class PassageEvent:
             athlete_name=_string_field(payload, "athlete_name", default=""),
             team_name=_string_field(payload, "team_name", default=""),
             is_active=_boolean_field(payload, "is_active", default=True),
+            received_at_ms=_integer_field(payload, "received_at_ms", default=0),
         )
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
-        return {
+        result = {
             "schema_version": payload["schema_version"],
             "message_type": payload["message_type"],
             "event_id": payload["event_id"],
@@ -288,6 +293,15 @@ class PassageEvent:
             "team_name": payload["team_name"],
             "is_active": payload["is_active"],
         }
+        if payload["received_at_ms"] > 0:
+            result["received_at_ms"] = payload["received_at_ms"]
+        return result
+
+
+def _same_protocol_event(left: PassageEvent, right: PassageEvent) -> bool:
+    """Compare sender-owned fields while ignoring local receipt metadata."""
+
+    return replace(left, received_at_ms=0) == replace(right, received_at_ms=0)
 
 
 def _looks_like_incomplete_json(value: str) -> bool:
@@ -378,11 +392,13 @@ class PassageEventStore:
         if event.revision < current.revision:
             return
         if event.revision == current.revision:
-            if event != current:
+            if not _same_protocol_event(event, current):
                 raise PassageJournalError(
                     "conflicting passage event revision in journal "
                     f"line {line_number}: {event.event_id}"
                 )
+            if current.received_at_ms <= 0 < event.received_at_ms:
+                self._events[event.event_id] = event
             return
         self._events[event.event_id] = event
 
@@ -402,16 +418,19 @@ class PassageEventStore:
             raise TypeError("event must be a PassageEvent")
         with self._lock:
             current = self._events.get(event.event_id)
+            result = PassageIngestResult.ACCEPTED
             if current is not None:
                 if event.revision < current.revision:
                     return PassageIngestResult.DUPLICATE
                 if event.revision == current.revision:
-                    if event != current:
+                    if not _same_protocol_event(event, current):
                         raise PassageEventConflictError(
                             "passage event revision was reused with different content: "
                             f"{event.event_id}"
                         )
-                    return PassageIngestResult.DUPLICATE
+                    if current.received_at_ms > 0 or event.received_at_ms <= 0:
+                        return PassageIngestResult.DUPLICATE
+                    result = PassageIngestResult.DUPLICATE
 
             record = (
                 json.dumps(
@@ -456,7 +475,7 @@ class PassageEventStore:
                 self._event_order.append(event.event_id)
             self._events[event.event_id] = event
             self._race_ids.add(event.race_id)
-            return PassageIngestResult.ACCEPTED
+            return result
 
     def get(self, event_id: str) -> Optional[PassageEvent]:
         with self._lock:
@@ -494,9 +513,14 @@ class PassageEventIngestor:
         self._delivered_revisions: dict[str, int] = {}
 
     def ingest_payload(self, payload: Mapping[str, Any]) -> PassageIngestResult:
-        return self.ingest(PassageEvent.from_payload(payload))
+        event = PassageEvent.from_payload(payload)
+        return self.ingest(
+            replace(event, received_at_ms=int(time.time() * 1000.0))
+        )
 
     def ingest(self, event: PassageEvent) -> PassageIngestResult:
+        if event.received_at_ms <= 0:
+            event = replace(event, received_at_ms=int(time.time() * 1000.0))
         result = self.store.append(event)
         current = self.store.get(event.event_id)
         if current is None or current.revision != event.revision:

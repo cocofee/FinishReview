@@ -7,6 +7,9 @@ from pathlib import Path
 
 ROOT = Path(SPECPATH).resolve().parent
 binaries = []
+icon_path = ROOT / "assets" / "finishreview.ico"
+if not icon_path.is_file():
+    raise SystemExit(f"Required application icon is missing: {icon_path}")
 
 ffmpeg_value = os.environ.get("FINISH_REVIEW_FFMPEG") or shutil.which("ffmpeg")
 ffmpeg_path = Path(ffmpeg_value).expanduser().resolve() if ffmpeg_value else None
@@ -18,7 +21,7 @@ a = Analysis(
     [str(ROOT / "realtime" / "review_main.py")],
     pathex=[str(ROOT)],
     binaries=binaries,
-    datas=[],
+    datas=[(str(icon_path), "assets")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -53,6 +56,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(icon_path),
     disable_windowed_traceback=False,
     argv_emulation=False,
 )
