@@ -327,6 +327,7 @@ class EvidenceImageView(QGraphicsView):
     passage_step_requested = pyqtSignal(int)
     scrub_started = pyqtSignal()
     scrub_delta_requested = pyqtSignal(int)
+    scrub_finished = pyqtSignal(int)
 
     MIN_SCALE = 0.25
     MAX_SCALE = 8.0
@@ -652,6 +653,7 @@ class EvidenceImageView(QGraphicsView):
                 event.accept()
                 return
             if video_scrubbing:
+                self.scrub_finished.emit(event.pos().x() - press_position.x())
                 self.setFocus(Qt.MouseFocusReason)
                 event.accept()
                 return
@@ -784,14 +786,19 @@ class PassageEvidencePane(QFrame):
     play_requested = pyqtSignal()
     passage_delta_requested = pyqtSignal(int)
     selection_step_requested = pyqtSignal(int)
+    position_changed = pyqtSignal(int)
     maximize_requested = pyqtSignal(object)
     marking_requested = pyqtSignal(object)
     confirmation_requested = pyqtSignal(object)
     cancel_requested = pyqtSignal(object)
     delete_requested = pyqtSignal(object)
     scrub_started = pyqtSignal()
+    scrub_preview_requested = pyqtSignal(int)
 
     MAX_SCRUB_SPAN_MS = 6_000
+    SCRUB_PREVIEW_INTERVAL_MS = 80
+    MIN_LINKED_DRIFT_TOLERANCE_MS = 40
+    LINKED_DRIFT_FRAME_MULTIPLIER = 1
     STATUS_COLORS = {
         "已确认": "#16845b",
         "未确认": "#c0372b",
@@ -838,6 +845,12 @@ class PassageEvidencePane(QFrame):
         self._timeline_dragging = False
         self._last_full_resolution_request = -1
         self._scrub_origin_delta_ms = 0
+        self._video_scrubbing = False
+        self._pending_scrub_delta_ms: Optional[int] = None
+        self._scrub_preview_timer = QTimer(self)
+        self._scrub_preview_timer.setSingleShot(True)
+        self._scrub_preview_timer.setInterval(self.SCRUB_PREVIEW_INTERVAL_MS)
+        self._scrub_preview_timer.timeout.connect(self._flush_scrub_preview)
 
         self.setObjectName("passageEvidencePane")
         self.setFrameShape(QFrame.StyledPanel)
@@ -893,6 +906,7 @@ class PassageEvidencePane(QFrame):
         self.video_view.scrub_delta_requested.connect(
             self._on_video_scrub_delta
         )
+        self.video_view.scrub_finished.connect(self._on_video_scrub_finished)
         layout.addWidget(self.video_view, 1)
 
         self.timeline = TargetTimelineSlider(Qt.Horizontal, self)
@@ -922,8 +936,8 @@ class PassageEvidencePane(QFrame):
         self.fit_btn.setToolTip("适应当前窗格")
         self.zoom_in_btn = QPushButton("+")
         self.zoom_in_btn.setToolTip("放大")
-        self.maximize_btn = QPushButton("□")
-        self.maximize_btn.setToolTip("最大化或恢复该机位")
+        self.maximize_btn = QPushButton("放大")
+        self.maximize_btn.setToolTip("放大该机位")
         self.mark_btn = QPushButton("标线")
         self.mark_btn.setToolTip("在画面中按住左键移动身份判读线")
         self.open_btn = QPushButton("定点回放")
@@ -1277,6 +1291,7 @@ class PassageEvidencePane(QFrame):
         self._current_frame_index = -1
         self._current_position_ms = 0
         self._last_full_resolution_request = -1
+        self._reset_video_scrub()
         self.play_btn.setText("▶")
         self.mark_btn.setText("重标" if association is not None else "标线")
         self.video_view.set_marker_mode(False)
@@ -1440,7 +1455,14 @@ class PassageEvidencePane(QFrame):
         if not self._timeline_dragging:
             self.timeline.setValue(max(0, min(int(position_ms), self._duration_ms)))
         self._update_time_label(position_ms)
-        if not self._playing and self.video_view.zoom_percent >= 100:
+        self.position_changed.emit(
+            self._current_position_ms - self._target_position_ms
+        )
+        if (
+            not self._playing
+            and not self._video_scrubbing
+            and self.video_view.zoom_percent >= 100
+        ):
             self._request_full_resolution()
 
     def _on_full_resolution_ready(
@@ -1479,7 +1501,7 @@ class PassageEvidencePane(QFrame):
     def _request_full_resolution(self) -> None:
         worker = self._worker
         frame_index = self._current_frame_index
-        if worker is None or frame_index < 0:
+        if worker is None or frame_index < 0 or self._video_scrubbing:
             return
         if frame_index == self._last_full_resolution_request:
             return
@@ -1509,12 +1531,21 @@ class PassageEvidencePane(QFrame):
         )
 
     def _on_video_scrub_started(self) -> None:
+        self._reset_video_scrub()
+        self._video_scrubbing = True
+        self._last_full_resolution_request = -1
         self._scrub_origin_delta_ms = (
             self._current_position_ms - self._target_position_ms
         )
         self.scrub_started.emit()
 
     def _on_video_scrub_delta(self, horizontal_pixels: int) -> None:
+        delta_ms = self._scrub_delta_ms(horizontal_pixels)
+        self._pending_scrub_delta_ms = delta_ms
+        if not self._scrub_preview_timer.isActive():
+            self._scrub_preview_timer.start()
+
+    def _scrub_delta_ms(self, horizontal_pixels: int) -> int:
         viewport_width = max(1, self.video_view.viewport().width())
         frame_ms = self.frame_duration_ms()
         scrub_span_ms = max(
@@ -1525,9 +1556,25 @@ class PassageEvidencePane(QFrame):
             int(horizontal_pixels) * scrub_span_ms / viewport_width
         )
         frame_delta = int(round(raw_delta_ms / frame_ms))
-        self.passage_delta_requested.emit(
-            self._scrub_origin_delta_ms + frame_delta * frame_ms
-        )
+        return self._scrub_origin_delta_ms + frame_delta * frame_ms
+
+    def _flush_scrub_preview(self) -> None:
+        delta_ms = self._pending_scrub_delta_ms
+        self._pending_scrub_delta_ms = None
+        if delta_ms is not None and self._video_scrubbing:
+            self.scrub_preview_requested.emit(delta_ms)
+
+    def _on_video_scrub_finished(self, horizontal_pixels: int) -> None:
+        final_delta_ms = self._scrub_delta_ms(horizontal_pixels)
+        self._scrub_preview_timer.stop()
+        self._pending_scrub_delta_ms = None
+        self._video_scrubbing = False
+        self.passage_delta_requested.emit(final_delta_ms)
+
+    def _reset_video_scrub(self) -> None:
+        self._scrub_preview_timer.stop()
+        self._pending_scrub_delta_ms = None
+        self._video_scrubbing = False
 
     def _on_playback_finished(self) -> None:
         if self.sender() is not self._worker:
@@ -1565,6 +1612,10 @@ class PassageEvidencePane(QFrame):
     def toggle_playing(self) -> None:
         self.set_playing(not self._playing)
 
+    @property
+    def is_playing(self) -> bool:
+        return self._playing
+
     def step(self, frame_delta: int) -> None:
         worker = self._worker
         if worker is None:
@@ -1591,6 +1642,7 @@ class PassageEvidencePane(QFrame):
         delta_ms: int,
         *,
         linked_playing: bool = False,
+        preview: bool = False,
     ) -> None:
         worker = self._worker
         if worker is None:
@@ -1600,17 +1652,85 @@ class PassageEvidencePane(QFrame):
             return
         lower, upper = bounds
         clamped_delta_ms = max(lower, min(int(delta_ms), upper))
-        worker.pause()
-        worker.seek(self._target_position_ms + clamped_delta_ms)
+        if preview:
+            self._video_scrubbing = True
+            self._last_full_resolution_request = -1
+        position_ms = self._target_position_ms + clamped_delta_ms
         self._playing = bool(linked_playing)
+        seek_and_play = getattr(worker, "seek_and_play", None)
+        if self._playing and callable(seek_and_play):
+            seek_and_play(position_ms, 1.0)
+        else:
+            worker.pause()
+            preview_seek = getattr(worker, "seek_preview", None)
+            if preview and callable(preview_seek):
+                preview_seek(position_ms)
+            else:
+                worker.seek(position_ms)
+            if self._playing:
+                worker.set_shuttle_speed(1.0)
         self.play_btn.setText("Ⅱ" if self._playing else "▶")
 
     def set_linked_playing(self, playing: bool) -> None:
         self._playing = bool(playing)
         worker = self._worker
         if worker is not None:
-            worker.pause()
+            if self._playing:
+                worker.set_shuttle_speed(1.0)
+            else:
+                worker.pause()
         self.play_btn.setText("Ⅱ" if self._playing else "▶")
+
+    def linked_drift_ms(self, delta_ms: int) -> Optional[int]:
+        bounds = self.available_delta_bounds()
+        if bounds is None:
+            return None
+        lower, upper = bounds
+        clamped_delta_ms = max(lower, min(int(delta_ms), upper))
+        expected_position_ms = self._target_position_ms + clamped_delta_ms
+        current_position_ms = self._current_position_ms
+        worker = self._worker
+        if worker is not None:
+            worker_position_ms = getattr(worker, "current_position_ms", None)
+            if isinstance(worker_position_ms, (int, float)):
+                current_position_ms = int(worker_position_ms)
+        return current_position_ms - expected_position_ms
+
+    def current_delta_ms(self) -> Optional[int]:
+        bounds = self.available_delta_bounds()
+        if bounds is None:
+            return None
+        current_frame_index = self._current_frame_index
+        current_position_ms = self._current_position_ms
+        worker = self._worker
+        if worker is not None:
+            worker_frame_index = getattr(worker, "current_frame_index", None)
+            if isinstance(worker_frame_index, int):
+                current_frame_index = worker_frame_index
+            worker_position_ms = getattr(worker, "current_position_ms", None)
+            if isinstance(worker_position_ms, (int, float)):
+                current_position_ms = int(worker_position_ms)
+        if current_frame_index < 0:
+            return None
+        lower, upper = bounds
+        return max(
+            lower,
+            min(current_position_ms - self._target_position_ms, upper),
+        )
+
+    def release_playback_cache(self) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        release_cache = getattr(worker, "release_cache", None)
+        if callable(release_cache):
+            release_cache()
+
+    def linked_drift_tolerance_ms(self) -> int:
+        return max(
+            self.MIN_LINKED_DRIFT_TOLERANCE_MS,
+            self.frame_duration_ms() * self.LINKED_DRIFT_FRAME_MULTIPLIER,
+        )
 
     def _set_transport_enabled(self, enabled: bool) -> None:
         self.previous_frame_btn.setEnabled(enabled)
@@ -1661,6 +1781,7 @@ class PassageEvidencePane(QFrame):
         worker.deleteLater()
 
     def _stop_worker(self, *, wait: bool = False) -> None:
+        self._reset_video_scrub()
         worker = self._worker
         self._worker = None
         if worker is None:
@@ -1712,6 +1833,9 @@ def _resolve_evidence_layout(
 class PassageReviewDialog(QDialog):
     clock_offset_changed = pyqtSignal(int)
     evidence_pane_added = pyqtSignal(object)
+
+    SYNC_STARTUP_GRACE_MS = 250
+    SYNC_CORRECTION_COOLDOWN_SECONDS = 0.5
 
     def __init__(
         self,
@@ -1770,9 +1894,11 @@ class PassageReviewDialog(QDialog):
         self._sync_playing = False
         self._sync_origin_delta_ms = 0
         self._sync_started_at = 0.0
+        self._last_sync_correction_at = 0.0
         self._sync_timer = QTimer(self)
         self._sync_timer.setInterval(30)
         self._sync_timer.timeout.connect(self._on_sync_tick)
+        self._active_pane: Optional[PassageEvidencePane] = None
         self._maximized_pane: Optional[PassageEvidencePane] = None
         self._available_evidence_count = 0
         self._located_event_ids: set[str] = set()
@@ -1794,7 +1920,7 @@ class PassageReviewDialog(QDialog):
         self._init_ui()
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_shortcut.setContext(Qt.WindowShortcut)
-        self.space_shortcut.activated.connect(self._toggle_both)
+        self.space_shortcut.activated.connect(self._toggle_active_pane)
         self.previous_passage_shortcut = QShortcut(
             QKeySequence(Qt.Key_PageUp), self
         )
@@ -1993,8 +2119,8 @@ class PassageReviewDialog(QDialog):
         self.previous_passage_btn.setToolTip("上一条")
         self.previous_frame_btn = QPushButton("|◀")
         self.previous_frame_btn.setToolTip("上一帧")
-        self.play_both_btn = QPushButton("▶")
-        self.play_both_btn.setToolTip("播放或暂停")
+        self.play_both_btn = QPushButton("联动 ▶")
+        self.play_both_btn.setToolTip("同时播放或暂停全部画面")
         self.next_frame_btn = QPushButton("▶|")
         self.next_frame_btn.setToolTip("下一帧")
         self.next_passage_btn = QPushButton("▼")
@@ -2007,15 +2133,18 @@ class PassageReviewDialog(QDialog):
             self.next_passage_btn,
         ):
             button.setFixedWidth(36)
+        self.play_both_btn.setFixedWidth(68)
         self.auto_advance_checkbox = QCheckBox("确认后下一条")
         self.auto_advance_checkbox.setChecked(False)
         self.auto_advance_checkbox.setToolTip(
             "开启后，当前可用录像均确认时自动定位下一条 passage"
         )
         self.previous_passage_btn.clicked.connect(lambda: self._move_selection(-1))
-        self.previous_frame_btn.clicked.connect(lambda: self._step_both(-1))
+        self.previous_frame_btn.setToolTip("当前画面上一帧")
+        self.next_frame_btn.setToolTip("当前画面下一帧")
+        self.previous_frame_btn.clicked.connect(lambda: self._step_active_pane(-1))
         self.play_both_btn.clicked.connect(self._toggle_both)
-        self.next_frame_btn.clicked.connect(lambda: self._step_both(1))
+        self.next_frame_btn.clicked.connect(lambda: self._step_active_pane(1))
         self.next_passage_btn.clicked.connect(lambda: self._move_selection(1))
         self.transport_layout.addWidget(self.current_passage_label)
         self.transport_layout.addWidget(self.current_context_label)
@@ -2038,6 +2167,7 @@ class PassageReviewDialog(QDialog):
             "高速摄像", HIGH_SPEED_SOURCE, self
         )
         self._connect_evidence_pane(self.high_speed_pane)
+        self._active_pane = self.regular_pane
         self.evidence_splitter.addWidget(self.high_speed_pane)
         self.configure_evidence_panes(
             self._configured_regular_camera_indexes,
@@ -2085,10 +2215,28 @@ class PassageReviewDialog(QDialog):
     def _connect_evidence_pane(self, pane: PassageEvidencePane) -> None:
         if pane.source_kind == REGULAR_SOURCE:
             pane.open_requested.connect(self._open_location_if_available)
-        pane.step_requested.connect(self._step_both)
-        pane.play_requested.connect(self._toggle_both)
-        pane.passage_delta_requested.connect(self._seek_both_delta)
-        pane.scrub_started.connect(lambda: self._set_sync_playing(False))
+        pane.step_requested.connect(
+            lambda delta, current=pane: self._step_pane(current, delta)
+        )
+        pane.play_requested.connect(lambda current=pane: self._toggle_pane(current))
+        pane.passage_delta_requested.connect(
+            lambda delta, current=pane: self._seek_pane_delta(
+                current, delta, preview=False
+            )
+        )
+        pane.scrub_preview_requested.connect(
+            lambda delta, current=pane: self._seek_pane_delta(
+                current, delta, preview=True
+            )
+        )
+        pane.scrub_started.connect(
+            lambda current=pane: self._on_pane_scrub_started(current)
+        )
+        pane.position_changed.connect(
+            lambda delta, current=pane: self._on_pane_position_changed(
+                current, delta
+            )
+        )
         pane.selection_step_requested.connect(self._move_selection)
         pane.maximize_requested.connect(self._toggle_maximized_pane)
         pane.marking_requested.connect(self._begin_marking)
@@ -2138,6 +2286,8 @@ class PassageReviewDialog(QDialog):
         self._configured_regular_camera_indexes = normalized_indexes
         self._show_high_speed_pane = resolved_high_speed
         self.regular_pane = self.regular_panes[0]
+        if self._active_pane not in self.evidence_panes:
+            self._active_pane = self.regular_pane
 
         active_regular = set(normalized_indexes)
         for camera_index, pane in self._regular_panes_by_camera.items():
@@ -2152,7 +2302,8 @@ class PassageReviewDialog(QDialog):
         compact = len(self.evidence_panes) >= 3
         for pane in self.all_evidence_panes:
             pane.set_compact_controls(compact and pane in self.evidence_panes)
-            pane.maximize_btn.setText("□")
+            pane.maximize_btn.setText("放大")
+            pane.maximize_btn.setToolTip("放大该机位")
         for index in range(self.evidence_splitter.count()):
             self.evidence_splitter.setStretchFactor(index, 1)
         self.evidence_splitter.setSizes([1] * self.evidence_splitter.count())
@@ -3069,7 +3220,7 @@ class PassageReviewDialog(QDialog):
                     initial_delta_ms=self._shared_delta_ms,
                     lookup_status=high_speed.status if high_speed is not None else "",
                 )
-            self.play_both_btn.setText("▶")
+            self.play_both_btn.setText("联动 ▶")
         else:
             for pane in self.regular_panes:
                 pane_association = self._source_association(
@@ -3559,6 +3710,138 @@ class PassageReviewDialog(QDialog):
             self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
         self._select_event(event_id)
 
+    def _focused_evidence_pane(self) -> Optional[PassageEvidencePane]:
+        widget = self.focusWidget()
+        while widget is not None:
+            for pane in self.evidence_panes:
+                if widget is pane:
+                    return pane
+            widget = widget.parentWidget()
+        return None
+
+    def _active_playback_pane(self) -> PassageEvidencePane:
+        focused = self._focused_evidence_pane()
+        if focused is not None and focused.available_delta_bounds() is not None:
+            return focused
+        if (
+            self._active_pane is not None
+            and self._active_pane.available_delta_bounds() is not None
+        ):
+            return self._active_pane
+        for pane in self.evidence_panes:
+            if pane.available_delta_bounds() is not None:
+                return pane
+        return self._active_pane or self.regular_pane
+
+    def _pause_inactive_panes(self, active: PassageEvidencePane) -> None:
+        for pane in self.evidence_panes:
+            if pane is not active:
+                pane.set_playing(False)
+                pane.release_playback_cache()
+
+    def _update_shared_from_pane(self, pane: PassageEvidencePane) -> None:
+        delta_ms = pane.current_delta_ms()
+        if delta_ms is None:
+            return
+        self._shared_delta_ms = delta_ms
+        self._update_shared_time_label()
+
+    def _activate_pane(
+        self,
+        pane: PassageEvidencePane,
+        *,
+        align: bool,
+    ) -> bool:
+        if pane not in self.evidence_panes:
+            return False
+        if self._sync_playing:
+            self._set_sync_playing(False, seek_final=False)
+        previous = self._active_pane
+        switched = previous is not pane
+        if switched and previous is not None:
+            self._update_shared_from_pane(previous)
+            previous.set_playing(False)
+        self._active_pane = pane
+        self._pause_inactive_panes(pane)
+        if switched and align:
+            pane.seek_passage_delta(self._shared_delta_ms)
+        return switched
+
+    def _toggle_active_pane(self) -> None:
+        self._toggle_pane(self._active_playback_pane())
+
+    def _toggle_pane(self, pane: PassageEvidencePane) -> None:
+        was_sync_playing = self._sync_playing
+        if was_sync_playing:
+            self._set_sync_playing(False, seek_final=False)
+        switched = self._activate_pane(pane, align=False)
+        if pane.is_playing and not was_sync_playing:
+            pane.set_playing(False)
+            self._update_shared_from_pane(pane)
+            return
+        if not switched:
+            self._update_shared_from_pane(pane)
+        pane.seek_passage_delta(self._shared_delta_ms, linked_playing=True)
+
+    def _step_active_pane(self, frame_delta: int) -> None:
+        self._step_pane(self._active_playback_pane(), frame_delta)
+
+    def _step_pane(
+        self,
+        pane: PassageEvidencePane,
+        frame_delta: int,
+    ) -> None:
+        switched = self._activate_pane(pane, align=False)
+        if not switched:
+            self._update_shared_from_pane(pane)
+        bounds = pane.available_delta_bounds()
+        if bounds is None:
+            return
+        lower, upper = bounds
+        self._shared_delta_ms = max(
+            lower,
+            min(
+                self._shared_delta_ms
+                + int(frame_delta) * pane.frame_duration_ms(),
+                upper,
+            ),
+        )
+        pane.seek_passage_delta(self._shared_delta_ms)
+        self._update_shared_time_label()
+
+    def _seek_pane_delta(
+        self,
+        pane: PassageEvidencePane,
+        delta_ms: int,
+        *,
+        preview: bool,
+    ) -> None:
+        self._activate_pane(pane, align=False)
+        bounds = pane.available_delta_bounds()
+        if bounds is None:
+            return
+        lower, upper = bounds
+        self._shared_delta_ms = max(lower, min(int(delta_ms), upper))
+        pane.seek_passage_delta(self._shared_delta_ms, preview=preview)
+        self._update_shared_time_label()
+
+    def _on_pane_scrub_started(self, pane: PassageEvidencePane) -> None:
+        if self._sync_playing:
+            self._set_sync_playing(False, seek_final=False)
+        self._active_pane = pane
+        self._pause_inactive_panes(pane)
+        self._update_shared_from_pane(pane)
+
+    def _on_pane_position_changed(
+        self,
+        pane: PassageEvidencePane,
+        delta_ms: int,
+    ) -> None:
+        if self._sync_playing or pane is not self._active_pane:
+            return
+        self._shared_delta_ms = int(delta_ms)
+        self._update_shared_time_label()
+
     def _step_both(self, frame_delta: int) -> None:
         self._set_sync_playing(False)
         reference = next(
@@ -3590,6 +3873,12 @@ class PassageReviewDialog(QDialog):
         return lower, upper
 
     def _seek_both_delta(self, delta_ms: int) -> None:
+        self._apply_both_delta(delta_ms, preview=False)
+
+    def _preview_both_delta(self, delta_ms: int) -> None:
+        self._apply_both_delta(delta_ms, preview=True)
+
+    def _apply_both_delta(self, delta_ms: int, *, preview: bool) -> None:
         bounds = self._sync_delta_bounds()
         if bounds is None:
             return
@@ -3599,17 +3888,28 @@ class PassageReviewDialog(QDialog):
             pane.seek_passage_delta(
                 self._shared_delta_ms,
                 linked_playing=self._sync_playing,
+                preview=preview,
             )
         self._update_shared_time_label()
 
-    def _set_sync_playing(self, playing: bool) -> None:
+    def _set_sync_playing(
+        self,
+        playing: bool,
+        *,
+        seek_final: bool = True,
+    ) -> None:
         playing = bool(playing) and self._sync_delta_bounds() is not None
         if playing == self._sync_playing:
             return
         if playing:
+            self._pause_inactive_panes(self.regular_pane)
             self._sync_origin_delta_ms = self._shared_delta_ms
-            self._sync_started_at = time.monotonic()
             self._sync_playing = True
+            self._seek_both_delta(self._shared_delta_ms)
+            self._sync_started_at = time.monotonic()
+            self._last_sync_correction_at = (
+                self._sync_started_at - self.SYNC_CORRECTION_COOLDOWN_SECONDS
+            )
             self._sync_timer.start()
         else:
             if self._sync_playing:
@@ -3617,10 +3917,12 @@ class PassageReviewDialog(QDialog):
                 self._shared_delta_ms = self._sync_origin_delta_ms + elapsed_ms
             self._sync_playing = False
             self._sync_timer.stop()
-        for pane in self.evidence_panes:
-            pane.set_linked_playing(self._sync_playing)
-        self.play_both_btn.setText("Ⅱ" if self._sync_playing else "▶")
-        if not self._sync_playing:
+            for pane in self.evidence_panes:
+                pane.set_linked_playing(False)
+        self.play_both_btn.setText(
+            "联动 Ⅱ" if self._sync_playing else "联动 ▶"
+        )
+        if not self._sync_playing and seek_final:
             self._seek_both_delta(self._shared_delta_ms)
 
     def _on_sync_tick(self) -> None:
@@ -3634,7 +3936,31 @@ class PassageReviewDialog(QDialog):
                 self._shared_delta_ms = bounds[1]
             self._set_sync_playing(False)
             return
-        self._seek_both_delta(target_delta_ms)
+        self._shared_delta_ms = target_delta_ms
+        self._update_shared_time_label()
+        self._correct_sync_drift(target_delta_ms)
+
+    def _correct_sync_drift(self, target_delta_ms: int) -> None:
+        now = time.monotonic()
+        elapsed_ms = int((now - self._sync_started_at) * 1000.0)
+        if (
+            elapsed_ms < self.SYNC_STARTUP_GRACE_MS
+            or (now - self._last_sync_correction_at)
+            < self.SYNC_CORRECTION_COOLDOWN_SECONDS
+        ):
+            return
+
+        corrected = False
+        for pane in self.evidence_panes:
+            drift_ms = pane.linked_drift_ms(target_delta_ms)
+            if drift_ms is None:
+                continue
+            if abs(drift_ms) <= pane.linked_drift_tolerance_ms():
+                continue
+            pane.seek_passage_delta(target_delta_ms, linked_playing=True)
+            corrected = True
+        if corrected:
+            self._last_sync_correction_at = now
 
     def _update_shared_time_label(self) -> None:
         event = self.passage_store.get(self._selected_event_id)
@@ -3649,12 +3975,18 @@ class PassageReviewDialog(QDialog):
         if self._maximized_pane is pane:
             for candidate in self.evidence_panes:
                 candidate.show()
-                candidate.maximize_btn.setText("□")
+                candidate.maximize_btn.setText("放大")
+                candidate.maximize_btn.setToolTip("放大该机位")
             self._maximized_pane = None
             return
         for candidate in self.evidence_panes:
             candidate.setVisible(candidate is pane)
-            candidate.maximize_btn.setText("▣" if candidate is pane else "□")
+            candidate.maximize_btn.setText(
+                "缩小" if candidate is pane else "放大"
+            )
+            candidate.maximize_btn.setToolTip(
+                "恢复多画面" if candidate is pane else "放大该机位"
+            )
         self._maximized_pane = pane
 
     def _open_preferred_source(self, row: int, _column: int) -> None:

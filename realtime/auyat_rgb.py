@@ -333,6 +333,12 @@ class AuyatRgbPlaybackWorker(QThread):
             self._seek_position_ms = max(0, int(milliseconds))
             self._condition.notify_all()
 
+    def seek_and_play(self, milliseconds: int, speed: float = 1.0) -> None:
+        with self._condition:
+            self._seek_position_ms = max(0, int(milliseconds))
+            self._playing = float(speed) > 0.01
+            self._condition.notify_all()
+
     def jump(self, delta_ms: int) -> None:
         self.seek(self.current_position_ms + int(delta_ms))
 

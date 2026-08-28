@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import cv2
 import numpy as np
 import pytest
 from PyQt5.QtCore import QEventLoop, QObject, QPoint, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QImage
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
@@ -120,6 +122,8 @@ class _FakeCapture:
         ]
         self.position = 0
         self.released = False
+        self.set_positions = []
+        self.read_positions = []
 
     def isOpened(self):
         return True
@@ -140,12 +144,14 @@ class _FakeCapture:
     def set(self, property_id, value):
         if property_id == cv2.CAP_PROP_POS_FRAMES:
             self.position = max(0, min(int(value), len(self.frames)))
+            self.set_positions.append(self.position)
             return True
         return False
 
     def read(self):
         if self.position >= len(self.frames):
             return False, None
+        self.read_positions.append(self.position)
         frame = self.frames[self.position]
         self.position += 1
         return True, frame.copy()
@@ -158,6 +164,26 @@ class _FakeCapture:
 
     def release(self):
         self.released = True
+
+
+class _BlockingCapture(_FakeCapture):
+    def __init__(self, frame_count=30):
+        super().__init__(frame_count=frame_count)
+        self.read_started = threading.Event()
+        self.allow_read = threading.Event()
+
+    def read(self):
+        self.read_started.set()
+        if not self.allow_read.wait(2.0):
+            return False, None
+        return super().read()
+
+
+class _ImpreciseSeekCapture(_FakeCapture):
+    def set(self, property_id, value):
+        if property_id == cv2.CAP_PROP_POS_FRAMES:
+            return super().set(property_id, max(0, int(value) - 1))
+        return super().set(property_id, value)
 
 
 class _FakeDialogWorker(QObject):
@@ -396,3 +422,311 @@ def test_playing_worker_continues_from_requested_seek_position(qapp):
     assert first_seeked_index
     assert min(positions[first_seeked_index[0] :]) >= 2_000
     assert capture.released is True
+
+
+def test_worker_drops_frame_from_obsolete_seek_generation(qapp):
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: _FakeCapture(),
+    )
+    emitted = []
+    image = QImage(32, 24, QImage.Format_RGB888)
+    worker.frame_ready.connect(
+        lambda _image, _position_ms, frame_index: emitted.append(frame_index)
+    )
+
+    worker.seek_frame(1)
+    obsolete_generation = worker._request_generation
+    worker.seek_frame(2)
+
+    assert not worker._emit_image(image, 1, generation=obsolete_generation)
+    assert worker.current_frame_index == -1
+    assert worker._emit_image(
+        image,
+        2,
+        generation=worker._request_generation,
+    )
+    qapp.processEvents()
+
+    assert emitted == [2]
+    assert worker.current_frame_index == 2
+
+
+def test_seek_and_play_emits_requested_frame_before_continuing(qapp):
+    capture = _FakeCapture(frame_count=100)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+    )
+    worker._fps = 20.0
+    worker._frame_count = 100
+    emitted = []
+    loop = QEventLoop()
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def on_frame(_image, _position_ms, frame_index):
+        emitted.append(frame_index)
+        if len(emitted) >= 3:
+            finish()
+
+    worker.frame_ready.connect(on_frame)
+    worker.seek_and_play(1_000)
+    QTimer.singleShot(2_000, finish)
+    worker.start()
+    loop.exec_()
+
+    assert worker.wait(2_000)
+    assert emitted[0] == 20
+    assert emitted[1:] == [21, 22]
+    assert capture.read_positions[:3] == [20, 21, 22]
+
+
+def test_reverse_window_uses_one_seek_then_serves_cached_frames(qapp):
+    capture = _FakeCapture(frame_count=30)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+    )
+    worker._fps = 20.0
+    worker._reverse_window_frames = 6
+    emitted = []
+    worker.frame_ready.connect(
+        lambda _image, _position_ms, frame_index: emitted.append(frame_index)
+    )
+
+    ok, capture_next_frame = worker._decode_target(
+        capture,
+        10,
+        20,
+        generation=worker._request_generation,
+        reverse_window=True,
+    )
+    assert ok
+    assert capture.set_positions == [5]
+    assert capture.read_positions == [5, 6, 7, 8, 9, 10]
+    assert capture_next_frame == 11
+    assert emitted == [10]
+
+    ok, cached_next_frame = worker._decode_target(
+        capture,
+        9,
+        capture_next_frame,
+        generation=worker._request_generation,
+        reverse_window=True,
+    )
+    qapp.processEvents()
+
+    assert ok
+    assert cached_next_frame == capture_next_frame
+    assert capture.set_positions == [5]
+    assert capture.read_positions == [5, 6, 7, 8, 9, 10]
+    assert emitted == [10, 9]
+
+
+def test_reverse_window_stops_before_seek_when_request_is_obsolete():
+    capture = _FakeCapture(frame_count=30)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+    )
+    worker.seek_frame(10)
+    obsolete_generation = worker._request_generation
+    worker.seek_frame(20)
+
+    ok, capture_next_frame = worker._decode_target(
+        capture,
+        10,
+        20,
+        generation=obsolete_generation,
+        reverse_window=True,
+    )
+
+    assert ok
+    assert capture_next_frame == 20
+    assert capture.set_positions == []
+    assert capture.read_positions == []
+
+
+def test_frame_cache_respects_configured_memory_limit():
+    worker = VideoPlaybackWorker(Path("recording.mkv"))
+    image = QImage(32, 24, QImage.Format_RGB888)
+    image.fill(0)
+    worker._max_cache_bytes = image.byteCount() * 2
+
+    worker._cache_image(1, image)
+    worker._cache_image(2, image)
+    worker._cache_image(3, image)
+
+    assert list(worker._frame_cache) == [2, 3]
+    assert worker._frame_cache_bytes <= worker._max_cache_bytes
+
+
+def test_reverse_double_buffer_fits_inside_default_cache_budget():
+    worker = VideoPlaybackWorker(Path("recording.mkv"))
+    worker._fps = 25.0
+
+    worker._configure_reverse_window(1920, 1080)
+
+    preview_frame_bytes = 1280 * 720 * 3
+    assert worker._max_cache_bytes == 64 * 1024 * 1024
+    assert worker._reverse_window_frames == 12
+    assert (
+        worker._reverse_window_frames * 2 * preview_frame_bytes
+        <= worker._max_cache_bytes
+    )
+
+
+def test_release_cache_cancels_prefetch_and_drops_cached_images():
+    worker = VideoPlaybackWorker(Path("recording.mkv"))
+    image = QImage(32, 24, QImage.Format_RGB888)
+    image.fill(0)
+    worker._cache_image(1, image)
+    worker._reverse_current_window = (0, 1, 0)
+    worker._reverse_prefetch_task = (0, 0, 0, 1)
+
+    worker.release_cache()
+
+    assert list(worker._frame_cache) == []
+    assert worker._frame_cache_bytes == 0
+    assert worker._reverse_current_window is None
+    assert worker._reverse_prefetch_task is None
+
+
+def test_pause_and_release_cancel_in_progress_reverse_decode():
+    capture = _BlockingCapture(frame_count=30)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+        reverse_prefetch=False,
+    )
+    worker._fps = 20.0
+    worker._frame_count = 30
+    worker._reverse_window_frames = 10
+    emitted = []
+    result = []
+    worker.frame_ready.connect(
+        lambda _image, _position_ms, frame_index: emitted.append(frame_index)
+    )
+    generation = worker._request_generation
+    decode_thread = threading.Thread(
+        target=lambda: result.append(
+            worker._decode_reverse_window(
+                capture,
+                9,
+                0,
+                generation=generation,
+            )
+        )
+    )
+    decode_thread.start()
+    assert capture.read_started.wait(1.0)
+
+    worker.pause()
+    worker.release_cache()
+    capture.allow_read.set()
+    decode_thread.join(2.0)
+
+    assert not decode_thread.is_alive()
+    assert worker._request_generation > generation
+    assert list(worker._frame_cache) == []
+    assert worker._frame_cache_bytes == 0
+    assert emitted == []
+    assert result == [(True, 1)]
+
+
+def test_reverse_window_rejects_imprecise_seek_result():
+    capture = _ImpreciseSeekCapture(frame_count=30)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+        reverse_prefetch=False,
+    )
+    worker._fps = 20.0
+    worker._frame_count = 30
+    worker._reverse_window_frames = 6
+
+    ok, _capture_next_frame = worker._decode_reverse_window(
+        capture,
+        10,
+        20,
+        generation=worker._request_generation,
+    )
+
+    assert not ok
+    assert list(worker._frame_cache) == []
+
+
+def test_playing_worker_uses_reverse_window_for_continuous_reverse(qapp):
+    capture = _FakeCapture(frame_count=100)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+        reverse_prefetch=False,
+    )
+    frame_indexes = []
+    loop = QEventLoop()
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def on_frame(_image, _position_ms, frame_index):
+        frame_indexes.append(frame_index)
+        if len(frame_indexes) >= 8:
+            finish()
+
+    worker.frame_ready.connect(on_frame)
+    worker.set_shuttle_speed(-1.0)
+    worker.seek_frame(75)
+    QTimer.singleShot(2_000, finish)
+    worker.start()
+    loop.exec_()
+
+    assert worker.wait(2_000)
+    assert frame_indexes[0] == 75
+    assert frame_indexes[1:] == sorted(frame_indexes[1:], reverse=True)
+    assert len(set(frame_indexes)) == len(frame_indexes)
+    assert len(capture.set_positions) <= 2
+    assert capture.released is True
+
+
+def test_reverse_playback_prefetches_next_window_with_secondary_capture(qapp):
+    captures = []
+
+    def capture_factory(_path):
+        capture = _FakeCapture(frame_count=100)
+        captures.append(capture)
+        return capture
+
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=capture_factory,
+    )
+    frame_indexes = []
+    loop = QEventLoop()
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def on_frame(_image, _position_ms, frame_index):
+        frame_indexes.append(frame_index)
+        if len(frame_indexes) >= 10:
+            QTimer.singleShot(50, finish)
+
+    worker.frame_ready.connect(on_frame)
+    worker.set_shuttle_speed(-1.0)
+    worker.seek_frame(75)
+    QTimer.singleShot(2_000, finish)
+    worker.start()
+    loop.exec_()
+
+    assert worker.wait(2_000)
+    assert len(captures) == 2
+    assert captures[1].set_positions == [55]
+    assert captures[1].read_positions == list(range(55, 65))
+    assert frame_indexes == sorted(frame_indexes, reverse=True)
+    assert all(capture.released for capture in captures)

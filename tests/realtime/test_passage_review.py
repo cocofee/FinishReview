@@ -53,10 +53,13 @@ class _FakePlaybackWorker(QObject):
         self.running = False
         self.stopped = False
         self.seek_calls = []
+        self.preview_seek_calls = []
+        self.pause_calls = 0
         self.wait_calls = []
         self.speed_calls = []
         self.step_calls = []
         self.full_resolution_calls = []
+        self.release_cache_calls = 0
         type(self).instances.append(self)
 
     def start(self):
@@ -68,10 +71,17 @@ class _FakePlaybackWorker(QObject):
         return self.running
 
     def pause(self):
-        return None
+        self.pause_calls += 1
 
     def seek(self, position_ms):
         self.seek_calls.append(int(position_ms))
+
+    def seek_and_play(self, position_ms, speed=1.0):
+        self.seek_calls.append(int(position_ms))
+        self.speed_calls.append(float(speed))
+
+    def seek_preview(self, position_ms):
+        self.preview_seek_calls.append(int(position_ms))
 
     def set_shuttle_speed(self, speed):
         self.speed_calls.append(float(speed))
@@ -81,6 +91,9 @@ class _FakePlaybackWorker(QObject):
 
     def request_full_resolution(self, frame_index=None):
         self.full_resolution_calls.append(frame_index)
+
+    def release_cache(self):
+        self.release_cache_calls += 1
 
     def stop(self):
         self.stopped = True
@@ -947,6 +960,15 @@ def test_high_speed_only_double_click_maximizes_judging_pane(
     assert dialog._maximized_pane is dialog.high_speed_pane
     assert not dialog.high_speed_pane.isHidden()
     assert dialog.regular_pane.isHidden()
+    assert dialog.high_speed_pane.maximize_btn.text() == "缩小"
+    assert dialog.high_speed_pane.maximize_btn.toolTip() == "恢复多画面"
+    assert dialog.regular_pane.maximize_btn.text() == "放大"
+
+    dialog._toggle_maximized_pane(dialog.high_speed_pane)
+
+    assert dialog._maximized_pane is None
+    assert dialog.high_speed_pane.maximize_btn.text() == "放大"
+    assert dialog.regular_pane.maximize_btn.text() == "放大"
     dialog.close()
 
 
@@ -1429,7 +1451,7 @@ def test_review_rejects_external_clip_from_another_race(qapp, tmp_path):
     dialog.close()
 
 
-def test_linked_frame_step_keeps_regular_and_high_speed_on_one_time_cursor(
+def test_frame_step_controls_only_focused_pane_at_its_native_frame_rate(
     qapp,
     tmp_path,
     fake_playback,
@@ -1460,14 +1482,15 @@ def test_linked_frame_step_keeps_regular_and_high_speed_on_one_time_cursor(
     dialog.show()
     qapp.processEvents()
     regular_worker, high_speed_worker = fake_playback.instances
+    high_speed_seek_calls = list(high_speed_worker.seek_calls)
 
     QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Right)
     qapp.processEvents()
 
-    assert dialog._shared_delta_ms == 4
-    assert regular_worker.seek_calls[-1] == 10_054
-    assert high_speed_worker.seek_calls[-1] == 1_054
-    assert "Δ+4 ms" in dialog.current_time_label.text()
+    assert dialog._shared_delta_ms == 20
+    assert regular_worker.seek_calls[-1] == 10_070
+    assert high_speed_worker.seek_calls == high_speed_seek_calls
+    assert "Δ+20 ms" in dialog.current_time_label.text()
     dialog.close()
 
 
@@ -1557,7 +1580,7 @@ def test_timeline_drag_seeks_video_before_mouse_release(
     dialog.close()
 
 
-def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
+def test_manual_marker_uses_enter_while_space_controls_focused_pane(
     qapp,
     tmp_path,
     fake_playback,
@@ -1632,13 +1655,253 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     assert dialog.table.item(0, 6).text() == "已确认"
     assert dialog.table.item(0, 8).text() == "已确认"
 
-    QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Space)
-    qapp.processEvents()
-    assert dialog._sync_playing
+    regular_worker.seek_calls.clear()
+    high_speed_worker.seek_calls.clear()
+    regular_worker.speed_calls.clear()
+    high_speed_worker.speed_calls.clear()
+    dialog.regular_pane.video_view.setFocus()
     QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Space)
     qapp.processEvents()
     assert not dialog._sync_playing
+    assert dialog.regular_pane.is_playing
+    assert not dialog.high_speed_pane.is_playing
+    assert regular_worker.speed_calls == [1.0]
+    assert high_speed_worker.speed_calls == []
+    QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Space)
+    qapp.processEvents()
+    assert not dialog._sync_playing
+    assert not dialog.regular_pane.is_playing
     assert association_store.get("passage-1", HIGH_SPEED_SOURCE) is None
+    dialog.close()
+
+
+def test_linked_playback_ticks_do_not_seek_workers_that_follow_master_clock(
+    qapp,
+    tmp_path,
+    fake_playback,
+    monkeypatch,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "high_speed_01.mp4",
+        source_id="high_speed_01",
+        camera_index=2,
+        started_at_ms=14_000,
+        ended_at_ms=17_000,
+        clock_source="external_clip_sidecar_beijing",
+        timing_error_ms=100,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    regular_worker, high_speed_worker = fake_playback.instances
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    regular_worker.frame_ready.emit(frame, 5_000, 250)
+    high_speed_worker.frame_ready.emit(frame, 1_000, 250)
+    qapp.processEvents()
+    for worker in (regular_worker, high_speed_worker):
+        worker.seek_calls.clear()
+        worker.speed_calls.clear()
+        worker.pause_calls = 0
+
+    clock = [100.0]
+    monkeypatch.setattr(passage_review.time, "monotonic", lambda: clock[0])
+    dialog._set_sync_playing(True)
+
+    assert regular_worker.seek_calls == [5_000]
+    assert high_speed_worker.seek_calls == [1_000]
+    assert regular_worker.speed_calls == [1.0]
+    assert high_speed_worker.speed_calls == [1.0]
+
+    regular_worker.seek_calls.clear()
+    high_speed_worker.seek_calls.clear()
+    clock[0] = 100.12
+    regular_worker.frame_ready.emit(frame, 5_120, 256)
+    high_speed_worker.frame_ready.emit(frame, 1_120, 280)
+    qapp.processEvents()
+    dialog._on_sync_tick()
+
+    assert dialog._shared_delta_ms == 120
+    assert regular_worker.seek_calls == []
+    assert high_speed_worker.seek_calls == []
+    dialog._set_sync_playing(False)
+    dialog.close()
+
+
+def test_linked_playback_corrects_only_the_pane_outside_drift_tolerance(
+    qapp,
+    tmp_path,
+    fake_playback,
+    monkeypatch,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "high_speed_01.mp4",
+        source_id="high_speed_01",
+        camera_index=2,
+        started_at_ms=14_000,
+        ended_at_ms=17_000,
+        clock_source="external_clip_sidecar_beijing",
+        timing_error_ms=100,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    regular_worker, high_speed_worker = fake_playback.instances
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    regular_worker.frame_ready.emit(frame, 5_000, 250)
+    high_speed_worker.frame_ready.emit(frame, 1_000, 250)
+    qapp.processEvents()
+
+    clock = [200.0]
+    monkeypatch.setattr(passage_review.time, "monotonic", lambda: clock[0])
+    dialog._set_sync_playing(True)
+    for worker in (regular_worker, high_speed_worker):
+        worker.seek_calls.clear()
+        worker.speed_calls.clear()
+
+    clock[0] = 200.6
+    regular_worker.frame_ready.emit(frame, 5_000, 250)
+    high_speed_worker.frame_ready.emit(frame, 1_600, 400)
+    qapp.processEvents()
+    dialog._on_sync_tick()
+
+    assert 599 <= dialog._shared_delta_ms <= 600
+    assert regular_worker.seek_calls == [5_000 + dialog._shared_delta_ms]
+    assert regular_worker.speed_calls == [1.0]
+    assert high_speed_worker.seek_calls == []
+    assert high_speed_worker.speed_calls == []
+    dialog._set_sync_playing(False)
+    dialog.close()
+
+
+def test_stopping_linked_playback_seeks_once_to_exact_master_position(
+    qapp,
+    tmp_path,
+    fake_playback,
+    monkeypatch,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "high_speed_01.mp4",
+        source_id="high_speed_01",
+        camera_index=2,
+        started_at_ms=14_000,
+        ended_at_ms=17_000,
+        clock_source="external_clip_sidecar_beijing",
+        timing_error_ms=100,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    regular_worker, high_speed_worker = fake_playback.instances
+    clock = [300.0]
+    monkeypatch.setattr(passage_review.time, "monotonic", lambda: clock[0])
+    dialog._set_sync_playing(True)
+    for worker in (regular_worker, high_speed_worker):
+        worker.seek_calls.clear()
+        worker.pause_calls = 0
+
+    clock[0] = 300.25
+    dialog._set_sync_playing(False)
+
+    assert not dialog._sync_playing
+    assert dialog._shared_delta_ms == 250
+    assert regular_worker.pause_calls == 2
+    assert high_speed_worker.pause_calls == 2
+    assert regular_worker.seek_calls == [5_250]
+    assert high_speed_worker.seek_calls == [1_250]
+    dialog.close()
+
+
+def test_switching_single_pane_playback_aligns_without_starting_other_pane(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "high_speed_01.mp4",
+        source_id="high_speed_01",
+        camera_index=2,
+        started_at_ms=14_000,
+        ended_at_ms=17_000,
+        clock_source="external_clip_sidecar_beijing",
+        timing_error_ms=100,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    regular_worker, high_speed_worker = fake_playback.instances
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    regular_worker.frame_ready.emit(frame, 5_120, 256)
+    high_speed_worker.frame_ready.emit(frame, 1_000, 250)
+    qapp.processEvents()
+    for worker in (regular_worker, high_speed_worker):
+        worker.seek_calls.clear()
+        worker.speed_calls.clear()
+        worker.pause_calls = 0
+
+    dialog._toggle_pane(dialog.regular_pane)
+
+    assert dialog.regular_pane.is_playing
+    assert not dialog.high_speed_pane.is_playing
+    assert regular_worker.seek_calls == [5_120]
+    assert regular_worker.speed_calls == [1.0]
+    assert high_speed_worker.seek_calls == []
+    assert high_speed_worker.speed_calls == []
+
+    dialog._toggle_pane(dialog.high_speed_pane)
+
+    assert dialog._active_pane is dialog.high_speed_pane
+    assert not dialog.regular_pane.is_playing
+    assert dialog.high_speed_pane.is_playing
+    assert high_speed_worker.seek_calls == [1_120]
+    assert high_speed_worker.speed_calls == [1.0]
+    assert regular_worker.release_cache_calls == 1
     dialog.close()
 
 
@@ -1715,6 +1978,92 @@ def test_left_drag_scrubs_video_middle_drag_pans_and_click_places_marker(
     QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=center)
     assert dialog.regular_pane.has_pending_marker
     assert view._marker is not None
+    dialog.close()
+
+
+def test_video_scrub_throttles_preview_and_commits_exact_seek(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000, bib="12"))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.show()
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    worker = fake_playback.instances[0]
+    dialog._set_sync_playing(True)
+    worker.seek_calls.clear()
+    worker.preview_seek_calls.clear()
+
+    pane._on_video_scrub_started()
+    pane._on_video_scrub_delta(10)
+    pane._on_video_scrub_delta(30)
+    pane._on_video_scrub_delta(60)
+
+    assert worker.preview_seek_calls == []
+    QTest.qWait(pane.SCRUB_PREVIEW_INTERVAL_MS + 20)
+    qapp.processEvents()
+    assert not dialog._sync_playing
+    assert len(worker.preview_seek_calls) == 1
+
+    final_delta_ms = pane._scrub_delta_ms(80)
+    pane._on_video_scrub_finished(80)
+    qapp.processEvents()
+
+    assert worker.seek_calls == [pane._target_position_ms + final_delta_ms]
+    assert not pane._video_scrubbing
+    assert not pane._scrub_preview_timer.isActive()
+    dialog.close()
+
+
+def test_video_scrub_defers_full_resolution_until_exact_frame(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    worker = fake_playback.instances[0]
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_000, 250)
+    qapp.processEvents()
+    pane.video_view.set_actual_size()
+    qapp.processEvents()
+    worker.full_resolution_calls.clear()
+
+    pane._on_video_scrub_started()
+    worker.frame_ready.emit(frame, 5_040, 252)
+    qapp.processEvents()
+    assert worker.full_resolution_calls == []
+
+    pane._on_video_scrub_finished(40)
+    worker.frame_ready.emit(frame, 5_080, 254)
+    qapp.processEvents()
+    assert worker.full_resolution_calls == [254]
     dialog.close()
 
 
