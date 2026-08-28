@@ -179,6 +179,21 @@ class _BlockingCapture(_FakeCapture):
         return super().read()
 
 
+class _BlockingFrameCapture(_FakeCapture):
+    def __init__(self, frame_count=30, *, block_position: int):
+        super().__init__(frame_count=frame_count)
+        self.block_position = int(block_position)
+        self.read_started = threading.Event()
+        self.allow_read = threading.Event()
+
+    def read(self):
+        if self.position == self.block_position:
+            self.read_started.set()
+            if not self.allow_read.wait(2.0):
+                return False, None
+        return super().read()
+
+
 class _ImpreciseSeekCapture(_FakeCapture):
     def set(self, property_id, value):
         if property_id == cv2.CAP_PROP_POS_FRAMES:
@@ -472,6 +487,51 @@ def test_hls_worker_uses_sequential_timestamps_when_metadata_doubles_fps(
     assert all(capture.released for capture in captures)
 
 
+def test_rapid_steps_keep_the_latest_absolute_target_when_decode_is_cancelled(qapp):
+    capture = _BlockingFrameCapture(frame_count=40, block_position=15)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"),
+        capture_factory=lambda _path: capture,
+        reverse_prefetch=False,
+    )
+    emitted = []
+    loop = QEventLoop()
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def queue_second_step():
+        if capture.read_started.wait(1.0):
+            worker.step(5)
+            capture.allow_read.set()
+
+    def on_metadata(*_values):
+        worker.seek_frame(10)
+
+    def on_frame(_image, _position_ms, frame_index):
+        emitted.append(frame_index)
+        if frame_index == 10:
+            worker.step(5)
+        elif frame_index == 20:
+            finish()
+
+    helper = threading.Thread(target=queue_second_step)
+    helper.start()
+    worker.pause()
+    worker.metadata_ready.connect(on_metadata)
+    worker.frame_ready.connect(on_frame)
+    QTimer.singleShot(2_000, finish)
+    worker.start()
+    loop.exec_()
+    helper.join(2.0)
+
+    assert worker.wait(2_000)
+    assert not helper.is_alive()
+    assert emitted == [10, 20]
+    assert capture.read_positions == [10, 15, 20]
+
+
 def test_playing_worker_continues_from_requested_seek_position(qapp):
     capture = _FakeCapture(frame_count=100)
     worker = VideoPlaybackWorker(
@@ -645,6 +705,164 @@ def test_frame_cache_respects_configured_memory_limit():
 
     assert list(worker._frame_cache) == [2, 3]
     assert worker._frame_cache_bytes <= worker._max_cache_bytes
+
+
+def test_paused_hls_worker_prefetches_the_forward_window():
+    capture = _FakeCapture(frame_count=40)
+    capture.position = 11
+    worker = VideoPlaybackWorker(Path("evidence.m3u8"), reverse_prefetch=False)
+    worker._playing = False
+    worker._frame_count = 40
+    worker._reverse_window_frames = 4
+
+    capture_next_frame = worker._prefetch_sequential_forward(
+        capture,
+        11,
+        10,
+        generation=worker._request_generation,
+    )
+
+    assert capture_next_frame == 15
+    assert capture.read_positions == [11, 12, 13, 14]
+    assert list(worker._frame_cache) == [11, 12, 13, 14]
+
+
+def test_disabled_hls_idle_prefetch_does_not_read_ahead():
+    capture = _FakeCapture(frame_count=40)
+    capture.position = 11
+    worker = VideoPlaybackWorker(
+        Path("evidence.m3u8"),
+        reverse_prefetch=False,
+        idle_prefetch=False,
+    )
+    worker._playing = False
+    worker._frame_count = 40
+    worker._reverse_window_frames = 4
+
+    capture_next_frame = worker._prefetch_sequential_forward(
+        capture,
+        11,
+        10,
+        generation=worker._request_generation,
+    )
+
+    assert capture_next_frame == 11
+    assert capture.read_positions == []
+    assert list(worker._frame_cache) == []
+
+
+def test_hls_idle_prefetch_yields_to_a_new_step_request():
+    capture = _BlockingFrameCapture(frame_count=40, block_position=11)
+    capture.position = 11
+    worker = VideoPlaybackWorker(Path("evidence.m3u8"), reverse_prefetch=False)
+    worker._playing = False
+    worker._frame_count = 40
+    worker._reverse_window_frames = 4
+    worker._current_frame_index = 10
+    worker._navigation_frame_index = 10
+    generation = worker._request_generation
+    result = []
+    prefetch_thread = threading.Thread(
+        target=lambda: result.append(
+            worker._prefetch_sequential_forward(
+                capture,
+                11,
+                10,
+                generation=generation,
+            )
+        )
+    )
+
+    prefetch_thread.start()
+    assert capture.read_started.wait(1.0)
+    worker.step(1)
+    capture.allow_read.set()
+    prefetch_thread.join(2.0)
+
+    assert not prefetch_thread.is_alive()
+    assert result == [12]
+    assert list(worker._frame_cache) == [11]
+
+    requested_frame, request_generation = worker._step_frame
+    worker._step_frame = None
+    ok, capture_next_frame = worker._decode_target(
+        capture,
+        requested_frame,
+        result[0],
+        generation=request_generation,
+    )
+
+    assert ok
+    assert capture_next_frame == 12
+    assert capture.set_positions == []
+    assert capture.read_positions == [11]
+
+
+def test_parked_hls_cache_keeps_the_nearby_navigation_window():
+    capture = _FakeCapture(frame_count=40)
+    worker = VideoPlaybackWorker(Path("evidence.m3u8"), reverse_prefetch=False)
+    worker._playing = False
+    worker._frame_count = 40
+    worker._reverse_window_frames = 4
+
+    ok, capture_next_frame = worker._decode_target(
+        capture,
+        10,
+        0,
+        generation=worker._request_generation,
+    )
+    assert ok
+    capture_next_frame = worker._prefetch_sequential_forward(
+        capture,
+        capture_next_frame,
+        10,
+        generation=worker._request_generation,
+    )
+    worker.park_cache()
+
+    assert list(worker._frame_cache) == list(range(7, 15))
+    generation = worker._request_generation
+    ok, parked_next_frame = worker._decode_target(
+        capture,
+        11,
+        capture_next_frame,
+        generation=generation,
+    )
+
+    assert ok
+    assert parked_next_frame == capture_next_frame
+    assert capture.set_positions == []
+
+
+def test_release_cache_blocks_an_inflight_forward_prefetch_write():
+    capture = _BlockingFrameCapture(frame_count=40, block_position=11)
+    capture.position = 11
+    worker = VideoPlaybackWorker(Path("evidence.m3u8"), reverse_prefetch=False)
+    worker._playing = False
+    worker._frame_count = 40
+    worker._reverse_window_frames = 4
+    generation = worker._request_generation
+    result = []
+    prefetch_thread = threading.Thread(
+        target=lambda: result.append(
+            worker._prefetch_sequential_forward(
+                capture,
+                11,
+                10,
+                generation=generation,
+            )
+        )
+    )
+
+    prefetch_thread.start()
+    assert capture.read_started.wait(1.0)
+    worker.release_cache()
+    capture.allow_read.set()
+    prefetch_thread.join(2.0)
+
+    assert not prefetch_thread.is_alive()
+    assert result == [12]
+    assert list(worker._frame_cache) == []
 
 
 def test_reverse_double_buffer_fits_inside_default_cache_budget():

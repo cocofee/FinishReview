@@ -379,6 +379,7 @@ class VideoPlaybackWorker(QThread):
     REVERSE_WINDOW_SECONDS = 0.5
     MIN_REVERSE_WINDOW_FRAMES = 8
     REVERSE_PREFETCH_TRIGGER_RATIO = 0.5
+    FORWARD_PREFETCH_IDLE_SECONDS = 0.04
     DEFAULT_CACHE_BYTES = 64 * 1024 * 1024
 
     def __init__(
@@ -388,11 +389,13 @@ class VideoPlaybackWorker(QThread):
         *,
         capture_factory: Callable[[str], cv2.VideoCapture] = cv2.VideoCapture,
         reverse_prefetch: bool = True,
+        idle_prefetch: bool = True,
     ):
         super().__init__(parent)
         self.video_path = Path(video_path)
         self._capture_factory = capture_factory
         self._reverse_prefetch_enabled = bool(reverse_prefetch)
+        self._idle_prefetch_enabled = bool(idle_prefetch)
         self._condition = threading.Condition()
         self._cache_lock = threading.Lock()
         self._stop_requested = False
@@ -401,7 +404,8 @@ class VideoPlaybackWorker(QThread):
         self._direction = 1
         self._seek_frame: Optional[tuple[int, int]] = None
         self._full_resolution_frame: Optional[tuple[int, int]] = None
-        self._step_frames = 0
+        self._step_frame: Optional[tuple[int, int]] = None
+        self._navigation_frame_index = -1
         self._request_generation = 0
         self._anchor_reset = True
         self._current_frame_index = -1
@@ -412,6 +416,7 @@ class VideoPlaybackWorker(QThread):
         self._sequential_capture = self.video_path.suffix.lower() == ".m3u8"
         self._frame_cache: OrderedDict[int, QImage] = OrderedDict()
         self._frame_cache_bytes = 0
+        self._cache_generation = 0
         self._max_cache_bytes = self.DEFAULT_CACHE_BYTES
         self._reverse_window_frames = 25
         self._reverse_current_window: Optional[tuple[int, int, int]] = None
@@ -440,6 +445,8 @@ class VideoPlaybackWorker(QThread):
             self._request_generation += 1
             self._playing = False
             self._reset_reverse_prefetch_locked()
+            self._step_frame = None
+            self._navigation_frame_index = self._current_frame_index
             self._full_resolution_frame = None
             self._condition.notify_all()
 
@@ -448,6 +455,8 @@ class VideoPlaybackWorker(QThread):
         with self._condition:
             self._request_generation += 1
             self._reset_reverse_prefetch_locked()
+            self._step_frame = None
+            self._navigation_frame_index = self._current_frame_index
             self._full_resolution_frame = None
             if abs(speed) < 0.01:
                 self._playing = False
@@ -467,6 +476,8 @@ class VideoPlaybackWorker(QThread):
                 max(0, min(int(frame_index), upper)),
                 self._request_generation,
             )
+            self._step_frame = None
+            self._navigation_frame_index = self._seek_frame[0]
             self._full_resolution_frame = None
             self._anchor_reset = True
             self._condition.notify_all()
@@ -485,6 +496,8 @@ class VideoPlaybackWorker(QThread):
                 max(0, min(frame_index, upper)),
                 self._request_generation,
             )
+            self._step_frame = None
+            self._navigation_frame_index = self._seek_frame[0]
             self._full_resolution_frame = None
             self._direction = 1 if speed >= 0 else -1
             self._speed = max(0.01, abs(speed))
@@ -500,12 +513,31 @@ class VideoPlaybackWorker(QThread):
         self.seek_frame(self.current_frame_index + delta_frames)
 
     def step(self, frame_delta: int) -> None:
+        frame_delta = int(frame_delta)
+        if not frame_delta:
+            return
         with self._condition:
             self._request_generation += 1
             self._reset_reverse_prefetch_locked()
             self._playing = False
+            self._seek_frame = None
             self._full_resolution_frame = None
-            self._step_frames += int(frame_delta)
+            base_frame = self._navigation_frame_index
+            if base_frame < 0:
+                base_frame = self._current_frame_index
+            target = self._clamp_frame(max(0, base_frame) + frame_delta)
+            self._navigation_frame_index = target
+            self._step_frame = (target, self._request_generation)
+            self._condition.notify_all()
+
+    def set_idle_prefetch_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        with self._condition:
+            if enabled == self._idle_prefetch_enabled:
+                return
+            self._request_generation += 1
+            self._idle_prefetch_enabled = enabled
+            self._reset_reverse_prefetch_locked()
             self._condition.notify_all()
 
     def request_full_resolution(self, frame_index: Optional[int] = None) -> None:
@@ -528,10 +560,30 @@ class VideoPlaybackWorker(QThread):
     def release_cache(self) -> None:
         with self._condition:
             self._request_generation += 1
+            self._cache_generation += 1
             self._reset_reverse_prefetch_locked()
+            self._step_frame = None
+            self._navigation_frame_index = self._current_frame_index
             self._full_resolution_frame = None
             self._condition.notify_all()
         self._clear_frame_cache()
+
+    def park_cache(self) -> None:
+        with self._condition:
+            self._request_generation += 1
+            self._reset_reverse_prefetch_locked()
+            self._step_frame = None
+            self._navigation_frame_index = self._current_frame_index
+            self._full_resolution_frame = None
+            current_frame_index = self._current_frame_index
+            self._condition.notify_all()
+        if current_frame_index < 0:
+            self._clear_frame_cache()
+            return
+        self._trim_cache_to_range(
+            max(0, current_frame_index - self._reverse_window_frames + 1),
+            self._clamp_frame(current_frame_index + self._reverse_window_frames),
+        )
 
     def _reset_reverse_prefetch_locked(self) -> None:
         self._reverse_prefetch_serial += 1
@@ -626,6 +678,34 @@ class VideoPlaybackWorker(QThread):
                 generation is not None
                 and generation != self._request_generation
             )
+
+    def _idle_prefetch_cancelled(self, generation: int) -> bool:
+        with self._condition:
+            return (
+                self._stop_requested
+                or not self._idle_prefetch_enabled
+                or not self._sequential_capture
+                or self._playing
+                or generation != self._request_generation
+                or self._seek_frame is not None
+                or self._step_frame is not None
+                or self._full_resolution_frame is not None
+            )
+
+    def _cache_image_if_generation(
+        self,
+        frame_index: int,
+        image: QImage,
+        cache_generation: int,
+    ) -> bool:
+        with self._condition:
+            if (
+                self._stop_requested
+                or cache_generation != self._cache_generation
+            ):
+                return False
+            self._cache_image(frame_index, image)
+            return True
 
     def _playlist_duration_ms(self) -> Optional[int]:
         if not self._sequential_capture:
@@ -938,6 +1018,8 @@ class VideoPlaybackWorker(QThread):
                 return False
             self._current_frame_index = frame_index
             self._current_position_ms = position_ms
+            if self._seek_frame is None and self._step_frame is None:
+                self._navigation_frame_index = frame_index
         self.frame_ready.emit(image, position_ms, frame_index)
         return True
 
@@ -1049,6 +1131,40 @@ class VideoPlaybackWorker(QThread):
             return False, capture_next_frame
         self._emit_image(target_image, target, generation=generation)
         return True, capture_next_frame
+
+    def _prefetch_sequential_forward(
+        self,
+        capture,
+        capture_next_frame: int,
+        current_frame_index: int,
+        *,
+        generation: int,
+    ) -> int:
+        if current_frame_index < 0 or self._idle_prefetch_cancelled(generation):
+            return capture_next_frame
+        with self._condition:
+            cache_generation = self._cache_generation
+
+        prefetch_end = self._clamp_frame(
+            current_frame_index + self._reverse_window_frames
+        )
+        while capture_next_frame <= prefetch_end:
+            if self._idle_prefetch_cancelled(generation):
+                break
+            frame_index = capture_next_frame
+            ok, frame = capture.read()
+            if not ok:
+                break
+            capture_next_frame = frame_index + 1
+            if frame_index > current_frame_index:
+                self._cache_image_if_generation(
+                    frame_index,
+                    self._image_from_frame(frame),
+                    cache_generation,
+                )
+            if self._idle_prefetch_cancelled(generation):
+                break
+        return capture_next_frame
 
     def _decode_reverse_window(
         self,
@@ -1204,8 +1320,8 @@ class VideoPlaybackWorker(QThread):
                     self._seek_frame = None
                     full_resolution_frame = self._full_resolution_frame
                     self._full_resolution_frame = None
-                    step_frames = self._step_frames
-                    self._step_frames = 0
+                    step_frame = self._step_frame
+                    self._step_frame = None
                     playing = self._playing
                     speed = self._speed
                     direction = self._direction
@@ -1222,7 +1338,7 @@ class VideoPlaybackWorker(QThread):
                         capture_next_frame,
                         generation=generation,
                     )
-                    if ok:
+                    if ok and not self._decode_request_cancelled(generation):
                         last_frame_index = target
                         anchor_frame = last_frame_index + direction
                     anchor_clock = time.monotonic()
@@ -1238,22 +1354,32 @@ class VideoPlaybackWorker(QThread):
                     )
                     continue
 
-                if step_frames:
-                    target = self._clamp_frame(last_frame_index + step_frames)
+                if step_frame is not None:
+                    requested_frame, generation = step_frame
+                    target = self._clamp_frame(requested_frame)
                     ok, capture_next_frame = self._decode_target(
                         capture,
                         target,
                         capture_next_frame,
-                        generation=request_generation,
-                        reverse_window=step_frames < 0,
+                        generation=generation,
+                        reverse_window=target < last_frame_index,
                     )
-                    if ok:
+                    if ok and not self._decode_request_cancelled(generation):
                         last_frame_index = target
                     continue
 
                 if not playing:
                     with self._condition:
-                        self._condition.wait(timeout=0.05)
+                        self._condition.wait(
+                            timeout=self.FORWARD_PREFETCH_IDLE_SECONDS
+                        )
+                        prefetch_generation = self._request_generation
+                    capture_next_frame = self._prefetch_sequential_forward(
+                        capture,
+                        capture_next_frame,
+                        last_frame_index,
+                        generation=prefetch_generation,
+                    )
                     continue
 
                 if anchor_reset:
@@ -1288,7 +1414,8 @@ class VideoPlaybackWorker(QThread):
                         self._playing = False
                     self.playback_finished.emit()
                     continue
-                last_frame_index = target
+                if not self._decode_request_cancelled(request_generation):
+                    last_frame_index = target
         except Exception as exc:
             self.playback_error.emit(f"录像回放失败: {exc}")
         finally:

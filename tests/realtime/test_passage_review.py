@@ -47,7 +47,7 @@ class _FakePlaybackWorker(QObject):
     finished = pyqtSignal()
     instances = []
 
-    def __init__(self, video_path, parent=None):
+    def __init__(self, video_path, parent=None, *, idle_prefetch=True):
         super().__init__(parent)
         self.video_path = Path(video_path)
         self.running = False
@@ -60,6 +60,8 @@ class _FakePlaybackWorker(QObject):
         self.step_calls = []
         self.full_resolution_calls = []
         self.release_cache_calls = 0
+        self.park_cache_calls = 0
+        self.idle_prefetch_calls = [bool(idle_prefetch)]
         type(self).instances.append(self)
 
     def start(self):
@@ -94,6 +96,12 @@ class _FakePlaybackWorker(QObject):
 
     def release_cache(self):
         self.release_cache_calls += 1
+
+    def park_cache(self):
+        self.park_cache_calls += 1
+
+    def set_idle_prefetch_enabled(self, enabled):
+        self.idle_prefetch_calls.append(bool(enabled))
 
     def stop(self):
         self.stopped = True
@@ -268,6 +276,15 @@ def test_review_shows_two_regular_camera_locations_side_by_side(
     assert second_pane.camera_combo.isVisible() is False
     assert first_pane.location.video_path == first_path.absolute()
     assert second_pane.location.video_path == second_path.absolute()
+    first_worker, second_worker = fake_playback.instances
+    assert first_worker.idle_prefetch_calls[-1] is True
+    assert second_worker.idle_prefetch_calls[-1] is False
+
+    second_pane.step_requested.emit(1)
+    qapp.processEvents()
+
+    assert first_worker.idle_prefetch_calls[-1] is False
+    assert second_worker.idle_prefetch_calls[-1] is True
     dialog.show()
     qapp.processEvents()
     assert first_pane.isVisible()
@@ -1969,7 +1986,8 @@ def test_switching_single_pane_playback_aligns_without_starting_other_pane(
     assert dialog.high_speed_pane.is_playing
     assert high_speed_worker.seek_calls == [1_120]
     assert high_speed_worker.speed_calls == [1.0]
-    assert regular_worker.release_cache_calls == 1
+    assert regular_worker.park_cache_calls == 1
+    assert regular_worker.release_cache_calls == 0
     dialog.close()
 
 
