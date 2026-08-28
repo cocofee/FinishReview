@@ -837,6 +837,7 @@ class PassageEvidencePane(QFrame):
         self._identity = ""
         self._worker: Optional[object] = None
         self._retired_workers: set[object] = set()
+        self._idle_prefetch_enabled = False
         self._target_position_ms = 0
         self._playing = False
         self._duration_ms = 0
@@ -1385,6 +1386,9 @@ class PassageEvidencePane(QFrame):
             if location.segment.clock_source == AUYAT_CLOCK_SOURCE
             else VideoPlaybackWorker(location.video_path, self)
         )
+        set_idle_prefetch = getattr(worker, "set_idle_prefetch_enabled", None)
+        if callable(set_idle_prefetch):
+            set_idle_prefetch(self._idle_prefetch_enabled)
         worker.pause()
         worker.metadata_ready.connect(self._on_metadata_ready)
         worker.frame_ready.connect(self._on_frame_ready)
@@ -1754,6 +1758,27 @@ class PassageEvidencePane(QFrame):
         release_cache = getattr(worker, "release_cache", None)
         if callable(release_cache):
             release_cache()
+
+    def park_playback_cache(self) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        park_cache = getattr(worker, "park_cache", None)
+        if callable(park_cache):
+            park_cache()
+            return
+        release_cache = getattr(worker, "release_cache", None)
+        if callable(release_cache):
+            release_cache()
+
+    def set_idle_prefetch_enabled(self, enabled: bool) -> None:
+        self._idle_prefetch_enabled = bool(enabled)
+        worker = self._worker
+        if worker is None:
+            return
+        set_enabled = getattr(worker, "set_idle_prefetch_enabled", None)
+        if callable(set_enabled):
+            set_enabled(self._idle_prefetch_enabled)
 
     def linked_drift_tolerance_ms(self) -> int:
         return max(
@@ -2220,6 +2245,7 @@ class PassageReviewDialog(QDialog):
             self._configured_regular_camera_indexes,
             show_high_speed=self._show_high_speed_pane,
         )
+        self._set_active_idle_prefetch(self._active_pane)
 
         review_panel = QFrame(self)
         review_layout = QVBoxLayout(review_panel)
@@ -2335,6 +2361,7 @@ class PassageReviewDialog(QDialog):
         self.regular_pane = self.regular_panes[0]
         if self._active_pane not in self.evidence_panes:
             self._active_pane = self.regular_pane
+        self._set_active_idle_prefetch(self._active_pane)
 
         active_regular = set(normalized_indexes)
         for camera_index, pane in self._regular_panes_by_camera.items():
@@ -3781,10 +3808,18 @@ class PassageReviewDialog(QDialog):
         return self._active_pane or self.regular_pane
 
     def _pause_inactive_panes(self, active: PassageEvidencePane) -> None:
+        self._set_active_idle_prefetch(active)
         for pane in self.evidence_panes:
             if pane is not active:
                 pane.set_playing(False)
-                pane.release_playback_cache()
+                pane.park_playback_cache()
+
+    def _set_active_idle_prefetch(
+        self,
+        active: Optional[PassageEvidencePane],
+    ) -> None:
+        for pane in self.all_evidence_panes:
+            pane.set_idle_prefetch_enabled(pane is active)
 
     def _update_shared_from_pane(self, pane: PassageEvidencePane) -> None:
         delta_ms = pane.current_delta_ms()
