@@ -6,6 +6,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from statistics import median
 from typing import Callable, Optional
 
 import cv2
@@ -348,6 +349,7 @@ class VideoPlaybackWorker(QThread):
         self._duration_ms = 0
         self._frame_count = 0
         self._fps = 25.0
+        self._sequential_capture = self.video_path.suffix.lower() == ".m3u8"
         self._frame_cache: OrderedDict[int, QImage] = OrderedDict()
         self._frame_cache_bytes = 0
         self._max_cache_bytes = self.DEFAULT_CACHE_BYTES
@@ -565,8 +567,95 @@ class VideoPlaybackWorker(QThread):
                 and generation != self._request_generation
             )
 
+    def _playlist_duration_ms(self) -> Optional[int]:
+        if not self._sequential_capture:
+            return None
+        try:
+            lines = self.video_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return None
+
+        duration_seconds = 0.0
+        found_duration = False
+        for line in lines:
+            if not line.startswith("#EXTINF:"):
+                continue
+            try:
+                value = float(line.split(":", 1)[1].split(",", 1)[0])
+            except (IndexError, ValueError):
+                return None
+            if value <= 0:
+                return None
+            duration_seconds += value
+            found_duration = True
+        if not found_duration:
+            return None
+        return max(1, int(round(duration_seconds * 1000.0)))
+
+    def _probe_sequential_fps(self, fallback_fps: float) -> float:
+        if not self._sequential_capture:
+            return fallback_fps
+        capture = _open_video_capture(self.video_path, self._capture_factory)
+        try:
+            if not capture or not capture.isOpened():
+                return fallback_fps
+            timestamps = []
+            for _ in range(8):
+                ok, _frame = capture.read()
+                if not ok:
+                    break
+                timestamps.append(
+                    float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                )
+            intervals = [
+                current - previous
+                for previous, current in zip(timestamps, timestamps[1:])
+                if 0.5 <= current - previous <= 1000.0
+            ]
+            if not intervals:
+                return fallback_fps
+            probed_fps = 1000.0 / float(median(intervals))
+            if not 1.0 <= probed_fps <= 240.0:
+                return fallback_fps
+            return probed_fps
+        except (TypeError, ValueError):
+            return fallback_fps
+        finally:
+            if capture:
+                capture.release()
+
+    def _position_capture(
+        self,
+        capture,
+        target: int,
+        capture_next_frame: int,
+    ) -> tuple[bool, int]:
+        if target == capture_next_frame:
+            return True, capture_next_frame
+
+        if self._sequential_capture:
+            if capture_next_frame < 0 or target < capture_next_frame:
+                if not capture.set(cv2.CAP_PROP_POS_FRAMES, 0):
+                    return False, capture_next_frame
+                capture_next_frame = 0
+            forward_gap = target - capture_next_frame
+            for _ in range(max(0, forward_gap)):
+                if not capture.grab():
+                    return False, capture_next_frame
+            return True, target
+
+        forward_gap = target - capture_next_frame
+        if capture_next_frame >= 0 and 0 < forward_gap <= 12:
+            for _ in range(forward_gap):
+                if not capture.grab():
+                    return False, capture_next_frame
+            return True, target
+        if not capture.set(cv2.CAP_PROP_POS_FRAMES, target):
+            return False, capture_next_frame
+        return True, target
+
     def _start_reverse_prefetcher(self) -> None:
-        if not self._reverse_prefetch_enabled:
+        if not self._reverse_prefetch_enabled or self._sequential_capture:
             return
         self._reverse_prefetch_shutdown = False
         thread = threading.Thread(
@@ -733,7 +822,11 @@ class VideoPlaybackWorker(QThread):
         target: int,
         generation: Optional[int],
     ) -> None:
-        if not self._reverse_prefetch_enabled or generation is None:
+        if (
+            not self._reverse_prefetch_enabled
+            or self._sequential_capture
+            or generation is None
+        ):
             return
         self._update_reverse_window_for_target(target, generation)
         with self._condition:
@@ -806,6 +899,14 @@ class VideoPlaybackWorker(QThread):
                 self._maybe_schedule_reverse_prefetch(target, generation)
             return True, capture_next_frame
 
+        if self._sequential_capture:
+            return self._decode_sequential_target(
+                capture,
+                target,
+                capture_next_frame,
+                generation=generation,
+            )
+
         if reverse_window:
             return self._decode_reverse_window(
                 capture,
@@ -814,25 +915,25 @@ class VideoPlaybackWorker(QThread):
                 generation=generation,
             )
 
-        if target != capture_next_frame:
-            forward_gap = target - capture_next_frame
-            if capture_next_frame >= 0 and 0 < forward_gap <= 12:
-                for _ in range(forward_gap):
-                    if not capture.grab():
-                        return False, capture_next_frame
-                capture_next_frame = target
-            else:
-                if not capture.set(cv2.CAP_PROP_POS_FRAMES, target):
-                    return False, capture_next_frame
-                capture_next_frame = target
+        positioned, capture_next_frame = self._position_capture(
+            capture,
+            target,
+            capture_next_frame,
+        )
+        if not positioned:
+            return False, capture_next_frame
 
         ok, frame = capture.read()
         if not ok:
             return False, capture_next_frame
-        actual_frame_index = self._reported_decoded_frame_index(capture, target)
-        capture_next_frame = int(
-            capture.get(cv2.CAP_PROP_POS_FRAMES) or actual_frame_index + 1
-        )
+        if self._sequential_capture:
+            actual_frame_index = target
+            capture_next_frame = target + 1
+        else:
+            actual_frame_index = self._reported_decoded_frame_index(capture, target)
+            capture_next_frame = int(
+                capture.get(cv2.CAP_PROP_POS_FRAMES) or actual_frame_index + 1
+            )
         if self._decode_request_cancelled(generation):
             return True, capture_next_frame
         if actual_frame_index != target:
@@ -840,6 +941,53 @@ class VideoPlaybackWorker(QThread):
         image = self._image_from_frame(frame)
         self._cache_image(target, image)
         self._emit_image(image, target, generation=generation)
+        return True, capture_next_frame
+
+    def _decode_sequential_target(
+        self,
+        capture,
+        target: int,
+        capture_next_frame: int,
+        *,
+        generation: Optional[int],
+    ) -> tuple[bool, int]:
+        if target < capture_next_frame:
+            if not capture.set(cv2.CAP_PROP_POS_FRAMES, 0):
+                return False, capture_next_frame
+            capture_next_frame = 0
+
+        cache_start = max(
+            capture_next_frame,
+            target - self._reverse_window_frames + 1,
+        )
+        while capture_next_frame < cache_start:
+            if self._decode_request_cancelled(generation):
+                return True, capture_next_frame
+            if not capture.grab():
+                return False, capture_next_frame
+            capture_next_frame += 1
+
+        target_image = None
+        while capture_next_frame <= target:
+            if self._decode_request_cancelled(generation):
+                return True, capture_next_frame
+            frame_index = capture_next_frame
+            ok, frame = capture.read()
+            if not ok:
+                return False, capture_next_frame
+            capture_next_frame = frame_index + 1
+            if self._decode_request_cancelled(generation):
+                return True, capture_next_frame
+            image = self._image_from_frame(frame)
+            self._cache_image(frame_index, image)
+            if frame_index == target:
+                target_image = image
+
+        if target_image is None:
+            target_image = self._cached_image(target)
+        if target_image is None:
+            return False, capture_next_frame
+        self._emit_image(target_image, target, generation=generation)
         return True, capture_next_frame
 
     def _decode_reverse_window(
@@ -861,10 +1009,13 @@ class VideoPlaybackWorker(QThread):
             self._reverse_current_window = None
             self._reverse_prefetched_window = None
         window_start = max(0, target - self._reverse_window_frames + 1)
-        if capture_next_frame != window_start:
-            if not capture.set(cv2.CAP_PROP_POS_FRAMES, window_start):
-                return False, capture_next_frame
-            capture_next_frame = window_start
+        positioned, capture_next_frame = self._position_capture(
+            capture,
+            window_start,
+            capture_next_frame,
+        )
+        if not positioned:
+            return False, capture_next_frame
 
         for frame_index in range(window_start, target + 1):
             with self._condition:
@@ -876,13 +1027,17 @@ class VideoPlaybackWorker(QThread):
             ok, frame = capture.read()
             if not ok:
                 return False, capture_next_frame
-            actual_frame_index = self._reported_decoded_frame_index(
-                capture,
-                frame_index,
-            )
-            capture_next_frame = int(
-                capture.get(cv2.CAP_PROP_POS_FRAMES) or actual_frame_index + 1
-            )
+            if self._sequential_capture:
+                actual_frame_index = frame_index
+                capture_next_frame = frame_index + 1
+            else:
+                actual_frame_index = self._reported_decoded_frame_index(
+                    capture,
+                    frame_index,
+                )
+                capture_next_frame = int(
+                    capture.get(cv2.CAP_PROP_POS_FRAMES) or actual_frame_index + 1
+                )
             if self._decode_request_cancelled(generation):
                 return True, capture_next_frame
             if actual_frame_index != frame_index:
@@ -907,17 +1062,24 @@ class VideoPlaybackWorker(QThread):
         with self._condition:
             if generation != self._request_generation:
                 return True, capture_next_frame
-        if target != capture_next_frame:
-            if not capture.set(cv2.CAP_PROP_POS_FRAMES, target):
-                return False, capture_next_frame
-            capture_next_frame = target
+        positioned, capture_next_frame = self._position_capture(
+            capture,
+            target,
+            capture_next_frame,
+        )
+        if not positioned:
+            return False, capture_next_frame
         ok, frame = capture.read()
         if not ok:
             return False, capture_next_frame
-        actual_frame_index = self._reported_decoded_frame_index(capture, target)
-        capture_next_frame = int(
-            capture.get(cv2.CAP_PROP_POS_FRAMES) or actual_frame_index + 1
-        )
+        if self._sequential_capture:
+            actual_frame_index = target
+            capture_next_frame = target + 1
+        else:
+            actual_frame_index = self._reported_decoded_frame_index(capture, target)
+            capture_next_frame = int(
+                capture.get(cv2.CAP_PROP_POS_FRAMES) or actual_frame_index + 1
+            )
         if self._decode_request_cancelled(generation):
             return True, capture_next_frame
         if actual_frame_index != target:
@@ -937,17 +1099,29 @@ class VideoPlaybackWorker(QThread):
                 self.playback_error.emit(f"无法打开录像: {self.video_path}")
                 return
 
-            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-            self._fps = fps if fps > 0.1 else 25.0
-            self._frame_count = max(0, int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+            reported_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            reported_fps = reported_fps if reported_fps > 0.1 else 25.0
+            reported_frame_count = max(
+                0,
+                int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
+            )
+            reported_duration_ms = (
+                int(reported_frame_count * 1000.0 / reported_fps)
+                if reported_frame_count
+                else 0
+            )
+            self._fps = self._probe_sequential_fps(reported_fps)
+            self._duration_ms = self._playlist_duration_ms() or reported_duration_ms
+            self._frame_count = (
+                max(1, int(round(self._duration_ms * self._fps / 1000.0)))
+                if self._sequential_capture and self._duration_ms
+                else reported_frame_count
+            )
             width = max(0, int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0))
             height = max(0, int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0))
             self._configure_reverse_window(width, height)
-            self._duration_ms = (
-                int(self._frame_count * 1000.0 / self._fps)
-                if self._frame_count
-                else 0
-            )
+            if not self._duration_ms and self._frame_count:
+                self._duration_ms = int(self._frame_count * 1000.0 / self._fps)
             self.metadata_ready.emit(
                 self._duration_ms,
                 self._fps,
