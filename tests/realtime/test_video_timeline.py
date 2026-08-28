@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import cv2
 import realtime.video_timeline as video_timeline
@@ -123,6 +124,29 @@ def test_reports_before_after_and_restart_gap(tmp_path):
     assert store.locate_passage(21_000).status == "after_recording"
     lookup = store.locate_passage(14_000)
     assert lookup.locations[0].video_path.name == "second.mkv"
+
+
+def test_boundary_status_uses_incremental_index_without_scanning_all_segments(
+    tmp_path,
+):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _segment(
+        store,
+        tmp_path,
+        name="race-1.mkv",
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        race_id="race-1",
+    )
+
+    class NoIterationList(list):
+        def __iter__(self):
+            raise AssertionError("locate_passage scanned the complete segment order")
+
+    store._segment_order = NoIterationList(store._segment_order)
+
+    assert store.locate_passage(9_000, race_id="race-1").status == "before_recording"
+    assert store.locate_passage(21_000, race_id="race-1").status == "after_recording"
 
 
 def test_reports_hls_playlist_with_missing_media_segment_as_missing(tmp_path):
@@ -341,6 +365,62 @@ def test_restart_restores_segment_boundaries_and_relative_paths(tmp_path):
     assert restored_segment.media_started_at_ms == 10_000
     assert restored.resolve_video_path(restored_segment) == path.absolute()
     assert not restored_segment.video_path.startswith(str(tmp_path))
+
+
+def test_path_index_and_revision_survive_restart(tmp_path):
+    journal = tmp_path / "video_timeline.jsonl"
+    store = VideoTimelineStore(journal)
+    segment, path = _segment(store, tmp_path)
+
+    assert store.revision == 2
+    assert store.find_segment_by_video_path(path) == store.segments()[0]
+
+    restored = VideoTimelineStore(journal)
+
+    assert restored.revision == 2
+    assert restored.find_segment_by_video_path(path).segment_id == segment.segment_id
+
+
+def test_repeated_lookup_reuses_playability_check(tmp_path, monkeypatch):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _segment(store, tmp_path)
+    calls = []
+    original = video_timeline._video_path_is_playable
+
+    def counted(path):
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(video_timeline, "_video_path_is_playable", counted)
+
+    assert store.locate_passage(15_000).status == "located"
+    assert store.locate_passage(15_100).status == "located"
+
+    assert len(calls) == 1
+
+
+def test_playability_cache_avoids_repeated_file_stat_within_ttl(
+    tmp_path,
+    monkeypatch,
+):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _, path = _segment(store, tmp_path)
+    original_stat = Path.stat
+    calls = []
+
+    def counted_stat(candidate, *args, **kwargs):
+        if candidate == path.absolute():
+            calls.append(candidate)
+        return original_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+
+    assert store.locate_passage(15_000).status == "located"
+    first_lookup_calls = len(calls)
+    assert store.locate_passage(15_100).status == "located"
+
+    assert first_lookup_calls > 0
+    assert len(calls) == first_lookup_calls
 
 
 def test_recovers_only_an_incomplete_final_record(tmp_path):

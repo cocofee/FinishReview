@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from realtime.review_clip import PassageReviewBindingStore
 from realtime.review_recorder import (
     ArchiveTimelinePublisher,
     FfmpegReviewRecorder,
@@ -735,6 +736,158 @@ def test_ready_window_publishes_one_idempotent_playable_timeline(
     )
     assert located.status == "located"
     assert located.locations[0].passage_position_ms == 3_000
+
+
+def test_identical_windows_share_one_playlist_and_timeline_segment(tmp_path):
+    buffer_dir = tmp_path / "review_buffer" / "camera_01"
+    buffer_dir.mkdir(parents=True)
+    playlist = _write_playlist(
+        buffer_dir,
+        [
+            ("before.ts", "2026-08-21T11:59:58.000+00:00", 2.0),
+            ("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0),
+            ("after.ts", "2026-08-21T12:00:02.000+00:00", 2.0),
+        ],
+    )
+    ring_buffer = ReviewRingBuffer(playlist, camera_index=1)
+    coordinator = PassageReviewCoordinator(ring_buffer)
+    first_window = coordinator.register(
+        "race-1-stage-1-passage-15",
+        passage_timestamp_ms=1_787_313_601_000,
+    )
+    second_window = coordinator.register(
+        "race-1-stage-1-passage-16",
+        passage_timestamp_ms=1_787_313_601_000,
+    )
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    publisher = PassageReviewTimelinePublisher(ring_buffer, timeline)
+
+    first = publisher.publish(first_window, race_id="race-1")
+    second = publisher.publish(second_window, race_id="race-1")
+
+    assert second == first
+    assert len(timeline.segments()) == 1
+    evidence_playlists = tuple(buffer_dir.glob("evidence_shared_*.m3u8"))
+    assert len(evidence_playlists) == 1
+    assert timeline.resolve_video_path(first) == evidence_playlists[0].resolve()
+
+
+def test_publish_many_merges_overlapping_windows_and_batches_bindings(tmp_path):
+    buffer_dir = tmp_path / "review_buffer" / "camera_01"
+    buffer_dir.mkdir(parents=True)
+    playlist = _write_playlist(
+        buffer_dir,
+        [
+            ("s0.ts", "2026-08-21T11:59:58.000+00:00", 2.0),
+            ("s1.ts", "2026-08-21T12:00:00.000+00:00", 2.0),
+            ("s2.ts", "2026-08-21T12:00:02.000+00:00", 2.0),
+            ("s3.ts", "2026-08-21T12:00:04.000+00:00", 2.0),
+            ("s4.ts", "2026-08-21T12:00:06.000+00:00", 2.0),
+            ("s5.ts", "2026-08-21T12:00:08.000+00:00", 2.0),
+        ],
+    )
+    ring_buffer = ReviewRingBuffer(playlist, camera_index=1)
+    coordinator = PassageReviewCoordinator(ring_buffer)
+    windows = tuple(
+        coordinator.register(
+            f"passage-{index}",
+            passage_timestamp_ms=timestamp_ms,
+        )
+        for index, timestamp_ms in enumerate(
+            (
+                1_787_313_601_000,
+                1_787_313_603_000,
+                1_787_313_605_000,
+            ),
+            start=1,
+        )
+    )
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    binding_store = PassageReviewBindingStore(tmp_path / "review_clips.jsonl")
+    publisher = PassageReviewTimelinePublisher(
+        ring_buffer,
+        timeline,
+        binding_store=binding_store,
+    )
+
+    segment = publisher.publish_many(
+        tuple((window, 1) for window in windows),
+        race_id="race-1",
+    )
+
+    assert len(timeline.segments()) == 1
+    clip_ids = {
+        binding_store.active_bindings(window.event_id, 1)[0].clip_id
+        for window in windows
+    }
+    assert len(clip_ids) == 1
+    offsets = [
+        binding_store.active_bindings(window.event_id, 1)[0].passage_offset_ms
+        for window in windows
+    ]
+    assert offsets == [3_000, 5_000, 7_000]
+    evidence_playlist = timeline.resolve_video_path(segment)
+    content = evidence_playlist.read_text(encoding="utf-8")
+    assert "s0.ts" in content
+    assert "s5.ts" in content
+
+
+def test_fifty_passages_in_five_seconds_publish_one_shared_clip(
+    tmp_path,
+    monkeypatch,
+):
+    buffer_dir = tmp_path / "review_buffer" / "camera_01"
+    buffer_dir.mkdir(parents=True)
+    playlist = _write_playlist(
+        buffer_dir,
+        [
+            (f"s{index}.ts", f"2026-08-21T11:59:{56 + index * 2:02d}.000+00:00", 2.0)
+            for index in range(2)
+        ]
+        + [
+            (f"s{index + 2}.ts", f"2026-08-21T12:00:{index * 2:02d}.000+00:00", 2.0)
+            for index in range(5)
+        ],
+    )
+    ring_buffer = ReviewRingBuffer(playlist, camera_index=1)
+    coordinator = PassageReviewCoordinator(ring_buffer)
+    base_timestamp_ms = 1_787_313_600_000
+    windows = tuple(
+        coordinator.register(
+            f"passage-{index:02d}",
+            passage_timestamp_ms=base_timestamp_ms + index * 100,
+        )
+        for index in range(50)
+    )
+    assert all(window.state is PassageReviewState.READY for window in windows)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    binding_store = PassageReviewBindingStore(tmp_path / "review_clips.jsonl")
+    append_sizes = []
+    original_append = binding_store._append_records
+
+    def counted_append(payloads):
+        append_sizes.append(len(payloads))
+        original_append(payloads)
+
+    monkeypatch.setattr(binding_store, "_append_records", counted_append)
+    publisher = PassageReviewTimelinePublisher(
+        ring_buffer,
+        timeline,
+        binding_store=binding_store,
+    )
+
+    publisher.publish_many(
+        tuple((window, 1) for window in windows),
+        race_id="race-1",
+    )
+
+    assert len(timeline.segments()) == 1
+    assert append_sizes == [1, 50]
+    clip_ids = {
+        binding_store.active_bindings(window.event_id, 1)[0].clip_id
+        for window in windows
+    }
+    assert len(clip_ids) == 1
 
 
 def test_incomplete_window_is_not_published(tmp_path):

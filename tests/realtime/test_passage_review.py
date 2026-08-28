@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from realtime.race_metadata import (
     RaceMetadata,
     RaceMetadataStore,
 )
+from realtime.review_clip import PassageReviewBindingStore
 from realtime.video_timeline import VideoTimelineStore
 
 
@@ -36,6 +38,15 @@ from realtime.video_timeline import VideoTimelineStore
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+def _wait_until(predicate, *, timeout_ms=1_000):
+    deadline = time.monotonic() + max(0, int(timeout_ms)) / 1_000.0
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        QTest.qWait(10)
+    return predicate()
 
 
 class _FakePlaybackWorker(QObject):
@@ -284,9 +295,10 @@ def test_review_shows_two_regular_camera_locations_side_by_side(
     assert first_worker.idle_prefetch_calls[-1] is True
     assert second_worker.idle_prefetch_calls[-1] is False
 
-    QTest.qWait(dialog.INACTIVE_CAMERA_START_DELAY_MS + 20)
-
-    assert second_worker.start_calls == 1
+    assert _wait_until(
+        lambda: second_worker.start_calls == 1,
+        timeout_ms=dialog.INACTIVE_CAMERA_START_DELAY_MS + 500,
+    )
 
     preview = QImage(1280, 720, QImage.Format_RGB888)
     preview.fill(0)
@@ -305,6 +317,137 @@ def test_review_shows_two_regular_camera_locations_side_by_side(
     assert first_pane.isVisible()
     assert second_pane.isVisible()
     assert dialog.high_speed_pane.isHidden()
+    dialog.close()
+
+
+def test_review_uses_direct_clip_binding_without_timeline_scan(
+    qapp,
+    tmp_path,
+    fake_playback,
+    monkeypatch,
+):
+    event = _event(passage_time_ms=5_000, passage_timestamp_ms=15_000)
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    video_path = tmp_path / "review_buffer" / "camera_01" / "shared.mkv"
+    segment = _add_segment(
+        timeline_store,
+        video_path,
+        source_id="camera_01_review",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    binding_store = PassageReviewBindingStore(tmp_path / "review_clips.jsonl")
+    clip = binding_store.get_or_add_clip(
+        race_id="race-1",
+        camera_index=1,
+        source_id="camera_01_review",
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        playlist_path=video_path,
+        segment_signature="shared-segments",
+        timeline_segment_id=segment.segment_id,
+    )
+    binding_store.bind(
+        event_id=event.event_id,
+        revision=event.revision,
+        camera_index=1,
+        clip_id=clip.clip_id,
+        passage_timestamp_ms=15_000,
+        passage_offset_ms=5_000,
+    )
+    monkeypatch.setattr(
+        timeline_store,
+        "locate_passage",
+        lambda *_args, **_kwargs: pytest.fail("direct binding must skip timeline scan"),
+    )
+
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        clock_offset_ms=500,
+        regular_camera_indexes=(1,),
+        show_high_speed_pane=False,
+        review_binding_store=binding_store,
+    )
+    qapp.processEvents()
+
+    location = dialog.regular_pane.location
+    assert location.video_path == video_path.absolute()
+    assert location.passage_position_ms == 5_500
+    assert location.media_locator == clip.clip_id
+    assert fake_playback.instances[0].media_locator == clip.clip_id
+    dialog.close()
+
+
+def test_switching_events_in_same_clip_reuses_playback_worker(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    first_event = _event(
+        event_id="passage-1",
+        sequence=1,
+        bib="1",
+        passage_timestamp_ms=15_000,
+    )
+    second_event = _event(
+        event_id="passage-2",
+        sequence=2,
+        bib="2",
+        passage_timestamp_ms=16_000,
+    )
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(first_event)
+    passage_store.append(second_event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    video_path = tmp_path / "review_buffer" / "camera_01" / "shared.mkv"
+    segment = _add_segment(
+        timeline_store,
+        video_path,
+        source_id="camera_01_review",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    binding_store = PassageReviewBindingStore(tmp_path / "review_clips.jsonl")
+    clip = binding_store.get_or_add_clip(
+        race_id="race-1",
+        camera_index=1,
+        source_id="camera_01_review",
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        playlist_path=video_path,
+        segment_signature="shared-segments",
+        timeline_segment_id=segment.segment_id,
+    )
+    for event, offset_ms in ((first_event, 5_000), (second_event, 6_000)):
+        binding_store.bind(
+            event_id=event.event_id,
+            revision=event.revision,
+            camera_index=1,
+            clip_id=clip.clip_id,
+            passage_timestamp_ms=event.timeline_timestamp_ms,
+            passage_offset_ms=offset_ms,
+        )
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        regular_camera_indexes=(1,),
+        show_high_speed_pane=False,
+        review_binding_store=binding_store,
+    )
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+
+    dialog._move_selection(1)
+    qapp.processEvents()
+
+    assert len(fake_playback.instances) == 1
+    assert dialog.regular_pane._worker is worker
+    assert worker.seek_calls[-1] == 6_000
     dialog.close()
 
 
@@ -406,10 +549,11 @@ def test_rapid_athlete_switch_cancels_the_previous_inactive_camera_start(
     assert second_active.start_calls == 1
     assert second_inactive.start_calls == 0
 
-    QTest.qWait(dialog.INACTIVE_CAMERA_START_DELAY_MS + 20)
-
     assert first_inactive.start_calls == 0
-    assert second_inactive.start_calls == 1
+    assert _wait_until(
+        lambda: second_inactive.start_calls == 1,
+        timeout_ms=dialog.INACTIVE_CAMERA_START_DELAY_MS + 500,
+    )
     dialog.close()
 
 
@@ -443,9 +587,40 @@ def test_regular_camera_opens_in_centered_system_window_and_restores(
     assert window.windowFlags() & Qt.WindowMinMaxButtonsHint
     assert window.windowFlags() & Qt.WindowSystemMenuHint
     assert window.windowFlags() & Qt.WindowCloseButtonHint
-    assert second_pane.parentWidget() is window
+    assert second_pane.parentWidget() is dialog._maximized_content_splitter
     assert second_pane.maximize_btn.text() == "缩小"
     assert first_pane.isVisible()
+    assert dialog._maximized_mode_label.text() == "当前判读：机位 2"
+    assert dialog._maximized_mode_buttons[2].isChecked()
+    assert second_pane.active_badge.isVisible()
+    assert not first_pane.active_badge.isVisible()
+
+    QTest.keyClick(window, Qt.Key_B)
+    qapp.processEvents()
+
+    assert dialog._maximized_mode_buttons["side_by_side"].isChecked()
+    assert first_pane.parentWidget() is dialog._maximized_content_splitter
+    assert second_pane.parentWidget() is dialog._maximized_content_splitter
+    assert first_pane.isVisible()
+    assert second_pane.isVisible()
+
+    QTest.keyClick(window, Qt.Key_1)
+    qapp.processEvents()
+
+    assert dialog._maximized_pane is first_pane
+    assert dialog._maximized_mode_label.text() == "当前判读：机位 1"
+    assert dialog._maximized_mode_buttons[1].isChecked()
+    assert first_pane.parentWidget() is dialog._maximized_content_splitter
+    assert second_pane.parentWidget() is dialog.evidence_splitter
+    assert first_pane.active_badge.isVisible()
+    assert not second_pane.active_badge.isVisible()
+
+    QTest.keyClick(window, Qt.Key_Tab)
+    qapp.processEvents()
+
+    assert dialog._maximized_pane is second_pane
+    assert dialog._maximized_mode_label.text() == "当前判读：机位 2"
+    assert dialog._maximized_mode_buttons[2].isChecked()
 
     second_pane.video_view.setFocus()
     QTest.keyClick(second_pane.video_view.viewport(), Qt.Key_Escape)
@@ -461,6 +636,52 @@ def test_regular_camera_opens_in_centered_system_window_and_restores(
     QTest.keyClick(dialog, Qt.Key_Escape)
     qapp.processEvents()
     assert dialog.isVisible()
+    dialog.close()
+
+
+def test_maximized_camera_switch_reuses_existing_playback_workers(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for camera_index in (1, 2):
+        _add_segment(
+            timeline_store,
+            tmp_path / "videos" / f"camera_{camera_index:02d}.mkv",
+            source_id=f"camera_{camera_index:02d}",
+            camera_index=camera_index,
+            started_at_ms=10_000,
+            ended_at_ms=20_000,
+        )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.show()
+    qapp.processEvents()
+    first_pane, second_pane = dialog.regular_panes
+    workers = tuple(fake_playback.instances)
+
+    dialog._toggle_maximized_pane(first_pane)
+    qapp.processEvents()
+    window = dialog._maximized_window
+    assert window is not None
+
+    QTest.keyClick(window, Qt.Key_2)
+    qapp.processEvents()
+
+    assert tuple(fake_playback.instances) == workers
+    assert first_pane._worker is workers[0]
+    assert second_pane._worker is workers[1]
+    assert dialog._active_pane is second_pane
+    assert dialog._maximized_mode_label.text() == "当前判读：机位 2"
+
+    QTest.keyClick(window, Qt.Key_B)
+    qapp.processEvents()
+
+    assert tuple(fake_playback.instances) == workers
+    assert first_pane.parentWidget() is dialog._maximized_content_splitter
+    assert second_pane.parentWidget() is dialog._maximized_content_splitter
     dialog.close()
 
 
@@ -1150,7 +1371,7 @@ def test_high_speed_only_double_click_maximizes_judging_pane(
     assert dialog._maximized_pane is dialog.high_speed_pane
     assert dialog._maximized_window is not None
     assert dialog._maximized_window.isVisible()
-    assert dialog.high_speed_pane.parentWidget() is dialog._maximized_window
+    assert dialog.high_speed_pane.parentWidget() is dialog._maximized_content_splitter
     assert not dialog.high_speed_pane.isHidden()
     assert dialog.high_speed_pane.maximize_btn.text() == "缩小"
     assert dialog.high_speed_pane.maximize_btn.toolTip() == "恢复主界面（Esc 或 F）"
@@ -1745,7 +1966,10 @@ def test_zoom_requests_full_resolution_without_replacing_the_worker(
     worker.frame_ready.emit(preview, 5_000, 250)
     qapp.processEvents()
     dialog.regular_pane.video_view.set_actual_size()
-    QTest.qWait(dialog.regular_pane.FULL_RESOLUTION_IDLE_MS + 20)
+    assert _wait_until(
+        lambda: bool(worker.full_resolution_calls),
+        timeout_ms=dialog.regular_pane.FULL_RESOLUTION_IDLE_MS + 500,
+    )
 
     assert fake_playback.instances == [worker]
     assert worker.full_resolution_calls[-1] == 250
@@ -1782,9 +2006,10 @@ def test_full_resolution_request_waits_for_the_latest_paused_frame(
     pane.video_view.set_actual_size()
     QTest.qWait(50)
     worker.frame_ready.emit(preview, 5_080, 254)
-    QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 20)
-
-    assert worker.full_resolution_calls == [254]
+    assert _wait_until(
+        lambda: worker.full_resolution_calls == [254],
+        timeout_ms=pane.FULL_RESOLUTION_IDLE_MS + 500,
+    )
     dialog.close()
 
 
@@ -2295,10 +2520,11 @@ def test_video_scrub_throttles_preview_and_commits_exact_seek(
     pane._on_video_scrub_delta(60)
 
     assert worker.preview_seek_calls == []
-    QTest.qWait(pane.SCRUB_PREVIEW_INTERVAL_MS + 20)
-    qapp.processEvents()
+    assert _wait_until(
+        lambda: len(worker.preview_seek_calls) == 1,
+        timeout_ms=pane.SCRUB_PREVIEW_INTERVAL_MS + 500,
+    )
     assert not dialog._sync_playing
-    assert len(worker.preview_seek_calls) == 1
 
     final_delta_ms = pane._scrub_delta_ms(80)
     pane._on_video_scrub_finished(80)
@@ -2345,8 +2571,10 @@ def test_video_scrub_defers_full_resolution_until_exact_frame(
 
     pane._on_video_scrub_finished(40)
     worker.frame_ready.emit(frame, 5_080, 254)
-    QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 20)
-    assert worker.full_resolution_calls == [254]
+    assert _wait_until(
+        lambda: worker.full_resolution_calls == [254],
+        timeout_ms=pane.FULL_RESOLUTION_IDLE_MS + 500,
+    )
     dialog.close()
 
 

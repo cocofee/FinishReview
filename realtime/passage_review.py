@@ -50,6 +50,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
+from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
 from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
 from .external_clip_import import EXTERNAL_CLOCK_SOURCE
 from .passage_evidence import (
@@ -64,6 +65,7 @@ from .race_metadata import (
     RaceMetadata,
     RaceMetadataStore,
 )
+from .review_clip import PassageReviewBindingStore
 from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
 from .video_timeline import (
     DEFAULT_CLOCK_SOURCE,
@@ -323,6 +325,7 @@ class EvidenceImageView(QGraphicsView):
     zoom_changed = pyqtSignal(int)
     full_resolution_requested = pyqtSignal()
     maximize_requested = pyqtSignal()
+    activated = pyqtSignal()
     marker_position_selected = pyqtSignal(float, float)
     marker_confirm_requested = pyqtSignal()
     marker_cancel_requested = pyqtSignal()
@@ -681,6 +684,10 @@ class EvidenceImageView(QGraphicsView):
             return
         super().mouseDoubleClickEvent(event)
 
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.activated.emit()
+
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key_Left, Qt.Key_Right):
             modifiers = event.modifiers()
@@ -877,6 +884,9 @@ class PassageEvidencePane(QFrame):
         header = QHBoxLayout()
         self.title_label = QLabel(title)
         self.title_label.setObjectName("evidencePaneTitle")
+        self.active_badge = QLabel("当前判读")
+        self.active_badge.setObjectName("activeJudgingBadge")
+        self.active_badge.hide()
         self.camera_combo = QComboBox(self)
         self.camera_combo.setMinimumWidth(88)
         self.camera_combo.setToolTip("切换普通录像机位")
@@ -886,6 +896,7 @@ class PassageEvidencePane(QFrame):
         self.status_label.setObjectName("evidencePaneStatus")
         self._set_status_label("未选择")
         header.addWidget(self.title_label)
+        header.addWidget(self.active_badge)
         header.addWidget(self.camera_combo)
         header.addStretch()
         header.addWidget(self.status_label)
@@ -1009,6 +1020,16 @@ class PassageEvidencePane(QFrame):
             )
             self._frame_step_shortcuts.append(shortcut)
         self._set_transport_enabled(False)
+
+    def set_active_judging(self, active: bool) -> None:
+        active = bool(active)
+        if self.property("activeJudging") == active:
+            return
+        self.setProperty("activeJudging", active)
+        self.active_badge.setVisible(active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
 
     def set_compact_controls(self, compact: bool) -> None:
         compact = bool(compact)
@@ -1399,6 +1420,7 @@ class PassageEvidencePane(QFrame):
             if location.segment.clock_source == AUYAT_CLOCK_SOURCE
             else VideoPlaybackWorker(location.video_path, self)
         )
+        worker.media_locator = str(location.media_locator)
         set_idle_prefetch = getattr(worker, "set_idle_prefetch_enabled", None)
         if callable(set_idle_prefetch):
             set_idle_prefetch(self._idle_prefetch_enabled)
@@ -1966,6 +1988,7 @@ class PassageReviewDialog(QDialog):
         regular_camera_indexes: Optional[Iterable[int]] = None,
         show_high_speed_pane: Optional[bool] = None,
         include_recorded_evidence: bool = True,
+        review_binding_store: Optional[PassageReviewBindingStore] = None,
     ):
         super().__init__(parent)
         self.setWindowFlags(
@@ -1977,6 +2000,7 @@ class PassageReviewDialog(QDialog):
         )
         self.passage_store = passage_store
         self.timeline_store = timeline_store
+        self.review_binding_store = review_binding_store
         self.association_store = association_store or PassageEvidenceAssociationStore(
             passage_store.journal_path.with_name("passage_evidence_associations.jsonl")
         )
@@ -2035,6 +2059,12 @@ class PassageReviewDialog(QDialog):
         self._maximized_window: Optional[QDialog] = None
         self._maximized_escape_shortcut: Optional[QShortcut] = None
         self._maximized_pane_index = -1
+        self._maximized_content_splitter: Optional[QSplitter] = None
+        self._maximized_original_indexes: dict[PassageEvidencePane, int] = {}
+        self._maximized_hosted_panes: tuple[PassageEvidencePane, ...] = ()
+        self._maximized_mode_label: Optional[QLabel] = None
+        self._maximized_mode_buttons: dict[object, QPushButton] = {}
+        self._maximized_camera_shortcuts: list[QShortcut] = []
         self._available_evidence_count = 0
         self._located_event_ids: set[str] = set()
         self._confirmed_event_ids: set[str] = set()
@@ -2049,7 +2079,7 @@ class PassageReviewDialog(QDialog):
         self._search_refresh_timer.setInterval(120)
         self._search_refresh_timer.timeout.connect(self._refresh_filtered_view)
 
-        self.setWindowTitle("FinishReview · 终点多源复核")
+        self.setWindowTitle(APP_WINDOW_TITLE)
         self.resize(1400, 860)
         self.setMinimumSize(1100, 700)
         self._init_ui()
@@ -2082,7 +2112,11 @@ class PassageReviewDialog(QDialog):
             f'font-size: {UI_BASE_FONT_POINT_SIZE}pt; }}'
             "QFrame#reviewPanel, QFrame#passageEvidencePane { background: #ffffff; "
             "border: 1px solid #cfd7df; border-radius: 4px; }"
+            "QFrame#passageEvidencePane[activeJudging=\"true\"] { "
+            "border: 3px solid #1976c9; background: #f5faff; }"
             "QLabel#panelTitle, QLabel#evidencePaneTitle { font-size: 11pt; font-weight: 700; }"
+            "QLabel#activeJudgingBadge { background: #1976c9; color: #ffffff; "
+            "border-radius: 3px; padding: 3px 8px; font-size: 10pt; font-weight: 700; }"
             "QLabel#evidencePaneStatus { color: #667085; font-size: 9pt; }"
             "QLabel#evidencePaneTime { font-family: Consolas; font-size: 10pt; font-weight: 700; }"
             "QPushButton { min-height: 28px; padding: 0 9px; font-size: 10pt; "
@@ -2389,6 +2423,9 @@ class PassageReviewDialog(QDialog):
         )
         pane.selection_step_requested.connect(self._move_selection)
         pane.maximize_requested.connect(self._toggle_maximized_pane)
+        pane.video_view.activated.connect(
+            lambda current=pane: self._activate_pane(current, align=True)
+        )
         pane.marking_requested.connect(self._begin_marking)
         pane.confirmation_requested.connect(self._confirm_pending_marker)
         pane.cancel_requested.connect(self._cancel_pending_marker)
@@ -2555,16 +2592,96 @@ class PassageReviewDialog(QDialog):
             return status == "受阻"
         return status == "待核对"
 
+    def _bound_regular_locations(
+        self,
+        event: PassageEvent,
+    ) -> tuple[PassageVideoLocation, ...]:
+        store = self.review_binding_store
+        if store is None:
+            return ()
+        locations = []
+        for binding in store.active_bindings(event.event_id, event.revision):
+            clip = store.get_clip(binding.clip_id)
+            if clip is None:
+                continue
+            segment = self.timeline_store.get_segment(clip.timeline_segment_id)
+            if segment is None:
+                continue
+            video_path = self.timeline_store.resolve_video_path(segment)
+            passage_position_ms = max(
+                0,
+                binding.passage_offset_ms + self.clock_offset_ms,
+            )
+            if segment.media_duration_ms is not None:
+                passage_position_ms = min(
+                    passage_position_ms,
+                    segment.media_duration_ms,
+                )
+            status = (
+                "located"
+                if self.timeline_store.video_path_is_playable(video_path)
+                else "missing_file"
+            )
+            locations.append(
+                PassageVideoLocation(
+                    segment=segment,
+                    video_path=video_path,
+                    passage_position_ms=passage_position_ms,
+                    playback_position_ms=max(
+                        0,
+                        passage_position_ms - self.pre_roll_ms,
+                    ),
+                    clock_offset_ms=self.clock_offset_ms,
+                    timing_error_ms=segment.timing_error_ms,
+                    status=status,
+                    media_locator=clip.clip_id,
+                )
+            )
+        return tuple(sorted(locations, key=lambda item: item.segment.camera_index))
+
     def _lookup(self, event: PassageEvent) -> PassageVideoLookup:
-        lookup = self.timeline_store.locate_passage(
-            event.timeline_timestamp_ms,
-            clock_offset_ms=self.clock_offset_ms,
-            pre_roll_ms=self.pre_roll_ms,
-            race_id=event.race_id,
+        direct_locations = self._bound_regular_locations(event)
+        configured = set(self._configured_regular_camera_indexes)
+        direct_camera_indexes = {
+            location.segment.camera_index
+            for location in direct_locations
+            if location.status in _OPENABLE_STATUSES
+        }
+        needs_fallback = not direct_locations or not configured.issubset(
+            direct_camera_indexes
+        )
+        if needs_fallback:
+            fallback = self.timeline_store.locate_passage(
+                event.timeline_timestamp_ms,
+                clock_offset_ms=self.clock_offset_ms,
+                pre_roll_ms=self.pre_roll_ms,
+                race_id=event.race_id,
+            )
+            locations_by_camera = {
+                location.segment.camera_index: location
+                for location in direct_locations
+            }
+            for location in fallback.locations:
+                current = locations_by_camera.get(location.segment.camera_index)
+                if current is None or (
+                    current.status == "missing_file"
+                    and location.status in _OPENABLE_STATUSES
+                ):
+                    locations_by_camera[location.segment.camera_index] = location
+            locations = list(locations_by_camera.values())
+            lookup_status = fallback.status
+        else:
+            locations = list(direct_locations)
+            lookup_status = "located"
+        lookup = PassageVideoLookup(
+            "located"
+            if any(location.status == "located" for location in locations)
+            else lookup_status,
+            event.timeline_timestamp_ms + self.clock_offset_ms,
+            tuple(sorted(locations, key=lambda item: item.segment.camera_index)),
         )
         locations = list(lookup.locations)
         if not self._include_recorded_evidence:
-            configured = set(self._configured_regular_camera_indexes)
             locations = [
                 location
                 for location in locations
@@ -2618,18 +2735,7 @@ class PassageReviewDialog(QDialog):
         self.refresh()
 
     def _timeline_cache_signature(self) -> tuple:
-        return tuple(
-            (
-                segment.segment_id,
-                segment.video_path,
-                segment.ended_at_ms,
-                segment.media_started_at_ms,
-                segment.media_duration_ms,
-                segment.timing_error_ms,
-                segment.race_id,
-            )
-            for segment in self.timeline_store.segments()
-        )
+        return (self.timeline_store.revision,)
 
     @staticmethod
     def _cache_survives_timeline_update(lookup: PassageVideoLookup) -> bool:
@@ -2648,6 +2754,9 @@ class PassageReviewDialog(QDialog):
             tuple(self._configured_regular_camera_indexes),
             self._show_high_speed_pane,
             self._include_recorded_evidence,
+            self.review_binding_store.revision
+            if self.review_binding_store is not None
+            else 0,
         )
         cached = self._lookup_cache.get(event.event_id)
         if cached is not None and cached[0] == key:
@@ -3981,6 +4090,7 @@ class PassageReviewDialog(QDialog):
     ) -> None:
         for pane in self.all_evidence_panes:
             pane.set_idle_prefetch_enabled(pane is active)
+            pane.set_active_judging(pane is active)
 
     def _update_shared_from_pane(self, pane: PassageEvidencePane) -> None:
         delta_ms = pane.current_delta_ms()
@@ -4008,6 +4118,12 @@ class PassageReviewDialog(QDialog):
         self._pause_inactive_panes(pane)
         if switched and align:
             pane.seek_passage_delta(self._shared_delta_ms)
+        if self._maximized_window is not None and pane in self._maximized_hosted_panes:
+            self._maximized_pane = pane
+            self._maximized_pane_index = self._maximized_original_indexes.get(pane, -1)
+            self._update_maximized_mode_controls(
+                side_by_side=len(self._maximized_hosted_panes) > 1
+            )
         return switched
 
     def _toggle_active_pane(self) -> None:
@@ -4248,10 +4364,16 @@ class PassageReviewDialog(QDialog):
         QTimer.singleShot(0, self._fit_visible_evidence_views)
 
     def _toggle_maximized_pane(self, pane: PassageEvidencePane) -> None:
-        if self._maximized_pane is pane:
+        if self._maximized_pane is pane and len(self._maximized_hosted_panes) == 1:
             self._restore_maximized_pane()
             return
         if self._maximized_pane is not None:
+            if (
+                pane.source_kind == REGULAR_SOURCE
+                and self._maximized_pane.source_kind == REGULAR_SOURCE
+            ):
+                self._set_maximized_regular_mode(pane.camera_index)
+                return
             self._restore_maximized_pane()
 
         pane_index = self.evidence_splitter.indexOf(pane)
@@ -4272,22 +4394,88 @@ class PassageReviewDialog(QDialog):
         window.setModal(False)
         window_layout = QVBoxLayout(window)
         window_layout.setContentsMargins(8, 8, 8, 8)
-        window_layout.addWidget(pane)
+        window_layout.setSpacing(6)
+        mode_bar = QHBoxLayout()
+        mode_bar.setContentsMargins(4, 0, 4, 0)
+        mode_bar.setSpacing(6)
+        mode_label = QLabel(window)
+        mode_label.setStyleSheet(
+            "color: #0f4f86; font-size: 14pt; font-weight: 700; padding: 4px 2px;"
+        )
+        mode_bar.addWidget(mode_label)
+        mode_bar.addStretch(1)
+        mode_buttons: dict[object, QPushButton] = {}
+        if pane.source_kind == REGULAR_SOURCE and len(self.regular_panes) > 1:
+            side_by_side_btn = QPushButton("并排", window)
+            side_by_side_btn.setCheckable(True)
+            side_by_side_btn.setToolTip("同时显示全部普通机位（B）")
+            side_by_side_btn.clicked.connect(
+                lambda _checked=False: self._set_maximized_regular_mode(None)
+            )
+            mode_buttons["side_by_side"] = side_by_side_btn
+            mode_bar.addWidget(side_by_side_btn)
+            for regular_pane in self.regular_panes:
+                camera_index = regular_pane.camera_index
+                camera_btn = QPushButton(f"机位 {camera_index}", window)
+                camera_btn.setCheckable(True)
+                camera_btn.setToolTip(f"切换到机位 {camera_index}（{camera_index}）")
+                camera_btn.clicked.connect(
+                    lambda _checked=False, index=camera_index: (
+                        self._set_maximized_regular_mode(index)
+                    )
+                )
+                mode_buttons[camera_index] = camera_btn
+                mode_bar.addWidget(camera_btn)
+        window_layout.addLayout(mode_bar)
+        content_splitter = QSplitter(Qt.Horizontal, window)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.setHandleWidth(5)
+        window_layout.addWidget(content_splitter, 1)
 
-        pane.show()
-        pane.maximize_btn.setText("缩小")
-        pane.maximize_btn.setToolTip("恢复主界面（Esc 或 F）")
         self._maximized_pane = pane
         self._maximized_window = window
         self._maximized_pane_index = pane_index
+        self._maximized_content_splitter = content_splitter
+        self._maximized_original_indexes = {
+            candidate: self.evidence_splitter.indexOf(candidate)
+            for candidate in self.evidence_panes
+        }
+        self._maximized_mode_label = mode_label
+        self._maximized_mode_buttons = mode_buttons
+        self._maximized_camera_shortcuts = []
         escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), window)
         escape_shortcut.setContext(Qt.WindowShortcut)
         escape_shortcut.setAutoRepeat(False)
         escape_shortcut.activated.connect(self._restore_maximized_pane)
         self._maximized_escape_shortcut = escape_shortcut
+        if pane.source_kind == REGULAR_SOURCE and len(self.regular_panes) > 1:
+            side_by_side_shortcut = QShortcut(QKeySequence("B"), window)
+            side_by_side_shortcut.setContext(Qt.WindowShortcut)
+            side_by_side_shortcut.setAutoRepeat(False)
+            side_by_side_shortcut.activated.connect(
+                lambda: self._set_maximized_regular_mode(None)
+            )
+            self._maximized_camera_shortcuts.append(side_by_side_shortcut)
+            cycle_shortcut = QShortcut(QKeySequence(Qt.Key_Tab), window)
+            cycle_shortcut.setContext(Qt.WindowShortcut)
+            cycle_shortcut.setAutoRepeat(False)
+            cycle_shortcut.activated.connect(self._cycle_maximized_regular_pane)
+            self._maximized_camera_shortcuts.append(cycle_shortcut)
+            for regular_pane in self.regular_panes:
+                camera_index = regular_pane.camera_index
+                shortcut = QShortcut(QKeySequence(str(camera_index)), window)
+                shortcut.setContext(Qt.WindowShortcut)
+                shortcut.setAutoRepeat(False)
+                shortcut.activated.connect(
+                    lambda index=camera_index: self._set_maximized_regular_mode(index)
+                )
+                self._maximized_camera_shortcuts.append(shortcut)
         window.finished.connect(
             lambda _result: self._restore_maximized_pane(close_window=False)
         )
+        self._host_maximized_panes((pane,))
+        self._activate_pane(pane, align=True)
+        self._update_maximized_mode_controls(side_by_side=False)
 
         screen = self.screen() or QApplication.primaryScreen()
         if screen is not None:
@@ -4305,22 +4493,121 @@ class PassageReviewDialog(QDialog):
         window.activateWindow()
         QTimer.singleShot(0, pane.video_view.fit_to_window)
 
+    def _restore_hosted_panes_to_splitter(self) -> None:
+        if not self._maximized_hosted_panes:
+            return
+        for pane in sorted(
+            self._maximized_hosted_panes,
+            key=lambda candidate: self._maximized_original_indexes.get(candidate, 0),
+        ):
+            pane_index = self._maximized_original_indexes.get(pane, 0)
+            pane.setParent(self.evidence_splitter)
+            self.evidence_splitter.insertWidget(max(0, pane_index), pane)
+        self._maximized_hosted_panes = ()
+
+    def _host_maximized_panes(
+        self,
+        panes: tuple[PassageEvidencePane, ...],
+    ) -> None:
+        content_splitter = self._maximized_content_splitter
+        if content_splitter is None:
+            return
+        self._restore_hosted_panes_to_splitter()
+        active_panes = self.evidence_panes
+        for candidate in self.all_evidence_panes:
+            if candidate not in panes:
+                candidate.setVisible(candidate in active_panes)
+                candidate.maximize_btn.setText("放大")
+                candidate.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
+        for pane in panes:
+            content_splitter.addWidget(pane)
+            pane.show()
+            pane.maximize_btn.setText("缩小")
+            pane.maximize_btn.setToolTip("恢复主界面（Esc 或 F）")
+            content_splitter.setStretchFactor(content_splitter.indexOf(pane), 1)
+        content_splitter.setSizes([1] * len(panes))
+        self._maximized_hosted_panes = panes
+
+    def _set_maximized_regular_mode(self, camera_index: Optional[int]) -> None:
+        if self._maximized_window is None or not self.regular_panes:
+            return
+        if camera_index is None:
+            panes = self.regular_panes
+            active = (
+                self._active_pane
+                if self._active_pane in panes
+                else panes[0]
+            )
+            side_by_side = True
+        else:
+            active = self._regular_panes_by_camera.get(int(camera_index))
+            if active is None or active not in self.regular_panes:
+                return
+            panes = (active,)
+            side_by_side = False
+        self._host_maximized_panes(panes)
+        self._maximized_pane = active
+        self._maximized_pane_index = self._maximized_original_indexes.get(active, -1)
+        self._activate_pane(active, align=True)
+        active.video_view.setFocus()
+        self._update_maximized_mode_controls(side_by_side=side_by_side)
+        for pane in panes:
+            QTimer.singleShot(0, pane.video_view.fit_to_window)
+
+    def _cycle_maximized_regular_pane(self) -> None:
+        panes = self.regular_panes
+        if not panes:
+            return
+        active = self._active_pane if self._active_pane in panes else panes[0]
+        next_index = (panes.index(active) + 1) % len(panes)
+        self._set_maximized_regular_mode(panes[next_index].camera_index)
+
+    def _update_maximized_mode_controls(self, *, side_by_side: bool) -> None:
+        active = self._active_pane or self._maximized_pane
+        if active is None:
+            return
+        if active.source_kind == REGULAR_SOURCE:
+            current_text = f"当前判读：机位 {active.camera_index}"
+        else:
+            current_text = "当前判读：高速摄像"
+        if self._maximized_mode_label is not None:
+            self._maximized_mode_label.setText(current_text)
+        if self._maximized_window is not None:
+            identity = f" - {active._identity}" if active._identity else ""
+            self._maximized_window.setWindowTitle(
+                f"{APP_DISPLAY_NAME} · {current_text}{identity}"
+            )
+        for key, button in self._maximized_mode_buttons.items():
+            checked = (
+                side_by_side
+                if key == "side_by_side"
+                else not side_by_side
+                and active.source_kind == REGULAR_SOURCE
+                and key == active.camera_index
+            )
+            button.setChecked(bool(checked))
+            button.setStyleSheet(
+                "QPushButton { padding: 6px 12px; font-weight: 700; }"
+                "QPushButton:checked { background: #1976c9; color: #ffffff; "
+                "border: 2px solid #0f5f9f; }"
+            )
+
     def _restore_maximized_pane(self, *, close_window: bool = True) -> None:
         pane = self._maximized_pane
         window = self._maximized_window
         if pane is None or window is None:
             return
 
-        pane_index = self._maximized_pane_index
+        self._restore_hosted_panes_to_splitter()
         self._maximized_pane = None
         self._maximized_window = None
         self._maximized_escape_shortcut = None
         self._maximized_pane_index = -1
-        window_layout = window.layout()
-        if window_layout is not None:
-            window_layout.removeWidget(pane)
-        pane.setParent(self.evidence_splitter)
-        self.evidence_splitter.insertWidget(max(0, pane_index), pane)
+        self._maximized_content_splitter = None
+        self._maximized_original_indexes = {}
+        self._maximized_mode_label = None
+        self._maximized_mode_buttons = {}
+        self._maximized_camera_shortcuts = []
 
         active_panes = self.evidence_panes
         for candidate in self.all_evidence_panes:

@@ -42,6 +42,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
 from .auyat_rgb import (
         AuyatRgbCatalog,
         AuyatRgbScanWorker,
@@ -77,20 +78,22 @@ from .preflight import (
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
 from .review_export import export_review_summary
+from .review_clip import PassageReviewBindingStore
 from .review_recorder import (
-        ArchiveTimelinePublisher,
-        DirectShowVideoDevice,
-        FfmpegReviewRecorder,
-        PassageReviewCoordinator,
-        PassageReviewState,
-        PassageReviewTimelinePublisher,
-        PassageReviewWindow,
-        ReviewRingBuffer,
-        discover_directshow_video_device_choices,
-        is_supported_review_source,
-        load_archive_recording_sessions,
-        make_directshow_source,
-        parse_directshow_source,
+    ArchiveTimelinePublisher,
+    DEFAULT_MAX_SHARED_REVIEW_CLIP_MS,
+    DirectShowVideoDevice,
+    FfmpegReviewRecorder,
+    PassageReviewCoordinator,
+    PassageReviewState,
+    PassageReviewTimelinePublisher,
+    PassageReviewWindow,
+    ReviewRingBuffer,
+    discover_directshow_video_device_choices,
+    is_supported_review_source,
+    load_archive_recording_sessions,
+    make_directshow_source,
+    parse_directshow_source,
     )
 from .stream_recorder import (
         apply_rtsp_credentials,
@@ -2299,6 +2302,9 @@ class FinishReviewWindow(PassageReviewDialog):
             else RaceMetadataStore(self.output_dir / "cyclerace_race_metadata.json")
         )
         timeline_store = VideoTimelineStore(self.output_dir / "video_timeline.jsonl")
+        review_binding_store = PassageReviewBindingStore(
+            self.output_dir / "review_clips.jsonl"
+        )
         historical_events = passage_store.events()
         self._evidence_timestamp_overrides = (
             _historical_evidence_timestamp_overrides(historical_events)
@@ -2336,9 +2342,10 @@ class FinishReviewWindow(PassageReviewDialog):
             regular_camera_indexes=regular_camera_indexes,
             show_high_speed_pane=self.high_speed_dir is not None,
             include_recorded_evidence=False,
+            review_binding_store=review_binding_store,
         )
 
-        self.setWindowTitle("FinishReview · 终点多源复核")
+        self.setWindowTitle(APP_WINDOW_TITLE)
         self.setMinimumSize(1180, 760)
         self._recorder: FfmpegReviewRecorder | None = None
         self._recorders: dict[int, FfmpegReviewRecorder] = {}
@@ -2358,7 +2365,7 @@ class FinishReviewWindow(PassageReviewDialog):
             int, dict[str, PassageReviewWindow]
         ] = {self.camera_index: {}}
         self._capture_windows = self._capture_windows_by_camera[self.camera_index]
-        self._published_keys: set[tuple[int, str, int]] = set()
+        self._published_keys: set[tuple[int, str, int, int]] = set()
         self._unsupported_event_ids: set[str] = set()
         self._runtime_error = ""
         self._auto_recording_error = ""
@@ -2925,6 +2932,9 @@ class FinishReviewWindow(PassageReviewDialog):
                 timeline_store = VideoTimelineStore(
                     output_dir / "video_timeline.jsonl"
                 )
+                review_binding_store = PassageReviewBindingStore(
+                    output_dir / "review_clips.jsonl"
+                )
                 association_store = PassageEvidenceAssociationStore(
                     output_dir / "passage_evidence_associations.jsonl"
                 )
@@ -2955,6 +2965,7 @@ class FinishReviewWindow(PassageReviewDialog):
                     passage_store,
                     metadata_store,
                     timeline_store,
+                    review_binding_store,
                     association_store,
                     preflight_journal,
                     historical_events,
@@ -3024,6 +3035,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 passage_store,
                 metadata_store,
                 timeline_store,
+                review_binding_store,
                 association_store,
                 preflight_journal,
                 historical_events,
@@ -3040,6 +3052,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self.passage_store = passage_store
             self.metadata_store = metadata_store
             self.timeline_store = timeline_store
+            self.review_binding_store = review_binding_store
             self.association_store = association_store
             self._lookup_cache.clear()
             self._timeline_signature = ()
@@ -3120,7 +3133,7 @@ class FinishReviewWindow(PassageReviewDialog):
         top_layout.setSpacing(8)
 
         top_layout.addWidget(_FinishReviewLogo(panel))
-        self.product_title_label = QLabel("FinishReview", panel)
+        self.product_title_label = QLabel(APP_DISPLAY_NAME, panel)
         self.product_title_label.setStyleSheet(
             "font-size: 12pt; font-weight: 700; color: #17212b;"
         )
@@ -3746,6 +3759,7 @@ class FinishReviewWindow(PassageReviewDialog):
                     ring_buffer,
                     self.timeline_store,
                     timing_error_ms=self.timing_error_ms,
+                    binding_store=self.review_binding_store,
                 )
                 archive_publishers.append(
                     ArchiveTimelinePublisher(recorder, self.timeline_store)
@@ -3827,7 +3841,10 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _register_passage(self, event: PassageEvent, *, scan: bool = True) -> None:
         if not event.is_active:
-            self._discard_registered_passage(event.event_id)
+            self._discard_registered_passage(
+                event.event_id,
+                revision=event.revision,
+            )
             return
         if not self._coordinators:
             return
@@ -3847,14 +3864,20 @@ class FinishReviewWindow(PassageReviewDialog):
             self._capture_windows_by_camera.setdefault(camera_index, {})[
                 event.event_id
             ] = window
-            self._publish_window(camera_index, window, event)
 
-    def _discard_registered_passage(self, event_id: str) -> None:
+    def _discard_registered_passage(
+        self,
+        event_id: str,
+        *,
+        revision: int | None = None,
+    ) -> None:
         for coordinator in self._coordinators.values():
             coordinator.discard(event_id)
         for windows in self._capture_windows_by_camera.values():
             windows.pop(event_id, None)
         self._unsupported_event_ids.discard(event_id)
+        if revision is not None:
+            self.review_binding_store.deactivate(event_id, revision)
 
     def _publish_window(
         self,
@@ -3863,16 +3886,163 @@ class FinishReviewWindow(PassageReviewDialog):
         event: PassageEvent,
     ) -> bool:
         publisher = self._publishers.get(camera_index)
-        key = (camera_index, window.event_id, window.passage_timestamp_ms)
+        key = (
+            camera_index,
+            window.event_id,
+            event.revision,
+            window.passage_timestamp_ms,
+        )
         if (
             publisher is None
             or window.state is not PassageReviewState.READY
             or key in self._published_keys
         ):
             return False
-        publisher.publish(window, race_id=event.race_id)
+        publisher.publish(
+            window,
+            race_id=event.race_id,
+            revision=event.revision,
+        )
         self._published_keys.add(key)
         return True
+
+    def _publish_ready_windows(self, camera_index: int) -> set[str]:
+        publisher = self._publishers.get(int(camera_index))
+        if publisher is None:
+            return set()
+        pending = []
+        for window in self._capture_windows_by_camera.get(int(camera_index), {}).values():
+            if window.state is not PassageReviewState.READY or not window.segments:
+                continue
+            event = self.passage_store.get(window.event_id)
+            if event is None or not event.is_active:
+                continue
+            key = (
+                int(camera_index),
+                window.event_id,
+                event.revision,
+                window.passage_timestamp_ms,
+            )
+            if key in self._published_keys:
+                continue
+            pending.append((window, event, key))
+        pending.sort(
+            key=lambda item: (
+                item[1].race_id,
+                item[0].started_at_ms,
+                item[0].passage_timestamp_ms,
+                item[0].event_id,
+            )
+        )
+        groups = []
+        for item in pending:
+            window, event, _key = item
+            media_started_at_ms = window.segments[0].started_at_ms
+            media_ended_at_ms = window.segments[-1].ended_at_ms
+            if not groups:
+                groups.append(
+                    {
+                        "items": [item],
+                        "race_id": event.race_id,
+                        "window_end_ms": window.ended_at_ms,
+                        "media_start_ms": media_started_at_ms,
+                        "media_end_ms": media_ended_at_ms,
+                    }
+                )
+                continue
+            current = groups[-1]
+            combined_duration_ms = (
+                max(current["media_end_ms"], media_ended_at_ms)
+                - min(current["media_start_ms"], media_started_at_ms)
+            )
+            if (
+                event.race_id == current["race_id"]
+                and window.started_at_ms <= current["window_end_ms"]
+                and combined_duration_ms <= DEFAULT_MAX_SHARED_REVIEW_CLIP_MS
+            ):
+                current["items"].append(item)
+                current["window_end_ms"] = max(
+                    current["window_end_ms"],
+                    window.ended_at_ms,
+                )
+                current["media_start_ms"] = min(
+                    current["media_start_ms"],
+                    media_started_at_ms,
+                )
+                current["media_end_ms"] = max(
+                    current["media_end_ms"],
+                    media_ended_at_ms,
+                )
+            else:
+                groups.append(
+                    {
+                        "items": [item],
+                        "race_id": event.race_id,
+                        "window_end_ms": window.ended_at_ms,
+                        "media_start_ms": media_started_at_ms,
+                        "media_end_ms": media_ended_at_ms,
+                    }
+                )
+
+        published_event_ids = set()
+        for group in groups:
+            items = group["items"]
+            publisher.publish_many(
+                tuple((window, event.revision) for window, event, _key in items),
+                race_id=group["race_id"],
+            )
+            for window, _event, key in items:
+                self._published_keys.add(key)
+                published_event_ids.add(window.event_id)
+        return published_event_ids
+
+    def _event_ids_for_archive_segments(self, archive_segments) -> set[str]:
+        segments = tuple(archive_segments)
+        if not segments:
+            return set()
+        affected = set()
+        for event in self._events_for_current_metadata(self.passage_store.events()):
+            timestamp_ms = self._evidence_timestamp(event)
+            if timestamp_ms is None:
+                continue
+            bound_cameras = set()
+            for binding in self.review_binding_store.active_bindings(
+                event.event_id,
+                event.revision,
+            ):
+                clip = self.review_binding_store.get_clip(binding.clip_id)
+                segment = (
+                    self.timeline_store.get_segment(clip.timeline_segment_id)
+                    if clip is not None
+                    else None
+                )
+                if segment is None:
+                    continue
+                video_path = self.timeline_store.resolve_video_path(segment)
+                if self.timeline_store.video_path_is_playable(video_path):
+                    bound_cameras.add(binding.camera_index)
+            for segment in segments:
+                if segment.camera_index in bound_cameras:
+                    continue
+                if segment.race_id and segment.race_id != event.race_id:
+                    continue
+                started_at_ms = (
+                    segment.media_started_at_ms
+                    if segment.media_started_at_ms is not None
+                    else segment.started_at_ms
+                )
+                ended_at_ms = (
+                    started_at_ms + segment.media_duration_ms
+                    if segment.media_duration_ms is not None
+                    else segment.ended_at_ms
+                )
+                if (
+                    ended_at_ms is not None
+                    and started_at_ms <= timestamp_ms <= ended_at_ms
+                ):
+                    affected.add(event.event_id)
+                    break
+        return affected
 
     def _activate_cyclerace_workspace(
         self,
@@ -4124,13 +4294,17 @@ class FinishReviewWindow(PassageReviewDialog):
                 if event.is_active and belongs_to_current_context(event):
                     self._register_passage(event, scan=False)
                 else:
-                    self._discard_registered_passage(event.event_id)
+                    self._discard_registered_passage(
+                        event.event_id,
+                        revision=event.revision,
+                    )
+            for camera_index in self._coordinators:
+                changed_event_ids.update(
+                    self._publish_ready_windows(camera_index)
+                )
             if archive_segments:
                 changed_event_ids.update(
-                    item.event_id
-                    for item in self._events_for_current_metadata(
-                        self.passage_store.events()
-                    )
+                    self._event_ids_for_archive_segments(archive_segments)
                 )
             self.refresh_events(changed_event_ids)
             self._apply_pending_focus()
@@ -4350,12 +4524,10 @@ class FinishReviewWindow(PassageReviewDialog):
             # waiting, so device health and retention remain current.
             for ring_buffer in self._ring_buffers.values():
                 ring_buffer.scan()
-            if self._publish_archive_segments():
+            archive_segments = self._publish_archive_segments()
+            if archive_segments:
                 changed_event_ids.update(
-                    event.event_id
-                    for event in self._events_for_current_metadata(
-                        self.passage_store.events()
-                    )
+                    self._event_ids_for_archive_segments(archive_segments)
                 )
             for camera_index, coordinator in self._coordinators.items():
                 windows = self._capture_windows_by_camera.setdefault(
@@ -4365,17 +4537,13 @@ class FinishReviewWindow(PassageReviewDialog):
                 for window in coordinator.refresh(scan=False):
                     previous = windows.get(window.event_id)
                     windows[window.event_id] = window
-                    event = self.passage_store.get(window.event_id)
-                    if event is not None and self._publish_window(
-                        camera_index,
-                        window,
-                        event,
-                    ):
-                        changed_event_ids.add(window.event_id)
                     if previous is not None and previous.state is not window.state:
                         changed_event_ids.add(window.event_id)
                     elif previous is not None and previous.segments != window.segments:
                         changed_event_ids.add(window.event_id)
+                changed_event_ids.update(
+                    self._publish_ready_windows(camera_index)
+                )
             now = time.monotonic()
             if now - self._last_cleanup_at >= 5.0:
                 current_time_ms = int(time.time() * 1000.0)
@@ -4925,7 +5093,7 @@ class FinishReviewWindow(PassageReviewDialog):
         if not self.stop():
             event.ignore()
             self.setEnabled(False)
-            self.setWindowTitle("FinishReview · 终点多源复核 - 正在停止高速目录扫描")
+            self.setWindowTitle(f"{APP_WINDOW_TITLE} - 正在停止高速目录扫描")
             QTimer.singleShot(100, self.close)
             return
         self._export_review_summary()

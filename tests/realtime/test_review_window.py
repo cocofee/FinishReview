@@ -38,7 +38,13 @@ from realtime.race_metadata import (
     RaceMetadataStore,
 )
 from realtime.review_export import REVIEW_SUMMARY_FILENAME
-from realtime.review_recorder import DirectShowVideoDevice, make_directshow_source
+from realtime.review_recorder import (
+    DirectShowVideoDevice,
+    PassageReviewState,
+    PassageReviewWindow,
+    ReviewSegment,
+    make_directshow_source,
+)
 from realtime.review_window import (
     FinishReviewLaunchDialog,
     FinishReviewSettings,
@@ -1173,6 +1179,124 @@ def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
     ]
     assert archive_calls == 1
     assert "本次收到 3 条" in window.receiver_status_label.text()
+    window.close()
+
+
+def test_ready_windows_are_grouped_by_overlap_and_twenty_second_limit(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    calls = []
+
+    class _Publisher:
+        def publish_many(self, windows, *, race_id):
+            calls.append((windows, race_id))
+
+    def ready_window(event_id, started_at_ms, ended_at_ms):
+        return PassageReviewWindow(
+            event_id=event_id,
+            passage_timestamp_ms=started_at_ms + 3_000,
+            started_at_ms=started_at_ms,
+            ended_at_ms=ended_at_ms,
+            state=PassageReviewState.READY,
+            segments=(
+                ReviewSegment(
+                    segment_id=f"{event_id}.ts",
+                    source_id="camera_01_review",
+                    camera_index=1,
+                    video_path=f"{event_id}.ts",
+                    started_at_ms=started_at_ms,
+                    duration_ms=ended_at_ms - started_at_ms,
+                ),
+            ),
+        )
+
+    windows = (
+        ready_window("passage-1", 10_000, 16_000),
+        ready_window("passage-2", 14_000, 20_000),
+        ready_window("passage-3", 40_000, 46_000),
+    )
+    for index, capture_window in enumerate(windows, start=1):
+        window.passage_store.append(
+            _event(
+                event_id=capture_window.event_id,
+                sequence=index,
+                bib=str(index),
+                passage_timestamp_ms=capture_window.passage_timestamp_ms,
+            )
+        )
+    window._publishers = {1: _Publisher()}
+    window._capture_windows_by_camera = {
+        1: {capture_window.event_id: capture_window for capture_window in windows}
+    }
+
+    published = window._publish_ready_windows(1)
+
+    assert published == {"passage-1", "passage-2", "passage-3"}
+    assert [len(group) for group, _race_id in calls] == [2, 1]
+    assert all(race_id == "race-1" for _group, race_id in calls)
+    window.close()
+
+
+def test_archive_refresh_only_targets_events_in_range_without_binding(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    in_range = _event(
+        event_id="passage-in-range",
+        sequence=1,
+        bib="1",
+        passage_timestamp_ms=15_000,
+    )
+    out_of_range = _event(
+        event_id="passage-out-of-range",
+        sequence=2,
+        bib="2",
+        passage_timestamp_ms=50_000,
+    )
+    window.passage_store.append(in_range)
+    window.passage_store.append(out_of_range)
+    video_path = tmp_path / "videos" / "archive.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    segment = window.timeline_store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=video_path,
+        media_started_at_ms=10_000,
+        media_duration_ms=10_000,
+        clock_source=DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="archive_segment",
+        race_id="race-1",
+    )
+
+    assert window._event_ids_for_archive_segments((segment,)) == {
+        in_range.event_id
+    }
+
+    clip = window.review_binding_store.get_or_add_clip(
+        race_id="race-1",
+        camera_index=1,
+        source_id="camera_01_review",
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        playlist_path=video_path,
+        segment_signature="archive-binding",
+        timeline_segment_id=segment.segment_id,
+    )
+    window.review_binding_store.bind(
+        event_id=in_range.event_id,
+        revision=in_range.revision,
+        camera_index=1,
+        clip_id=clip.clip_id,
+        passage_timestamp_ms=15_000,
+        passage_offset_ms=5_000,
+    )
+
+    assert window._event_ids_for_archive_segments((segment,)) == set()
     window.close()
 
 
@@ -2727,7 +2851,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.2.3 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -2741,7 +2865,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview"
+    assert window.product_title_label.text() == "FinishReview v0.2.3"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()

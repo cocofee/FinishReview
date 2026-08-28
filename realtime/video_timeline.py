@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import uuid
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -16,6 +17,7 @@ from typing import Any, Mapping, Optional
 SCHEMA_VERSION = 1
 DEFAULT_CLOCK_SOURCE = "videopipe_system_clock"
 DEFAULT_TIMING_ERROR_MS = 2_000
+_PLAYABILITY_CACHE_TTL_SECONDS = 2.0
 
 
 class VideoTimelineError(RuntimeError):
@@ -114,6 +116,81 @@ class PassageVideoLookup:
     locations: tuple[PassageVideoLocation, ...] = ()
 
 
+class _SegmentIntervalIndex:
+    """Incremental closed-segment interval index preserving journal order."""
+
+    def __init__(self) -> None:
+        self._entries: list[tuple[int, int, int, str]] = []
+        self._starts: list[int] = []
+        self._prefix_max_ends: list[int] = []
+
+    def add(
+        self,
+        *,
+        started_at_ms: int,
+        ended_at_ms: int,
+        order: int,
+        segment_id: str,
+    ) -> None:
+        entry = (int(started_at_ms), int(ended_at_ms), int(order), str(segment_id))
+        index = bisect_right(self._entries, entry)
+        self._entries.insert(index, entry)
+        self._starts.insert(index, entry[0])
+        previous_max = self._prefix_max_ends[index - 1] if index else -1
+        if index == len(self._prefix_max_ends):
+            self._prefix_max_ends.append(max(previous_max, entry[1]))
+            return
+        self._prefix_max_ends.insert(index, max(previous_max, entry[1]))
+        for cursor in range(index + 1, len(self._entries)):
+            self._prefix_max_ends[cursor] = max(
+                self._prefix_max_ends[cursor - 1],
+                self._entries[cursor][1],
+            )
+
+    def candidates(self, target_time_ms: int) -> tuple[str, ...]:
+        cursor = bisect_right(self._starts, int(target_time_ms)) - 1
+        segment_ids = []
+        while cursor >= 0 and self._prefix_max_ends[cursor] >= target_time_ms:
+            entry = self._entries[cursor]
+            if entry[1] >= target_time_ms:
+                segment_ids.append(entry[3])
+            cursor -= 1
+        return tuple(segment_ids)
+
+
+@dataclass(slots=True)
+class _ClosedTimelineBounds:
+    count: int = 0
+    earliest_start_ms: Optional[int] = None
+    latest_end_ms: Optional[int] = None
+
+    def add(self, segment: RecordingSegment) -> None:
+        if segment.ended_at_ms is None:
+            raise ValueError("closed timeline bounds require a completed segment")
+        started_at_ms = (
+            segment.media_started_at_ms
+            if segment.media_started_at_ms is not None
+            else segment.started_at_ms
+        )
+        ended_at_ms = (
+            segment.media_started_at_ms + segment.media_duration_ms
+            if segment.media_started_at_ms is not None
+            and segment.media_duration_ms is not None
+            else segment.ended_at_ms
+        )
+        self.count += 1
+        self.earliest_start_ms = (
+            started_at_ms
+            if self.earliest_start_ms is None
+            else min(self.earliest_start_ms, started_at_ms)
+        )
+        self.latest_end_ms = (
+            ended_at_ms
+            if self.latest_end_ms is None
+            else max(self.latest_end_ms, ended_at_ms)
+        )
+
+
 def _integer(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise VideoTimelineError(f"{name} must be an integer")
@@ -196,13 +273,29 @@ class VideoTimelineStore:
         self._lock = threading.RLock()
         self._segments: dict[str, RecordingSegment] = {}
         self._segment_order: list[str] = []
+        self._segment_order_index: dict[str, int] = {}
+        self._segment_ids_by_race: dict[str, list[str]] = {}
+        self._closed_indexes_by_race: dict[str, _SegmentIntervalIndex] = {}
+        self._open_segment_ids_by_race: dict[str, set[str]] = {}
+        self._closed_bounds_by_race: dict[str, _ClosedTimelineBounds] = {}
+        self._all_closed_bounds = _ClosedTimelineBounds()
+        self._legacy_default_closed_bounds = _ClosedTimelineBounds()
+        self._segments_by_path: dict[str, list[str]] = {}
+        self._playability_cache: dict[str, tuple[int, int, float, bool]] = {}
+        self._revision = 0
         self._recovered_incomplete_tail = False
         self._load_existing()
+        self._rebuild_indexes()
 
     @property
     def recovered_incomplete_tail(self) -> bool:
         with self._lock:
             return self._recovered_incomplete_tail
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
 
     def _load_existing(self) -> None:
         if not self.journal_path.exists():
@@ -267,6 +360,7 @@ class VideoTimelineStore:
                 )
             self._segments[segment.segment_id] = segment
             self._segment_order.append(segment.segment_id)
+            self._revision += 1
             return
         if record_type == "segment_ended":
             segment_id = _string(payload.get("segment_id"), "segment_id")
@@ -287,6 +381,7 @@ class VideoTimelineStore:
                 media_started_at_ms=media_started_at_ms,
                 end_reason=_string(payload.get("end_reason", ""), "end_reason"),
             )
+            self._revision += 1
             return
         raise VideoTimelineError(f"unsupported video timeline record_type: {record_type}")
 
@@ -355,6 +450,210 @@ class VideoTimelineStore:
             return path
         return (self.journal_path.parent / path).absolute()
 
+    @staticmethod
+    def _path_key(path: Path) -> str:
+        return os.path.normcase(str(path.absolute()))
+
+    @staticmethod
+    def _segment_interval(segment: RecordingSegment) -> tuple[int, int] | None:
+        if segment.ended_at_ms is None:
+            return None
+        started_at_ms = segment.started_at_ms
+        ended_at_ms = segment.ended_at_ms
+        if (
+            segment.media_started_at_ms is not None
+            and segment.media_duration_ms is not None
+        ):
+            media_started_at_ms = segment.media_started_at_ms
+            media_ended_at_ms = media_started_at_ms + segment.media_duration_ms
+            boundary_error_ms = (
+                segment.timing_error_ms
+                if segment.clock_source != DEFAULT_CLOCK_SOURCE
+                else 0
+            )
+            started_at_ms = min(
+                started_at_ms,
+                max(0, media_started_at_ms - boundary_error_ms),
+            )
+            ended_at_ms = max(
+                ended_at_ms,
+                media_ended_at_ms + boundary_error_ms,
+            )
+        return started_at_ms, ended_at_ms
+
+    def _index_segment(self, segment: RecordingSegment, order: int) -> None:
+        segment_id = segment.segment_id
+        self._segment_order_index[segment_id] = int(order)
+        self._segment_ids_by_race.setdefault(segment.race_id, []).append(segment_id)
+        path_key = self._path_key(self.resolve_video_path(segment))
+        self._segments_by_path.setdefault(path_key, []).append(segment_id)
+        interval = self._segment_interval(segment)
+        if interval is None:
+            self._open_segment_ids_by_race.setdefault(segment.race_id, set()).add(
+                segment_id
+            )
+            return
+        index = self._closed_indexes_by_race.setdefault(
+            segment.race_id,
+            _SegmentIntervalIndex(),
+        )
+        index.add(
+            started_at_ms=interval[0],
+            ended_at_ms=interval[1],
+            order=order,
+            segment_id=segment_id,
+        )
+        self._index_closed_bounds(segment)
+
+    def _index_closed_bounds(self, segment: RecordingSegment) -> None:
+        self._closed_bounds_by_race.setdefault(
+            segment.race_id,
+            _ClosedTimelineBounds(),
+        ).add(segment)
+        self._all_closed_bounds.add(segment)
+        if not segment.race_id and segment.clock_source == DEFAULT_CLOCK_SOURCE:
+            self._legacy_default_closed_bounds.add(segment)
+
+    def _rebuild_indexes(self) -> None:
+        self._segment_order_index.clear()
+        self._segment_ids_by_race.clear()
+        self._closed_indexes_by_race.clear()
+        self._open_segment_ids_by_race.clear()
+        self._closed_bounds_by_race.clear()
+        self._all_closed_bounds = _ClosedTimelineBounds()
+        self._legacy_default_closed_bounds = _ClosedTimelineBounds()
+        self._segments_by_path.clear()
+        for order, segment_id in enumerate(self._segment_order):
+            self._index_segment(self._segments[segment_id], order)
+
+    def find_segment_by_video_path(
+        self,
+        video_path: str | Path,
+    ) -> RecordingSegment | None:
+        path_key = self._path_key(Path(video_path).expanduser().absolute())
+        with self._lock:
+            segment_ids = self._segments_by_path.get(path_key, ())
+            return self._segments[segment_ids[0]] if segment_ids else None
+
+    def get_segment(self, segment_id: str) -> RecordingSegment | None:
+        with self._lock:
+            return self._segments.get(str(segment_id))
+
+    def video_path_is_playable(self, video_path: str | Path) -> bool:
+        return self._video_path_is_playable(Path(video_path).expanduser().absolute())
+
+    def _video_path_is_playable(self, video_path: Path) -> bool:
+        path_key = self._path_key(video_path)
+        now = time.monotonic()
+        cached = self._playability_cache.get(path_key)
+        if cached is not None and now - cached[2] <= _PLAYABILITY_CACHE_TTL_SECONDS:
+            return cached[3]
+        try:
+            stat = video_path.stat()
+            signature = (int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            signature = (-1, -1)
+        playable = _video_path_is_playable(video_path)
+        self._playability_cache[path_key] = (*signature, now, playable)
+        return playable
+
+    def _candidate_segment_ids(
+        self,
+        target_time_ms: int,
+        expected_race_id: str,
+    ) -> tuple[str, ...]:
+        if expected_race_id:
+            race_keys = (expected_race_id, "")
+        else:
+            race_keys = tuple(self._segment_ids_by_race)
+        segment_ids: set[str] = set()
+        for race_key in race_keys:
+            index = self._closed_indexes_by_race.get(race_key)
+            if index is not None:
+                segment_ids.update(index.candidates(target_time_ms))
+            segment_ids.update(self._open_segment_ids_by_race.get(race_key, ()))
+        return tuple(
+            sorted(
+                segment_ids,
+                key=lambda segment_id: self._segment_order_index[segment_id],
+            )
+        )
+
+    @staticmethod
+    def _segment_is_relevant(
+        segment: RecordingSegment,
+        expected_race_id: str,
+    ) -> bool:
+        if segment.ended_at_ms is None and segment.clock_source != DEFAULT_CLOCK_SOURCE:
+            return False
+        if not expected_race_id:
+            return True
+        return segment.race_id == expected_race_id or (
+            not segment.race_id and segment.clock_source == DEFAULT_CLOCK_SOURCE
+        )
+
+    def _relevant_timeline_bounds(
+        self,
+        expected_race_id: str,
+        now_ms: int,
+    ) -> tuple[int, Optional[int], Optional[int]]:
+        if expected_race_id:
+            closed_bounds = (
+                self._closed_bounds_by_race.get(expected_race_id),
+                self._legacy_default_closed_bounds,
+            )
+            open_race_ids = (expected_race_id, "")
+        else:
+            closed_bounds = (self._all_closed_bounds,)
+            open_race_ids = tuple(self._open_segment_ids_by_race)
+
+        count = 0
+        earliest_start_ms: Optional[int] = None
+        latest_end_ms: Optional[int] = None
+        for bounds in closed_bounds:
+            if bounds is None or not bounds.count:
+                continue
+            count += bounds.count
+            if bounds.earliest_start_ms is not None:
+                earliest_start_ms = (
+                    bounds.earliest_start_ms
+                    if earliest_start_ms is None
+                    else min(earliest_start_ms, bounds.earliest_start_ms)
+                )
+            if bounds.latest_end_ms is not None:
+                latest_end_ms = (
+                    bounds.latest_end_ms
+                    if latest_end_ms is None
+                    else max(latest_end_ms, bounds.latest_end_ms)
+                )
+
+        for race_id in open_race_ids:
+            for segment_id in self._open_segment_ids_by_race.get(race_id, ()):
+                segment = self._segments[segment_id]
+                if not self._segment_is_relevant(segment, expected_race_id):
+                    continue
+                count += 1
+                earliest_start_ms = (
+                    segment.started_at_ms
+                    if earliest_start_ms is None
+                    else min(earliest_start_ms, segment.started_at_ms)
+                )
+                latest_end_ms = (
+                    now_ms
+                    if latest_end_ms is None
+                    else max(latest_end_ms, now_ms)
+                )
+        return count, earliest_start_ms, latest_end_ms
+
+    def _has_any_eligible_segment(self) -> bool:
+        if self._all_closed_bounds.count:
+            return True
+        return any(
+            self._segments[segment_id].clock_source == DEFAULT_CLOCK_SOURCE
+            for segment_ids in self._open_segment_ids_by_race.values()
+            for segment_id in segment_ids
+        )
+
     def start_segment(
         self,
         *,
@@ -392,6 +691,8 @@ class VideoTimelineStore:
             self._append_record(payload)
             self._segments[segment.segment_id] = segment
             self._segment_order.append(segment.segment_id)
+            self._index_segment(segment, len(self._segment_order) - 1)
+            self._revision += 1
         return segment
 
     def finish_segment(
@@ -437,6 +738,23 @@ class VideoTimelineStore:
                 end_reason=str(end_reason),
             )
             self._segments[current.segment_id] = updated
+            self._open_segment_ids_by_race.get(current.race_id, set()).discard(
+                current.segment_id
+            )
+            interval = self._segment_interval(updated)
+            if interval is not None:
+                index = self._closed_indexes_by_race.setdefault(
+                    updated.race_id,
+                    _SegmentIntervalIndex(),
+                )
+                index.add(
+                    started_at_ms=interval[0],
+                    ended_at_ms=interval[1],
+                    order=self._segment_order_index[updated.segment_id],
+                    segment_id=updated.segment_id,
+                )
+                self._index_closed_bounds(updated)
+            self._revision += 1
             return updated
 
     def add_completed_segment(
@@ -495,6 +813,8 @@ class VideoTimelineStore:
             self._append_records((started_payload, ended_payload))
             self._segments[segment.segment_id] = segment
             self._segment_order.append(segment.segment_id)
+            self._index_segment(segment, len(self._segment_order) - 1)
+            self._revision += 2
         return segment
 
     def segments(self) -> tuple[RecordingSegment, ...]:
@@ -538,28 +858,29 @@ class VideoTimelineStore:
         target_time_ms = int(passage_time_ms) + int(clock_offset_ms)
         pre_roll_ms = max(0, int(pre_roll_ms))
         now_ms = int(time.time() * 1000.0) if current_time_ms is None else int(current_time_ms)
-        eligible_segments = tuple(
-            segment
-            for segment in self.segments()
-            if segment.ended_at_ms is not None
-            or segment.clock_source == DEFAULT_CLOCK_SOURCE
-        )
-        if not eligible_segments:
-            return PassageVideoLookup("no_segments", target_time_ms)
-
         expected_race_id = str(race_id or "").strip()
-        segments = tuple(
-            segment
-            for segment in eligible_segments
-            if not expected_race_id
-            or segment.race_id == expected_race_id
-            or (
-                not segment.race_id
-                and segment.clock_source == DEFAULT_CLOCK_SOURCE
+        with self._lock:
+            candidate_ids = self._candidate_segment_ids(
+                target_time_ms,
+                expected_race_id,
             )
-        )
-        if not segments:
-            return PassageVideoLookup("race_mismatch", target_time_ms)
+            segments = tuple(
+                self._segments[segment_id]
+                for segment_id in candidate_ids
+                if self._segment_is_relevant(
+                    self._segments[segment_id],
+                    expected_race_id,
+                )
+            )
+            eligible_count, earliest_start, latest_end = (
+                self._relevant_timeline_bounds(expected_race_id, now_ms)
+            )
+            any_eligible = self._has_any_eligible_segment()
+        if not eligible_count:
+            return PassageVideoLookup(
+                "race_mismatch" if expected_race_id and any_eligible else "no_segments",
+                target_time_ms,
+            )
 
         candidates: dict[
             str,
@@ -604,7 +925,7 @@ class VideoTimelineStore:
             if candidate_key is None:
                 continue
             playable_rank = int(
-                not _video_path_is_playable(self.resolve_video_path(segment))
+                not self._video_path_is_playable(self.resolve_video_path(segment))
             )
             ranked_candidate_key = (playable_rank, *candidate_key)
             current = candidates.get(segment.source_id)
@@ -617,7 +938,7 @@ class VideoTimelineStore:
             video_path = self.resolve_video_path(segment)
             if segment.ended_at_ms is None:
                 status = "recording"
-            elif not _video_path_is_playable(video_path):
+            elif not self._video_path_is_playable(video_path):
                 status = "missing_file"
             elif (
                 segment.media_started_at_ms is None
@@ -678,26 +999,11 @@ class VideoTimelineStore:
                 status = "missing_file"
             return PassageVideoLookup(status, target_time_ms, tuple(locations))
 
-        earliest_start = min(
-            item.media_started_at_ms
-            if item.media_started_at_ms is not None
-            else item.started_at_ms
-            for item in segments
-        )
+        assert earliest_start is not None
+        assert latest_end is not None
         if target_time_ms < earliest_start:
             status = "before_recording"
         else:
-            latest_end = max(
-                (
-                    item.media_started_at_ms + item.media_duration_ms
-                    if item.media_started_at_ms is not None
-                    and item.media_duration_ms is not None
-                    else item.ended_at_ms
-                    if item.ended_at_ms is not None
-                    else now_ms
-                )
-                for item in segments
-            )
             status = "after_recording" if target_time_ms > latest_end else "recording_gap"
         return PassageVideoLookup(status, target_time_ms)
 

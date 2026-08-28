@@ -22,6 +22,7 @@ from .stream_recorder import (
     is_rtsp_source,
     sanitize_recording_message,
 )
+from .review_clip import PassageReviewBinding, PassageReviewBindingStore
 from .video_timeline import (
     DEFAULT_CLOCK_SOURCE,
     DEFAULT_TIMING_ERROR_MS,
@@ -36,6 +37,7 @@ DEFAULT_REVIEW_SEGMENT_SECONDS = 2
 DEFAULT_REVIEW_RETENTION_SECONDS = 360
 DEFAULT_REVIEW_PRE_ROLL_SECONDS = 3
 DEFAULT_REVIEW_POST_ROLL_SECONDS = 3
+DEFAULT_MAX_SHARED_REVIEW_CLIP_MS = 20_000
 DEFAULT_ARCHIVE_TIMING_ERROR_MS = 3_000
 _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS = 5
 ARCHIVE_SESSION_SCHEMA_VERSION = 1
@@ -1211,16 +1213,44 @@ class PassageReviewTimelinePublisher:
         timeline_store: VideoTimelineStore,
         *,
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
+        binding_store: PassageReviewBindingStore | None = None,
     ):
         self.ring_buffer = ring_buffer
         self.timeline_store = timeline_store
+        self.binding_store = binding_store
         self.timing_error_ms = max(0, int(timing_error_ms))
         self._preview_segments: dict[tuple[str, int], RecordingSegment] = {}
 
-    @staticmethod
-    def _playlist_name(window: PassageReviewWindow) -> str:
-        digest = hashlib.sha256(window.event_id.encode("utf-8")).hexdigest()[:16]
-        return f"evidence_{digest}_{window.passage_timestamp_ms}.m3u8"
+    def _segment_signature(
+        self,
+        segments: tuple[ReviewSegment, ...],
+        *,
+        race_id: str,
+    ) -> str:
+        payload = {
+            "race_id": str(race_id),
+            "source_id": self.ring_buffer.source_id,
+            "camera_index": self.ring_buffer.camera_index,
+            "segments": [
+                (
+                    segment.segment_id,
+                    segment.video_path,
+                    segment.started_at_ms,
+                    segment.duration_ms,
+                )
+                for segment in segments
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _playlist_name(self, segment_signature: str) -> str:
+        return f"evidence_shared_{segment_signature[:24]}.m3u8"
 
     @staticmethod
     def _preview_playlist_name(window: PassageReviewWindow) -> str:
@@ -1228,8 +1258,8 @@ class PassageReviewTimelinePublisher:
         return f"preview_{digest}_{window.passage_timestamp_ms}.m3u8"
 
     @staticmethod
-    def _published_pin_id(window: PassageReviewWindow) -> str:
-        return f"published:{window.event_id}:{window.passage_timestamp_ms}"
+    def _published_pin_id(segment_signature: str) -> str:
+        return f"published:clip:{segment_signature}"
 
     @staticmethod
     def _program_date_time(timestamp_ms: int) -> str:
@@ -1362,37 +1392,93 @@ class PassageReviewTimelinePublisher:
         window: PassageReviewWindow,
         *,
         race_id: str,
+        revision: int = 1,
     ) -> RecordingSegment:
-        if window.state is not PassageReviewState.READY or not window.segments:
-            raise ValueError("only a complete passage review window can be published")
+        return self.publish_many(
+            ((window, int(revision)),),
+            race_id=race_id,
+        )
+
+    def publish_many(
+        self,
+        windows: tuple[tuple[PassageReviewWindow, int], ...],
+        *,
+        race_id: str,
+    ) -> RecordingSegment:
+        if not windows or any(
+            window.state is not PassageReviewState.READY or not window.segments
+            for window, _revision in windows
+        ):
+            raise ValueError("only complete passage review windows can be published")
+        segments_by_id = {
+            segment.segment_id: segment
+            for window, _revision in windows
+            for segment in window.segments
+        }
+        segments = tuple(
+            sorted(
+                segments_by_id.values(),
+                key=lambda segment: (segment.started_at_ms, segment.segment_id),
+            )
+        )
+        if segments[-1].ended_at_ms - segments[0].started_at_ms > (
+            DEFAULT_MAX_SHARED_REVIEW_CLIP_MS
+        ):
+            raise ValueError("shared passage review clip exceeds 20 seconds")
+        segment_signature = self._segment_signature(segments, race_id=race_id)
         self.ring_buffer.pin_window(
-            self._published_pin_id(window),
-            started_at_ms=window.started_at_ms,
-            ended_at_ms=window.ended_at_ms,
+            self._published_pin_id(segment_signature),
+            started_at_ms=segments[0].started_at_ms,
+            ended_at_ms=segments[-1].ended_at_ms,
             scan=False,
         )
-        playlist_path = self.ring_buffer.buffer_dir / self._playlist_name(window)
-        self._write_playlist(playlist_path, window.segments)
-        resolved_playlist = playlist_path.resolve()
-        for segment in self.timeline_store.segments():
-            if self.timeline_store.resolve_video_path(segment) == resolved_playlist:
-                return segment
-
-        media_started_at_ms = window.segments[0].started_at_ms
-        media_duration_ms = (
-            window.segments[-1].ended_at_ms - media_started_at_ms
+        playlist_path = self.ring_buffer.buffer_dir / self._playlist_name(
+            segment_signature
         )
-        return self.timeline_store.add_completed_segment(
-            source_id=self.ring_buffer.source_id,
-            camera_index=self.ring_buffer.camera_index,
-            video_path=playlist_path,
-            media_started_at_ms=media_started_at_ms,
-            media_duration_ms=media_duration_ms,
-            clock_source=DEFAULT_CLOCK_SOURCE,
-            timing_error_ms=self.timing_error_ms,
-            end_reason="passage_review_window",
-            race_id=str(race_id),
-        )
+        self._write_playlist(playlist_path, segments)
+        media_started_at_ms = segments[0].started_at_ms
+        media_duration_ms = segments[-1].ended_at_ms - media_started_at_ms
+        segment = self.timeline_store.find_segment_by_video_path(playlist_path)
+        if segment is None:
+            segment = self.timeline_store.add_completed_segment(
+                source_id=self.ring_buffer.source_id,
+                camera_index=self.ring_buffer.camera_index,
+                video_path=playlist_path,
+                media_started_at_ms=media_started_at_ms,
+                media_duration_ms=media_duration_ms,
+                clock_source=DEFAULT_CLOCK_SOURCE,
+                timing_error_ms=self.timing_error_ms,
+                end_reason="passage_review_window",
+                race_id=str(race_id),
+            )
+        if self.binding_store is not None:
+            clip = self.binding_store.get_or_add_clip(
+                race_id=str(race_id),
+                camera_index=self.ring_buffer.camera_index,
+                source_id=self.ring_buffer.source_id,
+                started_at_ms=media_started_at_ms,
+                ended_at_ms=media_started_at_ms + media_duration_ms,
+                playlist_path=playlist_path,
+                segment_signature=segment_signature,
+                timeline_segment_id=segment.segment_id,
+            )
+            self.binding_store.bind_many(
+                tuple(
+                    PassageReviewBinding(
+                        event_id=window.event_id,
+                        revision=int(window_revision),
+                        camera_index=self.ring_buffer.camera_index,
+                        clip_id=clip.clip_id,
+                        passage_timestamp_ms=window.passage_timestamp_ms,
+                        passage_offset_ms=max(
+                            0,
+                            window.passage_timestamp_ms - media_started_at_ms,
+                        ),
+                    )
+                    for window, window_revision in windows
+                )
+            )
+        return segment
 
 
 __all__ = [
@@ -1402,6 +1488,7 @@ __all__ = [
     "DEFAULT_ARCHIVE_SEGMENT_SECONDS",
     "DEFAULT_ARCHIVE_TIMING_ERROR_MS",
     "DEFAULT_REVIEW_POST_ROLL_SECONDS",
+    "DEFAULT_MAX_SHARED_REVIEW_CLIP_MS",
     "DEFAULT_REVIEW_PRE_ROLL_SECONDS",
     "DEFAULT_REVIEW_RETENTION_SECONDS",
     "DEFAULT_REVIEW_SEGMENT_SECONDS",
