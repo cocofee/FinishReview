@@ -59,6 +59,7 @@ exe = EXE(
     icon=str(icon_path),
     disable_windowed_traceback=False,
     argv_emulation=False,
+    version=str(ROOT / "packaging" / "version_info.txt"),
 )
 coll = COLLECT(
     exe,
