@@ -1,7 +1,25 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_project_and_runtime_versions_match_release_version():
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    runtime_init = (ROOT / "realtime" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+
+    project_version = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE)
+    runtime_version = re.search(
+        r'^__version__ = "([^"]+)"$', runtime_init, re.MULTILINE
+    )
+
+    assert project_version is not None
+    assert runtime_version is not None
+    assert project_version.group(1) == "0.2.0"
+    assert runtime_version.group(1) == project_version.group(1)
 
 
 def test_finish_review_package_excludes_detection_and_ocr_runtimes():
