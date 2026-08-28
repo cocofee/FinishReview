@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from statistics import median
 from typing import Callable, Optional
@@ -37,6 +38,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+logger = logging.getLogger("FinishReview.Playback")
 
 
 SUPPORTED_VIDEO_SUFFIXES = {".mkv", ".mp4", ".avi", ".mov", ".m4v"}
@@ -379,8 +382,9 @@ class VideoPlaybackWorker(QThread):
     REVERSE_WINDOW_SECONDS = 0.5
     MIN_REVERSE_WINDOW_FRAMES = 8
     REVERSE_PREFETCH_TRIGGER_RATIO = 0.5
-    FORWARD_PREFETCH_IDLE_SECONDS = 0.04
+    FORWARD_PREFETCH_IDLE_SECONDS = 0.12
     DEFAULT_CACHE_BYTES = 64 * 1024 * 1024
+    PERFORMANCE_LOG_INTERVAL = 25
 
     def __init__(
         self,
@@ -426,6 +430,12 @@ class VideoPlaybackWorker(QThread):
         self._reverse_prefetch_serial = 0
         self._reverse_prefetch_shutdown = False
         self._reverse_prefetch_thread: Optional[threading.Thread] = None
+        self._navigation_request: Optional[tuple[int, int, str, float]] = None
+        self._navigation_latency_ms: deque[float] = deque(maxlen=100)
+        self._navigation_decode_ms: deque[float] = deque(maxlen=100)
+        self._navigation_samples = 0
+        self._navigation_cache_hits = 0
+        self._navigation_boundary_misses = 0
 
     @property
     def current_position_ms(self) -> int:
@@ -478,6 +488,10 @@ class VideoPlaybackWorker(QThread):
             )
             self._step_frame = None
             self._navigation_frame_index = self._seek_frame[0]
+            self._set_navigation_request_locked(
+                "seek",
+                self._seek_frame[0],
+            )
             self._full_resolution_frame = None
             self._anchor_reset = True
             self._condition.notify_all()
@@ -498,6 +512,10 @@ class VideoPlaybackWorker(QThread):
             )
             self._step_frame = None
             self._navigation_frame_index = self._seek_frame[0]
+            self._set_navigation_request_locked(
+                "seek_play",
+                self._seek_frame[0],
+            )
             self._full_resolution_frame = None
             self._direction = 1 if speed >= 0 else -1
             self._speed = max(0.01, abs(speed))
@@ -528,7 +546,81 @@ class VideoPlaybackWorker(QThread):
             target = self._clamp_frame(max(0, base_frame) + frame_delta)
             self._navigation_frame_index = target
             self._step_frame = (target, self._request_generation)
+            self._set_navigation_request_locked("step", target)
             self._condition.notify_all()
+
+    def _set_navigation_request_locked(self, kind: str, target: int) -> None:
+        self._navigation_request = (
+            self._request_generation,
+            int(target),
+            str(kind),
+            time.perf_counter(),
+        )
+
+    @staticmethod
+    def _percentile(samples: deque[float], percentile: float) -> float:
+        if not samples:
+            return 0.0
+        ordered = sorted(samples)
+        index = round((len(ordered) - 1) * float(percentile))
+        return ordered[max(0, min(index, len(ordered) - 1))]
+
+    def _record_navigation_result(
+        self,
+        target: int,
+        generation: Optional[int],
+        *,
+        cache_hit: bool,
+        boundary_miss: bool,
+        decode_ms: float,
+    ) -> None:
+        with self._condition:
+            request = self._navigation_request
+            if (
+                request is None
+                or generation is None
+                or request[0] != generation
+                or request[1] != int(target)
+            ):
+                return
+            self._navigation_request = None
+            latency_ms = (time.perf_counter() - request[3]) * 1000.0
+            self._navigation_latency_ms.append(latency_ms)
+            self._navigation_decode_ms.append(max(0.0, float(decode_ms)))
+            self._navigation_samples += 1
+            self._navigation_cache_hits += int(cache_hit)
+            self._navigation_boundary_misses += int(boundary_miss)
+            should_log = (
+                self._navigation_samples % self.PERFORMANCE_LOG_INTERVAL == 0
+            )
+            kind = request[2]
+        if should_log:
+            self._log_navigation_summary(kind=kind, target=target)
+
+    def _log_navigation_summary(self, *, kind: str = "", target: int = -1) -> None:
+        with self._condition:
+            samples = self._navigation_samples
+            if not samples:
+                return
+            hit_rate = self._navigation_cache_hits * 100.0 / samples
+            latency_p50 = self._percentile(self._navigation_latency_ms, 0.50)
+            latency_p95 = self._percentile(self._navigation_latency_ms, 0.95)
+            decode_p95 = self._percentile(self._navigation_decode_ms, 0.95)
+            boundary_misses = self._navigation_boundary_misses
+        logger.info(
+            "Playback navigation path=%s samples=%d cache_hit=%.1f%% "
+            "latency_p50=%.1fms latency_p95=%.1fms decode_p95=%.1fms "
+            "boundary_misses=%d last=%s:%d",
+            self.video_path.name,
+            samples,
+            hit_rate,
+            latency_p50,
+            latency_p95,
+            decode_p95,
+            boundary_misses,
+            kind,
+            int(target),
+        )
 
     def set_idle_prefetch_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -1032,30 +1124,58 @@ class VideoPlaybackWorker(QThread):
         generation: Optional[int] = None,
         reverse_window: bool = False,
     ) -> tuple[bool, int]:
+        decode_started = time.perf_counter()
         if self._decode_request_cancelled(generation):
             return True, capture_next_frame
         cached = self._cached_image(target)
         if cached is not None:
             emitted = self._emit_image(cached, target, generation=generation)
+            if emitted:
+                self._record_navigation_result(
+                    target,
+                    generation,
+                    cache_hit=True,
+                    boundary_miss=False,
+                    decode_ms=(time.perf_counter() - decode_started) * 1000.0,
+                )
             if emitted and reverse_window:
                 self._maybe_schedule_reverse_prefetch(target, generation)
             return True, capture_next_frame
 
         if self._sequential_capture:
-            return self._decode_sequential_target(
+            boundary_miss = target < capture_next_frame
+            result = self._decode_sequential_target(
                 capture,
                 target,
                 capture_next_frame,
                 generation=generation,
             )
+            if result[0] and not self._decode_request_cancelled(generation):
+                self._record_navigation_result(
+                    target,
+                    generation,
+                    cache_hit=False,
+                    boundary_miss=boundary_miss,
+                    decode_ms=(time.perf_counter() - decode_started) * 1000.0,
+                )
+            return result
 
         if reverse_window:
-            return self._decode_reverse_window(
+            result = self._decode_reverse_window(
                 capture,
                 target,
                 capture_next_frame,
                 generation=generation,
             )
+            if result[0] and not self._decode_request_cancelled(generation):
+                self._record_navigation_result(
+                    target,
+                    generation,
+                    cache_hit=False,
+                    boundary_miss=True,
+                    decode_ms=(time.perf_counter() - decode_started) * 1000.0,
+                )
+            return result
 
         positioned, capture_next_frame = self._position_capture(
             capture,
@@ -1082,7 +1202,15 @@ class VideoPlaybackWorker(QThread):
             return False, capture_next_frame
         image = self._image_from_frame(frame)
         self._cache_image(target, image)
-        self._emit_image(image, target, generation=generation)
+        emitted = self._emit_image(image, target, generation=generation)
+        if emitted:
+            self._record_navigation_result(
+                target,
+                generation,
+                cache_hit=False,
+                boundary_miss=False,
+                decode_ms=(time.perf_counter() - decode_started) * 1000.0,
+            )
         return True, capture_next_frame
 
     def _decode_sequential_target(
@@ -1344,16 +1472,6 @@ class VideoPlaybackWorker(QThread):
                     anchor_clock = time.monotonic()
                     continue
 
-                if full_resolution_frame is not None:
-                    requested_frame, generation = full_resolution_frame
-                    _, capture_next_frame = self._decode_full_resolution(
-                        capture,
-                        self._clamp_frame(requested_frame),
-                        capture_next_frame,
-                        generation=generation,
-                    )
-                    continue
-
                 if step_frame is not None:
                     requested_frame, generation = step_frame
                     target = self._clamp_frame(requested_frame)
@@ -1366,6 +1484,16 @@ class VideoPlaybackWorker(QThread):
                     )
                     if ok and not self._decode_request_cancelled(generation):
                         last_frame_index = target
+                    continue
+
+                if full_resolution_frame is not None:
+                    requested_frame, generation = full_resolution_frame
+                    _, capture_next_frame = self._decode_full_resolution(
+                        capture,
+                        self._clamp_frame(requested_frame),
+                        capture_next_frame,
+                        generation=generation,
+                    )
                     continue
 
                 if not playing:
@@ -1419,6 +1547,7 @@ class VideoPlaybackWorker(QThread):
         except Exception as exc:
             self.playback_error.emit(f"录像回放失败: {exc}")
         finally:
+            self._log_navigation_summary()
             self._stop_reverse_prefetcher()
             if capture:
                 capture.release()

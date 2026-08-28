@@ -51,6 +51,7 @@ class _FakePlaybackWorker(QObject):
         super().__init__(parent)
         self.video_path = Path(video_path)
         self.running = False
+        self.start_calls = 0
         self.stopped = False
         self.seek_calls = []
         self.preview_seek_calls = []
@@ -65,6 +66,7 @@ class _FakePlaybackWorker(QObject):
         type(self).instances.append(self)
 
     def start(self):
+        self.start_calls += 1
         self.running = True
         fps = 250.0 if "high_speed" in self.video_path.name else 50.0
         self.metadata_ready.emit(60_000, fps, 2560, 1440, int(60 * fps))
@@ -277,8 +279,21 @@ def test_review_shows_two_regular_camera_locations_side_by_side(
     assert first_pane.location.video_path == first_path.absolute()
     assert second_pane.location.video_path == second_path.absolute()
     first_worker, second_worker = fake_playback.instances
+    assert first_worker.start_calls == 1
+    assert second_worker.start_calls == 0
     assert first_worker.idle_prefetch_calls[-1] is True
     assert second_worker.idle_prefetch_calls[-1] is False
+
+    QTest.qWait(dialog.INACTIVE_CAMERA_START_DELAY_MS + 20)
+
+    assert second_worker.start_calls == 1
+
+    preview = QImage(1280, 720, QImage.Format_RGB888)
+    preview.fill(0)
+    first_worker.frame_ready.emit(preview, 5_000, 250)
+    qapp.processEvents()
+
+    assert second_worker.start_calls == 1
 
     second_pane.step_requested.emit(1)
     qapp.processEvents()
@@ -290,6 +305,111 @@ def test_review_shows_two_regular_camera_locations_side_by_side(
     assert first_pane.isVisible()
     assert second_pane.isVisible()
     assert dialog.high_speed_pane.isHidden()
+    dialog.close()
+
+
+def test_switching_athletes_starts_the_active_regular_camera_first(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-1", sequence=1, passage_time_ms=15_000)
+    )
+    passage_store.append(
+        _event(event_id="passage-2", sequence=2, passage_time_ms=25_000)
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for camera_index in (1, 2):
+        _add_segment(
+            timeline_store,
+            tmp_path / "videos" / f"camera_{camera_index:02d}_first.mkv",
+            source_id=f"camera_{camera_index:02d}_first",
+            camera_index=camera_index,
+            started_at_ms=10_000,
+            ended_at_ms=20_000,
+        )
+        _add_segment(
+            timeline_store,
+            tmp_path / "videos" / f"camera_{camera_index:02d}_second.mkv",
+            source_id=f"camera_{camera_index:02d}_second",
+            camera_index=camera_index,
+            started_at_ms=20_000,
+            ended_at_ms=30_000,
+        )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    preview = QImage(1280, 720, QImage.Format_RGB888)
+    preview.fill(0)
+    first_active, first_inactive = fake_playback.instances
+    first_active.frame_ready.emit(preview, 5_000, 250)
+    qapp.processEvents()
+    assert first_inactive.start_calls == 1
+
+    dialog._move_selection(1)
+    qapp.processEvents()
+
+    second_active, second_inactive = fake_playback.instances[-2:]
+    assert second_active.start_calls == 1
+    assert second_inactive.start_calls == 0
+
+    second_active.frame_ready.emit(preview, 5_000, 250)
+    qapp.processEvents()
+
+    assert second_inactive.start_calls == 1
+    dialog.close()
+
+
+def test_rapid_athlete_switch_cancels_the_previous_inactive_camera_start(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-1", sequence=1, passage_time_ms=15_000)
+    )
+    passage_store.append(
+        _event(event_id="passage-2", sequence=2, passage_time_ms=25_000)
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for camera_index in (1, 2):
+        _add_segment(
+            timeline_store,
+            tmp_path / "videos" / f"camera_{camera_index:02d}_first.mkv",
+            source_id=f"camera_{camera_index:02d}_first",
+            camera_index=camera_index,
+            started_at_ms=10_000,
+            ended_at_ms=20_000,
+        )
+        _add_segment(
+            timeline_store,
+            tmp_path / "videos" / f"camera_{camera_index:02d}_second.mkv",
+            source_id=f"camera_{camera_index:02d}_second",
+            camera_index=camera_index,
+            started_at_ms=20_000,
+            ended_at_ms=30_000,
+        )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    first_active, first_inactive = fake_playback.instances
+
+    dialog._move_selection(1)
+    qapp.processEvents()
+    second_active, second_inactive = fake_playback.instances[-2:]
+
+    assert first_active.start_calls == 1
+    assert first_inactive.start_calls == 0
+    assert second_active.start_calls == 1
+    assert second_inactive.start_calls == 0
+
+    QTest.qWait(dialog.INACTIVE_CAMERA_START_DELAY_MS + 20)
+
+    assert first_inactive.start_calls == 0
+    assert second_inactive.start_calls == 1
     dialog.close()
 
 
@@ -1625,12 +1745,46 @@ def test_zoom_requests_full_resolution_without_replacing_the_worker(
     worker.frame_ready.emit(preview, 5_000, 250)
     qapp.processEvents()
     dialog.regular_pane.video_view.set_actual_size()
-    qapp.processEvents()
+    QTest.qWait(dialog.regular_pane.FULL_RESOLUTION_IDLE_MS + 20)
 
     assert fake_playback.instances == [worker]
     assert worker.full_resolution_calls[-1] == 250
     assert dialog.regular_pane.video_view.zoom_percent == 100
     assert dialog.regular_pane.video_view.sceneRect().width() == 2560
+    dialog.close()
+
+
+def test_full_resolution_request_waits_for_the_latest_paused_frame(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    worker = fake_playback.instances[0]
+    preview = QImage(1280, 720, QImage.Format_RGB888)
+    preview.fill(0)
+
+    worker.frame_ready.emit(preview, 5_000, 250)
+    qapp.processEvents()
+    pane.video_view.set_actual_size()
+    QTest.qWait(50)
+    worker.frame_ready.emit(preview, 5_080, 254)
+    QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 20)
+
+    assert worker.full_resolution_calls == [254]
     dialog.close()
 
 
@@ -2191,7 +2345,7 @@ def test_video_scrub_defers_full_resolution_until_exact_frame(
 
     pane._on_video_scrub_finished(40)
     worker.frame_ready.emit(frame, 5_080, 254)
-    qapp.processEvents()
+    QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 20)
     assert worker.full_resolution_calls == [254]
     dialog.close()
 

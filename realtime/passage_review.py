@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
 import time
 from typing import Callable, Iterable, Optional
@@ -70,6 +71,8 @@ from .video_timeline import (
     PassageVideoLookup,
     VideoTimelineStore,
 )
+
+logger = logging.getLogger("FinishReview.Review")
 
 
 _STATUS_TEXT = {
@@ -797,9 +800,11 @@ class PassageEvidencePane(QFrame):
     delete_requested = pyqtSignal(object)
     scrub_started = pyqtSignal()
     scrub_preview_requested = pyqtSignal(int)
+    initial_frame_ready = pyqtSignal(str)
 
     MAX_SCRUB_SPAN_MS = 6_000
     SCRUB_PREVIEW_INTERVAL_MS = 80
+    FULL_RESOLUTION_IDLE_MS = 200
     MIN_LINKED_DRIFT_TOLERANCE_MS = 40
     LINKED_DRIFT_FRAME_MULTIPLIER = 1
     STATUS_COLORS = {
@@ -855,6 +860,12 @@ class PassageEvidencePane(QFrame):
         self._scrub_preview_timer.setSingleShot(True)
         self._scrub_preview_timer.setInterval(self.SCRUB_PREVIEW_INTERVAL_MS)
         self._scrub_preview_timer.timeout.connect(self._flush_scrub_preview)
+        self._full_resolution_timer = QTimer(self)
+        self._full_resolution_timer.setSingleShot(True)
+        self._full_resolution_timer.setInterval(self.FULL_RESOLUTION_IDLE_MS)
+        self._full_resolution_timer.timeout.connect(
+            self._flush_full_resolution_request
+        )
 
         self.setObjectName("passageEvidencePane")
         self.setFrameShape(QFrame.StyledPanel)
@@ -885,7 +896,7 @@ class PassageEvidencePane(QFrame):
         self.video_view.clear_frame("选择一条通过记录后自动定位")
         self.video_view.zoom_changed.connect(self._on_zoom_changed)
         self.video_view.full_resolution_requested.connect(
-            self._request_full_resolution
+            self._schedule_full_resolution_request
         )
         self.video_view.maximize_requested.connect(
             lambda: self.maximize_requested.emit(self)
@@ -1293,6 +1304,7 @@ class PassageEvidencePane(QFrame):
         *,
         initial_delta_ms: int = 0,
         lookup_status: str = "",
+        defer_worker_start: bool = False,
     ) -> None:
         previous_context = self._media_context(self._location)
         previous_event_id = self._event.event_id if self._event is not None else ""
@@ -1321,6 +1333,7 @@ class PassageEvidencePane(QFrame):
         self._current_frame_index = -1
         self._current_position_ms = 0
         self._last_full_resolution_request = -1
+        self._full_resolution_timer.stop()
         self._reset_video_scrub()
         self.play_btn.setText("▶")
         self.mark_btn.setText("重标" if association is not None else "标线")
@@ -1396,7 +1409,24 @@ class PassageEvidencePane(QFrame):
         worker.playback_finished.connect(self._on_playback_finished)
         worker.playback_error.connect(self._on_playback_error)
         self._worker = worker
+        if not defer_worker_start:
+            worker.start()
+
+    @property
+    def has_playback_worker(self) -> bool:
+        return self._worker is not None
+
+    @property
+    def worker_start_deferred(self) -> bool:
+        worker = self._worker
+        return worker is not None and not worker.isRunning()
+
+    def start_deferred_worker(self) -> bool:
+        worker = self._worker
+        if worker is None or worker.isRunning():
+            return False
         worker.start()
+        return True
 
     @staticmethod
     def _media_context(
@@ -1496,7 +1526,9 @@ class PassageEvidencePane(QFrame):
             and not self._video_scrubbing
             and self.video_view.zoom_percent >= 100
         ):
-            self._request_full_resolution()
+            self._schedule_full_resolution_request()
+        if previous_frame_index < 0 and self._event is not None:
+            self.initial_frame_ready.emit(self._event.event_id)
 
     def _on_full_resolution_ready(
         self,
@@ -1540,6 +1572,19 @@ class PassageEvidencePane(QFrame):
             return
         self._last_full_resolution_request = frame_index
         worker.request_full_resolution(frame_index)
+
+    def _schedule_full_resolution_request(self) -> None:
+        if (
+            self._worker is None
+            or self._current_frame_index < 0
+            or self._playing
+            or self._video_scrubbing
+        ):
+            return
+        self._full_resolution_timer.start()
+
+    def _flush_full_resolution_request(self) -> None:
+        self._request_full_resolution()
 
     def _on_zoom_changed(self, percent: int) -> None:
         self.actual_size_btn.setText(f"{int(percent)}%")
@@ -1606,6 +1651,7 @@ class PassageEvidencePane(QFrame):
 
     def _reset_video_scrub(self) -> None:
         self._scrub_preview_timer.stop()
+        self._full_resolution_timer.stop()
         self._pending_scrub_delta_ms = None
         self._video_scrubbing = False
 
@@ -1634,6 +1680,8 @@ class PassageEvidencePane(QFrame):
         worker = self._worker
         if worker is None:
             return
+        self.start_deferred_worker()
+        self._full_resolution_timer.stop()
         self._playing = bool(playing)
         if self._playing:
             worker.set_shuttle_speed(1.0)
@@ -1653,6 +1701,9 @@ class PassageEvidencePane(QFrame):
         worker = self._worker
         if worker is None:
             return
+        self.start_deferred_worker()
+        self._full_resolution_timer.stop()
+        self._last_full_resolution_request = -1
         worker.step(frame_delta)
         self._playing = False
         self.play_btn.setText("▶")
@@ -1680,6 +1731,9 @@ class PassageEvidencePane(QFrame):
         worker = self._worker
         if worker is None:
             return
+        self.start_deferred_worker()
+        self._full_resolution_timer.stop()
+        self._last_full_resolution_request = -1
         bounds = self.available_delta_bounds()
         if bounds is None:
             return
@@ -1885,6 +1939,8 @@ def _resolve_evidence_layout(
 
 
 class PassageReviewDialog(QDialog):
+    INACTIVE_CAMERA_START_DELAY_MS = 120
+
     clock_offset_changed = pyqtSignal(int)
     evidence_pane_added = pyqtSignal(object)
 
@@ -1960,6 +2016,21 @@ class PassageReviewDialog(QDialog):
         self._sync_timer.setInterval(30)
         self._sync_timer.timeout.connect(self._on_sync_tick)
         self._active_pane: Optional[PassageEvidencePane] = None
+        self._selection_event_id = ""
+        self._selection_started_at = 0.0
+        self._selection_first_frame_ms = 0.0
+        self._selection_expected_panes = 0
+        self._selection_pending_panes: set[PassageEvidencePane] = set()
+        self._deferred_selection_panes: set[PassageEvidencePane] = set()
+        self._selection_priority_pane: Optional[PassageEvidencePane] = None
+        self._deferred_start_timer = QTimer(self)
+        self._deferred_start_timer.setSingleShot(True)
+        self._deferred_start_timer.setInterval(
+            self.INACTIVE_CAMERA_START_DELAY_MS
+        )
+        self._deferred_start_timer.timeout.connect(
+            self._start_deferred_selection_panes
+        )
         self._maximized_pane: Optional[PassageEvidencePane] = None
         self._maximized_window: Optional[QDialog] = None
         self._maximized_escape_shortcut: Optional[QShortcut] = None
@@ -2308,6 +2379,12 @@ class PassageReviewDialog(QDialog):
         pane.position_changed.connect(
             lambda delta, current=pane: self._on_pane_position_changed(
                 current, delta
+            )
+        )
+        pane.initial_frame_ready.connect(
+            lambda event_id, current=pane: self._on_pane_initial_frame_ready(
+                current,
+                event_id,
             )
         )
         pane.selection_step_requested.connect(self._move_selection)
@@ -3161,6 +3238,69 @@ class PassageReviewDialog(QDialog):
             locations[0] if locations else None,
         )
 
+    def _begin_selection_timing(
+        self,
+        event_id: str,
+        priority_pane: PassageEvidencePane,
+    ) -> None:
+        self._deferred_start_timer.stop()
+        self._selection_event_id = str(event_id)
+        self._selection_started_at = time.perf_counter()
+        self._selection_first_frame_ms = 0.0
+        self._selection_expected_panes = 0
+        self._selection_pending_panes.clear()
+        self._deferred_selection_panes.clear()
+        self._selection_priority_pane = priority_pane
+
+    def _track_selection_pane(
+        self,
+        pane: PassageEvidencePane,
+        *,
+        deferred: bool,
+    ) -> None:
+        if not pane.has_playback_worker:
+            return
+        self._selection_expected_panes += 1
+        self._selection_pending_panes.add(pane)
+        if deferred and pane.worker_start_deferred:
+            self._deferred_selection_panes.add(pane)
+
+    def _start_deferred_selection_panes(self) -> None:
+        self._deferred_start_timer.stop()
+        panes = tuple(self._deferred_selection_panes)
+        self._deferred_selection_panes.clear()
+        for pane in panes:
+            pane.start_deferred_worker()
+
+    def _on_pane_initial_frame_ready(
+        self,
+        pane: PassageEvidencePane,
+        event_id: str,
+    ) -> None:
+        if (
+            str(event_id) != self._selection_event_id
+            or pane not in self._selection_pending_panes
+        ):
+            return
+        elapsed_ms = (time.perf_counter() - self._selection_started_at) * 1000.0
+        if self._selection_first_frame_ms <= 0.0:
+            self._selection_first_frame_ms = elapsed_ms
+        self._selection_pending_panes.discard(pane)
+        if pane is self._selection_priority_pane:
+            self._start_deferred_selection_panes()
+        if self._selection_pending_panes:
+            return
+        logger.info(
+            "Athlete selection event=%s panes=%d first_frame=%.1fms all_frames=%.1fms",
+            self._selection_event_id,
+            self._selection_expected_panes,
+            self._selection_first_frame_ms,
+            elapsed_ms,
+        )
+        self._deferred_start_timer.stop()
+        self._selection_event_id = ""
+        self._selection_priority_pane = None
+
     def _select_event(self, event_id: str) -> None:
         event = self.passage_store.get(event_id)
         lookup = self._lookups.get(event_id)
@@ -3190,6 +3330,11 @@ class PassageReviewDialog(QDialog):
                 or self.high_speed_pane.matches_passage_context(event, high_speed)
             )
         )
+        active_pane = (
+            self._active_pane
+            if self._active_pane in self.evidence_panes
+            else self.regular_pane
+        )
         regular_association = self._source_association(
             event.event_id, REGULAR_SOURCE, regular
         )
@@ -3198,6 +3343,7 @@ class PassageReviewDialog(QDialog):
         )
         if not preserve_media:
             self._set_sync_playing(False)
+            self._begin_selection_timing(event.event_id, active_pane)
             self._shared_delta_ms = self._saved_delta_ms(
                 regular,
                 high_speed,
@@ -3271,6 +3417,7 @@ class PassageReviewDialog(QDialog):
             )
             for pane in self.regular_panes:
                 pane_location = regular_locations.get(pane.camera_index)
+                defer_worker_start = pane is not active_pane
                 pane.set_passage(
                     event,
                     pane_location,
@@ -3285,6 +3432,11 @@ class PassageReviewDialog(QDialog):
                         if pane_location is not None
                         else lookup.status
                     ),
+                    defer_worker_start=defer_worker_start,
+                )
+                self._track_selection_pane(
+                    pane,
+                    deferred=defer_worker_start,
                 )
             if self._show_high_speed_pane:
                 self.high_speed_pane.set_passage(
@@ -3294,6 +3446,15 @@ class PassageReviewDialog(QDialog):
                     initial_delta_ms=self._shared_delta_ms,
                     lookup_status=high_speed.status if high_speed is not None else "",
                 )
+                self._track_selection_pane(
+                    self.high_speed_pane,
+                    deferred=False,
+                )
+            if self._deferred_selection_panes:
+                if active_pane not in self._selection_pending_panes:
+                    self._start_deferred_selection_panes()
+                else:
+                    self._deferred_start_timer.start()
             self.play_both_btn.setText("联动 ▶")
         else:
             for pane in self.regular_panes:
