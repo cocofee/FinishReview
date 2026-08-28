@@ -525,9 +525,10 @@ def test_review_reuses_one_rgb_capture_and_marks_only_selected_identity(
     assert dialog.table.item(dialog.table.currentRow(), 8).text() == "未确认"
     assert dialog.high_speed_pane.video_view._marker_simple
 
-    dialog.high_speed_pane.video_view.set_actual_size()
-    dialog.high_speed_pane.video_view.zoom_by(1.2)
-    zoom_before = dialog.high_speed_pane.video_view.zoom_percent
+    view = dialog.high_speed_pane.video_view
+    view.set_actual_size()
+    view.zoom_by(1.2)
+    assert not view._fit_mode
     next_row = 1 - dialog.table.currentRow()
     dialog.table.setCurrentCell(next_row, 0)
     dialog.table.selectRow(next_row)
@@ -537,9 +538,9 @@ def test_review_reuses_one_rgb_capture_and_marks_only_selected_identity(
     )
 
     assert dialog.high_speed_pane._worker is first_worker
-    assert dialog.high_speed_pane.video_view.zoom_percent == zoom_before
-    assert dialog.high_speed_pane.video_view._marker[2] in {"15", "16"}
-    assert dialog.high_speed_pane.video_view._marker_simple
+    assert view._fit_mode
+    assert view._marker[2] in {"15", "16"}
+    assert view._marker_simple
     assert not dialog.high_speed_pane.open_btn.isEnabled()
 
     dialog.high_speed_pane.begin_marking()

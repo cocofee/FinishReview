@@ -186,6 +186,20 @@ class _ImpreciseSeekCapture(_FakeCapture):
         return super().set(property_id, value)
 
 
+class _MisreportedHlsCapture(_FakeCapture):
+    def __init__(self):
+        super().__init__(frame_count=200)
+
+    def get(self, property_id):
+        if property_id == cv2.CAP_PROP_FPS:
+            return 50.0
+        if property_id == cv2.CAP_PROP_FRAME_COUNT:
+            return 399
+        if property_id == cv2.CAP_PROP_POS_MSEC:
+            return max(0.0, (self.position - 1) * 40.0)
+        return super().get(property_id)
+
+
 class _FakeDialogWorker(QObject):
     metadata_ready = pyqtSignal(int, float, int, int, int)
     frame_ready = pyqtSignal(object, int, int)
@@ -387,6 +401,75 @@ def test_playback_worker_decodes_frames_and_stops_cleanly(qapp):
     assert positions[0] == 0
     assert positions[-1] <= 150
     assert capture.released is True
+
+
+def test_hls_worker_uses_sequential_timestamps_when_metadata_doubles_fps(
+    qapp,
+    tmp_path,
+):
+    playlist = tmp_path / "evidence.m3u8"
+    playlist.write_text(
+        "\n".join(
+            (
+                "#EXTM3U",
+                "#EXTINF:1.996,",
+                "segment-1.ts",
+                "#EXTINF:1.997,",
+                "segment-2.ts",
+                "#EXTINF:1.997,",
+                "segment-3.ts",
+                "#EXTINF:1.996,",
+                "segment-4.ts",
+                "#EXT-X-ENDLIST",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    captures = []
+
+    def capture_factory(_path):
+        capture = _MisreportedHlsCapture()
+        captures.append(capture)
+        return capture
+
+    worker = VideoPlaybackWorker(playlist, capture_factory=capture_factory)
+    metadata = []
+    frame_indexes = []
+    loop = QEventLoop()
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def on_metadata(*values):
+        metadata.append(values)
+        worker.seek(4_798)
+
+    def on_frame(_image, _position_ms, frame_index):
+        frame_indexes.append(frame_index)
+        if len(frame_indexes) == 1:
+            worker.step(5)
+        elif len(frame_indexes) == 2:
+            worker.step(-5)
+        elif len(frame_indexes) == 3:
+            worker.step(-5)
+        elif len(frame_indexes) == 4:
+            finish()
+
+    worker.pause()
+    worker.metadata_ready.connect(on_metadata)
+    worker.frame_ready.connect(on_frame)
+    QTimer.singleShot(2_000, finish)
+    worker.start()
+    loop.exec_()
+
+    assert worker.wait(2_000)
+    assert metadata == [(7_986, 25.0, 32, 24, 200)]
+    assert frame_indexes == [119, 124, 119, 114]
+    assert captures[0].read_positions == list(range(108, 125))
+    assert captures[0].set_positions == []
+    assert all(capture.released for capture in captures)
 
 
 def test_playing_worker_continues_from_requested_seek_position(qapp):

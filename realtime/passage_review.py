@@ -23,6 +23,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -489,8 +490,8 @@ class EvidenceImageView(QGraphicsView):
             Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
         )
         self.setToolTip(
-            "单击放置判读线；左键横向拖动视频；"
-            "Shift + 左键拖动判读线；中键拖动画面"
+            "单击放置判读线；Shift + 左键拖动判读线；"
+            "中键拖动缩放后的画面"
             if self._marker_mode
             else ""
         )
@@ -609,13 +610,6 @@ class EvidenceImageView(QGraphicsView):
             and self._mouse_press_position is not None
             and event.buttons() & Qt.LeftButton
         ):
-            if not self._video_scrubbing:
-                self._video_scrubbing = True
-                self.viewport().setCursor(Qt.SizeHorCursor)
-                self.scrub_started.emit()
-            self.scrub_delta_requested.emit(
-                event.pos().x() - self._mouse_press_position.x()
-            )
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -686,7 +680,16 @@ class EvidenceImageView(QGraphicsView):
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key_Left, Qt.Key_Right):
-            self.frame_step_requested.emit(-1 if event.key() == Qt.Key_Left else 1)
+            modifiers = event.modifiers()
+            step_size = (
+                10
+                if modifiers & Qt.ControlModifier
+                else 5
+                if modifiers & Qt.ShiftModifier
+                else 1
+            )
+            direction = -1 if event.key() == Qt.Key_Left else 1
+            self.frame_step_requested.emit(direction * step_size)
             event.accept()
             return
         if event.key() in (Qt.Key_Up, Qt.Key_Down):
@@ -912,6 +915,9 @@ class PassageEvidencePane(QFrame):
         self.timeline = TargetTimelineSlider(Qt.Horizontal, self)
         self.timeline.setRange(0, 0)
         self.timeline.setEnabled(False)
+        self.timeline.setFocusPolicy(Qt.NoFocus)
+        self.timeline.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.timeline.setToolTip("使用左右方向键逐帧查看")
         self.timeline.sliderPressed.connect(self._on_timeline_pressed)
         self.timeline.sliderMoved.connect(self._on_timeline_moved)
         self.timeline.sliderReleased.connect(self._on_timeline_released)
@@ -937,7 +943,7 @@ class PassageEvidencePane(QFrame):
         self.zoom_in_btn = QPushButton("+")
         self.zoom_in_btn.setToolTip("放大")
         self.maximize_btn = QPushButton("放大")
-        self.maximize_btn.setToolTip("放大该机位")
+        self.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
         self.mark_btn = QPushButton("标线")
         self.mark_btn.setToolTip("在画面中按住左键移动身份判读线")
         self.open_btn = QPushButton("定点回放")
@@ -966,8 +972,30 @@ class PassageEvidencePane(QFrame):
         self.fit_btn.clicked.connect(self.video_view.fit_to_window)
         self.zoom_in_btn.clicked.connect(lambda: self.video_view.zoom_by(1.2))
         self.maximize_btn.clicked.connect(lambda: self.maximize_requested.emit(self))
+        self._maximize_shortcut = QShortcut(QKeySequence(Qt.Key_F), self)
+        self._maximize_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._maximize_shortcut.setAutoRepeat(False)
+        self._maximize_shortcut.activated.connect(
+            lambda: self.maximize_requested.emit(self)
+        )
         self.mark_btn.clicked.connect(lambda: self.marking_requested.emit(self))
         self.open_btn.clicked.connect(self._request_open)
+        self._frame_step_shortcuts = []
+        for sequence, frame_delta in (
+            ("Left", -1),
+            ("Right", 1),
+            ("Shift+Left", -5),
+            ("Shift+Right", 5),
+            ("Ctrl+Left", -10),
+            ("Ctrl+Right", 10),
+        ):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(
+                lambda delta=frame_delta: self.step_requested.emit(delta)
+            )
+            self._frame_step_shortcuts.append(shortcut)
         self._set_transport_enabled(False)
 
     def set_compact_controls(self, compact: bool) -> None:
@@ -1266,6 +1294,7 @@ class PassageEvidencePane(QFrame):
         lookup_status: str = "",
     ) -> None:
         previous_context = self._media_context(self._location)
+        previous_event_id = self._event.event_id if self._event is not None else ""
         next_context = self._media_context(location)
         same_context = bool(previous_context) and previous_context == next_context
         self._event = event
@@ -1296,7 +1325,7 @@ class PassageEvidencePane(QFrame):
         self.mark_btn.setText("重标" if association is not None else "标线")
         self.video_view.set_marker_mode(False)
         self.video_view.clear_marker()
-        if not same_context:
+        if not same_context or previous_event_id != event.event_id:
             self.video_view.reset_view()
         if (
             location is None
@@ -1858,6 +1887,13 @@ class PassageReviewDialog(QDialog):
         include_recorded_evidence: bool = True,
     ):
         super().__init__(parent)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowCloseButtonHint
+        )
         self.passage_store = passage_store
         self.timeline_store = timeline_store
         self.association_store = association_store or PassageEvidenceAssociationStore(
@@ -1900,6 +1936,9 @@ class PassageReviewDialog(QDialog):
         self._sync_timer.timeout.connect(self._on_sync_tick)
         self._active_pane: Optional[PassageEvidencePane] = None
         self._maximized_pane: Optional[PassageEvidencePane] = None
+        self._maximized_window: Optional[QDialog] = None
+        self._maximized_escape_shortcut: Optional[QShortcut] = None
+        self._maximized_pane_index = -1
         self._available_evidence_count = 0
         self._located_event_ids: set[str] = set()
         self._confirmed_event_ids: set[str] = set()
@@ -1935,6 +1974,9 @@ class PassageReviewDialog(QDialog):
         self.next_passage_shortcut.activated.connect(
             lambda: self._move_selection(1)
         )
+        self.fullscreen_shortcut = QShortcut(QKeySequence(Qt.Key_F11), self)
+        self.fullscreen_shortcut.setContext(Qt.WindowShortcut)
+        self.fullscreen_shortcut.activated.connect(self._toggle_fullscreen)
         self.refresh()
 
     def _init_ui(self) -> None:
@@ -2125,6 +2167,9 @@ class PassageReviewDialog(QDialog):
         self.next_frame_btn.setToolTip("下一帧")
         self.next_passage_btn = QPushButton("▼")
         self.next_passage_btn.setToolTip("下一条")
+        self.fullscreen_btn = QPushButton("全屏")
+        self.fullscreen_btn.setToolTip("全屏显示整个复核窗口（F11）")
+        self.fullscreen_btn.setFixedWidth(48)
         for button in (
             self.previous_passage_btn,
             self.previous_frame_btn,
@@ -2146,6 +2191,7 @@ class PassageReviewDialog(QDialog):
         self.play_both_btn.clicked.connect(self._toggle_both)
         self.next_frame_btn.clicked.connect(lambda: self._step_active_pane(1))
         self.next_passage_btn.clicked.connect(lambda: self._move_selection(1))
+        self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
         self.transport_layout.addWidget(self.current_passage_label)
         self.transport_layout.addWidget(self.current_context_label)
         self.transport_layout.addStretch(1)
@@ -2156,6 +2202,7 @@ class PassageReviewDialog(QDialog):
         self.transport_layout.addWidget(self.auto_advance_checkbox)
         self.transport_layout.addWidget(self.previous_passage_btn)
         self.transport_layout.addWidget(self.next_passage_btn)
+        self.transport_layout.addWidget(self.fullscreen_btn)
 
         self.evidence_splitter = QSplitter(Qt.Horizontal)
         self.evidence_splitter.setChildrenCollapsible(False)
@@ -2280,7 +2327,7 @@ class PassageReviewDialog(QDialog):
             include_recorded=include_recorded,
         )
         self._set_sync_playing(False)
-        self._maximized_pane = None
+        self._restore_maximized_pane()
         for camera_index in normalized_indexes:
             self._create_regular_pane(camera_index)
         self._configured_regular_camera_indexes = normalized_indexes
@@ -2303,7 +2350,7 @@ class PassageReviewDialog(QDialog):
         for pane in self.all_evidence_panes:
             pane.set_compact_controls(compact and pane in self.evidence_panes)
             pane.maximize_btn.setText("放大")
-            pane.maximize_btn.setToolTip("放大该机位")
+            pane.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
         for index in range(self.evidence_splitter.count()):
             self.evidence_splitter.setStretchFactor(index, 1)
         self.evidence_splitter.setSizes([1] * self.evidence_splitter.count())
@@ -3793,7 +3840,26 @@ class PassageReviewDialog(QDialog):
     ) -> None:
         switched = self._activate_pane(pane, align=False)
         if not switched:
-            self._update_shared_from_pane(pane)
+            current_delta_ms = pane.current_delta_ms()
+            pane.step(frame_delta)
+            bounds = pane.available_delta_bounds()
+            if bounds is not None:
+                lower, upper = bounds
+                base_delta_ms = (
+                    self._shared_delta_ms
+                    if current_delta_ms is None
+                    else current_delta_ms
+                )
+                self._shared_delta_ms = max(
+                    lower,
+                    min(
+                        base_delta_ms
+                        + int(frame_delta) * pane.frame_duration_ms(),
+                        upper,
+                    ),
+                )
+                self._update_shared_time_label()
+            return
         bounds = pane.available_delta_bounds()
         if bounds is None:
             return
@@ -3971,23 +4037,107 @@ class PassageReviewDialog(QDialog):
             f"(Δ{self._shared_delta_ms:+d} ms)"
         )
 
+    def _fit_visible_evidence_views(self) -> None:
+        for pane in self.evidence_panes:
+            if pane.isVisible() and pane.video_view.has_frame:
+                pane.video_view.fit_to_window()
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showMaximized()
+            self.fullscreen_btn.setText("全屏")
+        else:
+            self.showFullScreen()
+            self.fullscreen_btn.setText("退出全屏")
+        QTimer.singleShot(0, self._fit_visible_evidence_views)
+
     def _toggle_maximized_pane(self, pane: PassageEvidencePane) -> None:
         if self._maximized_pane is pane:
-            for candidate in self.evidence_panes:
-                candidate.show()
-                candidate.maximize_btn.setText("放大")
-                candidate.maximize_btn.setToolTip("放大该机位")
-            self._maximized_pane = None
+            self._restore_maximized_pane()
             return
-        for candidate in self.evidence_panes:
-            candidate.setVisible(candidate is pane)
-            candidate.maximize_btn.setText(
-                "缩小" if candidate is pane else "放大"
-            )
-            candidate.maximize_btn.setToolTip(
-                "恢复多画面" if candidate is pane else "放大该机位"
-            )
+        if self._maximized_pane is not None:
+            self._restore_maximized_pane()
+
+        pane_index = self.evidence_splitter.indexOf(pane)
+        if pane_index < 0:
+            return
+        window = QDialog(
+            self,
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowCloseButtonHint,
+        )
+        title = pane.title_label.text().strip() or "机位画面"
+        if pane._identity:
+            title = f"{title} - {pane._identity}"
+        window.setWindowTitle(title)
+        window.setModal(False)
+        window_layout = QVBoxLayout(window)
+        window_layout.setContentsMargins(8, 8, 8, 8)
+        window_layout.addWidget(pane)
+
+        pane.show()
+        pane.maximize_btn.setText("缩小")
+        pane.maximize_btn.setToolTip("恢复主界面（Esc 或 F）")
         self._maximized_pane = pane
+        self._maximized_window = window
+        self._maximized_pane_index = pane_index
+        escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), window)
+        escape_shortcut.setContext(Qt.WindowShortcut)
+        escape_shortcut.setAutoRepeat(False)
+        escape_shortcut.activated.connect(self._restore_maximized_pane)
+        self._maximized_escape_shortcut = escape_shortcut
+        window.finished.connect(
+            lambda _result: self._restore_maximized_pane(close_window=False)
+        )
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            window.resize(
+                max(1, int(available.width() * 0.9)),
+                max(1, int(available.height() * 0.88)),
+            )
+        window.show()
+        if screen is not None:
+            frame = window.frameGeometry()
+            frame.moveCenter(available.center())
+            window.move(frame.topLeft())
+        window.raise_()
+        window.activateWindow()
+        QTimer.singleShot(0, pane.video_view.fit_to_window)
+
+    def _restore_maximized_pane(self, *, close_window: bool = True) -> None:
+        pane = self._maximized_pane
+        window = self._maximized_window
+        if pane is None or window is None:
+            return
+
+        pane_index = self._maximized_pane_index
+        self._maximized_pane = None
+        self._maximized_window = None
+        self._maximized_escape_shortcut = None
+        self._maximized_pane_index = -1
+        window_layout = window.layout()
+        if window_layout is not None:
+            window_layout.removeWidget(pane)
+        pane.setParent(self.evidence_splitter)
+        self.evidence_splitter.insertWidget(max(0, pane_index), pane)
+
+        active_panes = self.evidence_panes
+        for candidate in self.all_evidence_panes:
+            candidate.setVisible(candidate in active_panes)
+            candidate.maximize_btn.setText("放大")
+            candidate.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
+        for index in range(self.evidence_splitter.count()):
+            self.evidence_splitter.setStretchFactor(index, 1)
+        self.evidence_splitter.setSizes([1] * self.evidence_splitter.count())
+        if close_window:
+            window.close()
+        window.deleteLater()
+        QTimer.singleShot(0, self._fit_visible_evidence_views)
 
     def _open_preferred_source(self, row: int, _column: int) -> None:
         if not (0 <= row < len(self._visible_events)):
@@ -4054,12 +4204,17 @@ class PassageReviewDialog(QDialog):
             return
         self._open_location_if_available(event, location)
 
+    def reject(self) -> None:
+        if self._maximized_window is not None:
+            self._restore_maximized_pane()
+
     def closeEvent(self, event) -> None:
+        self._restore_maximized_pane()
         self._sync_playing = False
         self._sync_timer.stop()
         for pane in self.all_evidence_panes:
             pane.shutdown(wait=True)
-        super().closeEvent(event)
+        event.accept()
 
 
 __all__ = [

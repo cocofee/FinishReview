@@ -276,6 +276,57 @@ def test_review_shows_two_regular_camera_locations_side_by_side(
     dialog.close()
 
 
+def test_regular_camera_opens_in_centered_system_window_and_restores(
+    qapp,
+    tmp_path,
+):
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        regular_camera_indexes=(1, 2),
+        show_high_speed_pane=False,
+        include_recorded_evidence=False,
+    )
+    dialog.show()
+    qapp.processEvents()
+
+    assert dialog.windowFlags() & Qt.WindowMinMaxButtonsHint
+    assert dialog.windowFlags() & Qt.WindowSystemMenuHint
+    assert dialog.windowFlags() & Qt.WindowCloseButtonHint
+    assert not dialog.windowFlags() & Qt.WindowContextHelpButtonHint
+    first_pane, second_pane = dialog.regular_panes
+    original_index = dialog.evidence_splitter.indexOf(second_pane)
+    second_pane.video_view.setFocus()
+    QTest.keyClick(second_pane.video_view.viewport(), Qt.Key_F)
+    qapp.processEvents()
+
+    window = dialog._maximized_window
+    assert window is not None
+    assert window.isVisible()
+    assert window.windowFlags() & Qt.WindowMinMaxButtonsHint
+    assert window.windowFlags() & Qt.WindowSystemMenuHint
+    assert window.windowFlags() & Qt.WindowCloseButtonHint
+    assert second_pane.parentWidget() is window
+    assert second_pane.maximize_btn.text() == "缩小"
+    assert first_pane.isVisible()
+
+    second_pane.video_view.setFocus()
+    QTest.keyClick(second_pane.video_view.viewport(), Qt.Key_Escape)
+    qapp.processEvents()
+
+    assert dialog._maximized_window is None
+    assert dialog._maximized_pane is None
+    assert second_pane.parentWidget() is dialog.evidence_splitter
+    assert dialog.evidence_splitter.indexOf(second_pane) == original_index
+    assert first_pane.isVisible()
+    assert second_pane.isVisible()
+
+    QTest.keyClick(dialog, Qt.Key_Escape)
+    qapp.processEvents()
+    assert dialog.isVisible()
+    dialog.close()
+
+
 def test_confirming_either_regular_camera_confirms_passage_and_marks_others_reference(
     qapp,
     tmp_path,
@@ -952,21 +1003,29 @@ def test_high_speed_only_double_click_maximizes_judging_pane(
         timeline_store,
         open_location=lambda event, location: opened.append((event, location)),
     )
+    dialog.show()
     qapp.processEvents()
 
     dialog._open_preferred_source(0, 7)
+    qapp.processEvents()
 
     assert opened == []
     assert dialog._maximized_pane is dialog.high_speed_pane
+    assert dialog._maximized_window is not None
+    assert dialog._maximized_window.isVisible()
+    assert dialog.high_speed_pane.parentWidget() is dialog._maximized_window
     assert not dialog.high_speed_pane.isHidden()
-    assert dialog.regular_pane.isHidden()
     assert dialog.high_speed_pane.maximize_btn.text() == "缩小"
-    assert dialog.high_speed_pane.maximize_btn.toolTip() == "恢复多画面"
+    assert dialog.high_speed_pane.maximize_btn.toolTip() == "恢复主界面（Esc 或 F）"
     assert dialog.regular_pane.maximize_btn.text() == "放大"
 
-    dialog._toggle_maximized_pane(dialog.high_speed_pane)
+    dialog.high_speed_pane.video_view.setFocus()
+    QTest.keyClick(dialog.high_speed_pane.video_view.viewport(), Qt.Key_Escape)
+    qapp.processEvents()
 
     assert dialog._maximized_pane is None
+    assert dialog._maximized_window is None
+    assert dialog.high_speed_pane.parentWidget() is dialog.evidence_splitter
     assert dialog.high_speed_pane.maximize_btn.text() == "放大"
     assert dialog.regular_pane.maximize_btn.text() == "放大"
     dialog.close()
@@ -1482,15 +1541,45 @@ def test_frame_step_controls_only_focused_pane_at_its_native_frame_rate(
     dialog.show()
     qapp.processEvents()
     regular_worker, high_speed_worker = fake_playback.instances
+    regular_seek_calls = list(regular_worker.seek_calls)
     high_speed_seek_calls = list(high_speed_worker.seek_calls)
+    assert all(
+        not shortcut.autoRepeat()
+        for shortcut in dialog.regular_pane._frame_step_shortcuts
+    )
 
     QTest.keyClick(dialog.regular_pane.video_view, Qt.Key_Right)
     qapp.processEvents()
 
     assert dialog._shared_delta_ms == 20
-    assert regular_worker.seek_calls[-1] == 10_070
+    assert regular_worker.seek_calls == regular_seek_calls
+    assert regular_worker.step_calls == [1]
     assert high_speed_worker.seek_calls == high_speed_seek_calls
     assert "Δ+20 ms" in dialog.current_time_label.text()
+
+    dialog.regular_pane.timeline.setFocus()
+    QTest.keyClick(
+        dialog.regular_pane.timeline,
+        Qt.Key_Right,
+        Qt.ShiftModifier,
+    )
+    qapp.processEvents()
+
+    assert dialog._shared_delta_ms == 120
+    assert regular_worker.seek_calls == regular_seek_calls
+    assert regular_worker.step_calls == [1, 5]
+
+    QTest.keyClick(
+        dialog.regular_pane.timeline,
+        Qt.Key_Left,
+        Qt.ControlModifier,
+    )
+    qapp.processEvents()
+
+    assert dialog._shared_delta_ms == -80
+    assert regular_worker.seek_calls == regular_seek_calls
+    assert regular_worker.step_calls == [1, 5, -10]
+    assert high_speed_worker.seek_calls == high_speed_seek_calls
     dialog.close()
 
 
@@ -1528,7 +1617,7 @@ def test_zoom_requests_full_resolution_without_replacing_the_worker(
     dialog.close()
 
 
-def test_timeline_drag_seeks_video_before_mouse_release(
+def test_timeline_ignores_mouse_drag_for_frame_navigation(
     qapp,
     tmp_path,
     fake_playback,
@@ -1551,32 +1640,11 @@ def test_timeline_drag_seeks_video_before_mouse_release(
     pane = dialog.regular_pane
     worker = fake_playback.instances[0]
     worker.seek_calls.clear()
-    timeline_y = pane.timeline.height() // 2
 
-    QTest.mousePress(
-        pane.timeline,
-        Qt.LeftButton,
-        pos=QPoint(pane.timeline.width() // 4, timeline_y),
-    )
-    QTest.mouseMove(
-        pane.timeline,
-        QPoint(pane.timeline.width() * 3 // 4, timeline_y),
-        delay=10,
-    )
-    qapp.processEvents()
-
-    assert pane._timeline_dragging
-    assert worker.seek_calls
-    assert worker.seek_calls[-1] == pane.timeline.value()
-    assert "Δ" in pane.time_label.text()
-
-    QTest.mouseRelease(
-        pane.timeline,
-        Qt.LeftButton,
-        pos=QPoint(pane.timeline.width() * 3 // 4, timeline_y),
-    )
-    qapp.processEvents()
     assert not pane._timeline_dragging
+    assert worker.seek_calls == []
+    assert pane.timeline.testAttribute(Qt.WA_TransparentForMouseEvents)
+    assert pane.timeline.focusPolicy() == Qt.NoFocus
     dialog.close()
 
 
@@ -1905,7 +1973,7 @@ def test_switching_single_pane_playback_aligns_without_starting_other_pane(
     dialog.close()
 
 
-def test_left_drag_scrubs_video_middle_drag_pans_and_click_places_marker(
+def test_left_drag_does_not_scrub_middle_drag_pans_and_click_places_marker(
     qapp,
     tmp_path,
     fake_playback,
@@ -1936,6 +2004,8 @@ def test_left_drag_scrubs_video_middle_drag_pans_and_click_places_marker(
     horizontal_scrollbar = view.horizontalScrollBar()
     vertical_scrollbar = view.verticalScrollBar()
     before_pan = (horizontal_scrollbar.value(), vertical_scrollbar.value())
+    shared_delta_before_drag = dialog._shared_delta_ms
+    worker.seek_calls.clear()
     center = view.viewport().rect().center()
     scrub_target = center + QPoint(60, 0)
 
@@ -1952,8 +2022,8 @@ def test_left_drag_scrubs_video_middle_drag_pans_and_click_places_marker(
     QTest.mouseRelease(view.viewport(), Qt.LeftButton, pos=scrub_target)
     qapp.processEvents()
 
-    assert dialog._shared_delta_ms > 0
-    assert worker.seek_calls[-1] == 5_000 + dialog._shared_delta_ms
+    assert dialog._shared_delta_ms == shared_delta_before_drag
+    assert worker.seek_calls == []
     assert (horizontal_scrollbar.value(), vertical_scrollbar.value()) == before_pan
     assert not dialog.regular_pane.has_pending_marker
     assert view._marker is None
@@ -1978,6 +2048,47 @@ def test_left_drag_scrubs_video_middle_drag_pans_and_click_places_marker(
     QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=center)
     assert dialog.regular_pane.has_pending_marker
     assert view._marker is not None
+    dialog.close()
+
+
+def test_fullscreen_toggle_refits_the_entire_review_window(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000, bib="12"))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.show()
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_000, 250)
+    qapp.processEvents()
+    dialog.regular_pane.video_view.set_actual_size()
+
+    dialog._toggle_fullscreen()
+    qapp.processEvents()
+
+    assert dialog.isFullScreen()
+    assert dialog.fullscreen_btn.text() == "退出全屏"
+    assert dialog.regular_pane.video_view._fit_mode
+
+    dialog._toggle_fullscreen()
+    qapp.processEvents()
+
+    assert not dialog.isFullScreen()
+    assert dialog.fullscreen_btn.text() == "全屏"
     dialog.close()
 
 
