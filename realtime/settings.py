@@ -25,6 +25,13 @@ class FinishReviewSettings:
     racetiger_rid: str = ""
     racetiger_token: str = ""
     racetiger_poll_interval_seconds: float = 2.0
+    visual_detection_enabled: bool = True
+    visual_camera_index: int = 1
+    visual_finish_line: float = 0.50
+    visual_gate_width: float = 0.08
+    visual_forward_direction: str = "left_to_right"
+    visual_roi_top: float = 0.08
+    visual_roi_bottom: float = 0.95
 
 
 __all__ = ["FinishReviewSettings"]

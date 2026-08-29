@@ -111,6 +111,13 @@ from .video_timeline import (
         VideoTimelineStore,
     )
 from .video_playback import VideoPlaybackDialog
+from .visual_crossing import (
+    CrossingConfig,
+    VisualCrossingEvent,
+    VisualCrossingEventStore,
+    VisualCrossingWorker,
+    VisualLineCalibrationDialog,
+)
 
 
 logger = logging.getLogger("FinishReview")
@@ -294,6 +301,13 @@ class FinishReviewSettings:
     racetiger_rid: str = ""
     racetiger_token: str = ""
     racetiger_poll_interval_seconds: float = 2.0
+    visual_detection_enabled: bool = True
+    visual_camera_index: int = 1
+    visual_finish_line: float = 0.50
+    visual_gate_width: float = 0.08
+    visual_forward_direction: str = "left_to_right"
+    visual_roi_top: float = 0.08
+    visual_roi_bottom: float = 0.95
 
 
 class _RtspProbeWorker(QThread):
@@ -596,6 +610,13 @@ class FinishReviewLaunchDialog(QDialog):
         self._passage_host = settings.passage_host
         self._passage_port = settings.passage_port
         self._camera_index = settings.camera_index
+        self._visual_detection_enabled = bool(settings.visual_detection_enabled)
+        self._visual_camera_index = max(1, int(settings.visual_camera_index))
+        self._visual_finish_line = float(settings.visual_finish_line)
+        self._visual_gate_width = float(settings.visual_gate_width)
+        self._visual_forward_direction = str(settings.visual_forward_direction)
+        self._visual_roi_top = float(settings.visual_roi_top)
+        self._visual_roi_bottom = float(settings.visual_roi_bottom)
         self._finishreview_ip = str(settings.finishreview_ip).strip()
         self._cyclerace_ip = str(settings.cyclerace_ip).strip()
         self._high_speed_pc_ip = str(settings.high_speed_pc_ip).strip()
@@ -905,6 +926,49 @@ class FinishReviewLaunchDialog(QDialog):
             self.framerate_combo.addItem(f"{value:g} FPS", value)
         form.addRow("USB录像帧率", self.framerate_combo)
 
+        visual_settings_row = QHBoxLayout()
+        visual_settings_row.setSpacing(6)
+        self.visual_enabled_checkbox = QCheckBox("启用", self)
+        self.visual_enabled_checkbox.setChecked(self._visual_detection_enabled)
+        visual_settings_row.addWidget(self.visual_enabled_checkbox)
+        self.visual_camera_combo = QComboBox(self)
+        self.visual_camera_combo.addItem("机位1", self._camera_index)
+        self.visual_camera_combo.addItem("机位2", self._camera_index + 1)
+        self.visual_camera_combo.setCurrentIndex(
+            max(0, self.visual_camera_combo.findData(self._visual_camera_index))
+        )
+        visual_settings_row.addWidget(self.visual_camera_combo)
+        self.visual_line_label = QLabel(
+            f"终点线 {self._visual_finish_line * 100:.1f}%",
+            self,
+        )
+        visual_settings_row.addWidget(self.visual_line_label, 1)
+        self.visual_calibrate_button = QPushButton("在画面上设置", self)
+        self.visual_calibrate_button.clicked.connect(self._calibrate_visual_line)
+        visual_settings_row.addWidget(self.visual_calibrate_button)
+        self.visual_direction_combo = QComboBox(self)
+        self.visual_direction_combo.addItem("正向：左 → 右", "left_to_right")
+        self.visual_direction_combo.addItem("正向：右 → 左", "right_to_left")
+        self.visual_direction_combo.setCurrentIndex(
+            max(0, self.visual_direction_combo.findData(self._visual_forward_direction))
+        )
+        visual_settings_row.addWidget(self.visual_direction_combo)
+        self.visual_candidates_settings_button = QPushButton("候选事件：0 条", self)
+        self.visual_candidates_settings_button.setToolTip(
+            "打开视觉过线候选，逐条回放确认是否为真实运动员或芯片漏读"
+        )
+        review_window = self.parent()
+        open_candidates = getattr(review_window, "_open_visual_candidates", None)
+        if callable(open_candidates):
+            self.visual_candidates_settings_button.setText(
+                f"候选事件：{int(getattr(review_window, '_visual_event_count', 0))} 条"
+            )
+            self.visual_candidates_settings_button.clicked.connect(open_candidates)
+        else:
+            self.visual_candidates_settings_button.setEnabled(False)
+        self.visual_candidates_settings_button.setMinimumWidth(132)
+        visual_settings_row.addWidget(self.visual_candidates_settings_button)
+        form.addRow("过线辅助", visual_settings_row)
         high_speed_row = QHBoxLayout()
         high_speed_row.setSpacing(6)
         self.high_speed_edit = QLineEdit(
@@ -1993,7 +2057,45 @@ class FinishReviewLaunchDialog(QDialog):
             racetiger_poll_interval_seconds=(
                 self.racetiger_poll_interval_spin.value()
             ),
+            visual_detection_enabled=self.visual_enabled_checkbox.isChecked(),
+            visual_camera_index=int(self.visual_camera_combo.currentData() or self._camera_index),
+            visual_finish_line=self._visual_finish_line,
+            visual_gate_width=self._visual_gate_width,
+            visual_forward_direction=str(
+                self.visual_direction_combo.currentData() or "left_to_right"
+            ),
+            visual_roi_top=self._visual_roi_top,
+            visual_roi_bottom=self._visual_roi_bottom,
         )
+
+    def _calibrate_visual_line(self) -> None:
+        source = (
+            self._current_rtsp_source()
+            if self.visual_camera_combo.currentData() == self._camera_index
+            else self._current_secondary_rtsp_source()
+        )
+        if not is_rtsp_source(source):
+            QMessageBox.information(self, "无法设置终点线", "请选择有效的 RTSP 机位后再设置。")
+            return
+        dialog = VisualLineCalibrationDialog(
+            source,
+            line_x=self._visual_finish_line,
+            gate_width=self._visual_gate_width,
+            roi_top=self._visual_roi_top,
+            roi_bottom=self._visual_roi_bottom,
+            direction=str(self.visual_direction_combo.currentData() or "left_to_right"),
+            parent=self,
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            self._visual_finish_line = dialog.line_x
+            self._visual_roi_top = dialog.roi_top
+            self._visual_roi_bottom = dialog.roi_bottom
+            self.visual_direction_combo.setCurrentIndex(
+                max(0, self.visual_direction_combo.findData(dialog.direction))
+            )
+            self.visual_line_label.setText(
+                f"终点线 {self._visual_finish_line * 100:.1f}%"
+            )
 
     def _selected_recording_source(self) -> str:
         if self.source_type_combo.currentData() == "rtsp":
@@ -2222,6 +2324,13 @@ class FinishReviewWindow(PassageReviewDialog):
         racetiger_rid: str = "",
         racetiger_token: str = "",
         racetiger_poll_interval_seconds: float = 2.0,
+        visual_detection_enabled: bool = True,
+        visual_camera_index: int = 1,
+        visual_finish_line: float = 0.50,
+        visual_gate_width: float = 0.08,
+        visual_forward_direction: str = "left_to_right",
+        visual_roi_top: float = 0.08,
+        visual_roi_bottom: float = 0.95,
         ffmpeg_path: Path | None = None,
         review_retention_seconds: int = 360,
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
@@ -2238,6 +2347,13 @@ class FinishReviewWindow(PassageReviewDialog):
         self.passage_host = str(passage_host).strip()
         self.passage_port = int(passage_port)
         self.camera_index = max(1, int(camera_index))
+        self.visual_detection_enabled = bool(visual_detection_enabled)
+        self.visual_camera_index = max(1, int(visual_camera_index))
+        self.visual_finish_line = float(visual_finish_line)
+        self.visual_gate_width = float(visual_gate_width)
+        self.visual_forward_direction = str(visual_forward_direction)
+        self.visual_roi_top = max(0.0, min(0.80, float(visual_roi_top)))
+        self.visual_roi_bottom = max(0.20, min(1.0, float(visual_roi_bottom)))
         self.secondary_source = str(secondary_source).strip()
         self.high_speed_dir = (
             Path(high_speed_dir).expanduser().absolute()
@@ -2384,6 +2500,16 @@ class FinishReviewWindow(PassageReviewDialog):
         self._received_event_order: dict[tuple[str, str, str], int] = {}
         self._pending_focus: RaceFocus | None = None
         self._pending_passages: dict[str, PassageEvent] = {}
+        self._visual_workers: dict[int, VisualCrossingWorker] = {}
+        try:
+            self._visual_event_count = len(
+                VisualCrossingEventStore(
+                    self.output_dir / "visual_crossing_events.jsonl"
+                ).events()
+            )
+        except (OSError, ValueError, TypeError):
+            self._visual_event_count = 0
+        self._visual_error = ""
 
         self._signal_bridge = _PassageSignalBridge(self)
         self._signal_bridge.accepted.connect(self._on_passage_received)
@@ -2540,6 +2666,172 @@ class FinishReviewWindow(PassageReviewDialog):
             playback.exec_()
         finally:
             session.cleanup()
+
+    def _start_visual_crossing_workers(self) -> None:
+        """Start low-rate visual candidates alongside active RTSP recorders."""
+        self._stop_visual_crossing_workers()
+        # Headless Qt tests and packaged smoke tests must not open real camera
+        # handles; production Windows sessions still run this feature normally.
+        if (
+            os.environ.get("QT_QPA_PLATFORM", "").casefold() == "offscreen"
+            or os.environ.get("FINISH_REVIEW_DISABLE_VISUAL", "").strip()
+            in {"1", "true", "yes"}
+        ):
+            return
+        self._visual_error = ""
+        event_path = self.output_dir / "visual_crossing_events.jsonl"
+        try:
+            self._visual_event_count = len(VisualCrossingEventStore(event_path).events())
+        except (OSError, ValueError, TypeError):
+            self._visual_event_count = 0
+        self._update_visual_candidate_buttons()
+        for camera_index, source in self._configured_recording_sources():
+            if not self.visual_detection_enabled or camera_index != self.visual_camera_index:
+                continue
+            if not is_rtsp_source(source):
+                continue
+            worker = VisualCrossingWorker(
+                source,
+                camera_index,
+                event_path,
+                self,
+                config=CrossingConfig(
+                    finish_line=self.visual_finish_line,
+                    gate_width=self.visual_gate_width,
+                    forward_direction=self.visual_forward_direction,
+                    roi_top=self.visual_roi_top,
+                    roi_bottom=self.visual_roi_bottom,
+                ),
+            )
+            worker.crossing_detected.connect(self._on_visual_crossing)
+            worker.failed.connect(self._on_visual_detection_failed)
+            worker.start()
+            self._visual_workers[camera_index] = worker
+
+    def _stop_visual_crossing_workers(self) -> None:
+        workers = tuple(self._visual_workers.values())
+        self._visual_workers.clear()
+        for worker in workers:
+            worker.stop()
+        for worker in workers:
+            if worker.isRunning() and not worker.wait(1500):
+                logger.warning("Visual crossing worker did not stop promptly")
+
+    def _on_visual_crossing(self, event: VisualCrossingEvent) -> None:
+        del event
+        self._visual_event_count += 1
+        self._update_visual_candidate_buttons()
+        self._update_runtime_status()
+
+    def _on_visual_detection_failed(self, message: str) -> None:
+        self._visual_error = str(message)
+        logger.warning("%s", self._visual_error)
+        self._update_runtime_status()
+
+    def _open_visual_candidates(self) -> None:
+        events = VisualCrossingEventStore(
+            self.output_dir / "visual_crossing_events.jsonl"
+        ).events()
+        self._visual_event_count = len(events)
+        self._update_visual_candidate_buttons()
+        if not events:
+            QMessageBox.information(
+                self,
+                "视觉候选",
+                "当前赛事还没有视觉过线候选。请先开始录像并让人员通过终点线。",
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("视觉过线候选（双击回放确认）")
+        dialog.resize(760, 420)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "候选只代表摄像头检测到运动，双击一行打开对应机位录像；确认后由工作人员决定是否漏读芯片。",
+            dialog,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        table = QTableWidget(len(events), 6, dialog)
+        table.setHorizontalHeaderLabels(
+            ("时间", "机位", "方向", "置信度", "画面位置", "状态")
+        )
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        for row, event in enumerate(events):
+            values = (
+                datetime.fromtimestamp(event.timestamp_ms / 1000.0).strftime(
+                    "%H:%M:%S.%f"
+                )[:-3],
+                f"机位{event.camera_index}",
+                "正向" if event.direction == "forward" else "反向",
+                f"{event.confidence:.2f}",
+                f"({event.centroid_x:.0f}, {event.centroid_y:.0f})",
+                "待人工确认",
+            )
+            for column, value in enumerate(values):
+                table.setItem(row, column, QTableWidgetItem(value))
+        table.resizeColumnsToContents()
+        table.cellDoubleClicked.connect(
+            lambda row, _column: self._replay_visual_candidate(events[row], dialog)
+        )
+        layout.addWidget(table, 1)
+        close_button = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        close_button.rejected.connect(dialog.reject)
+        layout.addWidget(close_button)
+        dialog.exec_()
+
+    def _update_visual_candidate_buttons(self) -> None:
+        """Keep the review entry points aligned with the current candidate count."""
+        count = max(0, int(self._visual_event_count))
+        if hasattr(self, "visual_candidates_settings_button"):
+            self.visual_candidates_settings_button.setText(f"候选事件：{count} 条")
+        if hasattr(self, "visual_candidates_button"):
+            self.visual_candidates_button.setText(f"视觉候选 ({count})")
+
+    def _replay_visual_candidate(
+        self,
+        candidate: VisualCrossingEvent,
+        parent_dialog: QDialog,
+    ) -> None:
+        try:
+            self._publish_archive_segments()
+            self._refresh_capture_windows()
+            lookup = self.timeline_store.locate_passage(
+                candidate.timestamp_ms,
+                pre_roll_ms=3_000,
+            )
+            location = next(
+                (
+                    item
+                    for item in lookup.locations
+                    if item.segment.camera_index == candidate.camera_index
+                ),
+                None,
+            )
+        except Exception as error:  # noqa: BLE001 - keep candidate list usable.
+            QMessageBox.warning(parent_dialog, "无法打开回放", str(error))
+            return
+        if location is None:
+            QMessageBox.information(
+                parent_dialog,
+                "暂无录像定位",
+                "该视觉候选暂时没有对应的完整录像分段，请稍后重试。",
+            )
+            return
+        event = PassageEvent(
+            event_id=f"visual-{candidate.event_id}",
+            race_id=self._current_archive_race_id() or "visual-review",
+            stage_id="finish",
+            group_id="visual",
+            sequence=max(1, self._visual_event_count),
+            chip_id="visual-candidate",
+            bib="",
+            passage_time_ms=candidate.timestamp_ms,
+            passage_timestamp_ms=candidate.timestamp_ms,
+            source="visual_candidate",
+            emitted_at_ms=candidate.timestamp_ms,
+        )
+        self._open_point_playback(event, location)
 
     def _on_high_speed_scan_finished(self, result: AuyatScanResult) -> None:
         self._high_speed_scan_result = result
@@ -2727,6 +3019,13 @@ class FinishReviewWindow(PassageReviewDialog):
             racetiger_rid=self.racetiger_rid,
             racetiger_token=self.racetiger_token,
             racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
+            visual_detection_enabled=self.visual_detection_enabled,
+            visual_camera_index=self.visual_camera_index,
+            visual_finish_line=self.visual_finish_line,
+            visual_gate_width=self.visual_gate_width,
+            visual_forward_direction=self.visual_forward_direction,
+            visual_roi_top=self.visual_roi_top,
+            visual_roi_bottom=self.visual_roi_bottom,
         )
 
     def _saved_event_workspaces(self) -> tuple[EventWorkspaceDescriptor, ...]:
@@ -2997,6 +3296,17 @@ class FinishReviewWindow(PassageReviewDialog):
         self.passage_host = str(settings.passage_host).strip()
         self.passage_port = int(settings.passage_port)
         self.camera_index = max(1, int(settings.camera_index))
+        self.visual_detection_enabled = bool(settings.visual_detection_enabled)
+        self.visual_camera_index = max(1, int(settings.visual_camera_index))
+        self.visual_finish_line = max(0.10, min(0.90, float(settings.visual_finish_line)))
+        self.visual_gate_width = max(0.02, min(0.30, float(settings.visual_gate_width)))
+        self.visual_forward_direction = (
+            settings.visual_forward_direction
+            if settings.visual_forward_direction in {"left_to_right", "right_to_left"}
+            else "left_to_right"
+        )
+        self.visual_roi_top = max(0.0, min(0.80, float(settings.visual_roi_top)))
+        self.visual_roi_bottom = max(0.20, min(1.0, float(settings.visual_roi_bottom)))
         self.finishreview_ip = str(settings.finishreview_ip).strip()
         self.cyclerace_ip = str(settings.cyclerace_ip).strip()
         self.high_speed_pc_ip = str(settings.high_speed_pc_ip).strip()
@@ -3234,6 +3544,10 @@ class FinishReviewWindow(PassageReviewDialog):
         self.record_button.setMinimumWidth(88)
         self.record_button.clicked.connect(self._toggle_recording)
         top_layout.addWidget(self.record_button)
+        self.visual_candidates_button = QPushButton("视觉候选", panel)
+        self.visual_candidates_button.setToolTip("打开视觉过线候选，双击候选回放录像确认")
+        self.visual_candidates_button.clicked.connect(self._open_visual_candidates)
+        top_layout.addWidget(self.visual_candidates_button)
         panel_layout.addLayout(top_layout)
 
         status_strip = QFrame(panel)
@@ -3248,13 +3562,16 @@ class FinishReviewWindow(PassageReviewDialog):
         self.receiver_status_label = self._status_chip("计时源", status_strip)
         self.camera_status_label = self._status_chip("普通摄像", status_strip)
         self.high_speed_status_label = self._status_chip("高速摄像", status_strip)
+        self.visual_status_label = self._status_chip("过线辅助", status_strip)
         status_layout.addWidget(self.receiver_status_label)
         status_layout.addWidget(self.camera_status_label)
         status_layout.addWidget(self.high_speed_status_label)
+        status_layout.addWidget(self.visual_status_label)
         status_layout.addStretch(1)
         panel_layout.addWidget(status_strip)
         self.runtime_status_strip = status_strip
         self.runtime_header = panel
+        self._update_visual_candidate_buttons()
         root_layout = self.layout()
         if root_layout is not None:
             root_layout.insertWidget(0, panel)
@@ -3786,6 +4103,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 self._register_passage(event, scan=False)
             self._started = True
             self._recording_started_at = time.monotonic()
+            self._start_visual_crossing_workers()
             self._runtime_error = ""
             self._auto_recording_error = ""
             self._capture_error = ""
@@ -3795,6 +4113,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self._lookup_cache.clear()
             self.refresh()
         except Exception:
+            self._stop_visual_crossing_workers()
             for recorder in recorders.values():
                 try:
                     recorder.stop()
@@ -4667,6 +4986,31 @@ class FinishReviewWindow(PassageReviewDialog):
         self.camera_status_label.setToolTip(camera_tooltip)
         self.camera_status_label.setStyleSheet(f"color: {camera_color};")
 
+        if self._visual_error:
+            visual_text, visual_state = "过线辅助: 降级", "error"
+            visual_tooltip = self._visual_error
+        elif self._visual_workers:
+            visual_text = f"过线辅助: {self._visual_event_count} 个候选"
+            visual_state = "ready"
+            visual_tooltip = (
+                "低分辨率双窄门检测，仅生成辅助候选，不修改正式成绩；"
+                f"当前运行 {len(self._visual_workers)} 个机位"
+            )
+        elif recording_active:
+            visual_text, visual_state = "过线辅助: 启动中", "busy"
+            visual_tooltip = "等待视觉检测线程连接视频源"
+        else:
+            visual_text, visual_state = "过线辅助: 待机", "waiting"
+            visual_tooltip = "开始普通录像后自动影子运行"
+        self.visual_status_label.setStatus(visual_text, visual_state)
+        self.visual_status_label.setToolTip(visual_tooltip)
+        self.visual_status_label.setStyleSheet(
+            "color: #b54747;" if visual_state == "error" else
+            "color: #247a52;" if visual_state == "ready" else
+            "color: #a56300;" if visual_state == "busy" else
+            "color: #667085;"
+        )
+
         if self._workspace_mode == "archive" and not recording_active:
             recording_text, recording_color = "普通录像: 历史查看", "#667085"
             recording_tooltip = "返回当前赛事后可开始录像"
@@ -5027,6 +5371,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_operator_controls()
 
     def stop_recording(self) -> None:
+        self._stop_visual_crossing_workers()
         recorders = tuple(self._recorders.items())
         if recorders:
             errors = []
