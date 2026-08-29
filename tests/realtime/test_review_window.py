@@ -45,6 +45,10 @@ from realtime.review_recorder import (
     ReviewSegment,
     make_directshow_source,
 )
+from realtime.video_passage_detector import (
+    VideoPassageCandidate,
+    VideoPassageReconciliation,
+)
 from realtime.review_window import (
     FinishReviewLaunchDialog,
     FinishReviewSettings,
@@ -2851,7 +2855,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.2.3 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.24.0 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -2865,7 +2869,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.2.3"
+    assert window.product_title_label.text() == "FinishReview v0.24.0"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()
@@ -2959,4 +2963,90 @@ def test_recording_health_scans_buffer_without_pending_passages(
     window._refresh_capture_windows()
 
     assert scan_calls == 1
+    window.close()
+
+
+def test_video_anomaly_queue_accumulates_and_can_be_closed_as_verified(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    candidate = VideoPassageCandidate(
+        "segment-1:video-1",
+        1,
+        1_000,
+        1_500,
+        1_200,
+        0.3,
+        0.2,
+        video_path=str(video_path),
+        video_position_ms=200,
+    )
+    item = VideoPassageReconciliation(
+        candidate,
+        chip_count=0,
+        anomaly="视频候选无芯片记录",
+    )
+
+    requested = []
+    window.video_candidate_requested.connect(requested.append)
+    window.set_video_reconciliation((item,))
+    window.set_video_reconciliation((item,))
+
+    assert len(window.video_reconciliation()) == 1
+    assert window.video_review_button.text() == "视频异常：1"
+    window.video_review_button.click()
+    assert requested == [item]
+    window.video_review_done_button.click()
+    assert window.video_review_status(candidate.candidate_id) == "verified"
+    assert window.video_reconciliation() == ()
+    window.close()
+
+
+def test_finish_line_roi_is_persisted_per_event_workspace(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.set_finish_line_roi(2, (0.2, 0.1, 0.4, 0.9))
+    window.close()
+
+    restored = _window(tmp_path)
+    assert restored._finish_line_rois[2] == pytest.approx((0.2, 0.1, 0.4, 0.9))
+    restored.close()
+
+
+def test_video_anomaly_can_quickly_focus_roster_bib_without_creating_passage(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    metadata = RaceMetadata(
+        race_id="race-1",
+        stage_id="stage-1",
+        revision=1,
+        emitted_at_ms=1,
+        groups=(RaceGroupMetadata("men-open", "男子公开组"),),
+        athletes=(
+            RaceAthleteMetadata(
+                athlete_id="321",
+                bib="321",
+                name="运动员321",
+                team_name="示例队",
+                group_id="men-open",
+            ),
+        ),
+    )
+    window.metadata_store.store(metadata)
+    candidate = VideoPassageCandidate(
+        "video-321", 1, 1_000, 1_200, 1_100, 0.2, 0.1
+    )
+    item = VideoPassageReconciliation(candidate, 0, "视频候选无芯片记录")
+    window.set_video_reconciliation((item,))
+    window.video_review_button.click()
+    window.video_review_bib_edit.setText("321")
+    window.video_review_bib_edit.returnPressed.emit()
+
+    assert window._video_review_bibs[candidate.candidate_id] == "321"
+    assert window.selected_identity_value.text() == "321"
+    assert window.passage_store.events() == ()
     window.close()

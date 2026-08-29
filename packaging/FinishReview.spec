@@ -30,6 +30,8 @@ a = Analysis(
         "modelscope",
         "onnxruntime",
         "openvino",
+        "psutil",
+        "pyreadline3",
         "paddle",
         "paddleocr",
         "paddlex",

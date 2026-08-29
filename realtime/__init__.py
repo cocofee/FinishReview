@@ -5,6 +5,6 @@
 支持RTSP摄像头和USB摄像头的实时流处理
 """
 
-__version__ = "0.2.3"
+__version__ = "0.24.0"
 APP_DISPLAY_NAME = f"FinishReview v{__version__}"
 APP_WINDOW_TITLE = f"{APP_DISPLAY_NAME} · 终点多源复核"

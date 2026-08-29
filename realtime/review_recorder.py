@@ -826,6 +826,7 @@ class ReviewRingBuffer:
             if pin_journal_path is not None
             else self.buffer_dir / "review_buffer_pins.jsonl"
         )
+        self._lock = threading.RLock()
         self._segments: dict[str, ReviewSegment] = {}
         self._pins_by_event: dict[str, set[str]] = {}
         self._pins_by_segment: dict[str, set[str]] = {}
@@ -911,6 +912,10 @@ class ReviewRingBuffer:
                     self._pins_by_segment.pop(segment_id, None)
 
     def scan(self) -> tuple[ReviewSegment, ...]:
+        with self._lock:
+            return self._scan_unlocked()
+
+    def _scan_unlocked(self) -> tuple[ReviewSegment, ...]:
         """Load completed segments currently published by the HLS playlist."""
         try:
             lines = self.playlist_path.read_text(encoding="utf-8").splitlines()
@@ -979,13 +984,49 @@ class ReviewRingBuffer:
             current_start_ms = None
         return tuple(discovered)
 
-    def segments(self) -> tuple[ReviewSegment, ...]:
-        return tuple(
-            sorted(
-                self._segments.values(),
-                key=lambda item: (item.started_at_ms, item.segment_id),
-            )
+    def create_video_passage_scan_worker(
+        self,
+        result_callback: Callable,
+        *,
+        width: int,
+        height: int,
+        ffmpeg_path: str | Path = "ffmpeg",
+        sample_fps: float = 8.0,
+        roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+        interval_seconds: float = 2.0,
+        finish_line=None,
+        line_batch_gap_ms: int = 1_500,
+    ):
+        """Create the optional ordinary-video scanner for this camera buffer."""
+        from .video_passage_detector import VideoPassageScanWorker
+
+        def provider() -> tuple[ReviewSegment, ...]:
+            self.scan()
+            return self.segments()
+
+        return VideoPassageScanWorker(
+            provider,
+            result_callback,
+            camera_index=self.camera_index,
+            width=width,
+            height=height,
+            ffmpeg_path=ffmpeg_path,
+            sample_fps=sample_fps,
+            roi=roi,
+            interval_seconds=interval_seconds,
+            path_resolver=self.resolve_path,
+            finish_line=finish_line,
+            line_batch_gap_ms=line_batch_gap_ms,
         )
+
+    def segments(self) -> tuple[ReviewSegment, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    self._segments.values(),
+                    key=lambda item: (item.started_at_ms, item.segment_id),
+                )
+            )
 
     def resolve_path(self, segment: ReviewSegment) -> Path:
         return (self.buffer_dir / segment.video_path).resolve()

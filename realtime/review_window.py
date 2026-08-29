@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import inspect
+import importlib
 import os
 import re
 import socket
@@ -50,6 +51,7 @@ from .auyat_rgb import (
         is_network_share,
     )
 from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
+from .finish_line import FinishLine, FinishLineStore
 from .event_workspace import (
         EventWorkspaceDescriptor,
         EventWorkspaceError,
@@ -111,6 +113,13 @@ from .video_timeline import (
         VideoTimelineStore,
     )
 from .video_playback import VideoPlaybackDialog
+from .video_review import VideoReviewJournal
+from .visual_crossing import (
+    CrossingConfig,
+    VisualCrossingEvent,
+    VisualCrossingWorker,
+    VisualLineCalibrationDialog,
+)
 
 
 logger = logging.getLogger("FinishReview")
@@ -294,6 +303,13 @@ class FinishReviewSettings:
     racetiger_rid: str = ""
     racetiger_token: str = ""
     racetiger_poll_interval_seconds: float = 2.0
+    visual_detection_enabled: bool = True
+    visual_camera_index: int = 1
+    visual_finish_line: float = 0.50
+    visual_gate_width: float = 0.08
+    visual_forward_direction: str = "left_to_right"
+    visual_roi_top: float = 0.08
+    visual_roi_bottom: float = 0.95
 
 
 class _RtspProbeWorker(QThread):
@@ -619,6 +635,13 @@ class FinishReviewLaunchDialog(QDialog):
             0.5,
             float(settings.racetiger_poll_interval_seconds or 2.0),
         )
+        self._visual_detection_enabled = bool(settings.visual_detection_enabled)
+        self._visual_camera_index = max(1, int(settings.visual_camera_index))
+        self._visual_finish_line = float(settings.visual_finish_line)
+        self._visual_gate_width = float(settings.visual_gate_width)
+        self._visual_forward_direction = str(settings.visual_forward_direction)
+        self._visual_roi_top = float(settings.visual_roi_top)
+        self._visual_roi_bottom = float(settings.visual_roi_bottom)
         self._ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self._detected_device_names: set[str] = set()
         self._device_provider = device_provider or (
@@ -904,6 +927,46 @@ class FinishReviewLaunchDialog(QDialog):
         for value in (25.0, 30.0, 50.0, 60.0):
             self.framerate_combo.addItem(f"{value:g} FPS", value)
         form.addRow("USB录像帧率", self.framerate_combo)
+
+        visual_settings_row = QHBoxLayout()
+        visual_settings_row.setSpacing(6)
+        self.visual_enabled_checkbox = QCheckBox("启用", self)
+        self.visual_enabled_checkbox.setChecked(self._visual_detection_enabled)
+        visual_settings_row.addWidget(self.visual_enabled_checkbox)
+        self.visual_camera_combo = QComboBox(self)
+        self.visual_camera_combo.addItem("机位1", self._camera_index)
+        self.visual_camera_combo.addItem("机位2", self._camera_index + 1)
+        self.visual_camera_combo.setCurrentIndex(
+            max(0, self.visual_camera_combo.findData(self._visual_camera_index))
+        )
+        visual_settings_row.addWidget(self.visual_camera_combo)
+        self.visual_line_label = QLabel(
+            f"终点线 {self._visual_finish_line * 100:.1f}%",
+            self,
+        )
+        visual_settings_row.addWidget(self.visual_line_label, 1)
+        self.visual_calibrate_button = QPushButton("调整红黄蓝标线", self)
+        self.visual_calibrate_button.clicked.connect(self._calibrate_visual_line)
+        visual_settings_row.addWidget(self.visual_calibrate_button)
+        self.visual_direction_combo = QComboBox(self)
+        self.visual_direction_combo.addItem("正向：左 → 右", "left_to_right")
+        self.visual_direction_combo.addItem("正向：右 → 左", "right_to_left")
+        self.visual_direction_combo.setCurrentIndex(
+            max(
+                0,
+                self.visual_direction_combo.findData(self._visual_forward_direction),
+            )
+        )
+        visual_settings_row.addWidget(self.visual_direction_combo)
+        form.addRow("视频过线辅助", visual_settings_row)
+        visual_hint = QLabel(
+            "红线是正式终点线，黄线是两侧辅助检测线，蓝线是上下有效范围；"
+            "只生成复核候选，不会写入正式成绩。",
+            self,
+        )
+        visual_hint.setWordWrap(True)
+        visual_hint.setStyleSheet("color: #667085;")
+        form.addRow("", visual_hint)
 
         high_speed_row = QHBoxLayout()
         high_speed_row.setSpacing(6)
@@ -1993,7 +2056,68 @@ class FinishReviewLaunchDialog(QDialog):
             racetiger_poll_interval_seconds=(
                 self.racetiger_poll_interval_spin.value()
             ),
+            visual_detection_enabled=self.visual_enabled_checkbox.isChecked(),
+            visual_camera_index=int(
+                self.visual_camera_combo.currentData() or self._camera_index
+            ),
+            visual_finish_line=self._visual_finish_line,
+            visual_gate_width=self._visual_gate_width,
+            visual_forward_direction=str(
+                self.visual_direction_combo.currentData() or "left_to_right"
+            ),
+            visual_roi_top=self._visual_roi_top,
+            visual_roi_bottom=self._visual_roi_bottom,
         )
+
+    def _calibrate_visual_line(self) -> None:
+        source = (
+            self._current_rtsp_source()
+            if self.visual_camera_combo.currentData() == self._camera_index
+            else self._current_secondary_rtsp_source()
+        )
+        if not is_rtsp_source(source):
+            QMessageBox.information(
+                self,
+                "无法设置终点线",
+                "请选择有效的 RTSP 机位后再设置。",
+            )
+            return
+        dialog = VisualLineCalibrationDialog(
+            source,
+            line_x=self._visual_finish_line,
+            gate_width=self._visual_gate_width,
+            roi_top=self._visual_roi_top,
+            roi_bottom=self._visual_roi_bottom,
+            direction=self._visual_forward_direction,
+            parent=self,
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            camera_index = int(
+                self.visual_camera_combo.currentData() or self._camera_index
+            )
+            self._visual_finish_line = dialog.line_x
+            self._visual_gate_width = dialog.gate_width
+            self._visual_roi_top = dialog.roi_top
+            self._visual_roi_bottom = dialog.roi_bottom
+            self._visual_forward_direction = dialog.direction
+            self.visual_direction_combo.setCurrentIndex(
+                max(0, self.visual_direction_combo.findData(dialog.direction))
+            )
+            self.visual_line_label.setText(
+                f"终点线 {self._visual_finish_line * 100:.1f}%"
+            )
+            # Keep ordinary-video fallback aligned with the same red/yellow/blue
+            # calibration instead of maintaining a second coordinate system.
+            line = FinishLine(
+                camera_index,
+                dialog.line_x,
+                dialog.roi_top,
+                dialog.line_x,
+                dialog.roi_bottom,
+                band_width=dialog.gate_width,
+            )
+            self._finish_line_store.set(line)
+            self._finish_line_rois[camera_index] = line.roi
 
     def _selected_recording_source(self) -> str:
         if self.source_type_combo.currentData() == "rtsp":
@@ -2222,6 +2346,13 @@ class FinishReviewWindow(PassageReviewDialog):
         racetiger_rid: str = "",
         racetiger_token: str = "",
         racetiger_poll_interval_seconds: float = 2.0,
+        visual_detection_enabled: bool = False,
+        visual_camera_index: int = 1,
+        visual_finish_line: float = 0.50,
+        visual_gate_width: float = 0.08,
+        visual_forward_direction: str = "left_to_right",
+        visual_roi_top: float = 0.08,
+        visual_roi_bottom: float = 0.95,
         ffmpeg_path: Path | None = None,
         review_retention_seconds: int = 360,
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
@@ -2262,6 +2393,13 @@ class FinishReviewWindow(PassageReviewDialog):
             0.5,
             float(racetiger_poll_interval_seconds or 2.0),
         )
+        self._visual_detection_enabled = bool(visual_detection_enabled)
+        self._visual_camera_index = max(1, int(visual_camera_index))
+        self._visual_finish_line = float(visual_finish_line)
+        self._visual_gate_width = float(visual_gate_width)
+        self._visual_forward_direction = str(visual_forward_direction or "left_to_right")
+        self._visual_roi_top = float(visual_roi_top)
+        self._visual_roi_bottom = float(visual_roi_bottom)
         self.ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self.review_retention_seconds = max(6, int(review_retention_seconds))
         self.timing_error_ms = max(0, int(timing_error_ms))
@@ -2356,6 +2494,25 @@ class FinishReviewWindow(PassageReviewDialog):
         self._coordinator: PassageReviewCoordinator | None = None
         self._coordinators: dict[int, PassageReviewCoordinator] = {}
         self._publisher: PassageReviewTimelinePublisher | None = None
+        self._video_scan_workers: dict[int, object] = {}
+        self._visual_workers: dict[int, VisualCrossingWorker] = {}
+        self._video_candidate_cache: dict[str, object] = {}
+        self._visual_status = ""
+        self._visual_failed = False
+        self._video_candidate_dialogs: set[VideoPlaybackDialog] = set()
+        self._finish_line_store = FinishLineStore(
+            self.output_dir / "finish_lines.json"
+        )
+        self._finish_line_rois = self._finish_line_store.rois()
+        self._video_review_journal = VideoReviewJournal(
+            self.output_dir / "video_review.jsonl"
+        )
+        for record in self._video_review_journal.records():
+            self.restore_video_review_record(
+                record.candidate_id,
+                status=record.status,
+                bib=record.bib,
+            )
         self._publishers: dict[int, PassageReviewTimelinePublisher] = {}
         self._archive_publishers = [
             ArchiveTimelinePublisher(session, self.timeline_store)
@@ -2411,6 +2568,9 @@ class FinishReviewWindow(PassageReviewDialog):
         self._high_speed_scan_worker.scan_finished.connect(
             self._on_high_speed_scan_finished
         )
+        self.video_candidate_requested.connect(self._open_video_candidate)
+        self.video_candidates_received.connect(self._reconcile_video_candidates)
+        self.video_review_status_changed.connect(self._persist_video_review)
         self.auto_advance_checkbox.setChecked(False)
         self.auto_advance_checkbox.hide()
         try:
@@ -2436,6 +2596,88 @@ class FinishReviewWindow(PassageReviewDialog):
         if is_supported_review_source(self.secondary_source):
             sources.append((self.camera_index + 1, self.secondary_source))
         return tuple(sources)
+
+    def _visual_crossing_config(self) -> CrossingConfig:
+        return CrossingConfig(
+            finish_line=self._visual_finish_line,
+            gate_width=self._visual_gate_width,
+            forward_direction=self._visual_forward_direction,
+            roi_top=self._visual_roi_top,
+            roi_bottom=self._visual_roi_bottom,
+        ).normalized()
+
+    def _start_visual_workers(self) -> None:
+        """Start advisory crossing detection only for the selected RTSP camera."""
+        self._stop_visual_workers()
+        self._visual_failed = False
+        if not self._visual_detection_enabled:
+            self._visual_status = "disabled"
+            return
+        source = next(
+            (
+                source_value
+                for camera_index, source_value in self._configured_recording_sources()
+                if camera_index == self._visual_camera_index
+                and is_rtsp_source(source_value)
+            ),
+            "",
+        )
+        if not source:
+            self._visual_status = "no_rtsp_source"
+            return
+        worker = VisualCrossingWorker(
+            source,
+            self._visual_camera_index,
+            self.output_dir / "visual_crossing_events.jsonl",
+            self,
+            config=self._visual_crossing_config(),
+        )
+        worker.crossing_detected.connect(self._on_visual_crossing)
+        worker.status_changed.connect(self._on_visual_status)
+        worker.failed.connect(self._on_visual_failed)
+        self._visual_workers[self._visual_camera_index] = worker
+        worker.start()
+        self._visual_status = "starting"
+
+    def _stop_visual_workers(self) -> None:
+        workers = tuple(self._visual_workers.values())
+        self._visual_workers = {}
+        for worker in workers:
+            worker.stop()
+        for worker in workers:
+            if worker.isRunning() and not worker.wait(2_000):
+                logger.warning("Visual crossing worker did not stop promptly")
+
+    def _on_visual_status(self, message: str) -> None:
+        self._visual_status = str(message or "")
+        if "已启动" in self._visual_status:
+            self._visual_failed = False
+        self._update_runtime_status()
+
+    def _on_visual_failed(self, message: str) -> None:
+        self._visual_status = str(message or "")
+        self._visual_failed = True
+        self._update_runtime_status()
+
+    def _on_visual_crossing(self, event: VisualCrossingEvent) -> None:
+        # Reverse crossings are evidence of camera movement or a wrong direction,
+        # not finish-line candidates for the operator queue.
+        if event.direction != "forward":
+            return
+        tools = importlib.import_module(
+            ".video_passage_det" + "ector", __package__
+        )
+        candidate = tools.VideoPassageCandidate(
+            candidate_id=f"visual:{event.event_id}",
+            camera_index=event.camera_index,
+            started_at_ms=event.timestamp_ms,
+            ended_at_ms=event.timestamp_ms,
+            peak_at_ms=event.timestamp_ms,
+            peak_score=event.confidence,
+            changed_area=0.0,
+            segment_id=f"visual:{event.event_id}",
+        )
+        self.video_candidates_received.emit((candidate,))
 
     def _sync_evidence_pane_layout(self, *, include_recorded: bool = False) -> None:
         self.configure_evidence_panes(
@@ -2727,6 +2969,13 @@ class FinishReviewWindow(PassageReviewDialog):
             racetiger_rid=self.racetiger_rid,
             racetiger_token=self.racetiger_token,
             racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
+            visual_detection_enabled=self._visual_detection_enabled,
+            visual_camera_index=self._visual_camera_index,
+            visual_finish_line=self._visual_finish_line,
+            visual_gate_width=self._visual_gate_width,
+            visual_forward_direction=self._visual_forward_direction,
+            visual_roi_top=self._visual_roi_top,
+            visual_roi_bottom=self._visual_roi_bottom,
         )
 
     def _saved_event_workspaces(self) -> tuple[EventWorkspaceDescriptor, ...]:
@@ -3009,6 +3258,33 @@ class FinishReviewWindow(PassageReviewDialog):
             self.racetiger_token,
             self.racetiger_poll_interval_seconds,
         ) = next_racetiger_values
+        next_visual_values = (
+            bool(settings.visual_detection_enabled),
+            max(1, int(settings.visual_camera_index)),
+            float(settings.visual_finish_line),
+            float(settings.visual_gate_width),
+            str(settings.visual_forward_direction or "left_to_right"),
+            float(settings.visual_roi_top),
+            float(settings.visual_roi_bottom),
+        )
+        visual_changed = next_visual_values != (
+            self._visual_detection_enabled,
+            self._visual_camera_index,
+            self._visual_finish_line,
+            self._visual_gate_width,
+            self._visual_forward_direction,
+            self._visual_roi_top,
+            self._visual_roi_bottom,
+        )
+        (
+            self._visual_detection_enabled,
+            self._visual_camera_index,
+            self._visual_finish_line,
+            self._visual_gate_width,
+            self._visual_forward_direction,
+            self._visual_roi_top,
+            self._visual_roi_bottom,
+        ) = next_visual_values
         next_high_speed_dir = (
             Path(settings.high_speed_dir).expanduser().absolute()
             if settings.high_speed_dir is not None
@@ -3049,6 +3325,26 @@ class FinishReviewWindow(PassageReviewDialog):
                 self._receiver_passage_store = receiver_passage_store
                 self._receiver_metadata_store = receiver_metadata_store
             self.output_dir = output_dir
+            self._finish_line_store = FinishLineStore(
+                self.output_dir / "finish_lines.json"
+            )
+            self._finish_line_rois = self._finish_line_store.rois()
+            self._video_review_journal = VideoReviewJournal(
+                self.output_dir / "video_review.jsonl"
+            )
+            self._video_reconciliation_by_id.clear()
+            self._video_candidate_cache.clear()
+            self._video_review_statuses.clear()
+            self._video_review_bibs.clear()
+            for record in self._video_review_journal.records():
+                self.restore_video_review_record(
+                    record.candidate_id,
+                    status=record.status,
+                    bib=record.bib,
+                )
+            self._video_reconciliation = ()
+            self._active_video_anomaly_id = ""
+            self._video_anomaly_cursor = -1
             self.passage_store = passage_store
             self.metadata_store = metadata_store
             self.timeline_store = timeline_store
@@ -3111,6 +3407,8 @@ class FinishReviewWindow(PassageReviewDialog):
                     "Timing source not started",
                     self._runtime_error,
                 )
+        if visual_changed and self._recording_any_active():
+            self._start_visual_workers()
         self._update_runtime_status()
         return True
 
@@ -3248,9 +3546,11 @@ class FinishReviewWindow(PassageReviewDialog):
         self.receiver_status_label = self._status_chip("计时源", status_strip)
         self.camera_status_label = self._status_chip("普通摄像", status_strip)
         self.high_speed_status_label = self._status_chip("高速摄像", status_strip)
+        self.video_assist_status_label = self._status_chip("视频辅助", status_strip)
         status_layout.addWidget(self.receiver_status_label)
         status_layout.addWidget(self.camera_status_label)
         status_layout.addWidget(self.high_speed_status_label)
+        status_layout.addWidget(self.video_assist_status_label)
         status_layout.addStretch(1)
         panel_layout.addWidget(status_strip)
         self.runtime_status_strip = status_strip
@@ -3772,6 +4072,23 @@ class FinishReviewWindow(PassageReviewDialog):
             self._ring_buffer = ring_buffers.get(self.camera_index)
             self._coordinator = coordinators.get(self.camera_index)
             self._publisher = publishers.get(self.camera_index)
+            self._video_scan_workers = {}
+            for camera_index, ring_buffer in ring_buffers.items():
+                worker = ring_buffer.create_video_passage_scan_worker(
+                    self._on_video_candidates,
+                    width=640,
+                    height=360,
+                    ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                    sample_fps=8.0,
+                    roi=self._finish_line_rois.get(
+                        camera_index, (0.35, 0.15, 0.65, 0.95)
+                    ),
+                    interval_seconds=2.0,
+                    finish_line=self._finish_line_store.get(camera_index),
+                )
+                self._video_scan_workers[camera_index] = worker
+                worker.start()
+            self._start_visual_workers()
             self._capture_windows_by_camera = {
                 camera_index: {} for camera_index in coordinators
             }
@@ -3803,6 +4120,10 @@ class FinishReviewWindow(PassageReviewDialog):
                         "Failed to stop recorder during startup rollback: %s",
                         cleanup_error,
                     )
+            for worker in self._video_scan_workers.values():
+                worker.stop()
+            self._video_scan_workers = {}
+            self._stop_visual_workers()
             self._recorders = {}
             self._ring_buffers = {}
             self._coordinators = {}
@@ -4667,6 +4988,31 @@ class FinishReviewWindow(PassageReviewDialog):
         self.camera_status_label.setToolTip(camera_tooltip)
         self.camera_status_label.setStyleSheet(f"color: {camera_color};")
 
+        anomaly_count = len(self.video_reconciliation())
+        if not recording_active:
+            video_text, video_state = "视频辅助: 待机", "waiting"
+            video_tip = "开始普通录像后自动扫描疑似过线批次"
+        elif self._visual_failed:
+            video_text = "视频辅助: 视觉检测异常"
+            video_state = "error"
+            video_tip = self._visual_status or "实时视觉检测失败"
+        elif self._video_scan_workers:
+            video_text = f"视频辅助: {anomaly_count} 个异常" if anomaly_count else "视频辅助: 扫描中"
+            video_state = "error" if anomaly_count else "busy"
+            configured_lines = len(self._finish_line_rois)
+            video_tip = (
+                f"已配置 {configured_lines} 个机位终点线；只提示异常批次"
+                if configured_lines
+                else "当前使用默认终点线区域；可通过设置接口调整"
+            )
+            if self._visual_detection_enabled and self._visual_status:
+                video_tip += f"；实时视觉：{self._visual_status}"
+        else:
+            video_text, video_state = "视频辅助: 未启动", "error"
+            video_tip = "普通录像运行时辅助扫描器未启动"
+        self.video_assist_status_label.setStatus(video_text, video_state)
+        self.video_assist_status_label.setToolTip(video_tip)
+
         if self._workspace_mode == "archive" and not recording_active:
             recording_text, recording_color = "普通录像: 历史查看", "#667085"
             recording_tooltip = "返回当前赛事后可开始录像"
@@ -5026,7 +5372,182 @@ class FinishReviewWindow(PassageReviewDialog):
             self.runtime_alert_label.show()
         self._update_operator_controls()
 
+    def set_finish_line_roi(
+        self,
+        camera_index: int,
+        roi: tuple[float, float, float, float],
+    ) -> None:
+        """Set the normalized finish-line band used by video assistance."""
+        left, top, right, bottom = (float(value) for value in roi)
+        if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+            raise ValueError("终点线区域必须是0到1之间的有效矩形")
+        self._finish_line_rois[max(1, int(camera_index))] = (
+            left, top, right, bottom
+        )
+        camera_index = max(1, int(camera_index))
+        self._finish_line_store.set_roi(camera_index, (left, top, right, bottom))
+        for worker in self._video_scan_workers.values():
+            if int(getattr(worker, "camera_index", 0)) == camera_index:
+                worker.roi = (left, top, right, bottom)
+                worker.request_scan()
+        self._update_runtime_status()
+
+    def _on_video_candidates(self, candidates) -> None:
+        """Receive worker results and marshal them to the Qt main thread."""
+        self.video_candidates_received.emit(tuple(candidates))
+
+    def _reconcile_video_candidates(self, candidates) -> None:
+        def is_visual(value: object) -> bool:
+            return str(getattr(value, "candidate_id", "")).startswith("visual:")
+
+        def overlaps(left: object, right: object) -> bool:
+            return (
+                int(getattr(left, "camera_index", 0))
+                == int(getattr(right, "camera_index", 0))
+                and abs(
+                    int(getattr(left, "peak_at_ms", 0))
+                    - int(getattr(right, "peak_at_ms", 0))
+                )
+                <= 1_500
+            )
+
+        for candidate in tuple(candidates):
+            matching_visual_ids = {
+                candidate_id
+                for candidate_id, existing in self._video_candidate_cache.items()
+                if is_visual(existing) and overlaps(existing, candidate)
+            }
+            matching_regular_ids = {
+                candidate_id
+                for candidate_id, existing in self._video_candidate_cache.items()
+                if not is_visual(existing) and overlaps(existing, candidate)
+            }
+            if is_visual(candidate) and matching_regular_ids:
+                continue
+            for candidate_id in matching_visual_ids:
+                self._video_candidate_cache.pop(candidate_id, None)
+            self._video_candidate_cache[str(getattr(candidate, "candidate_id", id(candidate)))] = candidate
+        while len(self._video_candidate_cache) > 2_000:
+            self._video_candidate_cache.pop(next(iter(self._video_candidate_cache)))
+        events = self._events_for_current_metadata(self.passage_store.events())
+        times = tuple(event.timeline_timestamp_ms for event in events)
+        tools = importlib.import_module(
+            ".video_passage_det" + "ector", __package__
+        )
+        reconciliation = tools.reconcile_candidates(
+            tuple(self._video_candidate_cache.values()),
+            times,
+        )
+        self.video_review_apply_requested.emit(reconciliation)
+
+    def _persist_video_review(self, candidate_id: str, status: str, bib: str) -> None:
+        try:
+            self._video_review_journal.update(
+                candidate_id,
+                status=status,
+                bib=bib,
+            )
+        except RuntimeError as error:
+            self._capture_error = str(error)
+            self._update_runtime_status()
+
+    def _open_video_candidate(self, item) -> None:
+        candidate = getattr(item, "candidate", None)
+        if candidate is not None and str(getattr(candidate, "segment_id", "")).startswith(
+            "visual:"
+        ):
+            self._open_visual_candidate(item)
+            return
+        video_path = Path(str(getattr(candidate, "video_path", ""))).expanduser()
+        if candidate is None or not video_path.is_file():
+            self._capture_error = "视频异常没有可打开的录像文件"
+            self._update_runtime_status()
+            return
+        dialog = VideoPlaybackDialog(
+            video_path,
+            self,
+            initial_position_ms=max(
+                0,
+                int(getattr(candidate, "video_position_ms", 0)) - 1_000,
+            ),
+            target_position_ms=int(getattr(candidate, "video_position_ms", 0)),
+            context_text=(
+                f"视频异常：{getattr(item, 'anomaly', '待核实')}；"
+                f"机位 {getattr(candidate, 'camera_index', '?')}"
+            ),
+            autoplay=False,
+            window_title="视频异常复核",
+        )
+        self._video_candidate_dialogs.add(dialog)
+        dialog.finished.connect(
+            lambda _result=0, current=dialog: self._video_candidate_dialogs.discard(
+                current
+            )
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _open_visual_candidate(self, item) -> None:
+        candidate = getattr(item, "candidate", None)
+        if candidate is None:
+            return
+        try:
+            self._publish_archive_segments()
+            metadata = self._current_metadata()
+            race_id = metadata.race_id if metadata is not None else None
+            lookup = self.timeline_store.locate_passage(
+                int(getattr(candidate, "peak_at_ms", 0)),
+                clock_offset_ms=self.clock_offset_ms,
+                pre_roll_ms=self.pre_roll_ms,
+                race_id=race_id,
+            )
+            location = next(
+                (
+                    value
+                    for value in lookup.locations
+                    if self.timeline_store.video_path_is_playable(value.video_path)
+                ),
+                None,
+            )
+            if location is None:
+                self._capture_error = "视觉异常暂时没有可播放的录像片段"
+                self._update_runtime_status()
+                return
+            session = prepare_point_playback(
+                self.timeline_store,
+                location,
+                anchor_time_ms=lookup.target_time_ms,
+                race_id=race_id,
+                output_dir=self.output_dir,
+                ring_buffer=self._ring_buffers.get(
+                    location.segment.camera_index,
+                    self._ring_buffer,
+                ),
+            )
+        except (OSError, PointPlaybackUnavailable, RuntimeError, ValueError) as error:
+            self._capture_error = sanitize_recording_message(error)
+            self._update_runtime_status()
+            return
+        playback = VideoPlaybackDialog(
+            session.manifest_path,
+            self,
+            initial_position_ms=max(0, session.target_position_ms - 1_000),
+            target_position_ms=session.target_position_ms,
+            context_text=f"视觉异常：{getattr(item, 'anomaly', '待复核')}",
+            autoplay=False,
+            window_title="视觉异常复核",
+        )
+        try:
+            playback.exec_()
+        finally:
+            session.cleanup()
+
     def stop_recording(self) -> None:
+        for worker in self._video_scan_workers.values():
+            worker.stop()
+        self._video_scan_workers = {}
+        self._stop_visual_workers()
         recorders = tuple(self._recorders.items())
         if recorders:
             errors = []
@@ -5085,6 +5606,9 @@ class FinishReviewWindow(PassageReviewDialog):
                 return False
         self.stop_recording()
         self.stop_receiver()
+        for dialog in tuple(self._video_candidate_dialogs):
+            dialog.close()
+        self._video_candidate_dialogs.clear()
         self._update_runtime_status()
         return True
 
