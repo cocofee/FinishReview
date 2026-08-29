@@ -250,9 +250,9 @@ class FixedCameraLineCrossingDetector:
         finish_line: FinishLine,
         *,
         camera_index: int | None = None,
-        min_score: float = 0.012,
-        min_changed_area: float = 0.004,
-        cooldown_ms: int = 300,
+        min_score: float = 0.015,
+        min_changed_area: float = 0.006,
+        cooldown_ms: int = 500,
     ):
         self.finish_line = finish_line
         self.camera_index = max(1, int(camera_index or finish_line.camera_index))
@@ -263,6 +263,12 @@ class FixedCameraLineCrossingDetector:
         self._previous_center: tuple[float, float] | None = None
         self._last_crossing_ms = -10**12
         self._candidate_number = 0
+
+    def reset_segment_state(self) -> None:
+        """Forget frame-to-frame motion state at a video segment boundary."""
+
+        self._previous = None
+        self._previous_center = None
 
     def process_frame(
         self,
@@ -277,9 +283,15 @@ class FixedCameraLineCrossingDetector:
             raise ValueError("frame shape cannot change during detection")
         difference = np.abs(gray - self._previous)
         self._previous = gray.copy()
-        mask = difference > 0.08
+        roi_left, roi_top, roi_right, roi_bottom = self.finish_line.roi
+        x1 = max(0, min(gray.shape[1] - 1, int(gray.shape[1] * roi_left)))
+        y1 = max(0, min(gray.shape[0] - 1, int(gray.shape[0] * roi_top)))
+        x2 = max(x1 + 1, min(gray.shape[1], int(gray.shape[1] * roi_right)))
+        y2 = max(y1 + 1, min(gray.shape[0], int(gray.shape[0] * roi_bottom)))
+        roi_difference = difference[y1:y2, x1:x2]
+        mask = roi_difference > 0.08
         area = float(mask.mean())
-        score = float(difference.mean())
+        score = float(roi_difference.mean())
         if score < self.min_score or area < self.min_changed_area:
             self._previous_center = None
             return ()
@@ -288,7 +300,10 @@ class FixedCameraLineCrossingDetector:
             self._previous_center = None
             return ()
         height, width = gray.shape
-        center = (float(xs.mean()) / width, float(ys.mean()) / height)
+        center = (
+            float(xs.mean() + x1) / width,
+            float(ys.mean() + y1) / height,
+        )
         previous_center = self._previous_center
         self._previous_center = center
         if previous_center is None or int(timestamp_ms) - self._last_crossing_ms < self.cooldown_ms:
@@ -572,9 +587,12 @@ class VideoPassageScanWorker:
         self.finish_line = finish_line
         self.line_batch_gap_ms = max(0, int(line_batch_gap_ms))
         self._stop = threading.Event()
+        self._pause_requested = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._scanned_ids: set[str] = set()
+        self._line_detector: FixedCameraLineCrossingDetector | None = None
+        self._line_detector_last_end_ms: int | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -590,6 +608,18 @@ class VideoPassageScanWorker:
     def request_scan(self) -> None:
         self._wake.set()
 
+    def pause(self) -> None:
+        """Temporarily stop starting new FFmpeg scans without losing state."""
+
+        self._pause_requested.set()
+        self._wake.set()
+
+    def resume(self) -> None:
+        """Resume scanning after a temporary playback pause."""
+
+        self._pause_requested.clear()
+        self._wake.set()
+
     def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
         self._wake.set()
@@ -601,31 +631,39 @@ class VideoPassageScanWorker:
     def scan_once(self) -> tuple[VideoPassageCandidate, ...]:
         found: list[VideoPassageCandidate] = []
         for segment in tuple(self.segment_provider()):
-            if self._stop.is_set():
+            if self._stop.is_set() or self._pause_requested.is_set():
                 break
             segment_id = str(getattr(segment, "segment_id", ""))
             path = Path(self.path_resolver(segment))
             if not segment_id or segment_id in self._scanned_ids or not path.is_file():
                 continue
             try:
+                segment_start_ms = int(getattr(segment, "started_at_ms"))
+                camera_index = int(getattr(segment, "camera_index", self.camera_index))
+                detector = None
+                if self.finish_line is not None:
+                    if (
+                        self._line_detector is None
+                        or self._line_detector_last_end_ms is None
+                        or segment_start_ms - self._line_detector_last_end_ms > 1_000
+                        or self._line_detector.camera_index != max(1, camera_index)
+                    ):
+                        self._line_detector = FixedCameraLineCrossingDetector(
+                            self.finish_line,
+                            camera_index=camera_index,
+                        )
+                    else:
+                        self._line_detector.reset_segment_state()
+                    detector = self._line_detector
                 segment_candidates = scan_video_file(
                     path,
-                    started_at_ms=int(getattr(segment, "started_at_ms")),
+                    started_at_ms=segment_start_ms,
                     width=self.width,
                     height=self.height,
                     ffmpeg_path=self.ffmpeg_path,
                     sample_fps=self.sample_fps,
                     roi=self.roi,
-                    detector=(
-                        FixedCameraLineCrossingDetector(
-                            self.finish_line,
-                            camera_index=int(
-                                getattr(segment, "camera_index", self.camera_index)
-                            ),
-                        )
-                        if self.finish_line is not None
-                        else None
-                    ),
+                    detector=detector,
                 )
                 segment_candidates = (
                     merge_line_crossings(
@@ -635,8 +673,7 @@ class VideoPassageScanWorker:
                     if self.finish_line is not None
                     else merge_candidates(segment_candidates)
                 )
-                segment_started_at_ms = int(getattr(segment, "started_at_ms"))
-                camera_index = int(getattr(segment, "camera_index", 1))
+                segment_started_at_ms = segment_start_ms
                 found.extend(
                     replace(
                         candidate,
@@ -654,11 +691,19 @@ class VideoPassageScanWorker:
             except (OSError, RuntimeError, ValueError):
                 # A bad or still-being-removed segment must not stop recording.
                 continue
+            if self.finish_line is not None:
+                self._line_detector_last_end_ms = int(
+                    getattr(segment, "ended_at_ms", segment_started_at_ms)
+                )
             self._scanned_ids.add(segment_id)
         return tuple(found)
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            if self._pause_requested.is_set():
+                self._wake.wait(0.1)
+                self._wake.clear()
+                continue
             found = self.scan_once()
             if found and not self._stop.is_set():
                 self.result_callback(found)

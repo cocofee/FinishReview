@@ -2081,6 +2081,8 @@ class PassageReviewDialog(QDialog):
         self._video_review_bibs: dict[str, str] = {}
         self._active_video_anomaly_id = ""
         self._video_anomaly_cursor = -1
+        self._video_anomaly_dialog: Optional[QDialog] = None
+        self._video_anomaly_dialog_refresh: Optional[Callable[[], None]] = None
         self._active_review_filter = "all"
         self._total_event_count = 0
         self._queue_expanded = False
@@ -2188,15 +2190,22 @@ class PassageReviewDialog(QDialog):
 
         self.review_filter_buttons: dict[str, QPushButton] = {}
         self.review_filter_labels = {
-            "pending": "待核对",
-            "blocked": "待确认",
+            "pending": "异常复核",
+            "blocked": "待人工确认",
             "confirmed": "已确认",
             "all": "全部",
+        }
+        review_filter_tooltips = {
+            "pending": "有可用视频或时间位置，打开证据进行异常复核",
+            "blocked": "暂时没有可直接核实的证据，需要人工确认或补充",
+            "confirmed": "已经保存复核确认结果的记录",
+            "all": "显示全部通过记录",
         }
         for filter_key in ("pending", "blocked", "confirmed", "all"):
             button = QPushButton(self.review_filter_labels[filter_key], self)
             button.setCheckable(True)
             button.setProperty("queueFilter", True)
+            button.setToolTip(review_filter_tooltips[filter_key])
             button.clicked.connect(
                 lambda _checked=False, key=filter_key: self._set_review_filter(key)
             )
@@ -2225,11 +2234,9 @@ class PassageReviewDialog(QDialog):
         filters.addWidget(self.summary_label)
         self.video_review_apply_requested.connect(self.set_video_reconciliation)
         self.video_review_button = QPushButton("视频异常：0")
-        self.video_review_button.setToolTip(
-            "打开下一个视频辅助异常批次；无芯片批次将独立请求复核"
-        )
+        self.video_review_button.setToolTip("打开视频辅助异常列表")
         self.video_review_button.setVisible(False)
-        self.video_review_button.clicked.connect(self._open_next_video_anomaly)
+        self.video_review_button.clicked.connect(self._open_video_anomaly_list)
         filters.addWidget(self.video_review_button)
         self.video_review_done_button = QPushButton("已核实")
         self.video_review_done_button.setToolTip("将当前视频异常标记为已核实")
@@ -2597,10 +2604,16 @@ class PassageReviewDialog(QDialog):
         )
         if hasattr(self, "video_assist_status_label"):
             self._update_runtime_status()
+        pending_count = len(self._video_reconciliation)
+        total_count = len(self._video_reconciliation_by_id)
         self.video_review_button.setText(
-            f"视频异常：{len(self._video_reconciliation)}"
+            f"视频异常：{pending_count}"
+            if pending_count
+            else f"视频异常记录：{total_count}"
         )
-        self.video_review_button.setVisible(bool(self._video_reconciliation))
+        self.video_review_button.setVisible(bool(total_count))
+        if self._video_anomaly_dialog_refresh is not None:
+            self._video_anomaly_dialog_refresh()
         has_active = bool(self._active_video_anomaly_id)
         self.video_review_done_button.setVisible(has_active)
         self.video_review_ignore_button.setVisible(has_active)
@@ -2654,10 +2667,20 @@ class PassageReviewDialog(QDialog):
         current = getattr(self, "_video_anomaly_cursor", -1)
         current = (current + 1) % len(self._video_reconciliation)
         self._video_anomaly_cursor = current
-        item = self._video_reconciliation[current]
-        candidate_id = str(
-            getattr(getattr(item, "candidate", None), "candidate_id", "")
-        )
+        self._activate_video_anomaly(self._video_reconciliation[current], current)
+
+    def _activate_video_anomaly(self, item: object, index: int | None = None) -> None:
+        candidate = getattr(item, "candidate", None)
+        candidate_id = str(getattr(candidate, "candidate_id", ""))
+        if not candidate_id:
+            return
+        if index is not None:
+            self._video_anomaly_cursor = int(index)
+        else:
+            try:
+                self._video_anomaly_cursor = self._video_reconciliation.index(item)
+            except ValueError:
+                self._video_anomaly_cursor = -1
         self._active_video_anomaly_id = candidate_id
         self.video_review_done_button.setVisible(True)
         self.video_review_ignore_button.setVisible(True)
@@ -2682,11 +2705,126 @@ class PassageReviewDialog(QDialog):
             key=lambda event: abs(event.timeline_timestamp_ms - int(timestamp)),
         )
         self._select_event(nearest.event_id)
+        position = self._video_anomaly_cursor + 1
+        total = len(self._video_reconciliation)
         self.summary_label.setToolTip(
-            f"视频异常 {current + 1}/{len(self._video_reconciliation)}："
+            f"视频异常 {position}/{total}："
             f"已定位到最接近的芯片记录（{getattr(item, 'anomaly', '待复核')}）"
         )
         self.video_candidate_requested.emit(item)
+
+    @staticmethod
+    def _video_review_status_label(status: str) -> str:
+        return {
+            "pending": "待核实",
+            "verified": "已核实",
+            "ignored": "已忽略",
+        }.get(str(status), "待核实")
+
+    def _open_video_anomaly_list(self) -> None:
+        if not self._video_reconciliation_by_id:
+            return
+        dialog = self._video_anomaly_dialog
+        if dialog is not None:
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        dialog = QDialog(self)
+        dialog.setObjectName("videoAnomalyDialog")
+        dialog.setWindowTitle("视频辅助异常列表")
+        dialog.resize(980, 480)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel(
+            "双击一行或点击“打开选中”进入复核；已核实和已忽略记录会保留。",
+            dialog,
+        )
+        summary.setStyleSheet("color: #667085;")
+        layout.addWidget(summary)
+        table = QTableWidget(0, 7, dialog)
+        table.setObjectName("videoAnomalyTable")
+        table.setHorizontalHeaderLabels(
+            ["序号", "时间", "机位", "异常原因", "芯片数", "号码", "状态"]
+        )
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.setColumnWidth(0, 55)
+        table.setColumnWidth(1, 170)
+        table.setColumnWidth(2, 60)
+        table.setColumnWidth(4, 65)
+        table.setColumnWidth(5, 90)
+        records: list[tuple[str, object]] = []
+
+        def refresh_table() -> None:
+            nonlocal records
+            selected_id = ""
+            current_row = table.currentRow()
+            if 0 <= current_row < len(records):
+                selected_item = table.item(current_row, 0)
+                if selected_item is not None:
+                    selected_id = str(selected_item.data(Qt.UserRole) or "")
+            records = sorted(
+                self._video_reconciliation_by_id.items(),
+                key=lambda pair: int(
+                    getattr(getattr(pair[1], "candidate", None), "peak_at_ms", 0)
+                ),
+            )
+            table.setRowCount(len(records))
+            selected_row = -1
+            for row, (candidate_id, item) in enumerate(records):
+                if candidate_id == selected_id:
+                    selected_row = row
+                candidate = getattr(item, "candidate", None)
+                values = (
+                    str(row + 1),
+                    format_passage_time(int(getattr(candidate, "peak_at_ms", 0))),
+                    str(getattr(candidate, "camera_index", "-")),
+                    str(getattr(item, "anomaly", "待核实")),
+                    str(getattr(item, "chip_count", 0)),
+                    self._video_review_bibs.get(candidate_id, ""),
+                    self._video_review_status_label(
+                        self._video_review_statuses.get(candidate_id, "pending")
+                    ),
+                )
+                for column, value in enumerate(values):
+                    table.setItem(row, column, QTableWidgetItem(value))
+                table.item(row, 0).setData(Qt.UserRole, candidate_id)
+            if selected_row >= 0:
+                table.selectRow(selected_row)
+
+        refresh_table()
+        self._video_anomaly_dialog_refresh = refresh_table
+        layout.addWidget(table, 1)
+        buttons = QHBoxLayout()
+        open_button = QPushButton("打开选中", dialog)
+        open_button.setObjectName("videoAnomalyOpenButton")
+        close_button = QPushButton("关闭", dialog)
+        buttons.addStretch(1)
+        buttons.addWidget(open_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        def open_selected() -> None:
+            row = table.currentRow()
+            if not (0 <= row < len(records)):
+                return
+            self._activate_video_anomaly(records[row][1])
+            dialog.close()
+
+        open_button.clicked.connect(open_selected)
+        table.cellDoubleClicked.connect(lambda _row, _column: open_selected())
+        close_button.clicked.connect(dialog.close)
+        def clear_dialog_reference(_result: int) -> None:
+            self._video_anomaly_dialog = None
+            self._video_anomaly_dialog_refresh = None
+
+        dialog.finished.connect(clear_dialog_reference)
+        self._video_anomaly_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _apply_video_review_bib(self) -> None:
         candidate_id = self._active_video_anomaly_id

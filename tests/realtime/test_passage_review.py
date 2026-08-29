@@ -1031,11 +1031,11 @@ def test_large_finish_queue_supports_debounced_search_and_status_filters(
     dialog.review_filter_buttons["pending"].click()
     assert dialog.table.rowCount() == 0
     assert dialog.review_filter_buttons["pending"].text().startswith("✓ ")
-    assert dialog.summary_label.text() == "当前筛选：待核对 · 0 / 5,000 条"
+    assert dialog.summary_label.text() == "当前筛选：异常复核 · 0 / 5,000 条"
     dialog.review_filter_buttons["blocked"].click()
     assert dialog.table.rowCount() == 1
-    assert dialog.review_filter_buttons["blocked"].text().startswith("✓ 待确认 ")
-    assert dialog.summary_label.text() == "当前筛选：待确认 · 1 / 5,000 条"
+    assert dialog.review_filter_buttons["blocked"].text().startswith("✓ 待人工确认 ")
+    assert dialog.summary_label.text() == "当前筛选：待人工确认 · 1 / 5,000 条"
     dialog.review_filter_buttons["all"].click()
     assert dialog.table.rowCount() == 1
     assert dialog.review_filter_buttons["all"].text().startswith("✓ ")

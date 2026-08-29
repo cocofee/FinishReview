@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QTableWidget,
     QSizePolicy,
 )
 
@@ -2998,10 +2999,79 @@ def test_video_anomaly_queue_accumulates_and_can_be_closed_as_verified(
     assert len(window.video_reconciliation()) == 1
     assert window.video_review_button.text() == "视频异常：1"
     window.video_review_button.click()
+    dialog = window.findChild(QDialog, "videoAnomalyDialog")
+    assert dialog is not None
+    table = dialog.findChild(QTableWidget, "videoAnomalyTable")
+    assert table is not None and table.rowCount() == 1
+    table.selectRow(0)
+    open_button = dialog.findChild(QPushButton, "videoAnomalyOpenButton")
+    assert open_button is not None
+    open_button.click()
     assert requested == [item]
     window.video_review_done_button.click()
     assert window.video_review_status(candidate.candidate_id) == "verified"
     assert window.video_reconciliation() == ()
+    window.close()
+
+
+def test_video_anomaly_list_refreshes_status_while_open(qapp, tmp_path):
+    window = _window(tmp_path)
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    candidate = VideoPassageCandidate(
+        "segment-1:video-1",
+        1,
+        1_000,
+        1_500,
+        1_200,
+        0.3,
+        0.2,
+        video_path=str(video_path),
+        video_position_ms=200,
+    )
+    item = VideoPassageReconciliation(candidate, 0, "瑙嗛鍊欏緟澶嶆牳")
+    window.set_video_reconciliation((item,))
+    window.video_review_button.click()
+    dialog = window.findChild(QDialog, "videoAnomalyDialog")
+    table = dialog.findChild(QTableWidget, "videoAnomalyTable")
+    assert table.item(0, 6).text() == window._video_review_status_label("pending")
+
+    window._active_video_anomaly_id = candidate.candidate_id
+    window._mark_current_video_anomaly("verified")
+
+    assert table.item(0, 6).text() == window._video_review_status_label("verified")
+    window.close()
+
+
+def test_video_scan_workers_pause_with_nested_playback_tokens(qapp, tmp_path):
+    window = _window(tmp_path)
+
+    class _Worker:
+        def __init__(self):
+            self.pause_calls = 0
+            self.resume_calls = 0
+
+        def pause(self):
+            self.pause_calls += 1
+
+        def resume(self):
+            self.resume_calls += 1
+
+        def stop(self):
+            pass
+
+    worker = _Worker()
+    window._video_scan_workers = {1: worker}
+
+    first = window._pause_video_scan_workers()
+    second = window._pause_video_scan_workers()
+    assert worker.pause_calls == 1
+
+    window._resume_video_scan_workers(first)
+    assert worker.resume_calls == 0
+    window._resume_video_scan_workers(second)
+    assert worker.resume_calls == 1
+
     window.close()
 
 
@@ -3043,6 +3113,14 @@ def test_video_anomaly_can_quickly_focus_roster_bib_without_creating_passage(
     item = VideoPassageReconciliation(candidate, 0, "视频候选无芯片记录")
     window.set_video_reconciliation((item,))
     window.video_review_button.click()
+    dialog = window.findChild(QDialog, "videoAnomalyDialog")
+    assert dialog is not None
+    table = dialog.findChild(QTableWidget, "videoAnomalyTable")
+    assert table is not None and table.rowCount() == 1
+    table.selectRow(0)
+    open_button = dialog.findChild(QPushButton, "videoAnomalyOpenButton")
+    assert open_button is not None
+    open_button.click()
     window.video_review_bib_edit.setText("321")
     window.video_review_bib_edit.returnPressed.emit()
 

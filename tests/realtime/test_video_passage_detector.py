@@ -121,19 +121,82 @@ def test_fixed_camera_line_detector_emits_only_on_crossing():
         min_changed_area=0.01,
         cooldown_ms=0,
     )
-    blank = np.zeros((20, 20), dtype=np.uint8)
+    blank = np.zeros((20, 40), dtype=np.uint8)
     right = blank.copy()
-    right[:, 12:14] = 255
+    right[:, 20:23] = 255
     left = blank.copy()
-    left[:, 4:6] = 255
+    left[:, 17:20] = 255
 
     assert detector.process_frame(0, blank) == ()
     assert detector.process_frame(100, right) == ()
-    assert detector.process_frame(200, blank) == ()
-    result = detector.process_frame(300, left)
+    result = detector.process_frame(200, left)
 
     assert len(result) == 1
     assert result[0].candidate_id == "line-1-1"
+
+
+def test_scan_worker_keeps_line_detector_across_adjacent_segments(
+    tmp_path,
+    monkeypatch,
+):
+    paths = []
+    segments = []
+    for index, start in enumerate((0, 1_000), 1):
+        path = tmp_path / f"camera_{index}.ts"
+        path.write_bytes(b"video")
+        paths.append(path)
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"segment-{index}",
+                camera_index=1,
+                started_at_ms=start,
+                ended_at_ms=start + 1_000,
+                video_path=path.name,
+            )
+        )
+    seen_detectors = []
+
+    def fake_scan(*_args, **kwargs):
+        seen_detectors.append(kwargs["detector"])
+        return ()
+
+    monkeypatch.setattr(detector_module, "scan_video_file", fake_scan)
+    worker = VideoPassageScanWorker(
+        lambda: tuple(segments),
+        lambda _items: None,
+        width=16,
+        height=12,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        finish_line=FinishLine(1, 0.5, 0.0, 0.5, 1.0),
+    )
+
+    worker.scan_once()
+
+    assert len(seen_detectors) == 2
+    assert seen_detectors[0] is seen_detectors[1]
+
+
+def test_line_detector_resets_frame_state_between_adjacent_segments():
+    detector = FixedCameraLineCrossingDetector(
+        FinishLine(1, 0.5, 0.0, 0.5, 1.0),
+        min_score=0.01,
+        min_changed_area=0.01,
+        cooldown_ms=0,
+    )
+    blank = np.zeros((20, 40), dtype=np.uint8)
+    right = blank.copy()
+    right[:, 20:23] = 255
+    left = blank.copy()
+    left[:, 17:20] = 255
+
+    assert detector.process_frame(0, blank) == ()
+    assert detector.process_frame(100, right) == ()
+    detector.reset_segment_state()
+
+    # The first frame of a new file establishes a baseline; it must not be
+    # compared with the final frame of the previous file.
+    assert detector.process_frame(1_000, left) == ()
+    assert detector.process_frame(1_100, blank) == ()
 
 
 def test_fixed_camera_line_detector_supports_scan_flush():
@@ -141,6 +204,25 @@ def test_fixed_camera_line_detector_supports_scan_flush():
         FinishLine(1, 0.5, 0.0, 0.5, 1.0)
     )
     assert detector.flush() == ()
+
+
+def test_fixed_camera_line_detector_ignores_motion_outside_finish_line_roi():
+    detector = FixedCameraLineCrossingDetector(
+        FinishLine(1, 0.5, 0.4, 0.5, 0.6, band_width=0.08),
+        min_score=0.01,
+        min_changed_area=0.01,
+        cooldown_ms=0,
+    )
+    blank = np.zeros((40, 40), dtype=np.uint8)
+    upper_right = blank.copy()
+    upper_right[2:12, 26:34] = 255
+    upper_left = blank.copy()
+    upper_left[2:12, 6:14] = 255
+
+    assert detector.process_frame(0, blank) == ()
+    assert detector.process_frame(100, upper_right) == ()
+    assert detector.process_frame(200, blank) == ()
+    assert detector.process_frame(300, upper_left) == ()
 
 
 def test_long_motion_is_split_at_max_event_duration():
@@ -306,3 +388,38 @@ def test_scan_worker_uses_line_batch_merge_for_fixed_camera(
     assert result[0].is_group
     assert result[0].started_at_ms == 10_100
     assert result[0].ended_at_ms == 10_900
+
+
+def test_scan_worker_pause_and_resume_preserve_pending_segments(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    segment = SimpleNamespace(
+        segment_id="segment-01",
+        camera_index=1,
+        started_at_ms=10_000,
+        video_path="camera_01.ts",
+    )
+    scan_calls = []
+    monkeypatch.setattr(
+        detector_module,
+        "scan_video_file",
+        lambda *_args, **_kwargs: scan_calls.append(True) or (),
+    )
+    worker = VideoPassageScanWorker(
+        lambda: (segment,),
+        lambda _items: None,
+        width=16,
+        height=12,
+        path_resolver=lambda item: tmp_path / item.video_path,
+    )
+
+    worker.pause()
+    assert worker.scan_once() == ()
+    assert scan_calls == []
+
+    worker.resume()
+    assert worker.scan_once() == ()
+    assert scan_calls == [True]

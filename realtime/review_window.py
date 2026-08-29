@@ -2500,6 +2500,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._visual_status = ""
         self._visual_failed = False
         self._video_candidate_dialogs: set[VideoPlaybackDialog] = set()
+        self._video_scan_pause_tokens: set[object] = set()
         self._finish_line_store = FinishLineStore(
             self.output_dir / "finish_lines.json"
         )
@@ -2778,10 +2779,12 @@ class FinishReviewWindow(PassageReviewDialog):
             autoplay=True,
             window_title=f"定点回放 - {identity}号",
         )
+        pause_token = self._pause_video_scan_workers()
         try:
             playback.exec_()
         finally:
             session.cleanup()
+            self._resume_video_scan_workers(pause_token)
 
     def _on_high_speed_scan_finished(self, result: AuyatScanResult) -> None:
         self._high_speed_scan_result = result
@@ -5396,6 +5399,30 @@ class FinishReviewWindow(PassageReviewDialog):
         """Receive worker results and marshal them to the Qt main thread."""
         self.video_candidates_received.emit(tuple(candidates))
 
+    def _pause_video_scan_workers(self) -> object:
+        """Pause background video scans while a playback window is open."""
+
+        token = object()
+        self._video_scan_pause_tokens.add(token)
+        if len(self._video_scan_pause_tokens) != 1:
+            return token
+        for worker in self._video_scan_workers.values():
+            pause = getattr(worker, "pause", None)
+            if callable(pause):
+                pause()
+        return token
+
+    def _resume_video_scan_workers(self, token: object) -> None:
+        if token not in self._video_scan_pause_tokens:
+            return
+        self._video_scan_pause_tokens.remove(token)
+        if self._video_scan_pause_tokens:
+            return
+        for worker in self._video_scan_workers.values():
+            resume = getattr(worker, "resume", None)
+            if callable(resume):
+                resume()
+
     def _reconcile_video_candidates(self, candidates) -> None:
         def is_visual(value: object) -> bool:
             return str(getattr(value, "candidate_id", "")).startswith("visual:")
@@ -5478,11 +5505,15 @@ class FinishReviewWindow(PassageReviewDialog):
             autoplay=False,
             window_title="视频异常复核",
         )
+        pause_token = self._pause_video_scan_workers()
         self._video_candidate_dialogs.add(dialog)
         dialog.finished.connect(
             lambda _result=0, current=dialog: self._video_candidate_dialogs.discard(
                 current
             )
+        )
+        dialog.finished.connect(
+            lambda _result=0, token=pause_token: self._resume_video_scan_workers(token)
         )
         dialog.show()
         dialog.raise_()
@@ -5538,10 +5569,12 @@ class FinishReviewWindow(PassageReviewDialog):
             autoplay=False,
             window_title="视觉异常复核",
         )
+        pause_token = self._pause_video_scan_workers()
         try:
             playback.exec_()
         finally:
             session.cleanup()
+            self._resume_video_scan_workers(pause_token)
 
     def stop_recording(self) -> None:
         for worker in self._video_scan_workers.values():
