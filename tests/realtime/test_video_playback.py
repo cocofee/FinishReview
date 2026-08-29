@@ -226,6 +226,7 @@ class _FakeDialogWorker(QObject):
         self.speed_calls = []
         self.pause_calls = 0
         self.seek_calls = []
+        self.idle_prefetch_calls = []
 
     def start(self):
         self.metadata_ready.emit(10_000, 50.0, 640, 360, 500)
@@ -250,6 +251,9 @@ class _FakeDialogWorker(QObject):
 
     def stop(self):
         pass
+
+    def set_idle_prefetch_enabled(self, enabled):
+        self.idle_prefetch_calls.append(bool(enabled))
 
     def wait(self, _milliseconds):
         return True
@@ -287,6 +291,7 @@ def test_dialog_starts_paused_at_requested_passage_position(qapp):
 
     assert dialog._playing is False
     assert dialog.worker.pause_calls == 1
+    assert dialog.worker.idle_prefetch_calls == [False]
     assert dialog.worker.seek_calls == [4_250]
     assert dialog.timeline.value() == 4_250
     assert dialog.current_time_label.text() == "00:00:04.250"
@@ -314,6 +319,43 @@ def test_dialog_timeline_click_jumps_and_previews_immediately(qapp):
 
     assert 7_000 <= dialog.timeline.value() <= 8_000
     assert dialog.worker.seek_calls[-1] == dialog.timeline.value()
+    dialog.close()
+
+
+def test_dialog_coalesces_pending_frames_to_latest_for_rendering(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        autoplay=False,
+    )
+    dialog.show()
+    qapp.processEvents()
+
+    for frame_index in (1, 2, 3):
+        image = QImage(32, 24, QImage.Format_RGB888)
+        image.fill(frame_index)
+        dialog.worker.frame_ready.emit(image, frame_index * 40, frame_index)
+
+    assert dialog._current_frame_index == 0
+    qapp.processEvents()
+
+    assert dialog._current_frame_index == 3
+    assert dialog.timeline.value() == 120
+    dialog.close()
+
+
+def test_dialog_uses_fast_scaling_while_playing(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        autoplay=False,
+    )
+    assert dialog.video_label._smooth_scaling is True
+
+    dialog._set_playing(True)
+    assert dialog.video_label._smooth_scaling is False
+    dialog._set_playing(False)
+    assert dialog.video_label._smooth_scaling is True
     dialog.close()
 
 

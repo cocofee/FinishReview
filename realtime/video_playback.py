@@ -11,7 +11,7 @@ from statistics import median
 from typing import Callable, Optional
 
 import cv2
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QImage,
@@ -92,6 +92,7 @@ class PlaybackVideoLabel(QLabel):
         self._drag_origin_x: Optional[int] = None
         self._last_drag_frames = 0
         self._jog_frame_span = 1
+        self._smooth_scaling = True
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -113,6 +114,13 @@ class PlaybackVideoLabel(QLabel):
     def set_frame(self, image: QImage) -> None:
         self._frame = QPixmap.fromImage(image)
         self.setText("")
+        self._render_frame()
+
+    def set_smooth_scaling(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._smooth_scaling:
+            return
+        self._smooth_scaling = enabled
         self._render_frame()
 
     def clear_frame(self, message: str = "") -> None:
@@ -168,7 +176,9 @@ class PlaybackVideoLabel(QLabel):
             self._frame.scaled(
                 self.size(),
                 Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
+                Qt.SmoothTransformation
+                if self._smooth_scaling
+                else Qt.FastTransformation,
             )
         )
 
@@ -1592,6 +1602,8 @@ class VideoPlaybackDialog(QDialog):
         self._resume_after_seek = False
         self._resume_speed_after_seek = 1.0
         self._jog_origin_frame = 0
+        self._pending_frame: Optional[tuple[QImage, int, int]] = None
+        self._frame_update_scheduled = False
 
         self.setWindowTitle(self._window_title or f"裁判回放 - {self.video_path.name}")
         self.resize(1260, 840)
@@ -1603,6 +1615,9 @@ class VideoPlaybackDialog(QDialog):
         self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.playback_finished.connect(self._on_playback_finished)
         self.worker.playback_error.connect(self._on_playback_error)
+        set_idle_prefetch = getattr(self.worker, "set_idle_prefetch_enabled", None)
+        if callable(set_idle_prefetch):
+            set_idle_prefetch(False)
         if not self._playing:
             self.worker.pause()
         self.worker.start()
@@ -1753,6 +1768,7 @@ class VideoPlaybackDialog(QDialog):
 
     def _set_playing(self, playing: bool) -> None:
         self._playing = playing
+        self.video_label.set_smooth_scaling(not playing)
         self.play_btn.setText("Ⅱ" if playing else "▶")
         self.play_btn.setToolTip("暂停（空格）" if playing else "继续播放（空格）")
 
@@ -1832,6 +1848,21 @@ class VideoPlaybackDialog(QDialog):
         self._update_target_status(self.timeline.value())
 
     def _on_frame_ready(self, image: QImage, position_ms: int, frame_index: int) -> None:
+        self._pending_frame = (image, int(position_ms), int(frame_index))
+        if self._frame_update_scheduled:
+            return
+        self._frame_update_scheduled = True
+        QTimer.singleShot(0, self._flush_pending_frame)
+
+    def _flush_pending_frame(self) -> None:
+        self._frame_update_scheduled = False
+        pending = self._pending_frame
+        self._pending_frame = None
+        if pending is None:
+            return
+        self._render_frame_now(*pending)
+
+    def _render_frame_now(self, image: QImage, position_ms: int, frame_index: int) -> None:
         self._current_frame_index = frame_index
         self.video_label.set_frame(image)
         if not self._slider_dragging:
