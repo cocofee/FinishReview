@@ -1,3 +1,4 @@
+import io
 import numpy as np
 from types import SimpleNamespace
 
@@ -14,6 +15,40 @@ from realtime.video_passage_detector import (
     VideoPassageScanWorker,
 )
 from realtime.finish_line import FinishLine
+
+
+def test_scan_video_file_hides_ffmpeg_console_on_windows(tmp_path, monkeypatch):
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"video")
+    calls = []
+
+    class _Process:
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Process()
+
+    monkeypatch.setattr(detector_module.os, "name", "nt")
+    monkeypatch.setattr(detector_module.subprocess, "Popen", fake_popen)
+    detector_module.scan_video_file(
+        video_path,
+        started_at_ms=0,
+        width=2,
+        height=2,
+        ffmpeg_path="ffmpeg",
+    )
+
+    assert calls[0][1]["creationflags"] == getattr(
+        detector_module.subprocess,
+        "CREATE_NO_WINDOW",
+        0,
+    )
 
 
 def _frame(value: int = 0) -> np.ndarray:

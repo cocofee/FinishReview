@@ -9,6 +9,7 @@ on low-resource field computers.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import os
 import subprocess
 from pathlib import Path
 import threading
@@ -415,7 +416,17 @@ def scan_video_file(
         f"scale={int(width)}:{int(height)},fps={float(sample_fps):g}",
         "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
     ]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        process_kwargs["creationflags"] = getattr(
+            subprocess,
+            "CREATE_NO_WINDOW",
+            0,
+        )
+    process = subprocess.Popen(command, **process_kwargs)
     active_detector = detector or LightweightVideoPassageDetector()
     frame_size = width * height
     frame_index = 0
@@ -443,7 +454,11 @@ def scan_video_file(
     finally:
         if process.stdout is not None:
             process.stdout.close()
-        process.wait(timeout=10)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
     if process.returncode:
         detail = ""
         if process.stderr is not None:
