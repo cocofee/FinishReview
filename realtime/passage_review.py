@@ -1965,6 +1965,11 @@ class PassageReviewDialog(QDialog):
 
     clock_offset_changed = pyqtSignal(int)
     evidence_pane_added = pyqtSignal(object)
+    video_review_updated = pyqtSignal(object)
+    video_candidates_received = pyqtSignal(object)
+    video_candidate_requested = pyqtSignal(object)
+    video_review_apply_requested = pyqtSignal(object)
+    video_review_status_changed = pyqtSignal(str, str, str)
 
     SYNC_STARTUP_GRACE_MS = 250
     SYNC_CORRECTION_COOLDOWN_SECONDS = 0.5
@@ -2069,6 +2074,13 @@ class PassageReviewDialog(QDialog):
         self._located_event_ids: set[str] = set()
         self._confirmed_event_ids: set[str] = set()
         self._event_review_statuses: dict[str, str] = {}
+        # Video candidates are advisory only; they never enter PassageEventStore.
+        self._video_reconciliation: tuple[object, ...] = ()
+        self._video_reconciliation_by_id: dict[str, object] = {}
+        self._video_review_statuses: dict[str, str] = {}
+        self._video_review_bibs: dict[str, str] = {}
+        self._active_video_anomaly_id = ""
+        self._video_anomaly_cursor = -1
         self._active_review_filter = "all"
         self._total_event_count = 0
         self._queue_expanded = False
@@ -2211,6 +2223,36 @@ class PassageReviewDialog(QDialog):
         self.summary_label.setStyleSheet("color: #667085; font-size: 9pt;")
         self.summary_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         filters.addWidget(self.summary_label)
+        self.video_review_apply_requested.connect(self.set_video_reconciliation)
+        self.video_review_button = QPushButton("视频异常：0")
+        self.video_review_button.setToolTip(
+            "打开下一个视频辅助异常批次；无芯片批次将独立请求复核"
+        )
+        self.video_review_button.setVisible(False)
+        self.video_review_button.clicked.connect(self._open_next_video_anomaly)
+        filters.addWidget(self.video_review_button)
+        self.video_review_done_button = QPushButton("已核实")
+        self.video_review_done_button.setToolTip("将当前视频异常标记为已核实")
+        self.video_review_done_button.setVisible(False)
+        self.video_review_done_button.clicked.connect(
+            lambda: self._mark_current_video_anomaly("verified")
+        )
+        filters.addWidget(self.video_review_done_button)
+        self.video_review_ignore_button = QPushButton("忽略")
+        self.video_review_ignore_button.setToolTip("将当前视频异常标记为背景或无效")
+        self.video_review_ignore_button.setVisible(False)
+        self.video_review_ignore_button.clicked.connect(
+            lambda: self._mark_current_video_anomaly("ignored")
+        )
+        filters.addWidget(self.video_review_ignore_button)
+        self.video_review_bib_edit = QLineEdit(self)
+        self.video_review_bib_edit.setPlaceholderText("异常批次号码")
+        self.video_review_bib_edit.setClearButtonEnabled(True)
+        self.video_review_bib_edit.setMinimumWidth(110)
+        self.video_review_bib_edit.setMaximumWidth(150)
+        self.video_review_bib_edit.setVisible(False)
+        self.video_review_bib_edit.returnPressed.connect(self._apply_video_review_bib)
+        filters.addWidget(self.video_review_bib_edit)
 
         self.queue_expand_btn = QPushButton("↕", self)
         self.queue_expand_btn.setFixedWidth(34)
@@ -2495,6 +2537,176 @@ class PassageReviewDialog(QDialog):
         for index in range(self.evidence_splitter.count()):
             self.evidence_splitter.setStretchFactor(index, 1)
         self.evidence_splitter.setSizes([1] * self.evidence_splitter.count())
+
+    def set_video_reconciliation(self, items: Iterable[object]) -> None:
+        """Publish advisory video anomalies to the current review workspace.
+
+        The detector is intentionally decoupled from the official passage
+        table. Callers should pass reconciliation objects whose ``needs_review``
+        property identifies the small set requiring attention.
+        """
+        def candidate_of(value: object):
+            return getattr(value, "candidate", None)
+
+        def is_visual(value: object) -> bool:
+            candidate = candidate_of(value)
+            return str(getattr(candidate, "candidate_id", "")).startswith("visual:")
+
+        def overlaps(left: object, right: object) -> bool:
+            a = candidate_of(left)
+            b = candidate_of(right)
+            if a is None or b is None:
+                return False
+            if int(getattr(a, "camera_index", 0)) != int(getattr(b, "camera_index", 0)):
+                return False
+            return abs(
+                int(getattr(a, "peak_at_ms", 0)) - int(getattr(b, "peak_at_ms", 0))
+            ) <= 1_500
+
+        for item in items:
+            candidate = getattr(item, "candidate", None)
+            candidate_id = str(getattr(candidate, "candidate_id", ""))
+            if not candidate_id:
+                candidate_id = f"video-anomaly-{id(item)}"
+            matching_visual_ids = {
+                existing_id
+                for existing_id, existing in self._video_reconciliation_by_id.items()
+                if is_visual(existing) and overlaps(existing, item)
+            }
+            if not bool(getattr(item, "needs_review", False)):
+                for existing_id in matching_visual_ids:
+                    self._video_reconciliation_by_id.pop(existing_id, None)
+                continue
+            # Prefer the ordinary-video candidate because it contains the
+            # recorded file and playback position; the live candidate is only
+            # a timestamp hint.
+            if not is_visual(item):
+                for existing_id in matching_visual_ids:
+                    previous_status = self._video_review_statuses.pop(existing_id, "pending")
+                    previous_bib = self._video_review_bibs.pop(existing_id, "")
+                    self._video_reconciliation_by_id.pop(existing_id, None)
+                    self._video_review_statuses.setdefault(candidate_id, previous_status)
+                    if previous_bib:
+                        self._video_review_bibs.setdefault(candidate_id, previous_bib)
+            self._video_reconciliation_by_id[candidate_id] = item
+            self._video_review_statuses.setdefault(candidate_id, "pending")
+        self._video_reconciliation = tuple(
+            item
+            for candidate_id, item in self._video_reconciliation_by_id.items()
+            if self._video_review_statuses.get(candidate_id, "pending") == "pending"
+        )
+        if hasattr(self, "video_assist_status_label"):
+            self._update_runtime_status()
+        self.video_review_button.setText(
+            f"视频异常：{len(self._video_reconciliation)}"
+        )
+        self.video_review_button.setVisible(bool(self._video_reconciliation))
+        has_active = bool(self._active_video_anomaly_id)
+        self.video_review_done_button.setVisible(has_active)
+        self.video_review_ignore_button.setVisible(has_active)
+        self.video_review_bib_edit.setVisible(has_active)
+        self.video_review_updated.emit(self._video_reconciliation)
+        if self._video_reconciliation:
+            self.summary_label.setToolTip(
+                f"视频辅助发现 {len(self._video_reconciliation)} 个异常批次，需重点复核"
+            )
+        else:
+            self.summary_label.setToolTip("视频辅助：当前没有待复核异常批次")
+
+    def video_reconciliation(self) -> tuple[object, ...]:
+        """Return advisory anomalies currently supplied by the scanner."""
+        return self._video_reconciliation
+
+    def video_review_status(self, candidate_id: str) -> str:
+        return self._video_review_statuses.get(str(candidate_id), "pending")
+
+    def restore_video_review_record(
+        self,
+        candidate_id: str,
+        *,
+        status: str = "pending",
+        bib: str = "",
+    ) -> None:
+        candidate_id = str(candidate_id).strip()
+        if not candidate_id or status not in {"pending", "verified", "ignored"}:
+            return
+        self._video_review_statuses[candidate_id] = status
+        if bib:
+            self._video_review_bibs[candidate_id] = str(bib).strip()
+
+    def _mark_current_video_anomaly(self, status: str) -> None:
+        candidate_id = self._active_video_anomaly_id
+        if not candidate_id or status not in {"verified", "ignored"}:
+            return
+        self._video_review_statuses[candidate_id] = status
+        self._active_video_anomaly_id = ""
+        self.video_review_bib_edit.clear()
+        self.video_review_status_changed.emit(
+            candidate_id,
+            status,
+            self._video_review_bibs.get(candidate_id, ""),
+        )
+        self.set_video_reconciliation(())
+
+    def _open_next_video_anomaly(self) -> None:
+        if not self._video_reconciliation:
+            return
+        current = getattr(self, "_video_anomaly_cursor", -1)
+        current = (current + 1) % len(self._video_reconciliation)
+        self._video_anomaly_cursor = current
+        item = self._video_reconciliation[current]
+        candidate_id = str(
+            getattr(getattr(item, "candidate", None), "candidate_id", "")
+        )
+        self._active_video_anomaly_id = candidate_id
+        self.video_review_done_button.setVisible(True)
+        self.video_review_ignore_button.setVisible(True)
+        self.video_review_bib_edit.setText(
+            self._video_review_bibs.get(candidate_id, "")
+        )
+        self.video_review_bib_edit.setVisible(True)
+        candidate = getattr(item, "candidate", None)
+        timestamp = getattr(candidate, "peak_at_ms", None)
+        if timestamp is None:
+            return
+        if not self._visible_events:
+            self.refresh()
+        if not self._visible_events or int(getattr(item, "chip_count", 0)) == 0:
+            self.video_candidate_requested.emit(item)
+            self.summary_label.setToolTip(
+                "视频异常已发现，已发出独立视频复核请求"
+            )
+            return
+        nearest = min(
+            self._visible_events,
+            key=lambda event: abs(event.timeline_timestamp_ms - int(timestamp)),
+        )
+        self._select_event(nearest.event_id)
+        self.summary_label.setToolTip(
+            f"视频异常 {current + 1}/{len(self._video_reconciliation)}："
+            f"已定位到最接近的芯片记录（{getattr(item, 'anomaly', '待复核')}）"
+        )
+        self.video_candidate_requested.emit(item)
+
+    def _apply_video_review_bib(self) -> None:
+        candidate_id = self._active_video_anomaly_id
+        bib = self.video_review_bib_edit.text().strip()
+        if not candidate_id or not bib:
+            return
+        metadata = self._current_metadata()
+        if metadata is None:
+            self.summary_label.setToolTip("当前没有运动员名单，无法按号码定位")
+            return
+        if not self.focus_athlete(metadata.race_id, metadata.stage_id, bib=bib):
+            self.summary_label.setToolTip(f"名单中没有找到号码 {bib}")
+            return
+        self._video_review_bibs[candidate_id] = bib
+        self.video_review_status_changed.emit(
+            candidate_id,
+            self._video_review_statuses.get(candidate_id, "pending"),
+            bib,
+        )
+        self.summary_label.setToolTip(f"已按号码 {bib} 定位名单运动员")
 
     def _on_offset_changed(self, value: int) -> None:
         self.clock_offset_ms = int(value)

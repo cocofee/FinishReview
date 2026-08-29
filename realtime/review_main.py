@@ -393,39 +393,39 @@ def load_review_settings(
         _warn_invalid_setting("racetiger_poll_interval_seconds", error)
 
     enabled_value = payload.get("visual_detection_enabled", True)
-    if isinstance(enabled_value, str):
-        visual_detection_enabled = enabled_value.strip().casefold() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-    else:
-        visual_detection_enabled = bool(enabled_value)
+    visual_detection_enabled = (
+        enabled_value.strip().casefold() not in {"0", "false", "no", "off"}
+        if isinstance(enabled_value, str)
+        else bool(enabled_value)
+    )
     try:
         visual_camera_index = max(1, int(payload.get("visual_camera_index", 1)))
-        visual_finish_line = max(
-            0.10,
-            min(0.90, float(payload.get("visual_finish_line", 0.50))),
-        )
-        visual_gate_width = max(
-            0.02,
-            min(0.30, float(payload.get("visual_gate_width", 0.08))),
-        )
-    except (TypeError, ValueError) as error:
-        _warn_invalid_setting("visual_detection", error)
-    direction_candidate = str(
-        payload.get("visual_forward_direction") or "left_to_right"
-    ).strip()
-    if direction_candidate in {"left_to_right", "right_to_left"}:
-        visual_forward_direction = direction_candidate
-    try:
+        visual_finish_line = max(0.10, min(0.90, float(payload.get("visual_finish_line", 0.50))))
+        visual_gate_width = max(0.02, min(0.30, float(payload.get("visual_gate_width", 0.08))))
         visual_roi_top = max(0.0, min(0.80, float(payload.get("visual_roi_top", 0.08))))
         visual_roi_bottom = max(0.20, min(1.0, float(payload.get("visual_roi_bottom", 0.95))))
+        if not all(
+            math.isfinite(value)
+            for value in (
+                visual_finish_line,
+                visual_gate_width,
+                visual_roi_top,
+                visual_roi_bottom,
+            )
+        ):
+            raise ValueError("visual settings must be finite")
         if visual_roi_bottom <= visual_roi_top:
             raise ValueError("visual ROI bottom must be below top")
     except (TypeError, ValueError) as error:
-        _warn_invalid_setting("visual_roi", error)
+        _warn_invalid_setting("visual_detection", error)
+        visual_camera_index = 1
+        visual_finish_line = 0.50
+        visual_gate_width = 0.08
+        visual_roi_top = 0.08
+        visual_roi_bottom = 0.95
+    direction_candidate = str(payload.get("visual_forward_direction") or "left_to_right").strip()
+    if direction_candidate in {"left_to_right", "right_to_left"}:
+        visual_forward_direction = direction_candidate
 
     return FinishReviewSettings(
         source=source,
@@ -646,6 +646,8 @@ def main(argv: list[str] | None = None) -> int:
             visual_finish_line=saved_settings.visual_finish_line,
             visual_gate_width=saved_settings.visual_gate_width,
             visual_forward_direction=saved_settings.visual_forward_direction,
+            visual_roi_top=saved_settings.visual_roi_top,
+            visual_roi_bottom=saved_settings.visual_roi_bottom,
         )
         try:
             save_review_settings(config_path, settings)
@@ -685,6 +687,8 @@ def main(argv: list[str] | None = None) -> int:
         visual_finish_line=saved_settings.visual_finish_line,
         visual_gate_width=saved_settings.visual_gate_width,
         visual_forward_direction=saved_settings.visual_forward_direction,
+        visual_roi_top=saved_settings.visual_roi_top,
+        visual_roi_bottom=saved_settings.visual_roi_bottom,
     )
 
     window = FinishReviewWindow(
@@ -710,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
         visual_finish_line=settings.visual_finish_line,
         visual_gate_width=settings.visual_gate_width,
         visual_forward_direction=settings.visual_forward_direction,
+        visual_roi_top=settings.visual_roi_top,
+        visual_roi_bottom=settings.visual_roi_bottom,
         ffmpeg_path=Path(ffmpeg_path) if ffmpeg_path else None,
         settings_saver=lambda updated: save_review_settings(config_path, updated),
     )

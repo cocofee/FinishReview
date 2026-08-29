@@ -46,6 +46,7 @@ class CrossingConfig:
     max_track_age_ms: int = 1400
     cooldown_ms: int = 350
     min_motion_px: float = 3.0
+    max_track_distance_px: float = 180.0
     history: int = 180
     var_threshold: float = 32.0
 
@@ -78,6 +79,7 @@ class CrossingConfig:
             max_track_age_ms=max(250, int(self.max_track_age_ms)),
             cooldown_ms=max(0, int(self.cooldown_ms)),
             min_motion_px=max(0.5, float(self.min_motion_px)),
+            max_track_distance_px=max(40.0, float(self.max_track_distance_px)),
             history=max(30, int(self.history)),
             var_threshold=max(4.0, float(self.var_threshold)),
         )
@@ -206,7 +208,7 @@ class DualGateCrossingDetector:
         events: list[VisualCrossingEvent] = []
         for cx, cy, bbox in detections:
             best_id = None
-            best_distance = 70.0
+            best_distance = self.config.max_track_distance_px
             for track_id, track in self._tracks.items():
                 if track_id in used or stamp - int(track["last_ms"]) > self.config.max_track_age_ms:
                     continue
@@ -227,8 +229,12 @@ class DualGateCrossingDetector:
                 }
             track = self._tracks[best_id]
             previous_x = float(track["x"])
+            previous_y = float(track["y"])
             track.update(x=cx, y=cy, last_ms=stamp, bbox=bbox)
             used.add(best_id)
+            motion_distance = float(np.hypot(cx - previous_x, cy - previous_y))
+            if motion_distance < self.config.min_motion_px:
+                continue
             if previous_x < gate_a <= cx:
                 track["forward_gate_a_ms"] = stamp
             if previous_x > gate_b >= cx:
@@ -309,33 +315,50 @@ class VisualCrossingWorker(QThread):
             config=self.config,
             event_sink=self._on_event,
         )
-        capture = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        capture = cv2.VideoCapture()
+        for property_name, value in (
+            ("CAP_PROP_OPEN_TIMEOUT_MSEC", 3_000),
+            ("CAP_PROP_READ_TIMEOUT_MSEC", 1_000),
+        ):
+            property_id = getattr(cv2, property_name, None)
+            if property_id is not None:
+                capture.set(property_id, value)
+        capture.open(self.source, cv2.CAP_FFMPEG)
         self._capture = capture
         if not capture.isOpened():
             capture.release()
             self.failed.emit(f"机位{self.camera_index}视觉检测无法打开视频源")
             return
+        buffer_property = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+        if buffer_property is not None:
+            capture.set(buffer_property, 1)
         interval = 1.0 / self.config.process_fps
+        next_process_at = time.monotonic()
+        failed = False
         self.status_changed.emit(f"机位{self.camera_index}视觉检测已启动")
         try:
             while not self._stop_event.is_set():
-                started = time.monotonic()
                 ok, frame = capture.read()
                 if not ok:
+                    failed = True
                     self.failed.emit(f"机位{self.camera_index}视觉检测读取中断")
                     break
+                frame_timestamp_ms = int(time.time() * 1000)
                 self.frames_processed += 1
-                detector.process(frame, int(time.time() * 1000))
-                remaining = interval - (time.monotonic() - started)
-                if remaining > 0:
-                    self._stop_event.wait(remaining)
+                now = time.monotonic()
+                if now < next_process_at:
+                    continue
+                detector.process(frame, frame_timestamp_ms)
+                next_process_at = now + interval
         except Exception as exc:  # noqa: BLE001 - detector must never stop recording.
             logger.exception("Visual crossing worker failed")
+            failed = True
             self.failed.emit(f"机位{self.camera_index}视觉检测异常: {type(exc).__name__}")
         finally:
             capture.release()
             self._capture = None
-            self.status_changed.emit(f"机位{self.camera_index}视觉检测已停止")
+            if not failed:
+                self.status_changed.emit(f"机位{self.camera_index}视觉检测已停止")
 
     def _on_event(self, event: VisualCrossingEvent) -> None:
         try:
@@ -535,6 +558,10 @@ class VisualLineCalibrationDialog(QDialog):
     @property
     def line_x(self) -> float:
         return self.canvas.line_x
+
+    @property
+    def gate_width(self) -> float:
+        return self.canvas._gate_width
 
     @property
     def direction(self) -> str:
