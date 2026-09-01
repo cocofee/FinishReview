@@ -716,6 +716,7 @@ def main(argv: list[str] | None = None) -> int:
         visual_forward_direction=settings.visual_forward_direction,
         visual_roi_top=settings.visual_roi_top,
         visual_roi_bottom=settings.visual_roi_bottom,
+        video_assist_enabled=False,
         ffmpeg_path=Path(ffmpeg_path) if ffmpeg_path else None,
         settings_saver=lambda updated: save_review_settings(config_path, updated),
     )

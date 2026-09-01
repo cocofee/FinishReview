@@ -1496,17 +1496,10 @@ def test_batch_mode_keeps_one_video_worker_when_switching_events(
     qapp.processEvents()
     seek_count = len(worker.seek_calls)
     view = dialog.regular_pane.video_view
-    assert view._batch_roster_panel.isVisible()
-    assert view._batch_roster_title.text().startswith("待判号码 2 人")
-    assert [button.text() for button in view._batch_roster_buttons] == ["4", "1"]
-    assert view._batch_roster_panel.width() == 176
-    assert view._batch_roster_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
-    assert [
-        view._batch_roster_layout.itemAt(index).widget()
-        for index in range(view._batch_roster_layout.count())
-    ] == view._batch_roster_buttons
+    # Bibs are shown only in the athlete table; camera panes remain clear.
+    assert not view._batch_roster_panel.isVisible()
 
-    next(button for button in view._batch_roster_buttons if button.text() == "1").click()
+    dialog._select_event("passage-1")
     qapp.processEvents()
 
     assert dialog._batch_mode is True
@@ -1515,6 +1508,7 @@ def test_batch_mode_keeps_one_video_worker_when_switching_events(
     assert dialog.selected_identity_value.text() == "1"
     assert dialog.regular_pane._marking_enabled is True
     assert dialog.regular_pane.video_view._marker_mode is True
+    dialog.close()
 
 
 def test_batch_switch_pauses_current_frame_before_rebinding_identity(
@@ -1865,18 +1859,9 @@ def test_continuous_mode_shows_future_numbers_and_keeps_current_frame(
     worker.seek_calls.clear()
 
     assert [event.bib for event in dialog._visible_events] == ["4", "1", "62"]
-    assert [button.text() for button in pane.video_view._batch_roster_buttons] == [
-        "4",
-        "1",
-        "62",
-    ]
-    assert pane.video_view._batch_roster_title.text().startswith("待判号码 3 人")
+    assert not pane.video_view._batch_roster_panel.isVisible()
 
-    next(
-        button
-        for button in pane.video_view._batch_roster_buttons
-        if button.text() == "1"
-    ).click()
+    dialog._select_event("passage-1")
     qapp.processEvents()
 
     assert dialog._selected_event_id == "passage-1"
@@ -1884,10 +1869,7 @@ def test_continuous_mode_shows_future_numbers_and_keeps_current_frame(
     assert pane._current_position_ms == 7_250
     assert worker.seek_calls == []
     assert pane.video_view._marker_mode is True
-    assert [button.text() for button in pane.video_view._batch_roster_buttons] == [
-        "1",
-        "62",
-    ]
+    assert not pane.video_view._batch_roster_panel.isVisible()
     dialog.close()
 
 

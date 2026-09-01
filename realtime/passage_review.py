@@ -89,6 +89,7 @@ from .race_metadata import (
 )
 from .review_clip import PassageReviewBindingStore
 from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
+from .video_filmstrip import VideoFilmstripWidget
 from .video_timeline import (
     DEFAULT_CLOCK_SOURCE,
     PassageVideoLocation,
@@ -301,6 +302,11 @@ class _AutoFitTableWidget(QTableWidget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._column_fit_scheduled = False
+        self._compact_mode = False
+
+    def set_compact_mode(self, enabled: bool) -> None:
+        self._compact_mode = bool(enabled)
+        self.schedule_auto_fit()
 
     def schedule_auto_fit(self) -> None:
         if self._column_fit_scheduled:
@@ -319,6 +325,11 @@ class _AutoFitTableWidget(QTableWidget):
             for column in range(self.columnCount())
             if not self.isColumnHidden(column)
         )
+        if self._compact_mode:
+            compact_widths = {0: 52, 1: 92, 2: 140, 5: 132, 8: 118}
+            for column in visible_columns:
+                header.resizeSection(column, compact_widths.get(column, 84))
+            return
         content_widths = tuple(
             header.sectionSize(column) for column in visible_columns
         )
@@ -392,6 +403,8 @@ class EvidenceImageView(QGraphicsView):
         self._marker_mode = False
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
+        self._show_marker_label = True
+        self._show_identity_badge = True
         self._mouse_press_position: Optional[QPoint] = None
         self._mouse_dragged = False
         self._marker_dragging = False
@@ -523,6 +536,9 @@ class EvidenceImageView(QGraphicsView):
         self.viewport().update()
 
     def set_identity_cue(self, identity: str, status: str) -> None:
+        if not self._show_identity_badge:
+            self.clear_identity_cue()
+            return
         identity = str(identity).strip()
         if not identity or not self.has_frame:
             self.clear_identity_cue()
@@ -557,6 +573,15 @@ class EvidenceImageView(QGraphicsView):
     def clear_identity_cue(self) -> None:
         self._identity_badge.clear()
         self._identity_badge.hide()
+
+    def set_identity_badge_visible(self, visible: bool) -> None:
+        self._show_identity_badge = bool(visible)
+        if not self._show_identity_badge:
+            self.clear_identity_cue()
+
+    def set_marker_label_visible(self, visible: bool) -> None:
+        self._show_marker_label = bool(visible)
+        self.viewport().update()
 
     def set_batch_roster(
         self,
@@ -860,6 +885,10 @@ class EvidenceImageView(QGraphicsView):
             painter.drawLine(int(x - cross_extent), int(y), int(x + cross_extent), int(y))
             painter.drawLine(int(x), int(y - cross_extent), int(x), int(y + cross_extent))
 
+        if not self._show_marker_label:
+            painter.restore()
+            return
+
         tag_text = label
         margin = 8.0 / scale
         tag_width = max(76.0, 28.0 + len(tag_text) * 26.0) / scale
@@ -924,7 +953,7 @@ class EvidenceImageView(QGraphicsView):
         desired_height = 8 + title_height + 6 + visible_rows * 44 + 10
         panel_height = min(available_height, desired_height)
         self._batch_roster_panel.setGeometry(
-            max(margin, self.viewport().width() - panel_width - margin),
+            margin,
             margin,
             panel_width,
             panel_height,
@@ -2161,6 +2190,8 @@ def _resolve_evidence_layout(
 
 class PassageReviewDialog(QDialog):
     INACTIVE_CAMERA_START_DELAY_MS = 120
+    FILMSTRIP_WINDOW_MS = 300_000
+    VIDEO_ASSIST_ENABLED = True
     # Automatic gap seeking can hide riders whose chips were not read. Keep it
     # disabled; operators can use the guarded Shift/Ctrl shortcuts while
     # watching the video.
@@ -2357,11 +2388,19 @@ class PassageReviewDialog(QDialog):
         self._search_refresh_timer.setSingleShot(True)
         self._search_refresh_timer.setInterval(120)
         self._search_refresh_timer.timeout.connect(self._refresh_filtered_view)
+        self._filmstrip_context: tuple[Path, int, int] | None = None
+        self._filmstrip_absolute_window: tuple[int, int] | None = None
+        self._review_split_resize_pending = False
+        self._pending_filmstrip_position: int | None = None
+        self._filmstrip_seek_pending = False
 
         self.setWindowTitle(APP_WINDOW_TITLE)
         self.resize(1400, 860)
         self.setMinimumSize(1100, 700)
         self._init_ui()
+        # The review workspace is always the split athlete-list/evidence view.
+        self._set_continuous_review_layout(True)
+        self._set_video_assist_controls_visible(self._video_assist_enabled())
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_shortcut.setContext(Qt.WindowShortcut)
         self.space_shortcut.activated.connect(self._toggle_active_pane)
@@ -2697,6 +2736,11 @@ class PassageReviewDialog(QDialog):
         self.evidence_splitter = QSplitter(Qt.Horizontal)
         self.evidence_splitter.setChildrenCollapsible(False)
         self.evidence_splitter.setHandleWidth(5)
+        self.evidence_splitter.setMinimumWidth(0)
+        self.evidence_splitter.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Expanding,
+        )
         for camera_index in self._configured_regular_camera_indexes:
             self._create_regular_pane(camera_index)
         self.regular_pane = self.regular_panes[0]
@@ -2712,22 +2756,51 @@ class PassageReviewDialog(QDialog):
         )
         self._set_active_idle_prefetch(self._active_pane)
 
-        review_panel = QFrame(self)
-        review_layout = QVBoxLayout(review_panel)
-        review_layout.setContentsMargins(0, 0, 0, 0)
-        review_layout.setSpacing(6)
-        review_layout.addWidget(transport)
-        review_layout.addWidget(self.evidence_splitter, 1)
+        preview_panel = QFrame(self)
+        preview_panel.setMinimumSize(0, 0)
+        preview_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(6)
+        preview_layout.addWidget(transport)
+        self.video_filmstrip = VideoFilmstripWidget(self)
+        self.video_filmstrip.setVisible(False)
+        self.video_filmstrip.position_selected.connect(
+            self._seek_filmstrip_position
+        )
+        self.video_filmstrip.reload_requested.connect(self._update_filmstrip)
+        preview_layout.addWidget(self.video_filmstrip, 1)
 
-        self.workspace_splitter = QSplitter(Qt.Vertical, self)
+        # Bottom row: the athlete order list stays on the left, while all
+        # camera panes remain grouped on the right.
+        self.workspace_splitter = QSplitter(Qt.Horizontal, self)
         self.workspace_splitter.setChildrenCollapsible(False)
         self.workspace_splitter.setHandleWidth(5)
+        self.workspace_splitter.setMinimumSize(0, 0)
         self.workspace_splitter.addWidget(results_panel)
-        self.workspace_splitter.addWidget(review_panel)
-        self.workspace_splitter.setStretchFactor(0, 4)
-        self.workspace_splitter.setStretchFactor(1, 6)
-        self.workspace_splitter.setSizes([310, 500])
-        layout.addWidget(self.workspace_splitter, 1)
+        self.workspace_splitter.addWidget(self.evidence_splitter)
+        results_panel.setMinimumWidth(0)
+        results_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.workspace_splitter.setStretchFactor(0, 1)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setSizes([30, 70])
+
+        self.review_content_splitter = QSplitter(Qt.Vertical, self)
+        self.review_content_splitter.setChildrenCollapsible(False)
+        self.review_content_splitter.setHandleWidth(6)
+        self.review_content_splitter.setMinimumSize(0, 0)
+        self.review_content_splitter.addWidget(preview_panel)
+        self.review_content_splitter.addWidget(self.workspace_splitter)
+        self.review_content_splitter.setStretchFactor(0, 1)
+        self.review_content_splitter.setStretchFactor(1, 1)
+        # Full-width preview above the bottom athlete/camera row.
+        self.review_content_splitter.setSizes([60, 40])
+        layout.addWidget(self.review_content_splitter, 1)
+        # Nested splitters are not laid out yet during construction.  Apply
+        # the initial proportions after the dialog receives its real size;
+        # otherwise Qt may clamp the evidence area to a few pixels because
+        # the results table has a wide horizontal size hint.
+        # The real dimensions are available after the dialog is shown.
 
     @property
     def regular_panes(self) -> tuple[PassageEvidencePane, ...]:
@@ -2860,7 +2933,8 @@ class PassageReviewDialog(QDialog):
             pane.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
         for index in range(self.evidence_splitter.count()):
             self.evidence_splitter.setStretchFactor(index, 1)
-        self.evidence_splitter.setSizes([1] * self.evidence_splitter.count())
+        self._distribute_evidence_panes()
+        QTimer.singleShot(0, self._distribute_evidence_panes)
 
     def set_video_reconciliation(self, items: Iterable[object]) -> None:
         """Publish advisory video anomalies to the current review workspace.
@@ -2869,6 +2943,12 @@ class PassageReviewDialog(QDialog):
         table. Callers should pass reconciliation objects whose ``needs_review``
         property identifies the small set requiring attention.
         """
+        if not self._video_assist_enabled():
+            self._video_reconciliation_by_id.clear()
+            self._video_reconciliation = ()
+            self._set_video_assist_controls_visible(False)
+            return
+
         def candidate_of(value: object):
             return getattr(value, "candidate", None)
 
@@ -2949,6 +3029,26 @@ class PassageReviewDialog(QDialog):
         """Return advisory anomalies currently supplied by the scanner."""
         return self._video_reconciliation
 
+    def _video_assist_enabled(self) -> bool:
+        return bool(
+            getattr(self, "_video_assist_enabled_value", self.VIDEO_ASSIST_ENABLED)
+        )
+
+    def _set_video_assist_controls_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        for name in (
+            "video_arrival_button",
+            "video_review_button",
+            "video_review_done_button",
+            "video_review_ignore_button",
+            "video_review_bib_edit",
+            "video_discovered_btn",
+            "video_discovered_table",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setVisible(visible and widget.isVisible() if visible else False)
+
     def set_video_navigation_candidates(self, candidates: Iterable[object]) -> None:
         """Store visual passage candidates for modifier-key navigation.
 
@@ -2956,6 +3056,12 @@ class PassageReviewDialog(QDialog):
         camera-motion detections are excluded because they are not likely
         athlete passages.
         """
+
+        if not self._video_assist_enabled():
+            self._video_navigation_candidates = ()
+            self._video_arrival_batches = ()
+            self._set_video_assist_controls_visible(False)
+            return
 
         def candidate_key(value: object) -> tuple[int, int, str]:
             return (
@@ -4280,7 +4386,7 @@ class PassageReviewDialog(QDialog):
         self.batch_review_btn.setVisible(True)
         if self._batch_mode:
             row = max(0, self.table.currentRow())
-            context = f"连续判读 {row + 1:,}/{len(self._visible_events):,}"
+            context = f"判读 {row + 1:,}/{len(self._visible_events):,}"
             calibration = self._continuous_calibration_summary()
             self.batch_context_label.setText(
                 " · ".join(value for value in (context, calibration) if value)
@@ -4290,9 +4396,10 @@ class PassageReviewDialog(QDialog):
         else:
             self.batch_context_label.clear()
         self.batch_review_btn.setText(
-            "退出连续" if self._batch_mode else "连续判读"
+            "退出判读" if self._batch_mode else "判读"
         )
-        self.batch_review_btn.setVisible(True)
+        # The split review workflow is always active; no mode toggle is shown.
+        self.batch_review_btn.setVisible(False)
         self.video_discovered_btn.setEnabled(self._batch_mode and batch is not None)
         self._update_batch_roster_overlays(batch)
         self._refresh_video_discovered_table()
@@ -4314,38 +4421,10 @@ class PassageReviewDialog(QDialog):
         self,
         batch: Optional[PassageReviewBatch],
     ) -> None:
-        if not self._batch_mode:
-            entries = ()
-            title = ""
-        else:
-            selected_index = next(
-                (
-                    index
-                    for index, event in enumerate(self._visible_events)
-                    if event.event_id == self._selected_event_id
-                ),
-                0,
-            )
-            start = selected_index
-            candidates = self._visible_events[
-                start : start + self.CONTINUOUS_ROSTER_SIZE
-            ]
-            entries = tuple(
-                (
-                    event.event_id,
-                    event.bib.strip() or "?",
-                    self._event_review_statuses.get(event.event_id) == "已确认",
-                    event.event_id == self._selected_event_id,
-                )
-                for event in candidates
-            )
-            remaining = sum(
-                self._event_review_statuses.get(event.event_id) != "已确认"
-                for event in self._visible_events[selected_index:]
-            )
-            title = f"待判号码 {remaining:,} 人 · 看到谁就点谁"
+        # The athlete table is the single source of truth for bibs during
+        # review. Keep camera panes unobstructed for direct frame inspection.
         for pane in self.evidence_panes:
-            pane.video_view.set_batch_roster(entries, title=title)
+            pane.video_view.clear_batch_roster()
 
     def _select_batch_event_at_current_frame(
         self,
@@ -4634,6 +4713,7 @@ class PassageReviewDialog(QDialog):
         if not event_id or self.passage_store.get(event_id) is None:
             return False
         self._batch_mode = True
+        self._set_continuous_review_layout(True)
         self._active_review_batch_id = batch.batch_id if batch is not None else ""
         self._auto_advance_before_continuous = self.auto_advance_checkbox.isChecked()
         self.auto_advance_checkbox.setChecked(True)
@@ -4650,6 +4730,7 @@ class PassageReviewDialog(QDialog):
         self._lookup_cache.clear()
         self._selected_event_id = event_id
         self.refresh()
+        self._update_filmstrip()
         return True
 
     def _continuous_resume_event_id(self) -> str:
@@ -4678,12 +4759,18 @@ class PassageReviewDialog(QDialog):
         if not self._batch_mode and not self._active_review_batch_id:
             return
         self._batch_mode = False
+        self._set_continuous_review_layout(True)
         self._active_review_batch_id = ""
         self.auto_advance_checkbox.setChecked(
             self._auto_advance_before_continuous
         )
         self._lookup_cache.clear()
         self._update_batch_controls(self._selected_event_id)
+        self._filmstrip_context = None
+        self._filmstrip_absolute_window = None
+        if hasattr(self, "video_filmstrip"):
+            self.video_filmstrip.setVisible(False)
+            self.video_filmstrip.clear()
 
     def _toggle_batch_mode(self) -> None:
         if self._batch_mode:
@@ -4691,6 +4778,140 @@ class PassageReviewDialog(QDialog):
             self._refresh_filtered_view()
             return
         self._enter_batch_mode()
+
+    def _set_continuous_review_layout(self, enabled: bool) -> None:
+        """Use a 50/50 athlete-list and evidence layout during continuous review."""
+
+        if not hasattr(self, "workspace_splitter"):
+            return
+        if enabled:
+            self._set_continuous_results_table(True)
+            for pane in getattr(self, "evidence_panes", ()):
+                pane.setMinimumSize(0, 0)
+                pane.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+                pane.video_view.setMinimumSize(0, 0)
+                pane.video_view.setSizePolicy(
+                    QSizePolicy.Ignored,
+                    QSizePolicy.Expanding,
+                )
+                pane.video_view.set_identity_badge_visible(False)
+                pane.video_view.set_marker_label_visible(False)
+            if self.workspace_splitter.orientation() != Qt.Horizontal:
+                self.workspace_splitter.setOrientation(Qt.Horizontal)
+            self.workspace_splitter.setStretchFactor(0, 1)
+            self.workspace_splitter.setStretchFactor(1, 1)
+            # Keep the athlete list fixed without disabling the native Qt
+            # splitter handle, which can crash Qt5 during video re-layout.
+            if self.workspace_splitter.handleWidth() != 0:
+                self.workspace_splitter.setHandleWidth(0)
+            self._apply_review_split_sizes()
+            return
+        if self.workspace_splitter.orientation() != Qt.Horizontal:
+            self.workspace_splitter.setOrientation(Qt.Horizontal)
+        if self.workspace_splitter.handleWidth() != 5:
+            self.workspace_splitter.setHandleWidth(5)
+        for pane in getattr(self, "evidence_panes", ()):
+            pane.video_view.set_identity_badge_visible(True)
+            pane.video_view.set_marker_label_visible(True)
+        self._set_continuous_results_table(False)
+        if hasattr(self, "results_panel"):
+            self.results_panel.setMinimumWidth(0)
+            self.results_panel.setMaximumWidth(16777215)
+        self.workspace_splitter.setStretchFactor(0, 4)
+        self.workspace_splitter.setStretchFactor(1, 6)
+        total = max(2, self.workspace_splitter.height())
+        queue_height = min(360, max(220, int(total * 0.38)))
+        self.workspace_splitter.setSizes([queue_height, total - queue_height])
+
+    def _apply_review_split_sizes(self) -> None:
+        splitter = getattr(self, "workspace_splitter", None)
+        if splitter is None or splitter.orientation() != Qt.Horizontal:
+            return
+        total = splitter.width()
+        if total <= 0:
+            return
+        total = splitter.width()
+        if total <= 0:
+            return
+        current = splitter.sizes()
+        athlete_width = max(240, int(total * 0.30))
+        target = [athlete_width, max(1, total - athlete_width)]
+        if len(current) == 2 and abs(current[0] - target[0]) <= 2:
+            return
+        splitter.setSizes(target)
+
+    def _apply_review_content_split_sizes(self) -> None:
+        splitter = getattr(self, "review_content_splitter", None)
+        if splitter is None or splitter.height() <= 0:
+            return
+        total = splitter.height()
+        preview_height = max(360, int(total * 0.60))
+        target = [preview_height, max(1, total - preview_height)]
+        current = splitter.sizes()
+        if len(current) == 2 and abs(current[0] - target[0]) <= 2:
+            return
+        splitter.setSizes(target)
+
+    def _finish_review_content_split_resize(self) -> None:
+        self._review_split_resize_pending = False
+        self._apply_review_content_split_sizes()
+
+    def _set_continuous_results_table(self, enabled: bool) -> None:
+        table = getattr(self, "table", None)
+        if table is None:
+            return
+        hidden_columns = (3, 6, 7)
+        compact_controls = (
+            "group_combo",
+            "identity_search",
+            "summary_label",
+            "video_arrival_button",
+            "video_review_button",
+            "video_review_done_button",
+            "video_review_ignore_button",
+            "video_review_bib_edit",
+            "video_discovered_btn",
+            "queue_expand_btn",
+            "offset_spin",
+        )
+        if enabled:
+            table.setMinimumWidth(0)
+            table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+            if not hasattr(self, "_continuous_table_state"):
+                self._continuous_table_state = {
+                    column: (table.isColumnHidden(column), table.columnWidth(column))
+                    for column in range(table.columnCount())
+                }
+            if not hasattr(self, "_continuous_control_state"):
+                self._continuous_control_state = {
+                    name: getattr(self, name).isVisible()
+                    for name in compact_controls
+                    if hasattr(self, name)
+                }
+            for column in hidden_columns:
+                table.setColumnHidden(column, True)
+            for name in compact_controls:
+                widget = getattr(self, name, None)
+                if widget is not None:
+                    widget.setVisible(False)
+            table.set_compact_mode(True)
+            return
+        state = getattr(self, "_continuous_table_state", None)
+        if state is None:
+            return
+        table.set_compact_mode(False)
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        for column, (was_hidden, width) in state.items():
+            table.setColumnHidden(column, was_hidden)
+            table.setColumnWidth(column, width)
+        del self._continuous_table_state
+        control_state = getattr(self, "_continuous_control_state", {})
+        for name, was_visible in control_state.items():
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setVisible(was_visible)
+        if hasattr(self, "_continuous_control_state"):
+            del self._continuous_control_state
 
     def _refresh_filtered_view(self) -> None:
         events = self._events_for_current_metadata(self.passage_store.events())
@@ -4937,7 +5158,11 @@ class PassageReviewDialog(QDialog):
     def _on_table_selection_changed(self) -> None:
         row = self.table.currentRow()
         if 0 <= row < len(self._visible_events):
-            self._select_event(self._visible_events[row].event_id)
+            event_id = self._visible_events[row].event_id
+            if not self._batch_mode:
+                self._enter_batch_mode(event_id)
+            else:
+                self._select_event(event_id)
 
     @staticmethod
     def _regular_locations(
@@ -5101,6 +5326,8 @@ class PassageReviewDialog(QDialog):
         *,
         preserve_current_frame: Optional[PassageEvidencePane] = None,
     ) -> None:
+        if not self._batch_mode and self._enter_batch_mode(event_id):
+            return
         if self._active_video_discovered_entry_id:
             self._active_video_discovered_entry_id = ""
             for pane in self.evidence_panes:
@@ -5377,6 +5604,157 @@ class PassageReviewDialog(QDialog):
                 self._skip_continuous_gap(event, active_pane)
         self._update_batch_controls(event.event_id)
         self._update_navigation_controls()
+        self._update_filmstrip()
+
+    def _filmstrip_context_for_active_pane(
+        self,
+    ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:
+        if not self._batch_mode:
+            return None
+        pane = (
+            self._active_pane
+            if self._active_pane in self.regular_panes
+            else self.regular_pane
+        )
+        location = pane.location
+        if location is None or not location.video_path.is_file():
+            return None
+        duration_ms = int(
+            location.segment.media_duration_ms
+            or getattr(pane, "_duration_ms", 0)
+            or 0
+        )
+        if duration_ms <= 0:
+            return None
+        positions: list[int] = []
+        for event in self._visible_events:
+            projected = self._location_on_current_media(event, pane)
+            if projected is None:
+                continue
+            if projected.segment.segment_id != location.segment.segment_id:
+                continue
+            positions.append(int(projected.passage_position_ms))
+        for candidate in self._video_navigation_candidates:
+            if int(getattr(candidate, "camera_index", 0)) != int(pane.camera_index):
+                continue
+            if str(getattr(candidate, "segment_id", "")) != location.segment.segment_id:
+                continue
+            positions.append(int(getattr(candidate, "video_position_ms", 0)))
+        if not positions:
+            positions.append(int(location.passage_position_ms))
+        center = int(getattr(pane, "_current_position_ms", positions[0]))
+        window_start = (max(0, center) // self.FILMSTRIP_WINDOW_MS) * self.FILMSTRIP_WINDOW_MS
+        start_ms = min(window_start, max(0, duration_ms - 1))
+        end_ms = min(duration_ms, start_ms + self.FILMSTRIP_WINDOW_MS)
+        if end_ms <= start_ms:
+            end_ms = min(duration_ms, start_ms + 1_000)
+        window_positions = tuple(
+            position for position in positions if start_ms <= position <= end_ms
+        )
+        if not window_positions:
+            window_positions = (max(start_ms, min(end_ms, center)),)
+        origin_ms = int(
+            location.segment.media_started_at_ms
+            if location.segment.media_started_at_ms is not None
+            else location.segment.started_at_ms
+        )
+        return (
+            location.video_path,
+            start_ms,
+            end_ms,
+            center,
+            window_positions,
+            origin_ms + start_ms,
+            origin_ms + end_ms,
+        )
+
+    def _update_filmstrip(self) -> None:
+        if not hasattr(self, "video_filmstrip"):
+            return
+        context = self._filmstrip_context_for_active_pane()
+        if context is None:
+            if not self._batch_mode:
+                self._filmstrip_context = None
+                self._filmstrip_absolute_window = None
+                self.video_filmstrip.setVisible(False)
+                self.video_filmstrip.clear()
+            else:
+                # Pane rebinding is asynchronous while moving between
+                # athletes. Keep the decoded filmstrip cache intact; the next
+                # resolved context will restore it without re-decoding.
+                self.video_filmstrip.setVisible(False)
+            return
+        (
+            video_path,
+            start_ms,
+            end_ms,
+            current_position_ms,
+            anchors,
+            absolute_start_ms,
+            absolute_end_ms,
+        ) = context
+        was_visible = self.video_filmstrip.isVisible()
+        self.video_filmstrip.setVisible(True)
+        if not was_visible and not self._review_split_resize_pending:
+            self._review_split_resize_pending = True
+            QTimer.singleShot(0, self._finish_review_content_split_resize)
+        self.video_filmstrip.set_current_position(current_position_ms)
+        signature = (video_path, start_ms, end_ms)
+        if signature != self._filmstrip_context:
+            if (
+                self._filmstrip_context is not None
+                and self._filmstrip_absolute_window is not None
+                and self._filmstrip_context[0] == video_path
+                and self._filmstrip_absolute_window[0]
+                <= absolute_start_ms
+                < self._filmstrip_absolute_window[1]
+            ):
+                # Adjacent athletes can resolve through overlapping recording
+                # metadata. Keep the active five-minute filmstrip until the
+                # review time leaves its absolute window.
+                return
+            self._filmstrip_context = signature
+            self._filmstrip_absolute_window = (
+                absolute_start_ms,
+                absolute_end_ms,
+            )
+            self.video_filmstrip.load(
+                video_path,
+                start_ms,
+                end_ms,
+                positions_ms=anchors,
+            )
+            return
+        # The time range is unchanged: keep the existing filmstrip and only
+        # decode newly discovered arrival positions.
+        self.video_filmstrip.append_positions(video_path, anchors)
+
+    def _seek_filmstrip_position(self, position_ms: int) -> None:
+        self._pending_filmstrip_position = int(position_ms)
+        self.video_filmstrip.set_current_position(int(position_ms))
+        if self._filmstrip_seek_pending:
+            return
+        self._filmstrip_seek_pending = True
+        QTimer.singleShot(40, self._flush_filmstrip_position)
+
+    def _flush_filmstrip_position(self) -> None:
+        self._filmstrip_seek_pending = False
+        position_ms = self._pending_filmstrip_position
+        self._pending_filmstrip_position = None
+        if position_ms is None:
+            return
+        pane = (
+            self._active_pane
+            if self._active_pane in self.regular_panes
+            else self.regular_pane
+        )
+        if pane.location is None or pane.available_delta_bounds() is None:
+            return
+        target_delta_ms = int(position_ms) - int(pane._target_position_ms)
+        # The filmstrip represents the shared race timeline.  Move every
+        # visible camera together so each pane applies its own calibrated
+        # passage target instead of leaving the secondary angle behind.
+        self._seek_both_delta(target_delta_ms)
 
     def _skip_continuous_gap(
         self,
@@ -6414,6 +6792,44 @@ class PassageReviewDialog(QDialog):
             if pane.isVisible() and pane.video_view.has_frame:
                 pane.video_view.fit_to_window()
 
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        QTimer.singleShot(0, self._initialize_review_splitters)
+
+    def _initialize_review_splitters(self) -> None:
+        """Give the queue and evidence panes usable initial dimensions."""
+
+        total_width = self.workspace_splitter.width()
+        if total_width <= 0:
+            return
+        queue_width = max(320, int(total_width * 0.42))
+        evidence_width = max(1, total_width - queue_width)
+        self.workspace_splitter.setSizes([queue_width, evidence_width])
+        self._queue_default_sizes = [queue_width, evidence_width]
+        self._distribute_evidence_panes()
+
+    def _distribute_evidence_panes(self) -> None:
+        """Distribute the visible camera panes across the evidence splitter."""
+
+        count = self.evidence_splitter.count()
+        total_width = self.evidence_splitter.width()
+        if count <= 0 or total_width <= 0:
+            return
+        active_panes = set(self.evidence_panes)
+        active_count = sum(
+            1
+            for index in range(count)
+            if self.evidence_splitter.widget(index) in active_panes
+        )
+        if active_count <= 0:
+            return
+        share = max(1, total_width // active_count)
+        sizes = [
+            share if self.evidence_splitter.widget(index) in active_panes else 0
+            for index in range(count)
+        ]
+        self.evidence_splitter.setSizes(sizes)
+
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
             self.showMaximized()
@@ -6676,7 +7092,8 @@ class PassageReviewDialog(QDialog):
             candidate.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
         for index in range(self.evidence_splitter.count()):
             self.evidence_splitter.setStretchFactor(index, 1)
-        self.evidence_splitter.setSizes([1] * self.evidence_splitter.count())
+        self._distribute_evidence_panes()
+        QTimer.singleShot(0, self._distribute_evidence_panes)
         if close_window:
             window.close()
         window.deleteLater()

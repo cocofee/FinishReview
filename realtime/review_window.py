@@ -2364,10 +2364,12 @@ class FinishReviewWindow(PassageReviewDialog):
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
         refresh_interval_ms: int = 500,
         passage_batch_interval_ms: int = 150,
+        video_assist_enabled: bool = True,
         recorder_factory: Callable[..., FfmpegReviewRecorder] = FfmpegReviewRecorder,
         receiver_factory: Callable[..., PassageEventReceiver] = PassageEventReceiver,
         settings_saver: Callable[[FinishReviewSettings], None] | None = None,
     ):
+        self._video_assist_enabled_value = bool(video_assist_enabled)
         self.source = str(source).strip()
         self.workspace_root = Path(output_dir).expanduser().resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -2600,7 +2602,8 @@ class FinishReviewWindow(PassageReviewDialog):
             if self._publish_archive_segments():
                 self._lookup_cache.clear()
                 self.refresh()
-            self._start_archive_video_scan_workers()
+            if self._video_assist_enabled():
+                self._start_archive_video_scan_workers()
         except Exception as exc:  # noqa: BLE001 - recovery remains operator-visible.
             self._capture_error = sanitize_recording_message(exc)
             logger.exception("Failed to recover archived recording sessions")
@@ -2634,6 +2637,9 @@ class FinishReviewWindow(PassageReviewDialog):
         """Start advisory crossing detection only for the selected RTSP camera."""
         self._stop_visual_workers()
         self._visual_failed = False
+        if not self._video_assist_enabled():
+            self._visual_status = "disabled"
+            return
         if not self._visual_detection_enabled:
             self._visual_status = "disabled"
             return
@@ -2859,7 +2865,7 @@ class FinishReviewWindow(PassageReviewDialog):
     def _start_archive_video_scan_workers(self) -> None:
         """Scan existing ordinary recordings when opening an archive workspace."""
 
-        if self._recording_any_active():
+        if not self._video_assist_enabled() or self._recording_any_active():
             return
         self._stop_archive_video_scan_workers()
         segments_by_camera: dict[int, tuple[object, ...]] = {}
@@ -4194,21 +4200,22 @@ class FinishReviewWindow(PassageReviewDialog):
             self._coordinator = coordinators.get(self.camera_index)
             self._publisher = publishers.get(self.camera_index)
             self._video_scan_workers = {}
-            for camera_index, ring_buffer in ring_buffers.items():
-                worker = ring_buffer.create_video_passage_scan_worker(
-                    self._on_video_candidates,
-                    width=640,
-                    height=360,
-                    ffmpeg_path=self.ffmpeg_path or "ffmpeg",
-                    sample_fps=8.0,
-                    roi=self._finish_line_rois.get(
-                        camera_index, (0.35, 0.15, 0.65, 0.95)
-                    ),
-                    interval_seconds=2.0,
-                    finish_line=self._finish_line_store.get(camera_index),
-                )
-                self._video_scan_workers[camera_index] = worker
-                worker.start()
+            if self._video_assist_enabled():
+                for camera_index, ring_buffer in ring_buffers.items():
+                    worker = ring_buffer.create_video_passage_scan_worker(
+                        self._on_video_candidates,
+                        width=640,
+                        height=360,
+                        ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                        sample_fps=8.0,
+                        roi=self._finish_line_rois.get(
+                            camera_index, (0.35, 0.15, 0.65, 0.95)
+                        ),
+                        interval_seconds=2.0,
+                        finish_line=self._finish_line_store.get(camera_index),
+                    )
+                    self._video_scan_workers[camera_index] = worker
+                    worker.start()
             self._start_visual_workers()
             self._capture_windows_by_camera = {
                 camera_index: {} for camera_index in coordinators
@@ -4289,26 +4296,27 @@ class FinishReviewWindow(PassageReviewDialog):
                 timing_error_ms=self.timing_error_ms,
                 binding_store=self.review_binding_store,
             )
-            scan_worker = ring_buffer.create_video_passage_scan_worker(
-                lambda candidates, generation=self._video_scan_generation: self._on_video_candidates(
-                    candidates,
-                    generation,
-                ),
-                width=640,
-                height=360,
-                ffmpeg_path=self.ffmpeg_path or "ffmpeg",
-                sample_fps=8.0,
-                roi=self._finish_line_rois.get(
-                    camera_index, (0.35, 0.15, 0.65, 0.95)
-                ),
-                interval_seconds=2.0,
-                finish_line=self._finish_line_store.get(camera_index),
-            )
-            scan_worker.start()
-            if self._video_scan_pause_tokens:
-                pause = getattr(scan_worker, "pause", None)
-                if callable(pause):
-                    pause()
+            if self._video_assist_enabled():
+                scan_worker = ring_buffer.create_video_passage_scan_worker(
+                    lambda candidates, generation=self._video_scan_generation: self._on_video_candidates(
+                        candidates,
+                        generation,
+                    ),
+                    width=640,
+                    height=360,
+                    ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                    sample_fps=8.0,
+                    roi=self._finish_line_rois.get(
+                        camera_index, (0.35, 0.15, 0.65, 0.95)
+                    ),
+                    interval_seconds=2.0,
+                    finish_line=self._finish_line_store.get(camera_index),
+                )
+                scan_worker.start()
+                if self._video_scan_pause_tokens:
+                    pause = getattr(scan_worker, "pause", None)
+                    if callable(pause):
+                        pause()
         except Exception:
             if scan_worker is not None:
                 scan_worker.stop()
@@ -5309,6 +5317,7 @@ class FinishReviewWindow(PassageReviewDialog):
             video_tip = "普通录像运行时辅助扫描器未启动"
         self.video_assist_status_label.setStatus(video_text, video_state)
         self.video_assist_status_label.setToolTip(video_tip)
+        self.video_assist_status_label.setVisible(self._video_assist_enabled())
 
         if self._workspace_mode == "archive" and not recording_active:
             recording_text, recording_color = "普通录像: 历史查看", "#667085"
@@ -5691,6 +5700,8 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _on_video_candidates(self, candidates, generation: int | None = None) -> None:
         """Receive worker results and marshal them to the Qt main thread."""
+        if not self._video_assist_enabled():
+            return
         if generation is not None and generation != self._video_scan_generation:
             return
         self.video_candidates_received.emit(tuple(candidates))
@@ -5728,6 +5739,8 @@ class FinishReviewWindow(PassageReviewDialog):
                 resume()
 
     def _reconcile_video_candidates(self, candidates) -> None:
+        if not self._video_assist_enabled():
+            return
         def is_visual(value: object) -> bool:
             return str(getattr(value, "candidate_id", "")).startswith("visual:")
 
