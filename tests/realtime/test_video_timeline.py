@@ -211,6 +211,50 @@ def test_prefers_playable_archive_over_broken_hls_for_same_source(tmp_path):
     assert lookup.locations[0].video_path == archive.absolute()
 
 
+def test_continuous_lookup_prefers_archive_over_playable_hls(tmp_path):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    archive = tmp_path / "videos" / "camera_archive_0001.mkv"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"video")
+    store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=archive,
+        media_started_at_ms=10_000,
+        media_duration_ms=20_000,
+        clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="continuous_archive_fallback",
+    )
+    playlist = tmp_path / "review_buffer" / "evidence.m3u8"
+    media_segment = playlist.with_name("evidence.ts")
+    playlist.parent.mkdir(parents=True)
+    media_segment.write_bytes(b"video")
+    playlist.write_text(
+        "#EXTM3U\n#EXTINF:4.000,\nevidence.ts\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+    store.add_completed_segment(
+        source_id="camera_01_review",
+        camera_index=1,
+        video_path=playlist,
+        media_started_at_ms=14_000,
+        media_duration_ms=4_000,
+        clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="passage_review_window",
+    )
+
+    normal = store.locate_passage(15_000)
+    continuous = store.locate_passage(
+        15_000,
+        prefer_continuous_media=True,
+    )
+
+    assert normal.locations[0].video_path == playlist.absolute()
+    assert continuous.locations[0].video_path == archive.absolute()
+
+
 def test_reports_verified_clip_within_timing_error_as_near_boundary(tmp_path):
     store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
     _segment(
