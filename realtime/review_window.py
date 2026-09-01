@@ -60,7 +60,10 @@ from .event_workspace import (
         summarize_event_workspace,
         validate_event_workspace,
     )
-from .passage_evidence import PassageEvidenceAssociationStore
+from .passage_evidence import (
+    PassageEvidenceAssociationStore,
+    VideoClockCalibrationStore,
+)
 from .passage_receiver import (
         DEFAULT_HOST,
         DEFAULT_PORT,
@@ -69,7 +72,7 @@ from .passage_receiver import (
         PassageEventStore,
         RaceFocus,
     )
-from .passage_review import PassageReviewDialog, source_location
+from .passage_review import PassageEvidencePane, PassageReviewDialog, source_location
 from .point_playback import PointPlaybackUnavailable, prepare_point_playback
 from .preflight import (
         PreflightJournal,
@@ -113,6 +116,7 @@ from .video_timeline import (
         VideoTimelineStore,
     )
 from .video_playback import VideoPlaybackDialog
+from .video_arrival import VideoArrivalCandidateStore
 from .video_review import VideoReviewJournal
 from .visual_crossing import (
     CrossingConfig,
@@ -128,6 +132,8 @@ BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
 CYCLERACE_INBOX_DIRNAME = ".finishreview"
+CAMERA_RECONNECT_BASE_SECONDS = 2.0
+CAMERA_RECONNECT_MAX_SECONDS = 30.0
 _TEST_GROUP_NAMES = frozenset({"test", "testgroup"})
 _TEST_GROUP_MARKERS = ("测试", "检测")
 _INVALID_EVENT_FOLDER_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -2443,6 +2449,9 @@ class FinishReviewWindow(PassageReviewDialog):
         review_binding_store = PassageReviewBindingStore(
             self.output_dir / "review_clips.jsonl"
         )
+        calibration_store = VideoClockCalibrationStore(
+            self.output_dir / "video_clock_calibrations.jsonl"
+        )
         historical_events = passage_store.events()
         self._evidence_timestamp_overrides = (
             _historical_evidence_timestamp_overrides(historical_events)
@@ -2481,6 +2490,7 @@ class FinishReviewWindow(PassageReviewDialog):
             show_high_speed_pane=self.high_speed_dir is not None,
             include_recorded_evidence=False,
             review_binding_store=review_binding_store,
+            calibration_store=calibration_store,
         )
 
         self.setWindowTitle(APP_WINDOW_TITLE)
@@ -2495,12 +2505,17 @@ class FinishReviewWindow(PassageReviewDialog):
         self._coordinators: dict[int, PassageReviewCoordinator] = {}
         self._publisher: PassageReviewTimelinePublisher | None = None
         self._video_scan_workers: dict[int, object] = {}
+        self._archive_video_scan_workers: dict[int, object] = {}
         self._visual_workers: dict[int, VisualCrossingWorker] = {}
-        self._video_candidate_cache: dict[str, object] = {}
+        self._video_candidate_cache: dict[str, object] = {
+            str(candidate.candidate_id): candidate
+            for candidate in self.video_arrival_store.candidates()
+        }
         self._visual_status = ""
         self._visual_failed = False
         self._video_candidate_dialogs: set[VideoPlaybackDialog] = set()
         self._video_scan_pause_tokens: set[object] = set()
+        self._video_scan_generation = 0
         self._finish_line_store = FinishLineStore(
             self.output_dir / "finish_lines.json"
         )
@@ -2535,6 +2550,9 @@ class FinishReviewWindow(PassageReviewDialog):
         self._started = False
         self._last_cleanup_at = 0.0
         self._recording_started_at = 0.0
+        self._camera_reconnect_attempts: dict[int, int] = {}
+        self._camera_reconnect_not_before: dict[int, float] = {}
+        self._camera_reconnect_errors: dict[int, str] = {}
         self._historical_passage_count = len(passage_store)
         self._received_passage_count = 0
         self._last_passage_monotonic = 0.0
@@ -2572,12 +2590,17 @@ class FinishReviewWindow(PassageReviewDialog):
         self.video_candidate_requested.connect(self._open_video_candidate)
         self.video_candidates_received.connect(self._reconcile_video_candidates)
         self.video_review_status_changed.connect(self._persist_video_review)
+        if self._video_candidate_cache:
+            self._reconcile_video_candidates(
+                tuple(self._video_candidate_cache.values())
+            )
         self.auto_advance_checkbox.setChecked(False)
         self.auto_advance_checkbox.hide()
         try:
             if self._publish_archive_segments():
                 self._lookup_cache.clear()
                 self.refresh()
+            self._start_archive_video_scan_workers()
         except Exception as exc:  # noqa: BLE001 - recovery remains operator-visible.
             self._capture_error = sanitize_recording_message(exc)
             logger.exception("Failed to recover archived recording sessions")
@@ -2822,8 +2845,80 @@ class FinishReviewWindow(PassageReviewDialog):
             self.invalidate_external_locations()
             self._request_high_speed_scan()
 
-    def _select_event(self, event_id: str) -> None:
-        super()._select_event(event_id)
+    def _select_event(
+        self,
+        event_id: str,
+        *,
+        preserve_current_frame: PassageEvidencePane | None = None,
+    ) -> None:
+        super()._select_event(
+            event_id,
+            preserve_current_frame=preserve_current_frame,
+        )
+
+    def _start_archive_video_scan_workers(self) -> None:
+        """Scan existing ordinary recordings when opening an archive workspace."""
+
+        if self._recording_any_active():
+            return
+        self._stop_archive_video_scan_workers()
+        segments_by_camera: dict[int, tuple[object, ...]] = {}
+        for segment in self.timeline_store.segments():
+            if segment.clock_source != DEFAULT_CLOCK_SOURCE:
+                continue
+            camera_index = max(1, int(segment.camera_index))
+            segments_by_camera.setdefault(camera_index, ())
+            segments_by_camera[camera_index] = (
+                *segments_by_camera[camera_index],
+                segment,
+            )
+        if not segments_by_camera:
+            return
+        try:
+            scan_module = importlib.import_module(
+                ".video_passage_det" + "ector", __package__
+            )
+            worker_type = scan_module.VideoPassageScanWorker
+        except (ImportError, AttributeError) as error:
+            logger.warning("Archived video candidate scanner unavailable: %s", error)
+            return
+
+        for camera_index, camera_segments in segments_by_camera.items():
+            def provider(values=camera_segments):
+                return values
+
+            generation = self._video_scan_generation
+
+            worker = worker_type(
+                provider,
+                lambda candidates, generation=generation: self._on_video_candidates(
+                    candidates,
+                    generation,
+                ),
+                camera_index=camera_index,
+                width=640,
+                height=360,
+                ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                sample_fps=4.0,
+                roi=self._finish_line_rois.get(
+                    camera_index, (0.35, 0.15, 0.65, 0.95)
+                ),
+                interval_seconds=1.0,
+                path_resolver=self.timeline_store.resolve_video_path,
+                finish_line=self._finish_line_store.get(camera_index),
+            )
+            self._archive_video_scan_workers[camera_index] = worker
+            worker.start()
+
+    def _stop_archive_video_scan_workers(self) -> None:
+        self._video_scan_generation += 1
+        workers = tuple(self._archive_video_scan_workers.values())
+        self._archive_video_scan_workers = {}
+        for worker in workers:
+            try:
+                worker.stop()
+            except Exception:  # noqa: BLE001 - shutdown remains best effort.
+                logger.exception("Failed to stop archived video scanner")
         self._update_operator_controls()
         if hasattr(self, "high_speed_status_label"):
             self._update_runtime_status()
@@ -3190,6 +3285,9 @@ class FinishReviewWindow(PassageReviewDialog):
                 association_store = PassageEvidenceAssociationStore(
                     output_dir / "passage_evidence_associations.jsonl"
                 )
+                calibration_store = VideoClockCalibrationStore(
+                    output_dir / "video_clock_calibrations.jsonl"
+                )
                 preflight_journal = PreflightJournal(
                     output_dir / "preflight_tests.jsonl"
                 )
@@ -3219,6 +3317,7 @@ class FinishReviewWindow(PassageReviewDialog):
                     timeline_store,
                     review_binding_store,
                     association_store,
+                    calibration_store,
                     preflight_journal,
                     historical_events,
                     evidence_timestamp_overrides,
@@ -3316,6 +3415,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 timeline_store,
                 review_binding_store,
                 association_store,
+                calibration_store,
                 preflight_journal,
                 historical_events,
                 evidence_timestamp_overrides,
@@ -3335,8 +3435,17 @@ class FinishReviewWindow(PassageReviewDialog):
             self._video_review_journal = VideoReviewJournal(
                 self.output_dir / "video_review.jsonl"
             )
+            self.video_arrival_store = VideoArrivalCandidateStore(
+                self.output_dir / "video_arrival_candidates.jsonl"
+            )
             self._video_reconciliation_by_id.clear()
-            self._video_candidate_cache.clear()
+            self._video_candidate_cache = {
+                str(candidate.candidate_id): candidate
+                for candidate in self.video_arrival_store.candidates()
+            }
+            self.set_video_navigation_candidates(
+                tuple(self._video_candidate_cache.values())
+            )
             self._video_review_statuses.clear()
             self._video_review_bibs.clear()
             for record in self._video_review_journal.records():
@@ -3353,6 +3462,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self.timeline_store = timeline_store
             self.review_binding_store = review_binding_store
             self.association_store = association_store
+            self.calibration_store = calibration_store
             self._lookup_cache.clear()
             self._timeline_signature = ()
             self._selected_event_id = ""
@@ -3372,6 +3482,10 @@ class FinishReviewWindow(PassageReviewDialog):
             self._received_event_order.clear()
             self._capture_error = ""
             self.refresh()
+            if self._video_candidate_cache:
+                self._reconcile_video_candidates(
+                    tuple(self._video_candidate_cache.values())
+                )
             if not preserve_running_receiver:
                 try:
                     self.start_receiver()
@@ -4019,6 +4133,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_runtime_status()
 
     def start_recording(self) -> None:
+        self._stop_archive_video_scan_workers()
         if self._workspace_mode == "archive":
             raise RecordingError("历史赛事模式不能开始录像，请先返回当前赛事")
         if self._recording_all_active():
@@ -4028,6 +4143,9 @@ class FinishReviewWindow(PassageReviewDialog):
         configured_sources = self._configured_recording_sources()
         if not configured_sources:
             raise RecordingError("请先在设备设置中选择录像摄像头")
+        self._camera_reconnect_attempts.clear()
+        self._camera_reconnect_not_before.clear()
+        self._camera_reconnect_errors.clear()
         try:
             free_bytes = shutil.disk_usage(self.output_dir).free
         except OSError as exc:
@@ -4141,6 +4259,162 @@ class FinishReviewWindow(PassageReviewDialog):
             raise
         finally:
             self._update_runtime_status()
+
+    def _restart_recording_camera(
+        self,
+        camera_index: int,
+        source: str,
+    ) -> None:
+        camera_index = max(1, int(camera_index))
+        recorder = self._recorder_factory(
+            source,
+            self.output_dir,
+            camera_index=camera_index,
+            ffmpeg_path=self.ffmpeg_path,
+            review_retention_seconds=self.review_retention_seconds,
+        )
+        scan_worker = None
+        try:
+            playlist_path = recorder.start()
+            ring_buffer = ReviewRingBuffer(
+                playlist_path,
+                camera_index=camera_index,
+                retention_seconds=self.review_retention_seconds,
+            )
+            ring_buffer.scan()
+            coordinator = PassageReviewCoordinator(ring_buffer)
+            publisher = PassageReviewTimelinePublisher(
+                ring_buffer,
+                self.timeline_store,
+                timing_error_ms=self.timing_error_ms,
+                binding_store=self.review_binding_store,
+            )
+            scan_worker = ring_buffer.create_video_passage_scan_worker(
+                lambda candidates, generation=self._video_scan_generation: self._on_video_candidates(
+                    candidates,
+                    generation,
+                ),
+                width=640,
+                height=360,
+                ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                sample_fps=8.0,
+                roi=self._finish_line_rois.get(
+                    camera_index, (0.35, 0.15, 0.65, 0.95)
+                ),
+                interval_seconds=2.0,
+                finish_line=self._finish_line_store.get(camera_index),
+            )
+            scan_worker.start()
+            if self._video_scan_pause_tokens:
+                pause = getattr(scan_worker, "pause", None)
+                if callable(pause):
+                    pause()
+        except Exception:
+            if scan_worker is not None:
+                scan_worker.stop()
+            try:
+                recorder.stop()
+            except Exception:  # noqa: BLE001 - retain the original restart error.
+                pass
+            raise
+
+        try:
+            previous_windows = self._capture_windows_by_camera.get(camera_index, {})
+            replacement_windows = {
+                event_id: window
+                for event_id, window in previous_windows.items()
+                if window.state is not PassageReviewState.WAITING
+            }
+            for event_id, window in previous_windows.items():
+                if window.state is not PassageReviewState.WAITING:
+                    continue
+                event = self.passage_store.get(event_id)
+                timestamp_ms = (
+                    self._evidence_timestamp(event) if event is not None else None
+                )
+                if event is None or not event.is_active or timestamp_ms is None:
+                    continue
+                replacement_windows[event_id] = coordinator.register(
+                    event_id,
+                    passage_timestamp_ms=timestamp_ms,
+                    scan=False,
+                )
+        except Exception:
+            scan_worker.stop()
+            try:
+                recorder.stop()
+            except Exception:  # noqa: BLE001 - retain the registration error.
+                pass
+            raise
+
+        previous_worker = self._video_scan_workers.get(camera_index)
+        if previous_worker is not None:
+            previous_worker.stop()
+        self._recorders[camera_index] = recorder
+        self._ring_buffers[camera_index] = ring_buffer
+        self._coordinators[camera_index] = coordinator
+        self._publishers[camera_index] = publisher
+        self._video_scan_workers[camera_index] = scan_worker
+        self._capture_windows_by_camera[camera_index] = replacement_windows
+        self._archive_publishers.append(
+            ArchiveTimelinePublisher(recorder, self.timeline_store)
+        )
+        if camera_index == self.camera_index:
+            self._recorder = recorder
+            self._ring_buffer = ring_buffer
+            self._coordinator = coordinator
+            self._publisher = publisher
+            self._capture_windows = replacement_windows
+        self._lookup_cache.clear()
+
+    def _recover_failed_camera(
+        self,
+        camera_index: int,
+        recorder_error: str,
+        *,
+        now: float,
+    ) -> bool:
+        camera_index = max(1, int(camera_index))
+        if now < self._camera_reconnect_not_before.get(camera_index, 0.0):
+            return False
+        source = dict(self._configured_recording_sources()).get(camera_index)
+        if not source:
+            return False
+        attempt = self._camera_reconnect_attempts.get(camera_index, 0) + 1
+        try:
+            self._restart_recording_camera(camera_index, source)
+        except Exception as exc:  # noqa: BLE001 - reconnect remains operator-visible.
+            delay_seconds = min(
+                CAMERA_RECONNECT_MAX_SECONDS,
+                CAMERA_RECONNECT_BASE_SECONDS * (2 ** min(attempt - 1, 10)),
+            )
+            detail = sanitize_recording_message(exc)
+            self._camera_reconnect_attempts[camera_index] = attempt
+            self._camera_reconnect_not_before[camera_index] = now + delay_seconds
+            self._camera_reconnect_errors[camera_index] = (
+                f"{recorder_error}；重连失败：{detail}；"
+                f"{delay_seconds:g}秒后重试"
+            )
+            self._runtime_error = (
+                f"机位{camera_index}断开，自动重连中："
+                f"{self._camera_reconnect_errors[camera_index]}"
+            )
+            logger.warning(
+                "Camera %s reconnect attempt %s failed; retrying in %.1fs: %s",
+                camera_index,
+                attempt,
+                delay_seconds,
+                detail,
+            )
+            return False
+
+        self._camera_reconnect_attempts.pop(camera_index, None)
+        self._camera_reconnect_not_before.pop(camera_index, None)
+        self._camera_reconnect_errors.pop(camera_index, None)
+        if self._runtime_error.startswith(f"机位{camera_index}"):
+            self._runtime_error = ""
+        logger.warning("Camera %s recording automatically reconnected", camera_index)
+        return True
 
     def start(self) -> None:
         """Compatibility helper used by automation that starts the full session."""
@@ -4874,11 +5148,14 @@ class FinishReviewWindow(PassageReviewDialog):
                 for ring_buffer in self._ring_buffers.values():
                     ring_buffer.cleanup(current_time_ms=current_time_ms)
                 self._last_cleanup_at = now
-            for camera_index, recorder in self._recorders.items():
+            now = time.monotonic()
+            for camera_index, recorder in tuple(self._recorders.items()):
                 recorder_error = recorder.check_error()
                 if recorder_error:
-                    self._runtime_error = (
-                        f"机位{camera_index}: {recorder_error}"
+                    self._recover_failed_camera(
+                        camera_index,
+                        recorder_error,
+                        now=now,
                     )
             if changed_event_ids:
                 self.refresh_events(changed_event_ids)
@@ -4936,7 +5213,15 @@ class FinishReviewWindow(PassageReviewDialog):
             camera_index: ring_buffer.segments()
             for camera_index, ring_buffer in self._ring_buffers.items()
         }
-        if recording_active:
+        reconnecting = sorted(self._camera_reconnect_errors)
+        if reconnecting:
+            camera_text, camera_color = "录像设备: 自动重连中", "#b54747"
+            camera_state = "error"
+            camera_tooltip = "\n".join(
+                f"机位{camera_index}: {self._camera_reconnect_errors[camera_index]}"
+                for camera_index in reconnecting
+            )
+        elif recording_active:
             missing = [
                 camera_index
                 for camera_index, _source in configured_sources
@@ -4992,7 +5277,16 @@ class FinishReviewWindow(PassageReviewDialog):
         self.camera_status_label.setStyleSheet(f"color: {camera_color};")
 
         anomaly_count = len(self.video_reconciliation())
-        if not recording_active:
+        if not recording_active and self._archive_video_scan_workers:
+            candidate_count = len(self.video_navigation_candidates())
+            video_text = (
+                f"视频辅助: 候选 {candidate_count}"
+                if candidate_count
+                else "视频辅助: 扫描中"
+            )
+            video_state = "ready" if candidate_count else "busy"
+            video_tip = "正在扫描已录制录像；Ctrl+右/左可跳到下一个/上一个有人通过位置"
+        elif not recording_active:
             video_text, video_state = "视频辅助: 待机", "waiting"
             video_tip = "开始普通录像后自动扫描疑似过线批次"
         elif self._visual_failed:
@@ -5395,8 +5689,10 @@ class FinishReviewWindow(PassageReviewDialog):
                 worker.request_scan()
         self._update_runtime_status()
 
-    def _on_video_candidates(self, candidates) -> None:
+    def _on_video_candidates(self, candidates, generation: int | None = None) -> None:
         """Receive worker results and marshal them to the Qt main thread."""
+        if generation is not None and generation != self._video_scan_generation:
+            return
         self.video_candidates_received.emit(tuple(candidates))
 
     def _pause_video_scan_workers(self) -> object:
@@ -5406,7 +5702,11 @@ class FinishReviewWindow(PassageReviewDialog):
         self._video_scan_pause_tokens.add(token)
         if len(self._video_scan_pause_tokens) != 1:
             return token
-        for worker in self._video_scan_workers.values():
+        workers = (
+            *self._video_scan_workers.values(),
+            *self._archive_video_scan_workers.values(),
+        )
+        for worker in workers:
             pause = getattr(worker, "pause", None)
             if callable(pause):
                 pause()
@@ -5418,7 +5718,11 @@ class FinishReviewWindow(PassageReviewDialog):
         self._video_scan_pause_tokens.remove(token)
         if self._video_scan_pause_tokens:
             return
-        for worker in self._video_scan_workers.values():
+        workers = (
+            *self._video_scan_workers.values(),
+            *self._archive_video_scan_workers.values(),
+        )
+        for worker in workers:
             resume = getattr(worker, "resume", None)
             if callable(resume):
                 resume()
@@ -5438,7 +5742,22 @@ class FinishReviewWindow(PassageReviewDialog):
                 <= 1_500
             )
 
-        for candidate in tuple(candidates):
+        values = tuple(candidates)
+        persistent_candidates = tuple(
+            candidate
+            for candidate in values
+            if not is_visual(candidate)
+            and str(getattr(candidate, "segment_id", "")).strip()
+            and str(getattr(candidate, "video_path", "")).strip()
+        )
+        if persistent_candidates:
+            try:
+                self.video_arrival_store.add_many(persistent_candidates)
+            except RuntimeError as error:
+                self._capture_error = str(error)
+                self._update_runtime_status()
+
+        for candidate in values:
             matching_visual_ids = {
                 candidate_id
                 for candidate_id, existing in self._video_candidate_cache.items()
@@ -5454,8 +5773,9 @@ class FinishReviewWindow(PassageReviewDialog):
             for candidate_id in matching_visual_ids:
                 self._video_candidate_cache.pop(candidate_id, None)
             self._video_candidate_cache[str(getattr(candidate, "candidate_id", id(candidate)))] = candidate
-        while len(self._video_candidate_cache) > 2_000:
-            self._video_candidate_cache.pop(next(iter(self._video_candidate_cache)))
+        # Keep all visual candidates available for fast Ctrl+Left/Right
+        # navigation; the reconciliation list below remains anomaly-only.
+        self.set_video_navigation_candidates(tuple(self._video_candidate_cache.values()))
         events = self._events_for_current_metadata(self.passage_store.events())
         times = tuple(event.timeline_timestamp_ms for event in events)
         tools = importlib.import_module(
@@ -5464,6 +5784,11 @@ class FinishReviewWindow(PassageReviewDialog):
         reconciliation = tools.reconcile_candidates(
             tuple(self._video_candidate_cache.values()),
             times,
+            passage_time_offset_by_camera=getattr(
+                self,
+                "_clock_offset_by_camera",
+                None,
+            ),
         )
         self.video_review_apply_requested.emit(reconciliation)
 
@@ -5486,6 +5811,11 @@ class FinishReviewWindow(PassageReviewDialog):
             self._open_visual_candidate(item)
             return
         video_path = Path(str(getattr(candidate, "video_path", ""))).expanduser()
+        if not video_path.is_file() and candidate is not None:
+            segment_id = str(getattr(candidate, "segment_id", "")).strip()
+            segment = self.timeline_store.get_segment(segment_id) if segment_id else None
+            if segment is not None:
+                video_path = self.timeline_store.resolve_video_path(segment)
         if candidate is None or not video_path.is_file():
             self._capture_error = "视频异常没有可打开的录像文件"
             self._update_runtime_status()
@@ -5495,7 +5825,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self,
             initial_position_ms=max(
                 0,
-                int(getattr(candidate, "video_position_ms", 0)) - 1_000,
+                int(getattr(candidate, "video_position_ms", 0)) - 3_000,
             ),
             target_position_ms=int(getattr(candidate, "video_position_ms", 0)),
             context_text=(
@@ -5529,7 +5859,9 @@ class FinishReviewWindow(PassageReviewDialog):
             race_id = metadata.race_id if metadata is not None else None
             lookup = self.timeline_store.locate_passage(
                 int(getattr(candidate, "peak_at_ms", 0)),
-                clock_offset_ms=self.clock_offset_ms,
+                clock_offset_ms=self._clock_offset_for_camera(
+                    int(getattr(candidate, "camera_index", 1))
+                ),
                 pre_roll_ms=self.pre_roll_ms,
                 race_id=race_id,
             )
@@ -5577,6 +5909,7 @@ class FinishReviewWindow(PassageReviewDialog):
             self._resume_video_scan_workers(pause_token)
 
     def stop_recording(self) -> None:
+        self._video_scan_generation += 1
         for worker in self._video_scan_workers.values():
             worker.stop()
         self._video_scan_workers = {}
@@ -5608,6 +5941,10 @@ class FinishReviewWindow(PassageReviewDialog):
         self._publisher = None
         self._started = False
         self._recording_started_at = 0.0
+        self._camera_reconnect_attempts.clear()
+        self._camera_reconnect_not_before.clear()
+        self._camera_reconnect_errors.clear()
+        self._start_archive_video_scan_workers()
         self._update_runtime_status()
 
     def stop_receiver(self) -> None:
@@ -5638,6 +5975,7 @@ class FinishReviewWindow(PassageReviewDialog):
             if not worker.wait(1_000):
                 return False
         self.stop_recording()
+        self._stop_archive_video_scan_workers()
         self.stop_receiver()
         for dialog in tuple(self._video_candidate_dialogs):
             dialog.close()

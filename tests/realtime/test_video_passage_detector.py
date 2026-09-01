@@ -1,5 +1,8 @@
 import io
 import numpy as np
+from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 import realtime.video_passage_detector as detector_module
@@ -258,6 +261,23 @@ def test_reconciliation_only_marks_anomalous_batches_for_review():
     assert result[0].needs_review
 
 
+def test_reconciliation_applies_camera_specific_passage_offsets():
+    camera_one = VideoPassageCandidate(
+        "camera-1", 1, 8_000, 8_100, 8_050, 0.2, 0.1
+    )
+    camera_two = VideoPassageCandidate(
+        "camera-2", 2, 9_000, 9_100, 9_050, 0.2, 0.1
+    )
+
+    result = reconcile_candidates(
+        (camera_one, camera_two),
+        (9_350, 11_450),
+        passage_time_offset_by_camera={1: -1_300, 2: -2_400},
+    )
+
+    assert [item.chip_count for item in result] == [1, 1]
+
+
 def test_unmatched_chip_times_are_kept_as_anomalies():
     candidate = VideoPassageCandidate("v1", 1, 1_000, 1_300, 1_100, 0.2, 0.1)
     assert unmatched_passage_times((candidate,), (1_100, 5_000)) == (5_000,)
@@ -349,6 +369,50 @@ def test_scan_worker_merges_one_segment_and_preserves_video_location(
     assert result[0].is_group
 
 
+def test_scan_worker_publishes_each_segment_before_archive_scan_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    paths = []
+    segments = []
+    for index, start in enumerate((10_000, 20_000), 1):
+        path = tmp_path / f"camera_01_{index}.ts"
+        path.write_bytes(b"video")
+        paths.append(path)
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"segment-{index}",
+                camera_index=1,
+                started_at_ms=start,
+                video_path=path.name,
+            )
+        )
+
+    def fake_scan(path, **_kwargs):
+        start = 10_000 if Path(path) == paths[0] else 20_000
+        return (VideoPassageCandidate(
+            f"raw-{start}", 1, start + 100, start + 200, start + 150, 0.2, 0.1
+        ),)
+
+    monkeypatch.setattr(detector_module, "scan_video_file", fake_scan)
+    published = []
+    worker = VideoPassageScanWorker(
+        lambda: tuple(segments),
+        published.append,
+        width=16,
+        height=12,
+        path_resolver=lambda item: tmp_path / item.video_path,
+    )
+
+    result = worker.scan_once(result_callback=published.append)
+
+    assert len(result) == 2
+    assert [batch[0].segment_id for batch in published] == [
+        "segment-1",
+        "segment-2",
+    ]
+
+
 def test_scan_worker_uses_line_batch_merge_for_fixed_camera(
     tmp_path,
     monkeypatch,
@@ -423,3 +487,56 @@ def test_scan_worker_pause_and_resume_preserve_pending_segments(
     worker.resume()
     assert worker.scan_once() == ()
     assert scan_calls == [True]
+
+
+def test_scan_worker_stop_terminates_active_ffmpeg_process(tmp_path, monkeypatch):
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    segment = SimpleNamespace(
+        segment_id="segment-01",
+        camera_index=1,
+        started_at_ms=10_000,
+        video_path="camera_01.ts",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    class _Process:
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None if not self.terminated else -15
+
+        def terminate(self):
+            self.terminated = True
+            release.set()
+
+    process = _Process()
+
+    def blocking_scan(*_args, process_callback=None, **_kwargs):
+        process_callback(process)
+        started.set()
+        release.wait(2.0)
+        process_callback(None)
+        return ()
+
+    monkeypatch.setattr(detector_module, "scan_video_file", blocking_scan)
+    worker = VideoPassageScanWorker(
+        lambda: (segment,),
+        lambda _items: None,
+        width=16,
+        height=12,
+        path_resolver=lambda item: tmp_path / item.video_path,
+    )
+    worker.start()
+    assert started.wait(1.0)
+
+    worker.stop(timeout=1.0)
+
+    assert process.terminated
+    for _ in range(20):
+        if worker._thread is None:  # noqa: SLF001 - lifecycle assertion
+            break
+        time.sleep(0.01)
+    assert worker._thread is None  # noqa: SLF001 - lifecycle assertion
