@@ -9,7 +9,7 @@ from typing import Iterable
 import cv2
 from PyQt5.QtCore import QThread, QTimer, Qt, QRectF, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen
-from PyQt5.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 DEFAULT_FILMSTRIP_INTERVAL_MS = 2_000
 FILMSTRIP_TILE_WIDTH = 360
@@ -90,6 +90,13 @@ class FilmstripCanvas(QWidget):
         self.owner = owner
         self._dragging = False
         self._last_x = 0
+        self._press_x = 0
+        self._moved = False
+        self._pending_click_position: int | None = None
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(max(300, QApplication.doubleClickInterval() + 80))
+        self._click_timer.timeout.connect(self._emit_pending_click)
         self.setMouseTracking(True)
         self.setCursor(Qt.OpenHandCursor)
         self.setMinimumHeight(FILMSTRIP_TILE_HEIGHT + 34)
@@ -110,6 +117,33 @@ class FilmstripCanvas(QWidget):
             min(len(frames) - 1, int((x + scroll_offset - 4) // step)),
         )
         return frames[index]
+
+    def _display_time_text(self, frame: FilmstripFrame) -> str:
+        reference_ms = self.owner._display_reference_ms
+        if reference_ms is None:
+            end_ms = self.owner._display_end_ms
+            if end_ms is None:
+                return f"{frame.position_ms / 1000.0:.3f}s"
+            remaining_ms = max(0, int(end_ms) - int(frame.position_ms))
+            return f"{remaining_ms / 1000.0:.3f}s"
+        delta_ms = int(reference_ms) - int(frame.position_ms)
+        if delta_ms >= 0:
+            return f"{delta_ms / 1000.0:.3f}s"
+        return f"+{abs(delta_ms) / 1000.0:.3f}s"
+
+    def _update_status_for_frame(self, frame: FilmstripFrame) -> None:
+        display_text = self._display_time_text(frame)
+        if display_text.startswith("+"):
+            self.owner.status_label.setText(f"T{display_text}")
+        else:
+            self.owner.status_label.setText(f"T-{display_text}")
+
+    def _emit_pending_click(self) -> None:
+        position_ms = self._pending_click_position
+        self._pending_click_position = None
+        if position_ms is None:
+            return
+        self.position_released.emit(position_ms)
 
     def refresh_geometry(self) -> None:
         count = len(self.owner._frames)
@@ -138,15 +172,27 @@ class FilmstripCanvas(QWidget):
             painter.setPen(QPen(QColor("#2563eb" if selected else "#cbd5e1"), 3 if selected else 1))
             painter.drawRect(target)
             painter.setPen(QColor("#475569"))
-            painter.drawText(QRectF(x, FILMSTRIP_TILE_HEIGHT + 7, FILMSTRIP_TILE_WIDTH, 20), Qt.AlignCenter, f"{frame.position_ms / 1000.0:.3f}s")
+            painter.drawText(
+                QRectF(x, FILMSTRIP_TILE_HEIGHT + 7, FILMSTRIP_TILE_WIDTH, 20),
+                Qt.AlignCenter,
+                self._display_time_text(frame),
+            )
         painter.end()
 
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.LeftButton:
             event.ignore()
             return
+        # A second press belongs to a double-click when it arrives before the
+        # pending single-click timer fires. Cancel the first click now so the
+        # double-click handler can perform exactly one seek.
+        if self._click_timer.isActive():
+            self._click_timer.stop()
+            self._pending_click_position = None
         self._dragging = True
-        self._last_x = event.pos().x()
+        self._press_x = event.pos().x()
+        self._last_x = self._press_x
+        self._moved = False
         self.setCursor(Qt.ClosedHandCursor)
         event.accept()
 
@@ -157,11 +203,15 @@ class FilmstripCanvas(QWidget):
         x = event.pos().x()
         delta = x - self._last_x
         if delta:
+            self._moved = True
             scroll = self.owner.scroll.horizontalScrollBar()
             # Match the operator's review direction: dragging right advances
             # toward later arrivals, while dragging left goes back in time.
             scroll.setValue(scroll.value() + delta)
         self._last_x = x
+        frame = self._frame_at_x(x)
+        if frame is not None:
+            self._update_status_for_frame(frame)
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
@@ -172,7 +222,12 @@ class FilmstripCanvas(QWidget):
         self.setCursor(Qt.OpenHandCursor)
         frame = self._frame_at_x(event.pos().x())
         if frame is not None:
-            self.position_released.emit(frame.position_ms)
+            self._update_status_for_frame(frame)
+            if self._moved or abs(event.pos().x() - self._press_x) >= 4:
+                self.position_released.emit(frame.position_ms)
+            else:
+                self._pending_click_position = frame.position_ms
+                self._click_timer.start()
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -181,11 +236,14 @@ class FilmstripCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             event.ignore()
             return
+        self._click_timer.stop()
+        self._pending_click_position = None
         self._dragging = False
         self.setCursor(Qt.OpenHandCursor)
         frame = self._frame_at_x(event.pos().x())
         if frame is not None:
             self.position_released.emit(frame.position_ms)
+            self._update_status_for_frame(frame)
         event.accept()
 
 
@@ -206,8 +264,12 @@ class VideoFilmstripWidget(QFrame):
         self._render_timer_pending = False
         self._video_path: Path | None = None
         self._reverse = False
+        self._display_start_ms: int | None = None
+        self._display_end_ms: int | None = None
+        self._display_reference_ms: int | None = None
         self._current_position_ms = -1
         self._first_frame_received = False
+        self._align_pending = False
         self.setObjectName("videoFilmstrip")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumHeight(220)
@@ -249,11 +311,34 @@ class VideoFilmstripWidget(QFrame):
     def _on_direction_changed(self, index: int) -> None:
         self._reverse = bool(self.direction_combo.itemData(index))
         self.direction_changed.emit(self._reverse)
+        self._align_pending = True
         self.content.refresh_geometry()
+        self._schedule_render_pending()
 
     def set_current_position(self, position_ms: int) -> None:
         self._current_position_ms = int(position_ms)
+        self._display_reference_ms = int(position_ms)
+        self._align_pending = True
         self.content.update()
+        self._align_current_position_to_right()
+        self._schedule_render_pending()
+
+    def _align_current_position_to_right(self) -> None:
+        if not self._frames or self._current_position_ms < 0:
+            return
+        frames = self.content._visual_frames()
+        if not frames:
+            return
+        target_index, _target = min(
+            enumerate(frames),
+            key=lambda item: abs(int(item[1].position_ms) - self._current_position_ms),
+        )
+        step = FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP
+        target_right = 4 + (target_index + 1) * step
+        viewport_width = self.scroll.viewport().width()
+        scroll_bar = self.scroll.horizontalScrollBar()
+        scroll_value = max(0, target_right - max(1, viewport_width))
+        scroll_bar.setValue(min(scroll_bar.maximum(), scroll_value))
 
     def clear(self, message: str = "选择连续判读时间窗") -> None:
         self.stop()
@@ -262,7 +347,11 @@ class VideoFilmstripWidget(QFrame):
         self._requested_positions.clear()
         self._pending_positions.clear()
         self._video_path = None
+        self._display_start_ms = None
+        self._display_end_ms = None
+        self._display_reference_ms = None
         self._first_frame_received = False
+        self._align_pending = False
         self.content.refresh_geometry()
         self.status_label.setText(message)
 
@@ -291,7 +380,13 @@ class VideoFilmstripWidget(QFrame):
             self._frames.clear()
             self._video_path = path
         self._frames = sorted(self._frames_by_path.get(path, {}).values(), key=lambda value: value.position_ms)
+        self._display_start_ms = max(0, int(start_ms))
+        self._display_end_ms = max(self._display_start_ms, int(end_ms))
+        if self._current_position_ms < 0:
+            self._display_reference_ms = self._display_start_ms
         self.content.refresh_geometry()
+        self._align_pending = True
+        self._schedule_render_pending()
         self._requested_positions = {frame.position_ms for frame in self._frames}
         self._pending_positions.clear()
         self.status_label.setText("正在生成时间胶卷...")
@@ -367,6 +462,9 @@ class VideoFilmstripWidget(QFrame):
     def _flush_render_pending(self) -> None:
         self._render_timer_pending = False
         self.content.refresh_geometry()
+        if self._align_pending and self._frames:
+            self._align_pending = False
+            self._align_current_position_to_right()
 
     def closeEvent(self, event) -> None:
         self.stop()

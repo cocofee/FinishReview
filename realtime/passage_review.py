@@ -2393,6 +2393,7 @@ class PassageReviewDialog(QDialog):
         self._review_split_resize_pending = False
         self._pending_filmstrip_position: int | None = None
         self._filmstrip_seek_pending = False
+        self._filmstrip_seek_retry_count = 0
 
         self.setWindowTitle(APP_WINDOW_TITLE)
         self.resize(1400, 860)
@@ -5642,7 +5643,19 @@ class PassageReviewDialog(QDialog):
             positions.append(int(getattr(candidate, "video_position_ms", 0)))
         if not positions:
             positions.append(int(location.passage_position_ms))
-        center = int(getattr(pane, "_current_position_ms", positions[0]))
+        # Before the playback worker emits its first frame, the pane reports
+        # position 0 even though the selected athlete's target is later in
+        # the recording. Use the target passage frame in that transient state
+        # so the filmstrip's rightmost 0-second tile shows the athlete rather
+        # than an empty lead-in frame.
+        current_frame_index = int(getattr(pane, "_current_frame_index", -1))
+        current_position = int(getattr(pane, "_current_position_ms", 0))
+        target_position = int(getattr(pane, "_target_position_ms", 0))
+        center = (
+            target_position
+            if current_frame_index < 0
+            else current_position
+        )
         window_start = (max(0, center) // self.FILMSTRIP_WINDOW_MS) * self.FILMSTRIP_WINDOW_MS
         start_ms = min(window_start, max(0, duration_ms - 1))
         end_ms = min(duration_ms, start_ms + self.FILMSTRIP_WINDOW_MS)
@@ -5731,6 +5744,7 @@ class PassageReviewDialog(QDialog):
 
     def _seek_filmstrip_position(self, position_ms: int) -> None:
         self._pending_filmstrip_position = int(position_ms)
+        self._filmstrip_seek_retry_count = 0
         self.video_filmstrip.set_current_position(int(position_ms))
         if self._filmstrip_seek_pending:
             return
@@ -5743,14 +5757,37 @@ class PassageReviewDialog(QDialog):
         self._pending_filmstrip_position = None
         if position_ms is None:
             return
-        pane = (
+        preferred_pane = (
             self._active_pane
-            if self._active_pane in self.regular_panes
+            if self._active_pane in self.evidence_panes
             else self.regular_pane
         )
-        if pane.location is None or pane.available_delta_bounds() is None:
+        seek_pane = next(
+            (
+                pane
+                for pane in (preferred_pane, *self.evidence_panes)
+                if pane.location is not None
+                and pane.available_delta_bounds() is not None
+            ),
+            None,
+        )
+        if seek_pane is None:
+            # The filmstrip can be ready before the lower video worker has
+            # emitted metadata. Keep the requested position briefly so a
+            # double-click still links to both camera panes once duration and
+            # frame bounds become available.
+            if (
+                preferred_pane.location is not None
+                and self._filmstrip_seek_retry_count < 25
+            ):
+                self._filmstrip_seek_retry_count += 1
+                self._filmstrip_seek_pending = True
+                QTimer.singleShot(120, self._flush_filmstrip_position)
+                return
+            self._pending_filmstrip_position = None
             return
-        target_delta_ms = int(position_ms) - int(pane._target_position_ms)
+        self._filmstrip_seek_retry_count = 0
+        target_delta_ms = int(position_ms) - int(seek_pane._target_position_ms)
         # The filmstrip represents the shared race timeline.  Move every
         # visible camera together so each pane applies its own calibrated
         # passage target instead of leaving the secondary angle behind.

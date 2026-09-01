@@ -102,11 +102,13 @@ def test_canvas_click_and_drag_emit_one_final_position():
 
     spy = QSignalSpy(widget.position_selected)
     QTest.mouseClick(widget.content, Qt.LeftButton, pos=QPoint(380, 20))
+    QTest.qWait(QApplication.doubleClickInterval() + 140)
     app.processEvents()
     assert len(spy) == 1
     assert spy[-1][0] == 2_000
 
     spy = QSignalSpy(widget.position_selected)
+    QTest.qWait(500)
     QTest.mousePress(widget.content, Qt.LeftButton, pos=QPoint(380, 20))
     QTest.mouseMove(widget.content, QPoint(300, 20), 50)
     QTest.mouseMove(widget.content, QPoint(220, 20), 50)
@@ -129,8 +131,9 @@ def test_canvas_double_click_emits_preview_position():
 
     spy = QSignalSpy(widget.position_selected)
     QTest.mouseDClick(widget.content, Qt.LeftButton, pos=QPoint(380, 20))
+    QTest.qWait(QApplication.doubleClickInterval() + 80)
     app.processEvents()
-    assert len(spy) >= 1
+    assert len(spy) == 1
     assert spy[-1][0] == 2_000
     widget.close()
 
@@ -148,6 +151,42 @@ def test_filmstrip_load_prioritizes_current_area_and_queues_remaining_positions(
 
     assert started == [(10_000, 8_000, 12_000, 6_000, 14_000, 4_000, 16_000, 2_000, 18_000, 0, 20_000, 22_000)]
     assert len(widget._pending_positions) == 4
+    widget.close()
+
+
+def test_filmstrip_labels_are_relative_to_current_position():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    widget._display_start_ms = 0
+    widget._display_end_ms = 10_000
+    widget._display_reference_ms = 10_000
+    image = QImage(8, 8, QImage.Format_RGB888)
+    frame = FilmstripFrame(8_000, 0, image)
+    assert widget.content._display_time_text(frame) == "2.000s"
+    frame = FilmstripFrame(10_000, 0, image)
+    assert widget.content._display_time_text(frame) == "0.000s"
+    frame = FilmstripFrame(12_000, 0, image)
+    assert widget.content._display_time_text(frame) == "+2.000s"
+    widget.close()
+
+
+def test_filmstrip_aligns_current_frame_to_right_edge():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    widget._video_path = Path("race.mp4")
+    image = QImage(8, 8, QImage.Format_RGB888)
+    for position_ms in (0, 2_000, 4_000):
+        widget._on_frame_ready(image, position_ms, position_ms // 40)
+    widget.resize(500, 320)
+    widget.show()
+    app.processEvents()
+
+    widget.set_current_position(2_000)
+    widget._flush_render_pending()
+
+    bar = widget.scroll.horizontalScrollBar()
+    assert bar.value() > 0
+    assert bar.value() == min(bar.maximum(), 4 + 2 * (360 + 8) - widget.scroll.viewport().width())
     widget.close()
 
 
