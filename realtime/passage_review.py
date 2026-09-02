@@ -6704,7 +6704,11 @@ class PassageReviewSurface(QDialog):
         )
         self._update_event_confirmation_status(event.event_id)
         if should_advance and confirmed_row >= 0:
-            self._move_selection(1, skip_confirmed=True)
+            self._move_selection(
+                1,
+                skip_confirmed=True,
+                preserve_current_frame=True,
+            )
         return True
 
     def _update_event_confirmation_status(self, event_id: str) -> None:
@@ -6933,7 +6937,13 @@ class PassageReviewSurface(QDialog):
                 return
         QMessageBox.information(self, "未找到", "当前组别没有该号码或姓名的通过记录。")
 
-    def _move_selection(self, delta: int, *, skip_confirmed: bool = False) -> None:
+    def _move_selection(
+        self,
+        delta: int,
+        *,
+        skip_confirmed: bool = False,
+        preserve_current_frame: bool = False,
+    ) -> None:
         if self.table.rowCount() <= 0:
             return
         current_row = self.table.currentRow()
@@ -6969,11 +6979,12 @@ class PassageReviewSurface(QDialog):
             self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
         active_pane = self._active_playback_pane()
         moving_back_in_continuous_mode = self._batch_mode and int(delta) < 0
+        keep_current_frame = self._batch_mode and (
+            moving_back_in_continuous_mode or preserve_current_frame
+        )
         self._select_event(
             event_id,
-            preserve_current_frame=(
-                active_pane if moving_back_in_continuous_mode else None
-            ),
+            preserve_current_frame=(active_pane if keep_current_frame else None),
         )
         if not moving_back_in_continuous_mode:
             return

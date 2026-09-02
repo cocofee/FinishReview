@@ -1936,6 +1936,57 @@ def test_batch_next_with_several_seconds_gap_keeps_current_frame_for_safe_scan(
     dialog.close()
 
 
+def test_batch_next_across_media_boundary_keeps_current_frame_for_split_riders(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-246", sequence=1, passage_time_ms=15_000, bib="246")
+    )
+    passage_store.append(
+        _event(event_id="passage-235", sequence=2, passage_time_ms=24_000, bib="235")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_part1.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_part2.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=20_000,
+        ended_at_ms=30_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    assert dialog._enter_batch_mode("passage-246")
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    worker = pane._worker
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 9_500, 237)
+    qapp.processEvents()
+    worker.seek_calls.clear()
+
+    dialog._move_selection(1, preserve_current_frame=True)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-235"
+    assert pane._worker is worker
+    assert pane._current_position_ms == 9_500
+    assert worker.seek_calls == []
+    dialog.close()
+
+
 def test_continuous_mode_shows_future_numbers_and_keeps_current_frame(
     qapp,
     tmp_path,
