@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 import threading
 import time
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -404,6 +404,7 @@ def scan_video_file(
     sample_fps: float = 8.0,
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
     detector: LightweightVideoPassageDetector | None = None,
+    process_callback: Callable[[subprocess.Popen | None], None] | None = None,
 ) -> tuple[VideoPassageCandidate, ...]:
     """Scan a video at low FPS through FFmpeg without retaining video frames.
 
@@ -442,6 +443,8 @@ def scan_video_file(
             0,
         )
     process = subprocess.Popen(command, **process_kwargs)
+    if process_callback is not None:
+        process_callback(process)
     active_detector = detector or LightweightVideoPassageDetector()
     frame_size = width * height
     frame_index = 0
@@ -467,6 +470,8 @@ def scan_video_file(
             frame_index += 1
         candidates.extend(active_detector.flush())
     finally:
+        if process_callback is not None:
+            process_callback(None)
         if process.stdout is not None:
             process.stdout.close()
         try:
@@ -487,6 +492,8 @@ def reconcile_candidates(
     passage_times_ms: Iterable[int],
     *,
     tolerance_ms: int = 500,
+    passage_time_offset_ms: int = 0,
+    passage_time_offset_by_camera: Mapping[int, int] | None = None,
 ) -> tuple[VideoPassageReconciliation, ...]:
     """Classify only suspicious batches for manual review.
 
@@ -498,6 +505,8 @@ def reconcile_candidates(
         candidates,
         passage_times_ms,
         tolerance_ms=tolerance_ms,
+        passage_time_offset_ms=passage_time_offset_ms,
+        passage_time_offset_by_camera=passage_time_offset_by_camera,
     )
     result = []
     for candidate, chip_count in matched:
@@ -518,11 +527,33 @@ def unmatched_passage_times(
     passage_times_ms: Iterable[int],
     *,
     tolerance_ms: int = 500,
+    passage_time_offset_ms: int = 0,
+    passage_time_offset_by_camera: Mapping[int, int] | None = None,
 ) -> tuple[int, ...]:
     """Return chip times with no nearby visual batch."""
 
+    offset = int(passage_time_offset_ms)
     ranges = tuple(
-        (item.started_at_ms - tolerance_ms, item.ended_at_ms + tolerance_ms)
+        (
+            item.started_at_ms
+            - tolerance_ms
+            - int(
+                passage_time_offset_by_camera.get(
+                    int(item.camera_index), offset
+                )
+                if passage_time_offset_by_camera is not None
+                else offset
+            ),
+            item.ended_at_ms
+            + tolerance_ms
+            - int(
+                passage_time_offset_by_camera.get(
+                    int(item.camera_index), offset
+                )
+                if passage_time_offset_by_camera is not None
+                else offset
+            ),
+        )
         for item in candidates
     )
     return tuple(
@@ -537,14 +568,26 @@ def match_candidate_counts(
     passage_times_ms: Iterable[int],
     *,
     tolerance_ms: int = 500,
+    passage_time_offset_ms: int = 0,
+    passage_time_offset_by_camera: Mapping[int, int] | None = None,
 ) -> tuple[tuple[VideoPassageCandidate, int], ...]:
     """Count chip events inside each visual batch for anomaly-first review."""
 
     if tolerance_ms < 0:
         raise ValueError("tolerance_ms must be non-negative")
-    times = tuple(sorted(int(value) for value in passage_times_ms))
+    offset = int(passage_time_offset_ms)
+    raw_times = tuple(sorted(int(value) for value in passage_times_ms))
     result = []
     for candidate in candidates:
+        candidate_offset = offset
+        if passage_time_offset_by_camera is not None:
+            candidate_offset = int(
+                passage_time_offset_by_camera.get(
+                    int(candidate.camera_index),
+                    candidate_offset,
+                )
+            )
+        times = tuple(value + candidate_offset for value in raw_times)
         count = sum(
             candidate.started_at_ms - tolerance_ms <= timestamp <= candidate.ended_at_ms + tolerance_ms
             for timestamp in times
@@ -593,6 +636,8 @@ class VideoPassageScanWorker:
         self._scanned_ids: set[str] = set()
         self._line_detector: FixedCameraLineCrossingDetector | None = None
         self._line_detector_last_end_ms: int | None = None
+        self._process_lock = threading.Lock()
+        self._active_process: subprocess.Popen | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -623,12 +668,36 @@ class VideoPassageScanWorker:
     def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
         self._wake.set()
+        with self._process_lock:
+            process = self._active_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
         thread = self._thread
         if thread is not None:
             thread.join(timeout=max(0.1, float(timeout)))
-        self._thread = None
+        if thread is None or not thread.is_alive():
+            self._thread = None
 
-    def scan_once(self) -> tuple[VideoPassageCandidate, ...]:
+    def _set_active_process(self, process: subprocess.Popen | None) -> None:
+        with self._process_lock:
+            self._active_process = process
+
+    def scan_once(
+        self,
+        *,
+        result_callback: Callable[
+            [tuple[VideoPassageCandidate, ...]], None
+        ] | None = None,
+    ) -> tuple[VideoPassageCandidate, ...]:
+        """Scan pending segments and optionally publish each segment result.
+
+        The optional callback keeps archive review responsive: a long archive
+        is scanned segment by segment, so the operator can navigate to the
+        first discovered candidates before the remaining files finish.
+        """
         found: list[VideoPassageCandidate] = []
         for segment in tuple(self.segment_provider()):
             if self._stop.is_set() or self._pause_requested.is_set():
@@ -664,6 +733,7 @@ class VideoPassageScanWorker:
                     sample_fps=self.sample_fps,
                     roi=self.roi,
                     detector=detector,
+                    process_callback=self._set_active_process,
                 )
                 segment_candidates = (
                     merge_line_crossings(
@@ -688,9 +758,12 @@ class VideoPassageScanWorker:
                     )
                     for candidate in segment_candidates
                 )
+                segment_found = tuple(found[-len(segment_candidates):]) if segment_candidates else ()
             except (OSError, RuntimeError, ValueError):
                 # A bad or still-being-removed segment must not stop recording.
                 continue
+            if segment_found and result_callback is not None and not self._stop.is_set():
+                result_callback(segment_found)
             if self.finish_line is not None:
                 self._line_detector_last_end_ms = int(
                     getattr(segment, "ended_at_ms", segment_started_at_ms)
@@ -704,9 +777,7 @@ class VideoPassageScanWorker:
                 self._wake.wait(0.1)
                 self._wake.clear()
                 continue
-            found = self.scan_once()
-            if found and not self._stop.is_set():
-                self.result_callback(found)
+            self.scan_once(result_callback=self.result_callback)
             self._wake.wait(self.interval_seconds)
             self._wake.clear()
 

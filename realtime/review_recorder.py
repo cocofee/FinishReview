@@ -1412,7 +1412,7 @@ class PassageReviewTimelinePublisher:
             f"{window.event_id}:{window.passage_timestamp_ms}".encode("utf-8")
         ).hexdigest()[:20]
         preview = RecordingSegment(
-            segment_id=f"preview-{digest}",
+            segment_id=f"preview-{self.ring_buffer.camera_index}-{digest}",
             source_id=self.ring_buffer.source_id,
             camera_index=self.ring_buffer.camera_index,
             video_path=str(playlist_path.resolve()),

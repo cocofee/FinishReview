@@ -285,6 +285,27 @@ def _window(tmp_path, *, passage_batch_interval_ms=0):
     )
 
 
+def test_select_event_forwards_preserved_video_frame(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    captured = {}
+
+    def select_event(_self, event_id, *, preserve_current_frame=None):
+        captured["event_id"] = event_id
+        captured["pane"] = preserve_current_frame
+
+    monkeypatch.setattr(passage_review.PassageReviewDialog, "_select_event", select_event)
+    window._select_event(
+        "passage-1",
+        preserve_current_frame=window.regular_pane,
+    )
+
+    assert captured == {
+        "event_id": "passage-1",
+        "pane": window.regular_pane,
+    }
+    window.close()
+
+
 def test_runtime_status_reports_loaded_race_metadata_without_claiming_sync(
     qapp,
     tmp_path,
@@ -2130,6 +2151,79 @@ def test_two_rtsp_sources_start_independent_review_pipelines(qapp, tmp_path):
     window.close()
 
 
+def test_failed_secondary_camera_reconnects_without_stopping_primary(qapp, tmp_path):
+    _FakeRecorder.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_recording()
+    primary, failed_secondary = _FakeRecorder.instances
+    previous_secondary_buffer = window._ring_buffers[2]
+    failed_secondary.is_running = False
+    failed_secondary.check_error = lambda: "connection lost"
+
+    window._refresh_capture_windows()
+
+    replacement = _FakeRecorder.instances[-1]
+    assert len(_FakeRecorder.instances) == 3
+    assert window._recorders[1] is primary
+    assert primary.is_running
+    assert window._recorders[2] is replacement
+    assert replacement.is_running
+    assert window._ring_buffers[2] is not previous_secondary_buffer
+    assert not window._camera_reconnect_errors
+    assert window.camera_status_label.text() == "录像设备: 全部已连接"
+    window.close()
+
+
+def test_failed_camera_reconnect_uses_backoff_and_keeps_other_camera_running(
+    qapp,
+    tmp_path,
+):
+    class _ReconnectFailureRecorder(_FakeRecorder):
+        fail_reconnect = False
+
+        def start(self):
+            if self.camera_index == 2 and type(self).fail_reconnect:
+                raise RuntimeError("camera still offline")
+            return super().start()
+
+    _ReconnectFailureRecorder.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera-one/live",
+        tmp_path,
+        secondary_source="rtsp://camera-two/live",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_ReconnectFailureRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_recording()
+    primary, failed_secondary = _ReconnectFailureRecorder.instances
+    failed_secondary.is_running = False
+    failed_secondary.check_error = lambda: "connection lost"
+    _ReconnectFailureRecorder.fail_reconnect = True
+
+    window._refresh_capture_windows()
+    instance_count = len(_ReconnectFailureRecorder.instances)
+    window._refresh_capture_windows()
+
+    assert primary.is_running
+    assert window._recorders[1] is primary
+    assert window._recorders[2] is failed_secondary
+    assert len(_ReconnectFailureRecorder.instances) == instance_count
+    assert 2 in window._camera_reconnect_errors
+    assert window.camera_status_label.text() == "录像设备: 自动重连中"
+    assert "2秒后重试" in window.camera_status_label.toolTip()
+    window.close()
+
+
 def test_two_regular_sources_show_two_panes_without_high_speed(qapp, tmp_path):
     window = FinishReviewWindow(
         "rtsp://camera-one/live",
@@ -3012,6 +3106,42 @@ def test_video_anomaly_queue_accumulates_and_can_be_closed_as_verified(
     assert window.video_review_status(candidate.candidate_id) == "verified"
     assert window.video_reconciliation() == ()
     window.close()
+
+
+def test_video_arrival_candidates_persist_across_workspace_reopen(
+    qapp,
+    tmp_path,
+):
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    candidate = VideoPassageCandidate(
+        "segment-1:video-arrival-1",
+        1,
+        1_000,
+        1_300,
+        1_200,
+        0.3,
+        0.2,
+        segment_id="segment-1",
+        video_path=str(video_path),
+        video_position_ms=1_200,
+    )
+    window = _window(tmp_path)
+
+    window._reconcile_video_candidates((candidate,))
+
+    assert (tmp_path / "video_arrival_candidates.jsonl").is_file()
+    assert [item.candidate_id for item in window.video_navigation_candidates()] == [
+        candidate.candidate_id
+    ]
+    window.close()
+
+    restored = _window(tmp_path)
+    assert [item.candidate_id for item in restored.video_navigation_candidates()] == [
+        candidate.candidate_id
+    ]
+    assert restored.video_arrival_button.text() == "到达候选：1批/1点"
+    restored.close()
 
 
 def test_video_anomaly_list_refreshes_status_while_open(qapp, tmp_path):

@@ -854,6 +854,7 @@ class VideoTimelineStore:
         pre_roll_ms: int = 3_000,
         current_time_ms: Optional[int] = None,
         race_id: Optional[str] = None,
+        prefer_continuous_media: bool = False,
     ) -> PassageVideoLookup:
         target_time_ms = int(passage_time_ms) + int(clock_offset_ms)
         pre_roll_ms = max(0, int(pre_roll_ms))
@@ -884,7 +885,7 @@ class VideoTimelineStore:
 
         candidates: dict[
             str,
-            tuple[tuple[int, int, int, int], RecordingSegment],
+            tuple[tuple[int, int, int, int, int], RecordingSegment],
         ] = {}
         for segment in segments:
             process_end = (
@@ -924,10 +925,18 @@ class VideoTimelineStore:
                 candidate_key = (2, 0, -segment.started_at_ms)
             if candidate_key is None:
                 continue
-            playable_rank = int(
-                not self._video_path_is_playable(self.resolve_video_path(segment))
+            video_path = self.resolve_video_path(segment)
+            playable_rank = int(not self._video_path_is_playable(video_path))
+            continuous_rank = int(
+                bool(prefer_continuous_media)
+                and video_path.suffix.lower() == ".m3u8"
             )
-            ranked_candidate_key = (playable_rank, *candidate_key)
+            ranked_candidate_key = (
+                playable_rank,
+                candidate_key[0],
+                continuous_rank,
+                *candidate_key[1:],
+            )
             current = candidates.get(segment.source_id)
             if current is None or ranked_candidate_key < current[0]:
                 candidates[segment.source_id] = (ranked_candidate_key, segment)
