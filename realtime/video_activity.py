@@ -28,8 +28,12 @@ class VideoActivityWorker(QThread):
         self._paused = threading.Event()
 
     def request_stop(self) -> None:
+        self.requestInterruption()
         self._stop.set()
         self._paused.clear()
+
+    def stop(self) -> None:
+        self.request_stop()
 
     def set_paused(self, paused: bool) -> None:
         if paused:

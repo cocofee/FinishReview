@@ -11,7 +11,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable, Iterable, Mapping, Optional
 
-from PyQt5.QtCore import QPoint, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
     QColor,
@@ -82,15 +82,18 @@ from .video_arrival import (
     build_video_arrival_batches,
 )
 from .video_discovery import VideoDiscoveryError, VideoDiscoveryStore
+from .playback_coordinator import PlaybackCoordinator
 from .race_metadata import (
     RaceAthleteMetadata,
     RaceMetadata,
     RaceMetadataStore,
 )
+from .review_selection import ReviewSelectionController, ReviewSelectionPlan
 from .review_clip import PassageReviewBindingStore
+from .thread_lifecycle import retire_qthread
 from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
 from .video_filmstrip import VideoFilmstripWidget
-from .video_activity import ActivityTimelineWidget, VideoActivityWorker
+from .video_activity import ActivityTimelineWidget
 from .video_timeline import (
     DEFAULT_CLOCK_SOURCE,
     PassageVideoLocation,
@@ -1079,7 +1082,6 @@ class PassageEvidencePane(QFrame):
         self._marking_enabled = False
         self._identity = ""
         self._worker: Optional[object] = None
-        self._retired_workers: set[object] = set()
         self._idle_prefetch_enabled = False
         self._target_position_ms = 0
         self._playing = False
@@ -2252,25 +2254,14 @@ class PassageEvidencePane(QFrame):
         *,
         wait: bool,
     ) -> None:
-        if not worker.isRunning():
-            worker.deleteLater()
-            return
-        if worker not in self._retired_workers:
-            self._retired_workers.add(worker)
-            worker.finished.connect(
-                lambda retired=worker: self._dispose_worker(retired)
-            )
-        worker.stop()
+        request_stop = getattr(worker, "request_stop", worker.stop)
+        request_stop()
         if wait:
             worker.wait(2_000)
-        if not worker.isRunning():
-            self._dispose_worker(worker)
-
-    def _dispose_worker(self, worker: VideoPlaybackWorker) -> None:
-        if worker not in self._retired_workers:
-            return
-        self._retired_workers.discard(worker)
-        worker.deleteLater()
+        if worker.isRunning():
+            retire_qthread(worker)
+        else:
+            worker.deleteLater()
 
     def _stop_worker(self, *, wait: bool = False) -> None:
         self._reset_video_scrub()
@@ -2282,8 +2273,6 @@ class PassageEvidencePane(QFrame):
 
     def shutdown(self, *, wait: bool = True) -> None:
         self._stop_worker(wait=wait)
-        for worker in tuple(self._retired_workers):
-            self._retire_worker(worker, wait=wait)
 
 
 def _resolve_evidence_layout(
@@ -2322,7 +2311,12 @@ def _resolve_evidence_layout(
     return regular_indexes, show_high_speed
 
 
-class PassageReviewDialog(QDialog):
+class PassageReviewSurface(QDialog):
+    """Shared Qt review surface used by the standalone and formal windows.
+
+    This class is an implementation surface rather than an application window;
+    concrete windows are siblings so neither owns the other's lifecycle.
+    """
     INACTIVE_CAMERA_START_DELAY_MS = 120
     FILMSTRIP_WINDOW_MS = 300_000
     FILMSTRIP_ALWAYS_AVAILABLE = False
@@ -2548,31 +2542,20 @@ class PassageReviewDialog(QDialog):
         self._filmstrip_anchor_timer.timeout.connect(
             self._flush_filmstrip_anchor
         )
-        self._filmstrip_deferred_update_timer = QTimer(self)
-        self._filmstrip_deferred_update_timer.setSingleShot(True)
-        self._filmstrip_deferred_update_timer.setInterval(
-            self.INACTIVE_CAMERA_START_DELAY_MS + 80
-        )
-        self._filmstrip_deferred_update_timer.timeout.connect(
-            self._update_filmstrip
-        )
-        self._activity_worker: VideoActivityWorker | None = None
-        self._retired_activity_workers: set[VideoActivityWorker] = set()
-        self._activity_context: tuple[Path, int, int] | None = None
-        self._activity_points: list[tuple[int, float]] = []
-        self._activity_progress = 0
-        self._activity_cache: dict[
-            tuple[Path, int, int], tuple[tuple[int, float], ...]
-        ] = {}
-        self._activity_start_timer = QTimer(self)
-        self._activity_start_timer.setSingleShot(True)
-        self._activity_start_timer.setInterval(1_200)
-        self._activity_start_timer.timeout.connect(self._start_activity_analysis)
+        self.playback_coordinator: PlaybackCoordinator | None = None
 
         self.setWindowTitle(APP_WINDOW_TITLE)
         self.resize(1400, 860)
         self.setMinimumSize(1100, 700)
         self._init_ui()
+        self.selection_controller = ReviewSelectionController(
+            self,
+            high_speed_location=lambda lookup: source_location(
+                lookup,
+                high_speed=True,
+            ),
+            openable_statuses=frozenset(_OPENABLE_STATUSES),
+        )
         # Keep the standard queue/evidence layout until the operator enters
         # continuous filmstrip review explicitly.
         self._set_continuous_review_layout(False)
@@ -3016,6 +2999,14 @@ class PassageReviewDialog(QDialog):
         self.video_filmstrip.setMinimumHeight(340)
         self.video_filmstrip.setMaximumHeight(340)
         self.activity_timeline = ActivityTimelineWidget(self)
+        self.playback_coordinator = PlaybackCoordinator(
+            self.activity_timeline,
+            self,
+            filmstrip_update_delay_ms=self.INACTIVE_CAMERA_START_DELAY_MS + 80,
+        )
+        self.playback_coordinator.filmstrip_update_requested.connect(
+            self._update_filmstrip
+        )
         self.activity_timeline.position_selected.connect(
             self._seek_filmstrip_position
         )
@@ -5499,7 +5490,7 @@ class PassageReviewDialog(QDialog):
         return next(
             (
                 location
-                for location in PassageReviewDialog._regular_locations(lookup)
+                for location in PassageReviewSurface._regular_locations(lookup)
                 if location.segment.camera_index == int(camera_index)
             ),
             None,
@@ -5634,94 +5625,27 @@ class PassageReviewDialog(QDialog):
         *,
         preserve_current_frame: Optional[PassageEvidencePane] = None,
     ) -> None:
-        if self._active_video_discovered_entry_id:
-            self._active_video_discovered_entry_id = ""
-            for pane in self.evidence_panes:
-                pane.mark_btn.setEnabled(True)
-                pane.video_view.clear_identity_cue()
-        event = self.passage_store.get(event_id)
-        lookup = self._lookups.get(event_id)
-        if event is None or lookup is None:
-            self.refresh()
-            return
-        regular_locations = {
-            pane.camera_index: self._regular_location_for_camera(
-                lookup,
-                pane.camera_index,
-            )
-            for pane in self.regular_panes
-        }
-        if self._batch_mode and preserve_current_frame is not None:
-            projected = self._location_on_current_media(
-                event,
-                preserve_current_frame,
-            )
-            if projected is not None:
-                regular_locations[preserve_current_frame.camera_index] = projected
-        regular = self._regular_summary_location(event.event_id, lookup)
-        high_speed = source_location(lookup, high_speed=True)
-        reuse_continuous_media = (
-            self._batch_mode
-            and any(
-                pane.location is not None
-                and pane._media_context(regular_locations.get(pane.camera_index))
-                == pane._media_context(pane.location)
-                for pane in self.regular_panes
-            )
+        self.selection_controller.select(
+            event_id,
+            preserve_current_frame=preserve_current_frame,
         )
-        same_batch_media = (
-            reuse_continuous_media
-            and self._selected_event_id != event.event_id
-        )
-        preserve_media = (
-            self._selected_event_id == event.event_id
-            and all(
-                pane.matches_passage_context(
-                    event,
-                    regular_locations.get(pane.camera_index),
-                )
-                for pane in self.regular_panes
-            )
-            and (
-                not self._show_high_speed_pane
-                or self.high_speed_pane.matches_passage_context(event, high_speed)
-            )
-        ) or reuse_continuous_media
-        active_pane = self._active_pane
-        active_location = (
-            regular_locations.get(active_pane.camera_index)
-            if active_pane in self.regular_panes
-            else high_speed
-            if active_pane is self.high_speed_pane
-            else None
-        )
-        active_location_ready = (
-            active_location is not None
-            and active_location.status in _OPENABLE_STATUSES
-            and active_location.video_path.is_file()
-        )
-        if active_pane not in self.evidence_panes or not active_location_ready:
-            candidates = [
-                (pane, regular_locations.get(pane.camera_index))
-                for pane in self.regular_panes
-            ]
-            if self._show_high_speed_pane:
-                candidates.append((self.high_speed_pane, high_speed))
-            active_pane = next(
-                (
-                    pane
-                    for pane, location in candidates
-                    if location is not None
-                    and location.status in _OPENABLE_STATUSES
-                    and location.video_path.is_file()
-                ),
-                self._active_playback_pane(),
-            )
-        switching_batch_event = (
-            self._batch_mode
-            and bool(self._selected_event_id)
-            and self._selected_event_id != event.event_id
-        )
+
+    def _apply_selection_plan(
+        self,
+        plan: ReviewSelectionPlan,
+        *,
+        preserve_current_frame: Optional[PassageEvidencePane] = None,
+    ) -> None:
+        event = plan.event
+        lookup = plan.lookup
+        regular_locations = plan.regular_locations
+        regular = plan.regular_summary
+        high_speed = plan.high_speed
+        reuse_continuous_media = plan.reuse_continuous_media
+        same_batch_media = plan.same_batch_media
+        preserve_media = plan.preserve_media
+        active_pane = plan.active_pane
+        switching_batch_event = plan.switching_batch_event
         if switching_batch_event:
             # Identity changes must leave the displayed frame stable. Do not
             # start deferred workers merely to pause them.
@@ -5942,7 +5866,10 @@ class PassageReviewDialog(QDialog):
         if not self._batch_mode and self._filmstrip_context is not None:
             # Avoid blocking the UI while the previous strip worker is being
             # stopped; let the inactive camera start first on low-end PCs.
-            self._filmstrip_deferred_update_timer.start()
+            if self.playback_coordinator is not None:
+                self.playback_coordinator.request_filmstrip_update(deferred=True)
+        elif self.playback_coordinator is not None:
+            self.playback_coordinator.request_filmstrip_update(deferred=False)
         else:
             self._update_filmstrip()
 
@@ -6021,117 +5948,18 @@ class PassageReviewDialog(QDialog):
         )
 
     def _stop_activity_analysis(self) -> None:
-        self._activity_start_timer.stop()
-        worker = self._activity_worker
-        self._activity_worker = None
-        if worker is None:
-            return
-        worker.request_stop()
-        for signal in (
-            worker.points_ready,
-            worker.progress_ready,
-            worker.completed,
-            worker.finished,
-        ):
-            try:
-                signal.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-        if not worker.isRunning():
-            worker.deleteLater()
-            return
-        worker.setParent(None)
-        self._retired_activity_workers.add(worker)
-        worker.finished.connect(
-            lambda retired=worker: self._dispose_activity_worker(retired)
-        )
-
-    def _dispose_activity_worker(self, worker: VideoActivityWorker) -> None:
-        self._retired_activity_workers.discard(worker)
-        worker.deleteLater()
+        if self.playback_coordinator is not None:
+            self.playback_coordinator.stop_activity()
 
     def _schedule_activity_analysis(
         self, video_path: Path, start_ms: int, end_ms: int
     ) -> None:
-        context = (Path(video_path), int(start_ms), int(end_ms))
-        if context == self._activity_context:
-            return
-        self._stop_activity_analysis()
-        self._activity_context = context
-        self._activity_points = []
-        self._activity_progress = 0
-        self.activity_timeline.set_range(start_ms, end_ms)
-        self.activity_timeline.set_analysis_progress(0)
-        self.activity_timeline.set_analysis_state("等待分析")
-        cached = self._activity_cache.get(context)
-        if cached is not None:
-            self.activity_timeline.append_points(cached)
-            self.activity_timeline.set_analysis_progress(100)
-            self.activity_timeline.set_analysis_state("分析完成")
-            self.activity_timeline.show()
-            return
-        self.activity_timeline.hide()
-        # Give the selected frame and nearby thumbnails an uncontested head
-        # start. Analysis is advisory, so it may appear later on a slow PC.
-        self._activity_start_timer.start()
-
-    def _start_activity_analysis(self) -> None:
-        context = self._activity_context
-        if context is None or self._activity_worker is not None:
-            return
-        video_path, start_ms, end_ms = context
-        worker = VideoActivityWorker(video_path, start_ms, end_ms, self)
-        worker.points_ready.connect(self._on_activity_points)
-        worker.progress_ready.connect(self._on_activity_progress)
-        worker.completed.connect(self._on_activity_completed)
-        worker.finished.connect(self._on_activity_worker_finished)
-        self._activity_worker = worker
-        self.activity_timeline.set_analysis_state("正在分析 0%")
-        worker.start(QThread.LowestPriority)
-
-    def _on_activity_progress(self, progress: int) -> None:
-        if self.sender() is not self._activity_worker:
-            return
-        self._activity_progress = max(0, min(100, int(progress)))
-        self.activity_timeline.set_analysis_progress(self._activity_progress)
-        self.activity_timeline.set_analysis_state(
-            f"正在分析 {self._activity_progress}%"
-        )
-
-    def _on_activity_points(self, points) -> None:
-        if self.sender() is not self._activity_worker:
-            return
-        values = tuple((int(position), float(score)) for position, score in points)
-        self._activity_points.extend(values)
-        self.activity_timeline.append_points(values)
-        self.activity_timeline.show()
-
-    def _on_activity_completed(self) -> None:
-        if self.sender() is not self._activity_worker or self._activity_context is None:
-            return
-        self._activity_cache[self._activity_context] = tuple(self._activity_points)
-        self._activity_progress = 100
-        self.activity_timeline.set_analysis_progress(100)
-        self.activity_timeline.set_analysis_state("分析完成")
-        # Keep memory bounded during long events.
-        while len(self._activity_cache) > 3:
-            self._activity_cache.pop(next(iter(self._activity_cache)))
-
-    def _on_activity_worker_finished(self) -> None:
-        worker = self.sender()
-        if worker is self._activity_worker:
-            self._activity_worker = None
-            worker.deleteLater()
+        if self.playback_coordinator is not None:
+            self.playback_coordinator.schedule_activity(video_path, start_ms, end_ms)
 
     def _set_activity_paused(self, paused: bool) -> None:
-        worker = self._activity_worker
-        if worker is not None:
-            worker.set_paused(paused)
-            self.activity_timeline.set_analysis_state(
-                "暂停分析（正在操作视频）"
-                if paused
-                else f"正在分析 {self._activity_progress}%"
-            )
+        if self.playback_coordinator is not None:
+            self.playback_coordinator.set_operator_busy(paused)
 
     def _update_filmstrip(self) -> None:
         if not hasattr(self, "video_filmstrip"):
@@ -6142,8 +5970,8 @@ class PassageReviewDialog(QDialog):
             self._pending_filmstrip_anchor = None
             self._filmstrip_context = None
             self._filmstrip_absolute_window = None
-            self._stop_activity_analysis()
-            self._activity_context = None
+            if self.playback_coordinator is not None:
+                self.playback_coordinator.clear_activity()
             self.activity_timeline.set_target_position(None)
             self.activity_timeline.hide()
             self.video_filmstrip.setVisible(True)
@@ -7508,9 +7336,8 @@ class PassageReviewDialog(QDialog):
             return
         self.video_filmstrip.set_current_position(position_ms)
         self.activity_timeline.set_current_position(position_ms)
-        worker = self._activity_worker
-        if worker is not None:
-            worker.set_paused(
+        if self.playback_coordinator is not None:
+            self.playback_coordinator.set_operator_busy(
                 pane.is_playing
                 or bool(getattr(pane, "_video_scrubbing", False))
             )
@@ -8059,15 +7886,21 @@ class PassageReviewDialog(QDialog):
         self._sync_timer.stop()
         if hasattr(self, "video_filmstrip"):
             self.video_filmstrip.stop()
-        self._stop_activity_analysis()
+        if self.playback_coordinator is not None:
+            self.playback_coordinator.shutdown()
         for pane in self.all_evidence_panes:
             pane.shutdown(wait=True)
         event.accept()
 
 
+class PassageReviewDialog(PassageReviewSurface):
+    """Standalone passage-review window."""
+
+
 __all__ = [
     "PassageEvidencePane",
     "PassageReviewDialog",
+    "PassageReviewSurface",
     "UI_BASE_FONT_POINT_SIZE",
     "UI_FONT_FAMILY",
     "compact_source_status",

@@ -365,10 +365,14 @@ class AuyatRgbPlaybackWorker(QThread):
             return None
         return frame.x_for_position_ms(position_ms)
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        self.requestInterruption()
         with self._condition:
             self._stop_requested = True
             self._condition.notify_all()
+
+    def stop(self) -> None:
+        self.request_stop()
 
     def run(self) -> None:
         try:
@@ -502,10 +506,14 @@ class AuyatRgbScanWorker(QThread):
             self._scan_requested = True
             self._condition.notify_all()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        self.requestInterruption()
         with self._condition:
             self._stop_requested = True
             self._condition.notify_all()
+
+    def stop(self) -> None:
+        self.request_stop()
 
     def _should_stop(self) -> bool:
         with self._condition:

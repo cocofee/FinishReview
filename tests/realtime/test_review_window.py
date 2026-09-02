@@ -285,6 +285,15 @@ def _window(tmp_path, *, passage_batch_interval_ms=0):
     )
 
 
+def test_concrete_review_windows_are_sibling_types():
+    assert not issubclass(FinishReviewWindow, passage_review.PassageReviewDialog)
+    assert issubclass(FinishReviewWindow, passage_review.PassageReviewSurface)
+    assert issubclass(
+        passage_review.PassageReviewDialog,
+        passage_review.PassageReviewSurface,
+    )
+
+
 def test_select_event_forwards_preserved_video_frame(qapp, tmp_path, monkeypatch):
     window = _window(tmp_path)
     captured = {}
@@ -293,7 +302,7 @@ def test_select_event_forwards_preserved_video_frame(qapp, tmp_path, monkeypatch
         captured["event_id"] = event_id
         captured["pane"] = preserve_current_frame
 
-    monkeypatch.setattr(passage_review.PassageReviewDialog, "_select_event", select_event)
+    monkeypatch.setattr(passage_review.PassageReviewSurface, "_select_event", select_event)
     window._select_event(
         "passage-1",
         preserve_current_frame=window.regular_pane,
@@ -303,6 +312,30 @@ def test_select_event_forwards_preserved_video_frame(qapp, tmp_path, monkeypatch
         "event_id": "passage-1",
         "pane": window.regular_pane,
     }
+    window.close()
+
+
+def test_runtime_status_collection_does_not_mutate_labels(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.beijing_clock_label.setText("unchanged")
+
+    snapshot = window._collect_runtime_status()
+
+    assert isinstance(snapshot, review_window_module.RuntimeStatusSnapshot)
+    assert window.beijing_clock_label.text() == "unchanged"
+    window.close()
+
+
+def test_runtime_status_render_uses_supplied_snapshot(qapp, tmp_path):
+    window = _window(tmp_path)
+    snapshot = replace(
+        window._collect_runtime_status(),
+        beijing_clock_text="12:34:56",
+    )
+
+    window._render_runtime_status(snapshot)
+
+    assert window.beijing_clock_label.text() == "12:34:56"
     window.close()
 
 

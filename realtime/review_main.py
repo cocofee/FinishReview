@@ -35,6 +35,7 @@ from realtime.runtime_paths import (
 )
 from realtime.secure_storage import protect_secret, unprotect_secret
 from realtime.settings import FinishReviewSettings
+from realtime.thread_lifecycle import install_qthread_shutdown
 from realtime.stream_recorder import (
     apply_rtsp_credentials,
     is_rtsp_source,
@@ -561,6 +562,7 @@ def run_packaged_smoke_test(app_argv: list[str]) -> int:
     """Create the packaged Qt window without starting external services."""
 
     app = QApplication.instance() or QApplication(app_argv)
+    install_qthread_shutdown(app)
     configure_application_font(app)
     configure_application_icon(app)
     with tempfile.TemporaryDirectory(prefix="FinishReview-smoke-") as temp_dir:
@@ -658,6 +660,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     app = QApplication.instance() or QApplication(app_argv)
+    install_qthread_shutdown(app)
     configure_application_font(app)
     configure_application_icon(app)
     settings = FinishReviewSettings(

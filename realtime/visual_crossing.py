@@ -22,6 +22,8 @@ from PyQt5.QtCore import QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QWidget
 
+from .thread_lifecycle import retire_qthread
+
 logger = logging.getLogger("FinishReview.VisualCrossing")
 
 
@@ -300,7 +302,8 @@ class VisualCrossingWorker(QThread):
         self.frames_processed = 0
         self.events_detected = 0
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        self.requestInterruption()
         self._stop_event.set()
         capture = self._capture
         if capture is not None:
@@ -308,6 +311,9 @@ class VisualCrossingWorker(QThread):
                 capture.release()
             except Exception:
                 logger.debug("Could not release visual capture promptly", exc_info=True)
+
+    def stop(self) -> None:
+        self.request_stop()
 
     def run(self) -> None:
         detector = DualGateCrossingDetector(
@@ -376,6 +382,12 @@ class _PreviewFrameWorker(QThread):
     def __init__(self, source: str, parent=None):
         super().__init__(parent)
         self.source = str(source)
+
+    def request_stop(self) -> None:
+        self.requestInterruption()
+
+    def stop(self) -> None:
+        self.request_stop()
 
     def run(self) -> None:
         capture = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
@@ -584,9 +596,11 @@ class VisualLineCalibrationDialog(QDialog):
         super().done(result)
 
     def _stop_preview_worker(self) -> None:
-        if self._worker.isRunning():
-            self._worker.requestInterruption()
-            self._worker.wait(1000)
+        if not self._worker.isRunning():
+            return
+        self._worker.request_stop()
+        if not self._worker.wait(1_000):
+            retire_qthread(self._worker)
 
 
 __all__ = [

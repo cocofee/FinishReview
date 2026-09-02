@@ -98,12 +98,18 @@ class VideoClockCalibration:
 class VideoClockCalibrationStore:
     """Append-only latest-revision store for per-camera video offsets."""
 
-    def __init__(self, journal_path: str | Path):
+    def __init__(
+        self,
+        journal_path: str | Path,
+        *,
+        recover_incomplete_tail: bool = True,
+    ):
         self.journal_path = Path(journal_path).expanduser().absolute()
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._latest: dict[tuple[int, str], VideoClockCalibration] = {}
         self._recovered_incomplete_tail = False
+        self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
 
     def _load_existing(self) -> None:
@@ -134,7 +140,8 @@ class VideoClockCalibrationStore:
                     except UnicodeDecodeError:
                         candidate = ""
                     if candidate and _looks_like_incomplete_json(candidate):
-                        self._truncate(offset)
+                        if self._recover_incomplete_tail:
+                            self._truncate(offset)
                         self._recovered_incomplete_tail = True
                         return
                 raise PassageEvidenceError(
@@ -309,12 +316,18 @@ class PassageEvidenceAssociation:
 class PassageEvidenceAssociationStore:
     """Append-only latest-revision store, separate from official passage data."""
 
-    def __init__(self, journal_path: str | Path):
+    def __init__(
+        self,
+        journal_path: str | Path,
+        *,
+        recover_incomplete_tail: bool = True,
+    ):
         self.journal_path = Path(journal_path).expanduser().absolute()
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._latest: dict[tuple[str, str], PassageEvidenceAssociation] = {}
         self._recovered_incomplete_tail = False
+        self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
 
     def _load_existing(self) -> None:
@@ -345,7 +358,8 @@ class PassageEvidenceAssociationStore:
                     except UnicodeDecodeError:
                         candidate = ""
                     if candidate and _looks_like_incomplete_json(candidate):
-                        self._truncate(offset)
+                        if self._recover_incomplete_tail:
+                            self._truncate(offset)
                         self._recovered_incomplete_tail = True
                         return
                 raise PassageEvidenceError(

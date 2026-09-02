@@ -86,7 +86,12 @@ def _string(value: object, name: str) -> str:
 class PassageReviewBindingStore:
     """Append-only clip and binding journal scoped to one event workspace."""
 
-    def __init__(self, journal_path: str | Path):
+    def __init__(
+        self,
+        journal_path: str | Path,
+        *,
+        recover_incomplete_tail: bool = True,
+    ):
         self.journal_path = Path(journal_path).expanduser().absolute()
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -96,6 +101,8 @@ class PassageReviewBindingStore:
         self._active_bindings: dict[tuple[str, int], PassageReviewBinding] = {}
         self._active_camera_indexes_by_event: dict[str, set[int]] = {}
         self._revision = 0
+        self._recovered_incomplete_tail = False
+        self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
 
     @property
@@ -139,7 +146,9 @@ class PassageReviewBindingStore:
                 self._merge_record(payload)
             except (UnicodeDecodeError, json.JSONDecodeError, ReviewClipError) as error:
                 if line_number == len(lines) and not terminated:
-                    self._truncate(offset)
+                    if self._recover_incomplete_tail:
+                        self._truncate(offset)
+                    self._recovered_incomplete_tail = True
                     return
                 raise ReviewClipError(
                     f"invalid review clip journal line {line_number}: {error}"
@@ -400,6 +409,31 @@ class PassageReviewBindingStore:
             return tuple(
                 self._bindings[key]
                 for key in requested_by_key
+            )
+
+    def clips(self) -> tuple[ReviewClip, ...]:
+        with self._lock:
+            return tuple(
+                self._clips[clip_id]
+                for clip_id in sorted(self._clips)
+            )
+
+    def bindings(self, *, active_only: bool = True) -> tuple[PassageReviewBinding, ...]:
+        with self._lock:
+            source = (
+                self._active_bindings.values()
+                if active_only
+                else self._bindings.values()
+            )
+            return tuple(
+                sorted(
+                    source,
+                    key=lambda binding: (
+                        binding.event_id,
+                        binding.camera_index,
+                        binding.revision,
+                    ),
+                )
             )
 
     def active_bindings(

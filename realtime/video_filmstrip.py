@@ -12,6 +12,9 @@ from PyQt5.QtCore import QPoint, QThread, QTimer, Qt, QRectF, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPolygon
 from PyQt5.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
+from .thread_lifecycle import retire_qthread
+from .time_domain import DurationMs, MediaPositionMs, WallClockMs
+
 DEFAULT_FILMSTRIP_INTERVAL_MS = 2_000
 FILMSTRIP_TILE_WIDTH = 360
 # Leave room within the 320px filmstrip panel for the timestamp caption and
@@ -24,7 +27,7 @@ FILMSTRIP_INITIAL_BATCH = 5
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
-def format_filmstrip_time(timestamp_ms: int) -> str:
+def format_filmstrip_time(timestamp_ms: WallClockMs | int) -> str:
     """Format a media timestamp using the race clock shown elsewhere in review."""
 
     try:
@@ -39,12 +42,18 @@ def format_filmstrip_time(timestamp_ms: int) -> str:
 
 @dataclass(frozen=True, slots=True)
 class FilmstripFrame:
-    position_ms: int
+    position_ms: MediaPositionMs
     frame_index: int
     image: QImage
 
 
-def filmstrip_positions(start_ms: int, end_ms: int, *, interval_ms: int = DEFAULT_FILMSTRIP_INTERVAL_MS, anchors: Iterable[int] = ()) -> tuple[int, ...]:
+def filmstrip_positions(
+    start_ms: MediaPositionMs | int,
+    end_ms: MediaPositionMs | int,
+    *,
+    interval_ms: DurationMs | int = DEFAULT_FILMSTRIP_INTERVAL_MS,
+    anchors: Iterable[MediaPositionMs | int] = (),
+) -> tuple[MediaPositionMs, ...]:
     start = max(0, int(start_ms))
     end = max(start, int(end_ms))
     interval = max(1, int(interval_ms))
@@ -52,7 +61,10 @@ def filmstrip_positions(start_ms: int, end_ms: int, *, interval_ms: int = DEFAUL
     values = list(range(start, end + 1, interval))
     if not values or values[-1] != end:
         values.append(end)
-    return tuple(sorted(set(values).union(anchor_values)))
+    return tuple(
+        MediaPositionMs(value)
+        for value in sorted(set(values).union(anchor_values))
+    )
 
 
 class VideoFilmstripWorker(QThread):
@@ -66,7 +78,11 @@ class VideoFilmstripWorker(QThread):
         self._stop_requested = False
 
     def request_stop(self) -> None:
+        self.requestInterruption()
         self._stop_requested = True
+
+    def stop(self) -> None:
+        self.request_stop()
 
     def run(self) -> None:
         capture = cv2.VideoCapture(str(self.video_path))
@@ -416,7 +432,6 @@ class VideoFilmstripWidget(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._worker: VideoFilmstripWorker | None = None
-        self._retired_workers: set[VideoFilmstripWorker] = set()
         self._frames: list[FilmstripFrame] = []
         self._frames_by_path: dict[Path, dict[int, FilmstripFrame]] = {}
         self._requested_positions: set[int] = set()
@@ -638,17 +653,7 @@ class VideoFilmstripWidget(QFrame):
         # signals connected, so late thumbnails cannot update the new strip.
         # Detach it from the widget as well, so closing the dialog cannot
         # destroy a QThread that is still unwinding its decoder call.
-        worker.setParent(None)
-        self._retired_workers.add(worker)
-        worker.finished.connect(
-            lambda retired=worker: self._dispose_retired_worker(retired)
-        )
-
-    def _dispose_retired_worker(self, worker: VideoFilmstripWorker) -> None:
-        if worker not in self._retired_workers:
-            return
-        self._retired_workers.discard(worker)
-        worker.deleteLater()
+        retire_qthread(worker)
 
     def load(
         self,
@@ -736,7 +741,11 @@ class VideoFilmstripWidget(QFrame):
     def _on_frame_ready(self, image: QImage, position_ms: int, frame_index: int) -> None:
         if self._video_path is None:
             return
-        frame = FilmstripFrame(int(position_ms), int(frame_index), image)
+        frame = FilmstripFrame(
+            MediaPositionMs(int(position_ms)),
+            int(frame_index),
+            image,
+        )
         frame_cache = self._frames_by_path.setdefault(self._video_path, {})
         if frame.position_ms in frame_cache:
             return

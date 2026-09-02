@@ -8,6 +8,7 @@ from PyQt5.QtCore import QObject, QPoint, Qt, pyqtSignal
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
+import realtime.video_filmstrip as video_filmstrip
 from realtime.video_filmstrip import (
     FilmstripFrame,
     FILMSTRIP_TILE_GAP,
@@ -301,18 +302,17 @@ def test_filmstrip_releases_old_path_cache_when_switching_recording():
     widget.close()
 
 
-def test_filmstrip_stop_never_waits_for_slow_decoder_on_gui_thread():
+def test_filmstrip_stop_never_waits_for_slow_decoder_on_gui_thread(monkeypatch):
     app = QApplication.instance() or QApplication([])
     widget = VideoFilmstripWidget()
     worker = _SlowFilmstripWorker()
+    retired = []
+    monkeypatch.setattr(video_filmstrip, "retire_qthread", retired.append)
     widget._worker = worker
 
     widget.stop()
 
     assert worker.stop_requested
     assert worker.wait_calls == 0
-    assert worker in widget._retired_workers
-    worker.finished.emit()
-    app.processEvents()
-    assert worker not in widget._retired_workers
+    assert retired == [worker]
     widget.close()

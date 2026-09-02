@@ -13,6 +13,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from .time_domain import (
+    ClockOffsetMs,
+    DurationMs,
+    MediaPositionMs,
+    WallClockMs,
+)
+
 
 SCHEMA_VERSION = 1
 DEFAULT_CLOCK_SOURCE = "videopipe_system_clock"
@@ -59,12 +66,12 @@ class RecordingSegment:
     source_id: str
     camera_index: int
     video_path: str
-    started_at_ms: int
-    ended_at_ms: Optional[int] = None
-    media_duration_ms: Optional[int] = None
-    media_started_at_ms: Optional[int] = None
+    started_at_ms: WallClockMs
+    ended_at_ms: Optional[WallClockMs] = None
+    media_duration_ms: Optional[DurationMs] = None
+    media_started_at_ms: Optional[WallClockMs] = None
     clock_source: str = DEFAULT_CLOCK_SOURCE
-    timing_error_ms: int = DEFAULT_TIMING_ERROR_MS
+    timing_error_ms: DurationMs = DurationMs(DEFAULT_TIMING_ERROR_MS)
     end_reason: str = ""
     race_id: str = ""
 
@@ -101,10 +108,10 @@ class RecordingSegment:
 class PassageVideoLocation:
     segment: RecordingSegment
     video_path: Path
-    passage_position_ms: int
-    playback_position_ms: int
-    clock_offset_ms: int
-    timing_error_ms: int
+    passage_position_ms: MediaPositionMs
+    playback_position_ms: MediaPositionMs
+    clock_offset_ms: ClockOffsetMs
+    timing_error_ms: DurationMs
     status: str
     media_locator: str = ""
 
@@ -112,7 +119,7 @@ class PassageVideoLocation:
 @dataclass(frozen=True, slots=True)
 class PassageVideoLookup:
     status: str
-    target_time_ms: int
+    target_time_ms: WallClockMs
     locations: tuple[PassageVideoLocation, ...] = ()
 
 
@@ -161,8 +168,8 @@ class _SegmentIntervalIndex:
 @dataclass(slots=True)
 class _ClosedTimelineBounds:
     count: int = 0
-    earliest_start_ms: Optional[int] = None
-    latest_end_ms: Optional[int] = None
+    earliest_start_ms: Optional[WallClockMs] = None
+    latest_end_ms: Optional[WallClockMs] = None
 
     def add(self, segment: RecordingSegment) -> None:
         if segment.ended_at_ms is None:
@@ -267,7 +274,12 @@ def _looks_like_incomplete_json(value: str) -> bool:
 class VideoTimelineStore:
     """Append-only recording-segment journal scoped to one race directory."""
 
-    def __init__(self, journal_path: str | Path):
+    def __init__(
+        self,
+        journal_path: str | Path,
+        *,
+        recover_incomplete_tail: bool = True,
+    ):
         self.journal_path = Path(journal_path).expanduser().absolute()
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -284,6 +296,7 @@ class VideoTimelineStore:
         self._playability_cache: dict[str, tuple[int, int, float, bool]] = {}
         self._revision = 0
         self._recovered_incomplete_tail = False
+        self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
         self._rebuild_indexes()
 
@@ -327,7 +340,8 @@ class VideoTimelineStore:
                     except UnicodeDecodeError:
                         pass
                 if candidate and _looks_like_incomplete_json(candidate):
-                    self._truncate(offset)
+                    if self._recover_incomplete_tail:
+                        self._truncate(offset)
                     self._recovered_incomplete_tail = True
                     return
                 raise VideoTimelineError(
