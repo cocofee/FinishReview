@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import numpy as np
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
@@ -44,11 +44,15 @@ def test_activity_worker_emits_progressive_change_scores(monkeypatch, tmp_path):
     monkeypatch.setattr(activity_module.cv2, "VideoCapture", _FakeCapture)
     worker = VideoActivityWorker(Path(tmp_path / "video.mp4"), 0, 1_000)
     received = []
+    progress = []
     worker.points_ready.connect(lambda points: received.extend(points))
+    worker.progress_ready.connect(progress.append)
 
     worker.run()
 
     assert received
+    assert progress[0] == 0
+    assert progress[-1] == 100
     assert all(0 <= position <= 1_000 for position, _score in received)
     assert max(score for _position, score in received) > 0
 
@@ -63,7 +67,11 @@ def test_activity_timeline_click_maps_to_full_time_range():
     widget.show()
 
     QTest.mouseClick(widget, Qt.LeftButton, pos=widget.rect().center())
-
     assert 14_990 <= selected[-1] <= 15_010
+
+    QTest.mouseClick(widget, Qt.LeftButton, pos=QPoint(1_000, 22))
+    assert selected[-1] == 10_000
+    QTest.mouseClick(widget, Qt.LeftButton, pos=QPoint(1, 22))
+    assert 19_980 <= selected[-1] <= 20_000
     widget.close()
     app.processEvents()

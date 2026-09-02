@@ -129,7 +129,7 @@ _STATUS_PRIORITY = {
 
 # The race recordings are normally 25 fps. Keep plain arrows frame-accurate,
 # while modifier shortcuts cover gaps without jumping over an unchipped rider.
-SHIFT_FRAME_STEP = 12
+SHIFT_FRAME_STEP = 5
 CTRL_FRAME_STEP = 50
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 UI_FONT_FAMILY = "Microsoft YaHei UI"
@@ -1178,6 +1178,8 @@ class PassageEvidencePane(QFrame):
         layout.addWidget(self.video_view, 1)
 
         self.timeline = TargetTimelineSlider(Qt.Horizontal, self)
+        self.timeline.setInvertedAppearance(True)
+        self.timeline.setInvertedControls(True)
         self.timeline.setRange(0, 0)
         self.timeline.setEnabled(False)
         self.timeline.setFocusPolicy(Qt.NoFocus)
@@ -2558,6 +2560,7 @@ class PassageReviewDialog(QDialog):
         self._retired_activity_workers: set[VideoActivityWorker] = set()
         self._activity_context: tuple[Path, int, int] | None = None
         self._activity_points: list[tuple[int, float]] = []
+        self._activity_progress = 0
         self._activity_cache: dict[
             tuple[Path, int, int], tuple[tuple[int, float], ...]
         ] = {}
@@ -2947,7 +2950,10 @@ class PassageReviewDialog(QDialog):
 
         preview_panel = QFrame(self)
         self.preview_panel = preview_panel
-        preview_panel.setMinimumSize(0, 0)
+        # Reserve enough space for the transport row plus the complete
+        # filmstrip. QSizePolicy.Ignored otherwise lets the outer splitter
+        # compress this panel even when the inner filmstrip has a minimum.
+        preview_panel.setMinimumSize(0, 390)
         preview_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         preview_layout = QVBoxLayout(preview_panel)
         self.preview_layout = preview_layout
@@ -3004,10 +3010,17 @@ class PassageReviewDialog(QDialog):
             self._clear_filmstrip_marker
         )
         self.video_filmstrip.reload_requested.connect(self._update_filmstrip)
-        self.video_filmstrip.setMaximumHeight(320)
+        # The header, enlarged activity overview, thumbnails, timestamps and
+        # horizontal scrollbar need the full height. Keep divider dragging
+        # from clipping the timestamp row at the bottom of the filmstrip.
+        self.video_filmstrip.setMinimumHeight(340)
+        self.video_filmstrip.setMaximumHeight(340)
         self.activity_timeline = ActivityTimelineWidget(self)
         self.activity_timeline.position_selected.connect(
             self._seek_filmstrip_position
+        )
+        self.video_filmstrip.visible_range_changed.connect(
+            self.activity_timeline.set_visible_range
         )
         self.activity_timeline.hide()
         # Activity is part of the filmstrip, not a separate preview panel:
@@ -3015,6 +3028,8 @@ class PassageReviewDialog(QDialog):
         self.video_filmstrip.layout().insertWidget(1, self.activity_timeline)
         preview_layout.addWidget(self.video_filmstrip, 1)
         self.preview_timeline = TargetTimelineSlider(Qt.Horizontal, self)
+        self.preview_timeline.setInvertedAppearance(True)
+        self.preview_timeline.setInvertedControls(True)
         self.preview_timeline.setRange(0, 0)
         self.preview_timeline.setEnabled(False)
         self.preview_timeline.setFixedHeight(22)
@@ -3054,7 +3069,10 @@ class PassageReviewDialog(QDialog):
         self.workspace_splitter = QSplitter(Qt.Horizontal, self)
         self.workspace_splitter.setChildrenCollapsible(False)
         self.workspace_splitter.setHandleWidth(5)
-        self.workspace_splitter.setMinimumSize(0, 0)
+        # Keep the judgment row usable when the horizontal divider is dragged
+        # downward. Without a vertical minimum, the camera image and its
+        # frame controls can be compressed into a thin, broken-looking strip.
+        self.workspace_splitter.setMinimumSize(0, 320)
         self.workspace_splitter.addWidget(results_panel)
         self.workspace_splitter.addWidget(self.evidence_splitter)
         results_panel.setMinimumWidth(0)
@@ -6009,7 +6027,12 @@ class PassageReviewDialog(QDialog):
         if worker is None:
             return
         worker.request_stop()
-        for signal in (worker.points_ready, worker.completed, worker.finished):
+        for signal in (
+            worker.points_ready,
+            worker.progress_ready,
+            worker.completed,
+            worker.finished,
+        ):
             try:
                 signal.disconnect()
             except (TypeError, RuntimeError):
@@ -6036,10 +6059,15 @@ class PassageReviewDialog(QDialog):
         self._stop_activity_analysis()
         self._activity_context = context
         self._activity_points = []
+        self._activity_progress = 0
         self.activity_timeline.set_range(start_ms, end_ms)
+        self.activity_timeline.set_analysis_progress(0)
+        self.activity_timeline.set_analysis_state("等待分析")
         cached = self._activity_cache.get(context)
         if cached is not None:
             self.activity_timeline.append_points(cached)
+            self.activity_timeline.set_analysis_progress(100)
+            self.activity_timeline.set_analysis_state("分析完成")
             self.activity_timeline.show()
             return
         self.activity_timeline.hide()
@@ -6054,10 +6082,21 @@ class PassageReviewDialog(QDialog):
         video_path, start_ms, end_ms = context
         worker = VideoActivityWorker(video_path, start_ms, end_ms, self)
         worker.points_ready.connect(self._on_activity_points)
+        worker.progress_ready.connect(self._on_activity_progress)
         worker.completed.connect(self._on_activity_completed)
         worker.finished.connect(self._on_activity_worker_finished)
         self._activity_worker = worker
+        self.activity_timeline.set_analysis_state("正在分析 0%")
         worker.start(QThread.LowestPriority)
+
+    def _on_activity_progress(self, progress: int) -> None:
+        if self.sender() is not self._activity_worker:
+            return
+        self._activity_progress = max(0, min(100, int(progress)))
+        self.activity_timeline.set_analysis_progress(self._activity_progress)
+        self.activity_timeline.set_analysis_state(
+            f"正在分析 {self._activity_progress}%"
+        )
 
     def _on_activity_points(self, points) -> None:
         if self.sender() is not self._activity_worker:
@@ -6071,6 +6110,9 @@ class PassageReviewDialog(QDialog):
         if self.sender() is not self._activity_worker or self._activity_context is None:
             return
         self._activity_cache[self._activity_context] = tuple(self._activity_points)
+        self._activity_progress = 100
+        self.activity_timeline.set_analysis_progress(100)
+        self.activity_timeline.set_analysis_state("分析完成")
         # Keep memory bounded during long events.
         while len(self._activity_cache) > 3:
             self._activity_cache.pop(next(iter(self._activity_cache)))
@@ -6085,6 +6127,11 @@ class PassageReviewDialog(QDialog):
         worker = self._activity_worker
         if worker is not None:
             worker.set_paused(paused)
+            self.activity_timeline.set_analysis_state(
+                "暂停分析（正在操作视频）"
+                if paused
+                else f"正在分析 {self._activity_progress}%"
+            )
 
     def _update_filmstrip(self) -> None:
         if not hasattr(self, "video_filmstrip"):
@@ -6097,6 +6144,7 @@ class PassageReviewDialog(QDialog):
             self._filmstrip_absolute_window = None
             self._stop_activity_analysis()
             self._activity_context = None
+            self.activity_timeline.set_target_position(None)
             self.activity_timeline.hide()
             self.video_filmstrip.setVisible(True)
             self.video_filmstrip.clear("当前没有可用视频胶卷")
@@ -6139,6 +6187,7 @@ class PassageReviewDialog(QDialog):
         self.video_filmstrip.set_display_origin(origin_ms)
         self.video_filmstrip.set_current_position(current_position_ms)
         self.activity_timeline.set_current_position(current_position_ms)
+        self.activity_timeline.set_target_position(current_position_ms)
         self._schedule_activity_analysis(video_path, start_ms, end_ms)
         self.preview_timeline.setRange(int(start_ms), int(end_ms))
         self.preview_timeline.set_target_position(

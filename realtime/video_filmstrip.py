@@ -410,6 +410,7 @@ class VideoFilmstripWidget(QFrame):
     scrub_position_changed = pyqtSignal(int)
     marker_position_selected = pyqtSignal(int, float, float, int)
     direction_changed = pyqtSignal(bool)
+    visible_range_changed = pyqtSignal(int, int)
     reload_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -484,6 +485,9 @@ class VideoFilmstripWidget(QFrame):
         self.content = FilmstripCanvas(self, self)
         self.scroll.setWidget(self.content)
         self.scroll.viewport().setCursor(Qt.OpenHandCursor)
+        self.scroll.horizontalScrollBar().valueChanged.connect(
+            self._emit_visible_range
+        )
         self.content.position_released.connect(self.position_selected.emit)
         self.content.position_double_clicked.connect(self.position_double_clicked.emit)
         self.content.scrub_position_changed.connect(self.scrub_position_changed.emit)
@@ -561,6 +565,24 @@ class VideoFilmstripWidget(QFrame):
         )
         self.content.update()
 
+    def _emit_visible_range(self) -> None:
+        frames = self.content._visual_frames()
+        if not frames:
+            return
+        step = FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP
+        scroll_left = self.scroll.horizontalScrollBar().value()
+        viewport_width = max(1, self.scroll.viewport().width())
+        first_index = max(0, min(len(frames) - 1, int(scroll_left // step)))
+        last_index = max(
+            first_index,
+            min(len(frames) - 1, int((scroll_left + viewport_width) // step)),
+        )
+        positions = (
+            int(frames[first_index].position_ms),
+            int(frames[last_index].position_ms),
+        )
+        self.visible_range_changed.emit(min(positions), max(positions))
+
     def _align_current_position_to_center(self) -> None:
         if not self._frames or self._current_position_ms < 0:
             return
@@ -577,6 +599,7 @@ class VideoFilmstripWidget(QFrame):
         scroll_bar = self.scroll.horizontalScrollBar()
         scroll_value = max(0, int(round(target_center - max(1, viewport_width) / 2.0)))
         scroll_bar.setValue(min(scroll_bar.maximum(), scroll_value))
+        self._emit_visible_range()
 
     def clear(self, message: str = "选择连续判读时间窗") -> None:
         self.stop()
@@ -737,6 +760,8 @@ class VideoFilmstripWidget(QFrame):
         if self._align_pending and self._frames:
             self._align_pending = False
             self._align_current_position_to_center()
+        else:
+            self._emit_visible_range()
 
     def closeEvent(self, event) -> None:
         self.stop()

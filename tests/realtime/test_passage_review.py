@@ -2933,9 +2933,9 @@ def test_frame_step_controls_only_focused_pane_at_its_native_frame_rate(
     )
     qapp.processEvents()
 
-    assert dialog._shared_delta_ms == 260
+    assert dialog._shared_delta_ms == 120
     assert regular_worker.seek_calls == regular_seek_calls
-    assert regular_worker.step_calls == [1, 12]
+    assert regular_worker.step_calls == [1, 5]
 
     QTest.keyClick(
         dialog.regular_pane.timeline,
@@ -2944,9 +2944,9 @@ def test_frame_step_controls_only_focused_pane_at_its_native_frame_rate(
     )
     qapp.processEvents()
 
-    assert dialog._shared_delta_ms == -740
+    assert dialog._shared_delta_ms == -880
     assert regular_worker.seek_calls == regular_seek_calls
-    assert regular_worker.step_calls == [1, 12, -50]
+    assert regular_worker.step_calls == [1, 5, -50]
     assert high_speed_worker.seek_calls == high_speed_seek_calls
     dialog.close()
 
