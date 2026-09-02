@@ -11,7 +11,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable, Iterable, Mapping, Optional
 
-from PyQt5.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
     QColor,
@@ -90,6 +90,7 @@ from .race_metadata import (
 from .review_clip import PassageReviewBindingStore
 from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
 from .video_filmstrip import VideoFilmstripWidget
+from .video_activity import ActivityTimelineWidget, VideoActivityWorker
 from .video_timeline import (
     DEFAULT_CLOCK_SOURCE,
     PassageVideoLocation,
@@ -359,6 +360,10 @@ class _AutoFitTableWidget(QTableWidget):
             available_width,
         )
         for column, width in zip(visible_columns, widths):
+            # Chinese athlete names need only a compact, predictable column;
+            # do not let proportional spare-space expansion make it dominant.
+            if column == 2:
+                width = min(width, 150)
             header.resizeSection(column, width)
 
     def resizeEvent(self, event) -> None:
@@ -1934,7 +1939,9 @@ class PassageEvidencePane(QFrame):
             f" | Δ{delta_ms:+d}ms"
         )
         self.frame_indicator_label.setText(text)
-        self.video_view.set_frame_indicator(text)
+        # The pane header is the single authoritative frame/time display.
+        # Avoid repeating the same text over the video image.
+        self.video_view.clear_frame_indicator()
 
     def _request_full_resolution(self) -> None:
         worker = self._worker
@@ -2547,6 +2554,17 @@ class PassageReviewDialog(QDialog):
         self._filmstrip_deferred_update_timer.timeout.connect(
             self._update_filmstrip
         )
+        self._activity_worker: VideoActivityWorker | None = None
+        self._retired_activity_workers: set[VideoActivityWorker] = set()
+        self._activity_context: tuple[Path, int, int] | None = None
+        self._activity_points: list[tuple[int, float]] = []
+        self._activity_cache: dict[
+            tuple[Path, int, int], tuple[tuple[int, float], ...]
+        ] = {}
+        self._activity_start_timer = QTimer(self)
+        self._activity_start_timer.setSingleShot(True)
+        self._activity_start_timer.setInterval(1_200)
+        self._activity_start_timer.timeout.connect(self._start_activity_analysis)
 
         self.setWindowTitle(APP_WINDOW_TITLE)
         self.resize(1400, 860)
@@ -2764,7 +2782,7 @@ class PassageReviewDialog(QDialog):
         self.table.setHorizontalHeaderLabels(
             [
                 "序号",
-                "运动员编号",
+                "号码",
                 "姓名",
                 "组别",
                 "",
@@ -2774,7 +2792,11 @@ class PassageReviewDialog(QDialog):
                 "复核状态",
             ]
         )
-        self.table.setColumnHidden(4, True)
+        # The operator opens the selected row directly in the single-camera
+        # judgment pane, so per-source availability columns only add clutter.
+        # Keep their underlying data for navigation/status decisions.
+        for column in (3, 4, 6, 7):
+            self.table.setColumnHidden(column, True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2983,6 +3005,14 @@ class PassageReviewDialog(QDialog):
         )
         self.video_filmstrip.reload_requested.connect(self._update_filmstrip)
         self.video_filmstrip.setMaximumHeight(320)
+        self.activity_timeline = ActivityTimelineWidget(self)
+        self.activity_timeline.position_selected.connect(
+            self._seek_filmstrip_position
+        )
+        self.activity_timeline.hide()
+        # Activity is part of the filmstrip, not a separate preview panel:
+        # title -> activity overview -> chronological thumbnails.
+        self.video_filmstrip.layout().insertWidget(1, self.activity_timeline)
         preview_layout.addWidget(self.video_filmstrip, 1)
         self.preview_timeline = TargetTimelineSlider(Qt.Horizontal, self)
         self.preview_timeline.setRange(0, 0)
@@ -5972,6 +6002,90 @@ class PassageReviewDialog(QDialog):
             origin_ms + end_ms,
         )
 
+    def _stop_activity_analysis(self) -> None:
+        self._activity_start_timer.stop()
+        worker = self._activity_worker
+        self._activity_worker = None
+        if worker is None:
+            return
+        worker.request_stop()
+        for signal in (worker.points_ready, worker.completed, worker.finished):
+            try:
+                signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        if not worker.isRunning():
+            worker.deleteLater()
+            return
+        worker.setParent(None)
+        self._retired_activity_workers.add(worker)
+        worker.finished.connect(
+            lambda retired=worker: self._dispose_activity_worker(retired)
+        )
+
+    def _dispose_activity_worker(self, worker: VideoActivityWorker) -> None:
+        self._retired_activity_workers.discard(worker)
+        worker.deleteLater()
+
+    def _schedule_activity_analysis(
+        self, video_path: Path, start_ms: int, end_ms: int
+    ) -> None:
+        context = (Path(video_path), int(start_ms), int(end_ms))
+        if context == self._activity_context:
+            return
+        self._stop_activity_analysis()
+        self._activity_context = context
+        self._activity_points = []
+        self.activity_timeline.set_range(start_ms, end_ms)
+        cached = self._activity_cache.get(context)
+        if cached is not None:
+            self.activity_timeline.append_points(cached)
+            self.activity_timeline.show()
+            return
+        self.activity_timeline.hide()
+        # Give the selected frame and nearby thumbnails an uncontested head
+        # start. Analysis is advisory, so it may appear later on a slow PC.
+        self._activity_start_timer.start()
+
+    def _start_activity_analysis(self) -> None:
+        context = self._activity_context
+        if context is None or self._activity_worker is not None:
+            return
+        video_path, start_ms, end_ms = context
+        worker = VideoActivityWorker(video_path, start_ms, end_ms, self)
+        worker.points_ready.connect(self._on_activity_points)
+        worker.completed.connect(self._on_activity_completed)
+        worker.finished.connect(self._on_activity_worker_finished)
+        self._activity_worker = worker
+        worker.start(QThread.LowestPriority)
+
+    def _on_activity_points(self, points) -> None:
+        if self.sender() is not self._activity_worker:
+            return
+        values = tuple((int(position), float(score)) for position, score in points)
+        self._activity_points.extend(values)
+        self.activity_timeline.append_points(values)
+        self.activity_timeline.show()
+
+    def _on_activity_completed(self) -> None:
+        if self.sender() is not self._activity_worker or self._activity_context is None:
+            return
+        self._activity_cache[self._activity_context] = tuple(self._activity_points)
+        # Keep memory bounded during long events.
+        while len(self._activity_cache) > 3:
+            self._activity_cache.pop(next(iter(self._activity_cache)))
+
+    def _on_activity_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker is self._activity_worker:
+            self._activity_worker = None
+            worker.deleteLater()
+
+    def _set_activity_paused(self, paused: bool) -> None:
+        worker = self._activity_worker
+        if worker is not None:
+            worker.set_paused(paused)
+
     def _update_filmstrip(self) -> None:
         if not hasattr(self, "video_filmstrip"):
             return
@@ -5981,6 +6095,9 @@ class PassageReviewDialog(QDialog):
             self._pending_filmstrip_anchor = None
             self._filmstrip_context = None
             self._filmstrip_absolute_window = None
+            self._stop_activity_analysis()
+            self._activity_context = None
+            self.activity_timeline.hide()
             self.video_filmstrip.setVisible(True)
             self.video_filmstrip.clear("当前没有可用视频胶卷")
             self.preview_timeline.setRange(0, 0)
@@ -6021,6 +6138,8 @@ class PassageReviewDialog(QDialog):
             QTimer.singleShot(0, self._finish_review_content_split_resize)
         self.video_filmstrip.set_display_origin(origin_ms)
         self.video_filmstrip.set_current_position(current_position_ms)
+        self.activity_timeline.set_current_position(current_position_ms)
+        self._schedule_activity_analysis(video_path, start_ms, end_ms)
         self.preview_timeline.setRange(int(start_ms), int(end_ms))
         self.preview_timeline.set_target_position(
             int(pane._target_position_ms)
@@ -7089,6 +7208,7 @@ class PassageReviewDialog(QDialog):
         self._toggle_pane(self._active_playback_pane())
 
     def _toggle_pane(self, pane: PassageEvidencePane) -> None:
+        self._set_activity_paused(not pane.is_playing)
         was_sync_playing = self._sync_playing
         if was_sync_playing:
             self._set_sync_playing(False, seek_final=False)
@@ -7301,6 +7421,7 @@ class PassageReviewDialog(QDialog):
         self._update_shared_time_label()
 
     def _on_pane_scrub_started(self, pane: PassageEvidencePane) -> None:
+        self._set_activity_paused(True)
         if self._sync_playing:
             self._set_sync_playing(False, seek_final=False)
         self._active_pane = pane
@@ -7337,6 +7458,13 @@ class PassageReviewDialog(QDialog):
             self._update_filmstrip()
             return
         self.video_filmstrip.set_current_position(position_ms)
+        self.activity_timeline.set_current_position(position_ms)
+        worker = self._activity_worker
+        if worker is not None:
+            worker.set_paused(
+                pane.is_playing
+                or bool(getattr(pane, "_video_scrubbing", False))
+            )
         # When the operator stops on a lower-pane frame, decode that exact
         # frame as a temporary filmstrip anchor. During playback/scrubbing we
         # deliberately avoid per-frame thumbnail generation.
@@ -7422,6 +7550,7 @@ class PassageReviewDialog(QDialog):
         seek_final: bool = True,
     ) -> None:
         playing = bool(playing) and self._sync_delta_bounds() is not None
+        self._set_activity_paused(playing)
         if playing == self._sync_playing:
             return
         if playing:
@@ -7881,6 +8010,7 @@ class PassageReviewDialog(QDialog):
         self._sync_timer.stop()
         if hasattr(self, "video_filmstrip"):
             self.video_filmstrip.stop()
+        self._stop_activity_analysis()
         for pane in self.all_evidence_panes:
             pane.shutdown(wait=True)
         event.accept()

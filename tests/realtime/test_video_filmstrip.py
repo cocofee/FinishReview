@@ -4,7 +4,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtGui import QImage
-from PyQt5.QtCore import QPoint, Qt
+from PyQt5.QtCore import QObject, QPoint, Qt, pyqtSignal
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
@@ -15,6 +15,27 @@ from realtime.video_filmstrip import (
     VideoFilmstripWidget,
     filmstrip_positions,
 )
+
+
+class _SlowFilmstripWorker(QObject):
+    frame_ready = pyqtSignal(QImage, int, int)
+    failed = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.stop_requested = False
+        self.wait_calls = 0
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def isRunning(self):
+        return True
+
+    def wait(self, _timeout):
+        self.wait_calls += 1
+        return False
 
 
 def test_filmstrip_positions_include_end_without_duplicates():
@@ -213,8 +234,8 @@ def test_filmstrip_load_prioritizes_current_area_and_queues_remaining_positions(
 
     widget.load(path, 0, 30_000)
 
-    assert started == [(10_000, 8_000, 12_000, 6_000, 14_000, 4_000, 16_000, 2_000, 18_000, 0, 20_000, 22_000)]
-    assert len(widget._pending_positions) == 4
+    assert started == [(10_000, 8_000, 12_000, 6_000, 14_000)]
+    assert len(widget._pending_positions) == 11
     widget.close()
 
 
@@ -277,4 +298,21 @@ def test_filmstrip_releases_old_path_cache_when_switching_recording():
 
     assert first not in widget._frames_by_path
     assert widget._video_path == second
+    widget.close()
+
+
+def test_filmstrip_stop_never_waits_for_slow_decoder_on_gui_thread():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    worker = _SlowFilmstripWorker()
+    widget._worker = worker
+
+    widget.stop()
+
+    assert worker.stop_requested
+    assert worker.wait_calls == 0
+    assert worker in widget._retired_workers
+    worker.finished.emit()
+    app.processEvents()
+    assert worker not in widget._retired_workers
     widget.close()

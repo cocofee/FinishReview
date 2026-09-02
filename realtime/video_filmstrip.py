@@ -14,9 +14,13 @@ from PyQt5.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel
 
 DEFAULT_FILMSTRIP_INTERVAL_MS = 2_000
 FILMSTRIP_TILE_WIDTH = 360
-FILMSTRIP_TILE_HEIGHT = 240
+# Leave room within the 320px filmstrip panel for the timestamp caption and
+# horizontal scrollbar. At 240px the caption was clipped on scaled displays.
+FILMSTRIP_TILE_HEIGHT = 204
 FILMSTRIP_TILE_GAP = 8
-FILMSTRIP_INITIAL_BATCH = 12
+# Decode only the selected athlete's immediate neighborhood first. This keeps
+# random thumbnail seeks from competing with the primary judgment frame.
+FILMSTRIP_INITIAL_BATCH = 5
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -237,7 +241,9 @@ class FilmstripCanvas(QWidget):
                     "当前",
                 )
                 painter.setBrush(Qt.NoBrush)
-            painter.setPen(QColor("#475569"))
+            # Show only the time below each preview frame. The shorter image
+            # height reserves this caption row above the horizontal scrollbar.
+            painter.setPen(QColor("#334155"))
             painter.drawText(
                 QRectF(x, FILMSTRIP_TILE_HEIGHT + 7, FILMSTRIP_TILE_WIDTH, 20),
                 Qt.AlignCenter,
@@ -409,6 +415,7 @@ class VideoFilmstripWidget(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._worker: VideoFilmstripWorker | None = None
+        self._retired_workers: set[VideoFilmstripWorker] = set()
         self._frames: list[FilmstripFrame] = []
         self._frames_by_path: dict[Path, dict[int, FilmstripFrame]] = {}
         self._requested_positions: set[int] = set()
@@ -445,26 +452,26 @@ class VideoFilmstripWidget(QFrame):
         self.direction_combo.addItem("最后一名 → 第一名", True)
         self.direction_combo.setToolTip("只改变胶卷显示方向，不改变真实时间和成绩顺序")
         self.direction_combo.currentIndexChanged.connect(self._on_direction_changed)
-        header.addWidget(self.direction_combo)
+        self.direction_combo.hide()
         self.reload_button = QPushButton("刷新胶卷", self)
         self.reload_button.setToolTip("重新读取当前连续判读时间窗的缩略图")
         self.reload_button.clicked.connect(self.reload_requested.emit)
-        header.addWidget(self.reload_button)
+        self.reload_button.hide()
         self.mark_button = QPushButton("标线", self)
         self.mark_button.setToolTip("在时间胶卷上点击运动员位置")
         self.mark_button.setCheckable(True)
         self.mark_button.setEnabled(False)
         self.mark_button.clicked.connect(self._toggle_marker_mode)
-        header.addWidget(self.mark_button)
+        self.mark_button.hide()
         self.confirm_button = QPushButton("确认", self)
         self.confirm_button.setToolTip("确认时间胶卷上的当前标线")
         self.confirm_button.setEnabled(False)
-        header.addWidget(self.confirm_button)
+        self.confirm_button.hide()
         self.cancel_button = QPushButton("取消", self)
         self.cancel_button.setToolTip("取消当前时间胶卷标线")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.clear_marker)
-        header.addWidget(self.cancel_button)
+        self.cancel_button.hide()
         layout.addLayout(header)
 
         self.scroll = QScrollArea(self)
@@ -594,13 +601,30 @@ class VideoFilmstripWidget(QFrame):
         if worker is None:
             return
         worker.request_stop()
-        for signal in (worker.frame_ready, worker.failed):
+        for signal in (worker.frame_ready, worker.failed, worker.finished):
             try:
                 signal.disconnect()
             except (TypeError, RuntimeError):
                 pass
-        if worker.isRunning():
-            worker.wait(2_000)
+        if not worker.isRunning():
+            worker.deleteLater()
+            return
+        # VideoCapture may still be inside a slow seek/read. Never wait for it
+        # on the GUI thread: athlete selection and the primary judgment frame
+        # must remain responsive. Retired workers no longer have result
+        # signals connected, so late thumbnails cannot update the new strip.
+        # Detach it from the widget as well, so closing the dialog cannot
+        # destroy a QThread that is still unwinding its decoder call.
+        worker.setParent(None)
+        self._retired_workers.add(worker)
+        worker.finished.connect(
+            lambda retired=worker: self._dispose_retired_worker(retired)
+        )
+
+    def _dispose_retired_worker(self, worker: VideoFilmstripWorker) -> None:
+        if worker not in self._retired_workers:
+            return
+        self._retired_workers.discard(worker)
         worker.deleteLater()
 
     def load(

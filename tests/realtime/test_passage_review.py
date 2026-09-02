@@ -945,6 +945,8 @@ def test_review_auto_fits_table_columns_without_squeezing_them(qapp, tmp_path):
         width >= minimum
         for width, minimum in zip(widths, passage_review._TABLE_COLUMN_MIN_WIDTHS)
     )
+    dialog.table._fit_columns_to_viewport()
+    assert header.sectionSize(2) <= 150
     dialog.close()
 
 
@@ -2536,12 +2538,9 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
         for column in visible_columns
     ] == [
         "序号",
-        "运动员编号",
+        "号码",
         "姓名",
-        "组别",
         "通过时间",
-        "普通录像",
-        "高速摄像",
         "复核状态",
     ]
     assert dialog.table.item(0, 0).text() == "1"
