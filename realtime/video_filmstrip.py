@@ -12,7 +12,7 @@ from PyQt5.QtCore import QPoint, QThread, QTimer, Qt, QRectF, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPolygon
 from PyQt5.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
-from .thread_lifecycle import retire_qthread
+from .thread_lifecycle import retire_qthread, track_qthread
 from .time_domain import DurationMs, MediaPositionMs, WallClockMs
 
 DEFAULT_FILMSTRIP_INTERVAL_MS = 2_000
@@ -722,6 +722,7 @@ class VideoFilmstripWidget(QFrame):
         worker.failed.connect(self._on_worker_failed)
         worker.finished.connect(self._on_worker_finished)
         self._worker = worker
+        track_qthread(worker)
         worker.start()
 
     def _on_worker_failed(self, message: str) -> None:

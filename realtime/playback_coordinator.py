@@ -7,7 +7,7 @@ from typing import Callable
 
 from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
 
-from .thread_lifecycle import retire_qthread
+from .thread_lifecycle import retire_qthread, track_qthread
 from .time_domain import MediaPositionMs, MediaWindow
 from .video_activity import ActivityTimelineWidget, VideoActivityWorker
 
@@ -163,6 +163,7 @@ class PlaybackCoordinator(QObject):
         worker.completed.connect(self._on_activity_completed)
         worker.finished.connect(self._on_activity_worker_finished)
         self._activity_worker = worker
+        track_qthread(worker)
         self.activity_timeline.set_analysis_state("正在分析 0%")
         worker.start(QThread.LowestPriority)
 

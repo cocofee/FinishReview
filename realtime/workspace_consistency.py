@@ -53,6 +53,10 @@ class WorkspaceConsistencyError(RuntimeError):
     """Raised when an inconsistent workspace cannot be projected safely."""
 
 
+class _WorkspaceSourcesChanged(RuntimeError):
+    """Internal signal used to retry a projection from changing journals."""
+
+
 class WorkspaceConsistencyService:
     """Validate references across append-only workspace journals.
 
@@ -302,12 +306,42 @@ class WorkspaceConsistencyService:
         )
 
     def rebuild_projection(self, output_path: str | Path) -> Path:
-        """Atomically rebuild a disposable latest-state JSON projection."""
+        """Atomically rebuild from stable journal bytes, retrying concurrent appends."""
 
         with self._locked_stores():
-            return self._rebuild_projection_locked(output_path)
+            for _attempt in range(3):
+                before = self._source_fingerprints()
+                snapshot = type(self).open_read_only(
+                    passage_journal=self.passage_store.journal_path,
+                    timeline_journal=self.timeline_store.journal_path,
+                    association_journal=self.association_store.journal_path,
+                    calibration_journal=self.calibration_store.journal_path,
+                    binding_journal=(
+                        self.binding_store.journal_path
+                        if self.binding_store is not None
+                        else None
+                    ),
+                )
+                if snapshot._source_fingerprints() != before:
+                    continue
+                try:
+                    with snapshot._locked_stores():
+                        return snapshot._rebuild_projection_locked(
+                            output_path,
+                            expected_sources=before,
+                        )
+                except _WorkspaceSourcesChanged:
+                    continue
+        raise WorkspaceConsistencyError(
+            "workspace journals changed repeatedly during projection rebuild"
+        )
 
-    def _rebuild_projection_locked(self, output_path: str | Path) -> Path:
+    def _rebuild_projection_locked(
+        self,
+        output_path: str | Path,
+        *,
+        expected_sources: dict[str, dict[str, Any]] | None = None,
+    ) -> Path:
         report = self._check_locked()
         if not report.is_consistent:
             codes = ", ".join(
@@ -323,10 +357,13 @@ class WorkspaceConsistencyService:
         calibrations = self.calibration_store.calibrations()
         clips = self.binding_store.clips() if self.binding_store is not None else ()
         bindings = self.binding_store.bindings() if self.binding_store is not None else ()
+        sources = self._source_fingerprints()
+        if expected_sources is not None and sources != expected_sources:
+            raise _WorkspaceSourcesChanged
         payload: dict[str, Any] = {
             "schema_version": PROJECTION_SCHEMA_VERSION,
             "generated_at_ms": int(time.time() * 1000),
-            "sources": self._source_fingerprints(),
+            "sources": sources,
             "events": {event.event_id: event.to_payload() for event in events},
             "segments": {segment.segment_id: asdict(segment) for segment in segments},
             "associations": {
@@ -364,6 +401,11 @@ class WorkspaceConsistencyService:
                 temporary.write(data)
                 temporary.flush()
                 os.fsync(temporary.fileno())
+            if (
+                expected_sources is not None
+                and self._source_fingerprints() != expected_sources
+            ):
+                raise _WorkspaceSourcesChanged
             os.replace(temporary_path, target)
         finally:
             if temporary_path is not None and temporary_path.exists():

@@ -22,7 +22,7 @@ from PyQt5.QtCore import QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QWidget
 
-from .thread_lifecycle import retire_qthread
+from .thread_lifecycle import retire_qthread, track_qthread
 
 logger = logging.getLogger("FinishReview.VisualCrossing")
 
@@ -565,6 +565,7 @@ class VisualLineCalibrationDialog(QDialog):
         self._worker.failed.connect(lambda message: self.help_label.setText(str(message)))
         import os
         if os.environ.get("QT_QPA_PLATFORM", "").casefold() != "offscreen":
+            track_qthread(self._worker)
             self._worker.start()
 
     @property

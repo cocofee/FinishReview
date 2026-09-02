@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import inspect
 import importlib
 import os
 import re
@@ -11,10 +10,11 @@ import socket
 import shutil
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 from PyQt5.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor, QDesktopServices, QPainter, QPen
@@ -88,6 +88,12 @@ from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
 from .review_export import export_review_summary
 from .review_clip import PassageReviewBindingStore
+from .receiver_controller import ReceiverController
+from .recording_controller import (
+    RecordingPipeline,
+    RecordingSessionController,
+)
+from .settings import FinishReviewSettings
 from .review_recorder import (
     ArchiveTimelinePublisher,
     DEFAULT_MAX_SHARED_REVIEW_CLIP_MS,
@@ -119,7 +125,7 @@ from .video_timeline import (
         PassageVideoLookup,
         VideoTimelineStore,
     )
-from .thread_lifecycle import retire_qthread
+from .thread_lifecycle import retire_qthread, track_qthread
 from .video_playback import VideoPlaybackDialog
 from .video_arrival import VideoArrivalCandidateStore
 from .video_review import VideoReviewJournal
@@ -138,12 +144,12 @@ logger = logging.getLogger("FinishReview")
 class RuntimeStatusSnapshot:
     beijing_clock_text: str
     epoch_now_ms: int
-    configured_sources: tuple
+    configured_sources: tuple[tuple[int, str], ...]
     recording_active: bool
     recording_all_active: bool
-    segments_by_camera: dict
+    segments_by_camera: Mapping[int, tuple[object, ...]]
     reconnecting_cameras: tuple[int, ...]
-    reconnect_errors: dict[int, str]
+    reconnect_errors: Mapping[int, str]
     running_recorder_cameras: frozenset[int]
     auto_recording_error: str
     archive_scan_active: bool
@@ -158,7 +164,7 @@ class RuntimeStatusSnapshot:
     runtime_error: str
     recording_elapsed_seconds: int
     receiver_running: bool
-    receiver_metadata: object | None
+    receiver_metadata: RaceMetadata | None
     pending_passage_count: int
     archive_background_passage_count: int
     received_passage_count: int
@@ -166,14 +172,14 @@ class RuntimeStatusSnapshot:
     receiver_error: str
     timing_provider: str
     racetiger_running: bool
-    racetiger_status: object | None
+    racetiger_status: RaceTigerStatus | None
     racetiger_configured: bool
-    high_speed_result: object
+    high_speed_result: AuyatScanResult
     high_speed_root: Path | None
     high_speed_remote: bool
     storage_free_gb: float | None
     storage_error: str
-    capture_counts: dict
+    capture_counts: Mapping[PassageReviewState, int]
     aligned_event_count: int
     capture_error: str
     available_evidence_count: int
@@ -341,34 +347,6 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
         if is_empty:
             return candidate
     raise RuntimeError("无法为赛事创建唯一保存目录")
-
-
-@dataclass(frozen=True, slots=True)
-class FinishReviewSettings:
-    source: str
-    output_dir: Path
-    passage_host: str
-    passage_port: int
-    camera_index: int
-    secondary_source: str = ""
-    high_speed_dir: Path | None = None
-    finishreview_ip: str = "192.168.50.10"
-    cyclerace_ip: str = "192.168.50.20"
-    high_speed_pc_ip: str = "192.168.50.30"
-    switch_ip: str = "192.168.50.2"
-    timing_provider: str = "cyclerace"
-    racetiger_base_url: str = ""
-    racetiger_pc: str = ""
-    racetiger_rid: str = ""
-    racetiger_token: str = ""
-    racetiger_poll_interval_seconds: float = 2.0
-    visual_detection_enabled: bool = True
-    visual_camera_index: int = 1
-    visual_finish_line: float = 0.50
-    visual_gate_width: float = 0.08
-    visual_forward_direction: str = "left_to_right"
-    visual_roi_top: float = 0.08
-    visual_roi_bottom: float = 0.95
 
 
 class _RtspProbeWorker(QThread):
@@ -1793,6 +1771,7 @@ class FinishReviewLaunchDialog(QDialog):
         worker.probe_finished.connect(self._on_rtsp_probe_finished)
         worker.finished.connect(self._on_rtsp_probe_worker_finished)
         self._rtsp_probe_worker = worker
+        track_qthread(worker)
         worker.start()
 
     def _test_secondary_rtsp_source(self) -> None:
@@ -1814,6 +1793,7 @@ class FinishReviewLaunchDialog(QDialog):
         worker.probe_finished.connect(self._on_secondary_rtsp_probe_finished)
         worker.finished.connect(self._on_secondary_rtsp_probe_worker_finished)
         self._secondary_rtsp_probe_worker = worker
+        track_qthread(worker)
         worker.start()
 
     def _on_rtsp_probe_finished(self, ok: bool, message: str) -> None:
@@ -2474,6 +2454,14 @@ class FinishReviewWindow(PassageReviewSurface):
         self.timing_error_ms = max(0, int(timing_error_ms))
         self._recorder_factory = recorder_factory
         self._receiver_factory = receiver_factory
+        self._receiver_controller = ReceiverController(
+            receiver_factory=receiver_factory,
+            racetiger_client_factory=RaceTigerClient,
+            racetiger_source_factory=RaceTigerSource,
+        )
+        self._recording_controller = RecordingSessionController(
+            recorder_factory=recorder_factory,
+        )
         self._settings_saver = settings_saver
         self._workspace_mode = "live"
         self._archive_background_passage_count = 0
@@ -2670,6 +2658,7 @@ class FinishReviewWindow(PassageReviewSurface):
             logger.exception("Failed to recover archived recording sessions")
         self._clock_timer.start()
         if self.high_speed_dir is not None:
+            track_qthread(self._high_speed_scan_worker)
             self._high_speed_scan_worker.start()
         self._update_runtime_status()
 
@@ -2894,6 +2883,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._update_runtime_status()
             return
         if not self._high_speed_scan_worker.isRunning():
+            track_qthread(self._high_speed_scan_worker)
             self._high_speed_scan_worker.start()
         else:
             self._high_speed_scan_worker.request_scan()
@@ -3836,9 +3826,12 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def start_receiver(self) -> None:
         if self.timing_provider == "racetiger":
-            if self._receiver is not None:
+            if self._receiver_controller.receiver is not None:
                 self.stop_receiver()
-            if self._racetiger_source is not None and self._racetiger_source.is_running:
+            if (
+                self._receiver_controller.racetiger_source is not None
+                and self._receiver_controller.racetiger_source.is_running
+            ):
                 return
             try:
                 self._start_racetiger_source()
@@ -3851,50 +3844,24 @@ class FinishReviewWindow(PassageReviewSurface):
                 self._update_runtime_status()
                 raise
             return
-        if self._racetiger_source is not None:
+        if self._receiver_controller.racetiger_source is not None:
             self.stop_receiver()
-        if self._receiver is not None and self._receiver.is_running:
+        receiver = self._receiver_controller.receiver
+        if receiver is not None and receiver.is_running:
+            self._receiver = receiver
             return
-        receiver_kwargs = {
-            "on_accepted": self._signal_bridge.accepted.emit,
-        }
-        parameters = inspect.signature(self._receiver_factory).parameters.values()
-        supports_metadata = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        ) or "metadata_store" in {
-            parameter.name for parameter in parameters
-        }
-        if supports_metadata:
-            receiver_kwargs.update(
+        try:
+            receiver = self._receiver_controller.start_cyclerace(
+                self.passage_host,
+                self.passage_port,
+                self._receiver_passage_store,
+                on_accepted=self._signal_bridge.accepted.emit,
                 metadata_store=self._receiver_metadata_store,
                 on_metadata_accepted=self._signal_bridge.metadata_accepted.emit,
+                on_focus_accepted=self._signal_bridge.focus_accepted.emit,
             )
-        parameters = inspect.signature(self._receiver_factory).parameters.values()
-        supports_focus = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        ) or "on_focus_accepted" in {
-            parameter.name for parameter in parameters
-        }
-        if supports_focus:
-            receiver_kwargs["on_focus_accepted"] = (
-                self._signal_bridge.focus_accepted.emit
-            )
-        receiver = self._receiver_factory(
-            self.passage_host,
-            self.passage_port,
-            self._receiver_passage_store,
-            **receiver_kwargs,
-        )
-        try:
-            receiver.start()
         except Exception as exc:
             self._receiver_error = sanitize_recording_message(exc)
-            try:
-                receiver.stop()
-            except Exception as exc:  # noqa: BLE001 - rollback is best effort.
-                logger.warning("Failed to stop CycleRace receiver: %s", exc)
             self._update_runtime_status()
             raise
         self._receiver = receiver
@@ -3903,51 +3870,16 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_runtime_status()
 
     def _start_racetiger_source(self) -> None:
-        missing = [
-            label
-            for label, value in (
-                ("接口地址", self.racetiger_base_url),
-                ("PC", self.racetiger_pc),
-                ("RID", self.racetiger_rid),
-                ("令牌", self.racetiger_token),
-            )
-            if not value
-        ]
-        if missing:
-            raise ValueError("赛虎配置不完整，请填写：" + "、".join(missing))
-        client = RaceTigerClient(
+        source = self._receiver_controller.start_racetiger(
             self.racetiger_base_url,
             self.racetiger_token,
             pc=self.racetiger_pc,
             rid=self.racetiger_rid,
-        )
-        generation = self._racetiger_generation
-
-        def emit_event(event: PassageEvent) -> None:
-            if generation == self._racetiger_generation:
-                self._signal_bridge.accepted.emit(event)
-
-        def emit_status(status: RaceTigerStatus) -> None:
-            if generation == self._racetiger_generation:
-                self._signal_bridge.timing_status.emit(status)
-
-        source = RaceTigerSource(
-            client,
-            self.passage_store,
-            race_id=self.racetiger_rid,
-            stage_id="finish",
+            store=self.passage_store,
             poll_interval_seconds=self.racetiger_poll_interval_seconds,
-            on_event=emit_event,
-            on_status=emit_status,
+            on_event=lambda event, _generation: self._signal_bridge.accepted.emit(event),
+            on_status=lambda status, _generation: self._signal_bridge.timing_status.emit(status),
         )
-        try:
-            source.start()
-        except Exception:
-            try:
-                source.stop()
-            except Exception:  # noqa: BLE001 - startup rollback is best effort.
-                logger.exception("Failed to stop RaceTiger source after startup error")
-            raise
         self._racetiger_source = source
         self._receiver_error = ""
         self._racetiger_status = RaceTigerStatus(
@@ -4231,43 +4163,26 @@ class FinishReviewWindow(PassageReviewSurface):
             raise RecordingError(f"无法检查赛事存储空间: {exc}") from exc
         if free_bytes < 1024**3:
             raise RecordingError("赛事存储空间不足 1 GB，无法开始录像")
-        recorders: dict[int, FfmpegReviewRecorder] = {}
-        ring_buffers: dict[int, ReviewRingBuffer] = {}
-        coordinators: dict[int, PassageReviewCoordinator] = {}
-        publishers: dict[int, PassageReviewTimelinePublisher] = {}
         archive_publishers = []
         try:
-            for camera_index, source in configured_sources:
-                recorder = self._recorder_factory(
-                    source,
-                    self.output_dir,
-                    camera_index=camera_index,
-                    ffmpeg_path=self.ffmpeg_path,
-                    review_retention_seconds=self.review_retention_seconds,
-                )
-                playlist_path = recorder.start()
-                recorders[camera_index] = recorder
-                ring_buffer = ReviewRingBuffer(
-                    playlist_path,
-                    camera_index=camera_index,
-                    retention_seconds=self.review_retention_seconds,
-                )
-                ring_buffer.scan()
-                ring_buffers[camera_index] = ring_buffer
-                coordinators[camera_index] = PassageReviewCoordinator(ring_buffer)
-                publishers[camera_index] = PassageReviewTimelinePublisher(
-                    ring_buffer,
-                    self.timeline_store,
-                    timing_error_ms=self.timing_error_ms,
-                    binding_store=self.review_binding_store,
-                )
-                archive_publishers.append(
-                    ArchiveTimelinePublisher(recorder, self.timeline_store)
-                )
-            self._recorders = recorders
-            self._ring_buffers = ring_buffers
-            self._coordinators = coordinators
-            self._publishers = publishers
+            pipelines = self._recording_controller.start(
+                sources=configured_sources,
+                output_dir=self.output_dir,
+                ffmpeg_path=self.ffmpeg_path,
+                review_retention_seconds=self.review_retention_seconds,
+                timeline_store=self.timeline_store,
+                timing_error_ms=self.timing_error_ms,
+                binding_store=self.review_binding_store,
+            )
+            self._recorders = self._recording_controller.recorders
+            self._ring_buffers = self._recording_controller.ring_buffers
+            self._coordinators = self._recording_controller.coordinators
+            self._publishers = self._recording_controller.timeline_publishers
+            archive_publishers = [pipeline.archive_publisher for pipeline in pipelines]
+            recorders = self._recorders
+            ring_buffers = self._ring_buffers
+            coordinators = self._coordinators
+            publishers = self._publishers
             self._recorder = recorders.get(self.camera_index)
             self._ring_buffer = ring_buffers.get(self.camera_index)
             self._coordinator = coordinators.get(self.camera_index)
@@ -4313,14 +4228,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._lookup_cache.clear()
             self.refresh()
         except Exception:
-            for recorder in recorders.values():
-                try:
-                    recorder.stop()
-                except Exception as cleanup_error:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to stop recorder during startup rollback: %s",
-                        cleanup_error,
-                    )
+            self._recording_controller.stop()
             for worker in self._video_scan_workers.values():
                 worker.stop()
             self._video_scan_workers = {}
@@ -4431,15 +4339,25 @@ class FinishReviewWindow(PassageReviewSurface):
         previous_worker = self._video_scan_workers.get(camera_index)
         if previous_worker is not None:
             previous_worker.stop()
-        self._recorders[camera_index] = recorder
-        self._ring_buffers[camera_index] = ring_buffer
-        self._coordinators[camera_index] = coordinator
-        self._publishers[camera_index] = publisher
+        archive_publisher = ArchiveTimelinePublisher(recorder, self.timeline_store)
+        self._recording_controller.replace_pipeline(
+            RecordingPipeline(
+                source=str(source),
+                camera_index=camera_index,
+                recorder=recorder,
+                ring_buffer=ring_buffer,
+                coordinator=coordinator,
+                timeline_publisher=publisher,
+                archive_publisher=archive_publisher,
+            )
+        )
+        self._recorders = self._recording_controller.recorders
+        self._ring_buffers = self._recording_controller.ring_buffers
+        self._coordinators = self._recording_controller.coordinators
+        self._publishers = self._recording_controller.timeline_publishers
         self._video_scan_workers[camera_index] = scan_worker
         self._capture_windows_by_camera[camera_index] = replacement_windows
-        self._archive_publishers.append(
-            ArchiveTimelinePublisher(recorder, self.timeline_store)
-        )
+        self._archive_publishers.append(archive_publisher)
         if camera_index == self.camera_index:
             self._recorder = recorder
             self._ring_buffer = ring_buffer
@@ -5323,9 +5241,9 @@ class FinishReviewWindow(PassageReviewSurface):
             configured_sources=configured_sources,
             recording_active=recording_active,
             recording_all_active=self._recording_all_active(),
-            segments_by_camera=segments_by_camera,
+            segments_by_camera=MappingProxyType(segments_by_camera),
             reconnecting_cameras=tuple(sorted(self._camera_reconnect_errors)),
-            reconnect_errors=dict(self._camera_reconnect_errors),
+            reconnect_errors=MappingProxyType(dict(self._camera_reconnect_errors)),
             running_recorder_cameras=frozenset(
                 camera_index
                 for camera_index, recorder in self._recorders.items()
@@ -5379,7 +5297,7 @@ class FinishReviewWindow(PassageReviewSurface):
             high_speed_remote=is_network_share(high_speed_root),
             storage_free_gb=storage_free_gb,
             storage_error=storage_error,
-            capture_counts=counts,
+            capture_counts=MappingProxyType(counts),
             aligned_event_count=len(self._evidence_timestamp_overrides),
             capture_error=self._capture_error,
             available_evidence_count=self._available_evidence_count,
@@ -6090,27 +6008,24 @@ class FinishReviewWindow(PassageReviewSurface):
             worker.stop()
         self._video_scan_workers = {}
         self._stop_visual_workers()
-        recorders = tuple(self._recorders.items())
-        if recorders:
-            errors = []
-            for camera_index, recorder in recorders:
-                try:
-                    recorder.stop()
-                except RecordingError as exc:
-                    errors.append(
-                        f"机位{camera_index}: {sanitize_recording_message(exc)}"
-                    )
+        had_recorders = bool(self._recorders)
+        failures = self._recording_controller.stop()
+        if had_recorders:
             try:
                 self._publish_archive_segments(recording=False)
                 self._refresh_capture_windows()
             except Exception:
                 logger.exception("Failed to publish final review segments")
-            if errors:
-                self._runtime_error = "; ".join(errors)
-        self._recorders = {}
-        self._ring_buffers = {}
-        self._coordinators = {}
-        self._publishers = {}
+            if failures:
+                self._runtime_error = "; ".join(
+                    f"机位{failure.camera_index}: "
+                    f"{sanitize_recording_message(failure.error)}"
+                    for failure in failures
+                )
+        self._recorders = self._recording_controller.recorders
+        self._ring_buffers = self._recording_controller.ring_buffers
+        self._coordinators = self._recording_controller.coordinators
+        self._publishers = self._recording_controller.timeline_publishers
         self._recorder = None
         self._ring_buffer = None
         self._coordinator = None
@@ -6124,21 +6039,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_runtime_status()
 
     def stop_receiver(self) -> None:
-        self._racetiger_generation += 1
-        receiver = self._receiver
-        self._receiver = None
-        if receiver is not None:
-            try:
-                receiver.stop()
-            except Exception as exc:  # noqa: BLE001 - receiver factories may vary.
-                logger.warning("Failed to stop CycleRace receiver: %s", exc)
-        racetiger_source = self._racetiger_source
-        self._racetiger_source = None
-        if racetiger_source is not None:
-            try:
-                racetiger_source.stop()
-            except Exception as exc:  # noqa: BLE001 - shutdown is best effort.
-                logger.warning("Failed to stop RaceTiger source: %s", exc)
+        errors = self._receiver_controller.stop()
+        self._receiver = self._receiver_controller.receiver
+        self._racetiger_source = self._receiver_controller.racetiger_source
+        if errors:
+            self._receiver_error = "; ".join(errors)
         self._update_runtime_status()
 
     def stop(self) -> bool:

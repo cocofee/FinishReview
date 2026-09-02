@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .thread_lifecycle import retire_qthread
+from .thread_lifecycle import retire_qthread, track_qthread
 from .time_domain import ClockOffsetMs, MediaPositionMs
 
 logger = logging.getLogger("FinishReview.Playback")
@@ -1636,6 +1636,7 @@ class VideoPlaybackDialog(QDialog):
             set_idle_prefetch(False)
         if not self._playing:
             self.worker.pause()
+        track_qthread(self.worker)
         self.worker.start()
         self._set_playing(self._playing)
         self._set_shuttle_indicator(self._last_playback_speed if self._playing else 0.0)
@@ -2003,8 +2004,7 @@ class VideoPlaybackDialog(QDialog):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
-        request_stop = getattr(self.worker, "request_stop", self.worker.stop)
-        request_stop()
+        self.worker.request_stop()
         if not self.worker.wait(3_000):
             retire_qthread(self.worker)
         else:

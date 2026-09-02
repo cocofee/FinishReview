@@ -254,6 +254,9 @@ class _FakeDialogWorker(QObject):
     def stop(self):
         pass
 
+    def request_stop(self):
+        self.stop()
+
     def set_idle_prefetch_enabled(self, enabled):
         self.idle_prefetch_calls.append(bool(enabled))
 

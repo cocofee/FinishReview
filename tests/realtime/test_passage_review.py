@@ -133,6 +133,9 @@ class _FakePlaybackWorker(QObject):
             self.running = False
             self.finished.emit()
 
+    def request_stop(self):
+        self.stop()
+
     def wait(self, timeout_ms):
         self.wait_calls.append(int(timeout_ms))
         return True

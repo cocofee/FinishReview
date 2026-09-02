@@ -90,7 +90,7 @@ from .race_metadata import (
 )
 from .review_selection import ReviewSelectionController, ReviewSelectionPlan
 from .review_clip import PassageReviewBindingStore
-from .thread_lifecycle import retire_qthread
+from .thread_lifecycle import retire_qthread, track_qthread
 from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
 from .video_filmstrip import VideoFilmstripWidget
 from .video_activity import ActivityTimelineWidget
@@ -1730,6 +1730,7 @@ class PassageEvidencePane(QFrame):
         worker.playback_error.connect(self._on_playback_error)
         self._worker = worker
         if not defer_worker_start:
+            track_qthread(worker)
             worker.start()
 
     def rebind_passage(
@@ -1788,6 +1789,7 @@ class PassageEvidencePane(QFrame):
         worker = self._worker
         if worker is None or worker.isRunning():
             return False
+        track_qthread(worker)
         worker.start()
         return True
 
@@ -2254,8 +2256,7 @@ class PassageEvidencePane(QFrame):
         *,
         wait: bool,
     ) -> None:
-        request_stop = getattr(worker, "request_stop", worker.stop)
-        request_stop()
+        worker.request_stop()
         if wait:
             worker.wait(2_000)
         if worker.isRunning():
