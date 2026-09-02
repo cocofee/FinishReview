@@ -2316,6 +2316,7 @@ def _resolve_evidence_layout(
 class PassageReviewDialog(QDialog):
     INACTIVE_CAMERA_START_DELAY_MS = 120
     FILMSTRIP_WINDOW_MS = 300_000
+    FILMSTRIP_ALWAYS_AVAILABLE = False
     VIDEO_ASSIST_ENABLED = True
     # Automatic gap seeking can hide riders whose chips were not read. Keep it
     # disabled; operators can use the guarded Shift/Ctrl shortcuts while
@@ -2537,6 +2538,14 @@ class PassageReviewDialog(QDialog):
         self._filmstrip_anchor_timer.setInterval(100)
         self._filmstrip_anchor_timer.timeout.connect(
             self._flush_filmstrip_anchor
+        )
+        self._filmstrip_deferred_update_timer = QTimer(self)
+        self._filmstrip_deferred_update_timer.setSingleShot(True)
+        self._filmstrip_deferred_update_timer.setInterval(
+            self.INACTIVE_CAMERA_START_DELAY_MS + 80
+        )
+        self._filmstrip_deferred_update_timer.timeout.connect(
+            self._update_filmstrip
         )
 
         self.setWindowTitle(APP_WINDOW_TITLE)
@@ -5010,13 +5019,10 @@ class PassageReviewDialog(QDialog):
         )
         self._lookup_cache.clear()
         self._update_batch_controls(self._selected_event_id)
-        self._filmstrip_context = None
-        self._filmstrip_absolute_window = None
         self._filmstrip_preview_timer.stop()
         self._pending_filmstrip_preview_position = None
-        if hasattr(self, "video_filmstrip"):
-            self.video_filmstrip.setVisible(False)
-            self.video_filmstrip.clear()
+        # Filmstrip review remains available after leaving continuous mode.
+        self._update_filmstrip()
 
     def _toggle_batch_mode(self) -> None:
         if self._batch_mode:
@@ -5885,12 +5891,17 @@ class PassageReviewDialog(QDialog):
                 self._skip_continuous_gap(event, active_pane)
         self._update_batch_controls(event.event_id)
         self._update_navigation_controls()
-        self._update_filmstrip()
+        if not self._batch_mode and self._filmstrip_context is not None:
+            # Avoid blocking the UI while the previous strip worker is being
+            # stopped; let the inactive camera start first on low-end PCs.
+            self._filmstrip_deferred_update_timer.start()
+        else:
+            self._update_filmstrip()
 
     def _filmstrip_context_for_active_pane(
         self,
     ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:
-        if not self._batch_mode:
+        if not self._batch_mode and not self.FILMSTRIP_ALWAYS_AVAILABLE:
             return None
         pane = (
             self._active_pane

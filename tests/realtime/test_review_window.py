@@ -2976,6 +2976,16 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.beijing_clock_label.font().pointSize() >= 11
     assert window.beijing_zone_label.text() == "北京时间"
     assert window.beijing_zone_label.font().pointSize() >= 9
+    assert window.beijing_clock_label.minimumWidth() >= 72
+    assert window.beijing_zone_label.minimumWidth() >= 64
+    assert (
+        window.beijing_clock_label.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Fixed
+    )
+    assert (
+        window.beijing_zone_label.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Fixed
+    )
     header = window.findChild(
         review_window_module.QFrame,
         "finishConsoleHeader",

@@ -2331,6 +2331,8 @@ class _CompactStatusIndicator(QFrame):
 class FinishReviewWindow(PassageReviewDialog):
     """Production console for recording, CycleRace intake, and evidence review."""
 
+    FILMSTRIP_ALWAYS_AVAILABLE = True
+
     def __init__(
         self,
         source: str,
@@ -3607,10 +3609,21 @@ class FinishReviewWindow(PassageReviewDialog):
         clock_layout.setContentsMargins(0, 0, 0, 0)
         clock_layout.setSpacing(4)
         self.beijing_clock_label = QLabel(panel)
+        # Keep the live clock readable when the event header is compressed.
+        self.beijing_clock_label.setMinimumWidth(72)
+        self.beijing_clock_label.setSizePolicy(
+            QSizePolicy.Fixed,
+            QSizePolicy.Preferred,
+        )
         self.beijing_clock_label.setStyleSheet(
             "font-family: Consolas; color: #17212b; font-size: 11pt; font-weight: 700;"
         )
         self.beijing_zone_label = QLabel("北京时间", panel)
+        self.beijing_zone_label.setMinimumWidth(64)
+        self.beijing_zone_label.setSizePolicy(
+            QSizePolicy.Fixed,
+            QSizePolicy.Preferred,
+        )
         self.beijing_zone_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.beijing_zone_label.setStyleSheet(
             "color: #667085; font-size: 9pt; font-weight: 500;"
