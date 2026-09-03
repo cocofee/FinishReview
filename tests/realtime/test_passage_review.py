@@ -201,6 +201,8 @@ def _add_segment(
     clock_source="videopipe_system_clock",
     timing_error_ms=1_000,
     race_id="race-1",
+    media_duration_ms=None,
+    media_started_at_ms=None,
 ):
     video_path.parent.mkdir(parents=True, exist_ok=True)
     video_path.write_bytes(b"video")
@@ -216,10 +218,30 @@ def _add_segment(
     timeline_store.finish_segment(
         segment.segment_id,
         ended_at_ms=ended_at_ms,
-        media_duration_ms=ended_at_ms - started_at_ms,
-        media_started_at_ms=started_at_ms,
+        media_duration_ms=(
+            ended_at_ms - started_at_ms
+            if media_duration_ms is None
+            else media_duration_ms
+        ),
+        media_started_at_ms=(
+            started_at_ms
+            if media_started_at_ms is None
+            else media_started_at_ms
+        ),
     )
     return segment
+
+
+def test_empty_preview_keeps_time_filmstrip_visible(qapp, tmp_path):
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    dialog.show()
+    qapp.processEvents()
+
+    assert dialog.video_filmstrip.isVisible()
+    dialog.close()
 
 
 def test_review_uses_one_row_per_passage_and_opens_regular_video(
@@ -2058,6 +2080,80 @@ def test_enter_confirmation_outside_batch_keeps_frame_across_video_boundary(
     )
     assert dialog.table.item(passage_35_row, 8).text() == "已确认"
     assert dialog.table.item(passage_29_row, 8).text() != "已确认"
+    dialog.close()
+
+
+def test_manual_clicks_keep_overlapping_split_video_after_confirmation(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-29", sequence=1, passage_time_ms=19_000, bib="29")
+    )
+    passage_store.append(
+        _event(event_id="passage-40", sequence=2, passage_time_ms=20_500, bib="40")
+    )
+    passage_store.append(
+        _event(event_id="passage-3", sequence=3, passage_time_ms=20_800, bib="3")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_part1.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        media_started_at_ms=10_000,
+        media_duration_ms=10_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_part2.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=20_000,
+        ended_at_ms=30_000,
+        media_started_at_ms=20_000,
+        media_duration_ms=10_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.show()
+    dialog.auto_advance_checkbox.setChecked(True)
+    dialog._select_event("passage-29")
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    worker = pane._worker
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 8_500, 425)
+    qapp.processEvents()
+    view = pane.video_view
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=view.viewport().rect().center())
+    QTest.keyClick(view, Qt.Key_Return)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-40"
+    assert pane.location.segment.segment_id == first.segment_id
+    assert pane._worker is worker
+    assert pane._current_position_ms == 8_500
+
+    row = next(
+        index
+        for index, event in enumerate(dialog._visible_events)
+        if event.event_id == "passage-3"
+    )
+    dialog.table.setCurrentCell(row, 1)
+    dialog.table.selectRow(row)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-3"
+    assert pane.location.segment.segment_id == first.segment_id
+    assert pane._worker is worker
+    assert pane._current_position_ms == 8_500
     dialog.close()
 
 

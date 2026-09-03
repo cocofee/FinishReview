@@ -875,13 +875,21 @@ class VideoTimelineStore:
         now_ms = int(time.time() * 1000.0) if current_time_ms is None else int(current_time_ms)
         expected_race_id = str(race_id or "").strip()
         with self._lock:
-            candidate_ids = self._candidate_segment_ids(
-                target_time_ms,
-                expected_race_id,
+            candidate_ids = set(
+                self._candidate_segment_ids(target_time_ms, expected_race_id)
+            )
+            candidate_ids.update(
+                self._candidate_segment_ids(
+                    target_time_ms - 5_000,
+                    expected_race_id,
+                )
             )
             segments = tuple(
                 self._segments[segment_id]
-                for segment_id in candidate_ids
+                for segment_id in sorted(
+                    candidate_ids,
+                    key=lambda value: self._segment_order_index[value],
+                )
                 if self._segment_is_relevant(
                     self._segments[segment_id],
                     expected_race_id,
@@ -896,6 +904,37 @@ class VideoTimelineStore:
                 "race_mismatch" if expected_race_id and any_eligible else "no_segments",
                 target_time_ms,
             )
+
+        segments_by_source: dict[tuple[str, int], list[RecordingSegment]] = {}
+        for segment in segments:
+            segments_by_source.setdefault(
+                (segment.source_id, int(segment.camera_index)), []
+            ).append(segment)
+        split_previous_ids: set[str] = set()
+        split_boundary_ids: set[str] = set()
+        for source_segments in segments_by_source.values():
+            source_segments.sort(key=lambda item: (item.started_at_ms, item.segment_id))
+            for previous, following in zip(source_segments, source_segments[1:]):
+                previous_end = (
+                    previous.media_started_at_ms + previous.media_duration_ms
+                    if previous.media_started_at_ms is not None
+                    and previous.media_duration_ms is not None
+                    else previous.ended_at_ms
+                )
+                following_start = (
+                    following.media_started_at_ms
+                    if following.media_started_at_ms is not None
+                    else following.started_at_ms
+                )
+                if previous_end is None or abs(
+                    int(following_start) - int(previous_end)
+                ) > max(
+                    int(previous.timing_error_ms),
+                    int(following.timing_error_ms),
+                ):
+                    continue
+                split_previous_ids.add(following.segment_id)
+                split_boundary_ids.update((previous.segment_id, following.segment_id))
 
         candidates: dict[
             str,
@@ -914,20 +953,32 @@ class VideoTimelineStore:
                 media_start = segment.media_started_at_ms
                 media_end = media_start + segment.media_duration_ms
                 if media_start <= target_time_ms <= media_end:
-                    candidate_key = (0, 0, -segment.started_at_ms)
+                    near_split_start = (
+                        segment.segment_id in split_previous_ids
+                        and 0 < target_time_ms - media_start
+                        < min(1_000, int(segment.timing_error_ms))
+                    )
+                    candidate_key = (
+                        (1, target_time_ms - media_start, segment.started_at_ms)
+                        if near_split_start
+                        else (0, 0, -segment.started_at_ms)
+                    )
                 else:
                     boundary_distance = min(
                         abs(target_time_ms - media_start),
                         abs(target_time_ms - media_end),
                     )
                     if (
-                        segment.clock_source != DEFAULT_CLOCK_SOURCE
-                        and boundary_distance <= segment.timing_error_ms
+                        boundary_distance <= segment.timing_error_ms
+                        and (
+                            segment.clock_source != DEFAULT_CLOCK_SOURCE
+                            or segment.segment_id in split_boundary_ids
+                        )
                     ):
                         candidate_key = (
                             1,
                             boundary_distance,
-                            -segment.started_at_ms,
+                            segment.started_at_ms,
                         )
                     elif process_hit:
                         candidate_key = (
@@ -975,12 +1026,15 @@ class VideoTimelineStore:
                 if segment.media_started_at_ms <= target_time_ms <= media_end_at_ms:
                     status = "located"
                 elif (
-                    segment.clock_source != DEFAULT_CLOCK_SOURCE
-                    and min(
+                    min(
                         abs(target_time_ms - segment.media_started_at_ms),
                         abs(target_time_ms - media_end_at_ms),
                     )
                     <= segment.timing_error_ms
+                    and (
+                        segment.clock_source != DEFAULT_CLOCK_SOURCE
+                        or segment.segment_id in split_boundary_ids
+                    )
                 ):
                     status = "near_boundary"
                 else:

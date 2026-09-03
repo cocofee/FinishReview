@@ -2333,7 +2333,7 @@ class PassageReviewSurface(QDialog):
     """
     INACTIVE_CAMERA_START_DELAY_MS = 120
     FILMSTRIP_WINDOW_MS = 300_000
-    FILMSTRIP_ALWAYS_AVAILABLE = False
+    FILMSTRIP_ALWAYS_AVAILABLE = True
     VIDEO_ASSIST_ENABLED = True
     # Automatic gap seeking can hide riders whose chips were not read. Keep it
     # disabled; operators can use the guarded Shift/Ctrl shortcuts while
@@ -2341,6 +2341,7 @@ class PassageReviewSurface(QDialog):
     CONTINUOUS_AUTO_SKIP = False
     CONTINUOUS_SKIP_GAP_MS = 2_000
     CONTINUOUS_SKIP_LEAD_MS = 2_000
+    MANUAL_CONTINUATION_WINDOW_MS = 5_000
     CONTINUOUS_ROSTER_SIZE = 24
     SINGLE_CAMERA_PREVIEW = True
 
@@ -2958,7 +2959,7 @@ class PassageReviewSurface(QDialog):
         preview_layout.setSpacing(6)
         preview_layout.addWidget(transport)
         self.video_filmstrip = VideoFilmstripWidget(self)
-        self.video_filmstrip.setVisible(False)
+        self.video_filmstrip.setVisible(True)
         # This course is reviewed in the athletes' travel direction: scan the
         # filmstrip from right to left while keeping timestamps unchanged.
         self.video_filmstrip.direction_combo.setCurrentIndex(1)
@@ -5476,7 +5477,18 @@ class PassageReviewSurface(QDialog):
         row = self.table.currentRow()
         if 0 <= row < len(self._visible_events):
             event_id = self._visible_events[row].event_id
-            self._select_event(event_id)
+            active_pane = self._active_playback_pane()
+            event = self.passage_store.get(event_id)
+            preserve_current_frame = (
+                active_pane
+                if event is not None
+                and getattr(active_pane, "_current_frame_index", -1) >= 0
+                else None
+            )
+            self._select_event(
+                event_id,
+                preserve_current_frame=preserve_current_frame,
+            )
 
     @staticmethod
     def _regular_locations(
@@ -5616,11 +5628,10 @@ class PassageReviewSurface(QDialog):
             (camera_index, session_key),
             self._clock_offset_for_camera(camera_index),
         )
+        target_time_ms = int(event.timeline_timestamp_ms) + int(offset_ms)
         position_ms = max(
             0,
-            event.timeline_timestamp_ms
-            + offset_ms
-            - int(location.segment.media_started_at_ms),
+            target_time_ms - int(location.segment.media_started_at_ms),
         )
         if location.segment.media_duration_ms is not None:
             position_ms = min(position_ms, location.segment.media_duration_ms)
@@ -5820,6 +5831,10 @@ class PassageReviewSurface(QDialog):
                     current_media_location = self._location_on_current_media(
                         event, pane
                     )
+                    # At a split boundary the new passage may not resolve to
+                    # this segment at all. The loaded location still identifies
+                    # the active recording and is valid for rebinding the
+                    # passage while preserving the decoded frame.
                     if current_media_location is not None:
                         pane_location = current_media_location
                 pane_association = self._source_association(
@@ -5832,7 +5847,9 @@ class PassageReviewSurface(QDialog):
                     and pane._media_context(pane_location)
                     == pane._media_context(pane.location)
                 )
-                if (reuse_continuous_media or preserve_current_frame is not None) and pane_same_media:
+                if (reuse_continuous_media or preserve_current_frame is not None) and (
+                    pane_same_media or preserve_current_frame is pane
+                ):
                     pane.rebind_passage(
                         event,
                         pane_location,
@@ -7016,8 +7033,8 @@ class PassageReviewSurface(QDialog):
         active_pane = self._active_playback_pane()
         moving_back_in_continuous_mode = self._batch_mode and int(delta) < 0
         keep_current_frame = preserve_current_frame or (
-            self._batch_mode
-            and getattr(active_pane, "_current_frame_index", -1) >= 0
+            getattr(active_pane, "_current_frame_index", -1) >= 0
+            and self._selection_is_near_current_event(event_id)
         )
         self._select_event(
             event_id,
@@ -7030,6 +7047,19 @@ class PassageReviewSurface(QDialog):
         event = self.passage_store.get(event_id)
         if event is not None:
             self._skip_continuous_gap(event, active_pane)
+
+    def _selection_is_near_current_event(self, event_id: str) -> bool:
+        current = self.passage_store.get(self._selected_event_id)
+        target = self.passage_store.get(event_id)
+        if current is None or target is None:
+            return False
+        return (
+            abs(
+                int(target.timeline_timestamp_ms)
+                - int(current.timeline_timestamp_ms)
+            )
+            <= self.MANUAL_CONTINUATION_WINDOW_MS
+        )
 
     def _seek_saved_confirmation(self, event_id: str) -> bool:
         association = self.association_store.get(event_id, REGULAR_SOURCE)
