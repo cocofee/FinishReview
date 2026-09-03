@@ -200,6 +200,8 @@ def source_location(
             _STATUS_PRIORITY.get(location.status, 99),
             location.timing_error_ms,
             location.segment.camera_index,
+            -location.segment.started_at_ms,
+            location.segment.segment_id,
         ),
     )
 
@@ -3650,6 +3652,7 @@ class PassageReviewDialog(QDialog):
                 key=lambda location: (
                     _STATUS_PRIORITY.get(location.status, 99),
                     location.segment.camera_index,
+                    -location.segment.started_at_ms,
                     location.segment.segment_id,
                 ),
             )

@@ -3265,6 +3265,46 @@ def test_overlapping_window_does_not_retarget_existing_passage(
     dialog.close()
 
 
+def test_split_video_prefers_later_segment_for_same_camera(
+    qapp,
+    tmp_path,
+):
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_first.mkv",
+        source_id="camera_01_first",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_second.mkv",
+        source_id="camera_01_second",
+        camera_index=1,
+        started_at_ms=14_000,
+        ended_at_ms=24_000,
+    )
+
+    lookup = timeline_store.locate_passage(16_000, race_id="race-1")
+    assert len(lookup.locations) == 2
+    first, second = lookup.locations
+    first = replace(first, segment=replace(first.segment, segment_id="segment-first"))
+    second = replace(second, segment=replace(second.segment, segment_id="segment-second"))
+    split_lookup = replace(lookup, locations=(first, second))
+
+    selected = passage_review.source_location(split_lookup, high_speed=False)
+    assert selected is second
+
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        timeline_store,
+    )
+    assert dialog._regular_location_for_camera(split_lookup, 1) is second
+    dialog.close()
+
+
 def test_confirmation_summary_work_is_bounded_by_changed_passage(
     qapp,
     tmp_path,
