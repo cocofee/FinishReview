@@ -395,6 +395,7 @@ class VideoPlaybackWorker(QThread):
     frame_ready = pyqtSignal(QImage, int, int)
     full_resolution_ready = pyqtSignal(QImage, int, int)
     playback_finished = pyqtSignal()
+    step_boundary_reached = pyqtSignal(int)
     playback_error = pyqtSignal(str)
 
     REVERSE_WINDOW_SECONDS = 0.5
@@ -1501,6 +1502,11 @@ class VideoPlaybackWorker(QThread):
                 if step_frame is not None:
                     requested_frame, generation = step_frame
                     target = self._clamp_frame(requested_frame)
+                    direction = 1 if requested_frame > last_frame_index else -1
+                    if target == last_frame_index and requested_frame != target:
+                        if not self._decode_request_cancelled(generation):
+                            self.step_boundary_reached.emit(direction)
+                        continue
                     ok, capture_next_frame = self._decode_target(
                         capture,
                         target,
@@ -1510,6 +1516,8 @@ class VideoPlaybackWorker(QThread):
                     )
                     if ok and not self._decode_request_cancelled(generation):
                         last_frame_index = target
+                    elif not self._decode_request_cancelled(generation):
+                        self.step_boundary_reached.emit(direction)
                     continue
 
                 if full_resolution_frame is not None:

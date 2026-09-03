@@ -71,17 +71,20 @@ class ReviewSelectionController:
             )
             for pane in review.regular_panes
         }
-        if review._batch_mode and preserve_current_frame is not None:
-            projected = review._location_on_current_media(
-                event,
-                preserve_current_frame,
-            )
-            if projected is not None:
-                regular_locations[preserve_current_frame.camera_index] = projected
+        if preserve_current_frame is not None:
+            # Changing the roster identity must not move either linked camera
+            # to that identity's nominal recording. Keep every loaded regular
+            # pane on its current media; the operator advances video explicitly.
+            for pane in review.regular_panes:
+                projected = review._location_on_current_media(event, pane)
+                if projected is not None:
+                    regular_locations[pane.camera_index] = projected
 
         regular = review._regular_summary_location(event.event_id, lookup)
         high_speed = self._high_speed_location(lookup)
-        reuse_continuous_media = review._batch_mode and any(
+        reuse_continuous_media = (
+            review._batch_mode or preserve_current_frame is not None
+        ) and any(
             pane.location is not None
             and pane._media_context(regular_locations.get(pane.camera_index))
             == pane._media_context(pane.location)

@@ -1029,6 +1029,7 @@ class EvidenceImageView(QGraphicsView):
 class PassageEvidencePane(QFrame):
     open_requested = pyqtSignal(object, object)
     step_requested = pyqtSignal(int)
+    step_boundary_reached = pyqtSignal(int)
     play_requested = pyqtSignal()
     passage_delta_requested = pyqtSignal(int)
     selection_step_requested = pyqtSignal(int)
@@ -1087,6 +1088,7 @@ class PassageEvidencePane(QFrame):
         self._playing = False
         self._duration_ms = 0
         self._fps = 0.0
+        self._frame_count = 0
         self._source_width = 0
         self._source_height = 0
         self._current_frame_index = -1
@@ -1727,6 +1729,8 @@ class PassageEvidencePane(QFrame):
         worker.frame_ready.connect(self._on_frame_ready)
         worker.full_resolution_ready.connect(self._on_full_resolution_ready)
         worker.playback_finished.connect(self._on_playback_finished)
+        if hasattr(worker, "step_boundary_reached"):
+            worker.step_boundary_reached.connect(self._on_step_boundary_reached)
         worker.playback_error.connect(self._on_playback_error)
         self._worker = worker
         if not defer_worker_start:
@@ -1761,12 +1765,15 @@ class PassageEvidencePane(QFrame):
                 max(0, min(self._current_position_ms, self._duration_ms))
             )
         self._lookup_status = str(lookup_status or location.status)
-        self._identity = event.bib.strip() or "鏈煡"
+        self._identity = event.bib.strip() or "未知"
+        # The playback frame belongs to the recording, while markers belong to
+        # one passage. Rebinding an athlete must therefore discard the prior
+        # athlete's marker/confirmation state even though the frame is kept.
         self._association = association
         self._pending_marker = None
         self._marking_enabled = association is None
         self._reference_only = False
-        self.mark_btn.setText("閲嶆爣" if association is not None else "鏍囩嚎")
+        self.mark_btn.setText("重标" if association is not None else "标线")
         self.video_view.set_marker_mode(
             self.video_view.has_frame and self._marking_enabled
         )
@@ -1847,6 +1854,7 @@ class PassageEvidencePane(QFrame):
             return
         self._duration_ms = max(0, int(duration_ms))
         self._fps = max(0.0, float(fps))
+        self._frame_count = max(0, int(_frame_count))
         self._source_width = max(0, int(width))
         self._source_height = max(0, int(height))
         initial_position_ms = int(self.timeline.property("initial_position_ms") or 0)
@@ -2046,6 +2054,11 @@ class PassageEvidencePane(QFrame):
             return
         self._playing = False
         self.play_btn.setText("▶")
+
+    def _on_step_boundary_reached(self, direction: int) -> None:
+        if self.sender() is not self._worker:
+            return
+        self.step_boundary_reached.emit(1 if int(direction) > 0 else -1)
 
     def _on_playback_error(self, message: str) -> None:
         if self.sender() is not self._worker:
@@ -3117,6 +3130,11 @@ class PassageReviewSurface(QDialog):
         pane.step_requested.connect(
             lambda delta, current=pane: self._step_pane(current, delta)
         )
+        pane.step_boundary_reached.connect(
+            lambda direction, current=pane: self._step_across_recording_boundary(
+                current, direction
+            )
+        )
         pane.play_requested.connect(lambda current=pane: self._toggle_pane(current))
         pane.passage_delta_requested.connect(
             lambda delta, current=pane: self._seek_pane_delta(
@@ -4002,16 +4020,12 @@ class PassageReviewSurface(QDialog):
             lookup,
             high_speed=True,
         )
-        regular_association = self._source_association(
-            event_id,
-            REGULAR_SOURCE,
-            regular,
-        )
-        high_speed_association = self._source_association(
-            event_id,
-            HIGH_SPEED_SOURCE,
-            high_speed,
-        )
+        # A manually confirmed rider may be found in the adjacent archive
+        # segment rather than the segment selected from the official passage
+        # timestamp. The saved association is authoritative for list status;
+        # location matching is only needed when rendering a marker in a pane.
+        regular_association = self.association_store.get(event_id, REGULAR_SOURCE)
+        high_speed_association = self.association_store.get(event_id, HIGH_SPEED_SOURCE)
         fallback = review_status_text(lookup, regular, high_speed)
         return self._confirmation_status(
             regular_association,
@@ -5626,6 +5640,10 @@ class PassageReviewSurface(QDialog):
         *,
         preserve_current_frame: Optional[PassageEvidencePane] = None,
     ) -> None:
+        if preserve_current_frame is None and self._batch_mode:
+            active_pane = self._active_playback_pane()
+            if getattr(active_pane, "_current_frame_index", -1) >= 0:
+                preserve_current_frame = active_pane
         self.selection_controller.select(
             event_id,
             preserve_current_frame=preserve_current_frame,
@@ -5790,6 +5808,20 @@ class PassageReviewSurface(QDialog):
         else:
             for pane in self.regular_panes:
                 pane_location = regular_locations.get(pane.camera_index)
+                if (
+                    preserve_current_frame is not None
+                    and pane.location is not None
+                    and getattr(pane, "_current_frame_index", -1) >= 0
+                ):
+                    # Manual navigation establishes the active recording for
+                    # continuous judging. Identity changes must stay on that
+                    # recording even when the next rider's official timestamp
+                    # resolves to the neighbouring archive segment.
+                    current_media_location = self._location_on_current_media(
+                        event, pane
+                    )
+                    if current_media_location is not None:
+                        pane_location = current_media_location
                 pane_association = self._source_association(
                     event.event_id,
                     REGULAR_SOURCE,
@@ -5800,7 +5832,7 @@ class PassageReviewSurface(QDialog):
                     and pane._media_context(pane_location)
                     == pane._media_context(pane.location)
                 )
-                if reuse_continuous_media and pane_same_media:
+                if (reuse_continuous_media or preserve_current_frame is not None) and pane_same_media:
                     pane.rebind_passage(
                         event,
                         pane_location,
@@ -5858,6 +5890,14 @@ class PassageReviewSurface(QDialog):
                 elif self.high_speed_pane.association != high_speed_association:
                     self.high_speed_pane.set_association(high_speed_association)
         self._update_reference_states(event.event_id)
+        if preserve_current_frame is not None:
+            # In continuous judging the operator-selected current recording is
+            # the authoritative source, even when an older association points
+            # at the neighbouring archive segment. Keep it editable so the
+            # next rider can be marked and confirmed without pressing Target.
+            for pane in self.regular_panes:
+                if pane.location is not None and pane.association is None:
+                    pane.set_reference_only(False)
         if same_batch_media:
             self._update_shared_from_pane(active_pane)
             if preserve_current_frame is None:
@@ -6725,12 +6765,8 @@ class PassageReviewSurface(QDialog):
             lookup,
             high_speed=True,
         )
-        regular_association = self._source_association(
-            event_id, REGULAR_SOURCE, regular
-        )
-        high_speed_association = self._source_association(
-            event_id, HIGH_SPEED_SOURCE, high_speed
-        )
+        regular_association = self.association_store.get(event_id, REGULAR_SOURCE)
+        high_speed_association = self.association_store.get(event_id, HIGH_SPEED_SOURCE)
         readiness_status = review_status_text(lookup, regular, high_speed)
         status = self._confirmation_status(
             regular_association,
@@ -6979,8 +7015,9 @@ class PassageReviewSurface(QDialog):
             self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
         active_pane = self._active_playback_pane()
         moving_back_in_continuous_mode = self._batch_mode and int(delta) < 0
-        keep_current_frame = self._batch_mode and (
-            moving_back_in_continuous_mode or preserve_current_frame
+        keep_current_frame = preserve_current_frame or (
+            self._batch_mode
+            and getattr(active_pane, "_current_frame_index", -1) >= 0
         )
         self._select_event(
             event_id,
@@ -7124,6 +7161,8 @@ class PassageReviewSurface(QDialog):
                 return
         switched = self._activate_pane(pane, align=False)
         if not switched:
+            if self._step_across_recording_boundary(pane, frame_delta):
+                return
             current_delta_ms = pane.current_delta_ms()
             pane.step(frame_delta)
             bounds = pane.available_delta_bounds()
@@ -7158,6 +7197,128 @@ class PassageReviewSurface(QDialog):
         )
         pane.seek_passage_delta(self._shared_delta_ms)
         self._update_shared_time_label()
+
+    def _step_across_recording_boundary(
+        self,
+        pane: PassageEvidencePane,
+        frame_delta: int,
+    ) -> bool:
+        """Continue single-frame navigation into an adjacent recording file."""
+
+        location = pane.location
+        worker = getattr(pane, "_worker", None)
+        if location is None or worker is None or abs(int(frame_delta)) != 1:
+            return False
+        frame_ms = max(1, pane.frame_duration_ms())
+        position_ms = int(getattr(pane, "_current_position_ms", 0))
+        duration_ms = int(getattr(pane, "_duration_ms", 0))
+        direction = 1 if int(frame_delta) > 0 else -1
+        frame_index = int(getattr(pane, "_current_frame_index", -1))
+        frame_count = int(getattr(pane, "_frame_count", 0))
+        at_first_frame = frame_index == 0 or position_ms <= frame_ms
+        at_last_frame = (
+            frame_count > 0 and frame_index >= frame_count - 1
+        ) or (
+            duration_ms > 0 and position_ms >= duration_ms - frame_ms
+        )
+        if direction < 0 and not at_first_frame:
+            return False
+        if direction > 0 and not at_last_frame:
+            return False
+
+        current = location.segment
+        event = self.passage_store.get(self._selected_event_id)
+        if event is None:
+            return False
+        current_session_key = self._recording_session_key(location)
+        segments = sorted(
+            (
+                segment
+                for segment in self.timeline_store.segments()
+                if segment.segment_id != current.segment_id
+                and int(segment.camera_index) == int(current.camera_index)
+                and segment.source_id == current.source_id
+                and self._recording_session_key_from_path(
+                    segment.source_id,
+                    self.timeline_store.resolve_video_path(segment),
+                )
+                == current_session_key
+                and (not event.race_id or not segment.race_id or segment.race_id == event.race_id)
+                and segment.ended_at_ms is not None
+            ),
+            key=lambda segment: (segment.started_at_ms, segment.segment_id),
+        )
+        current_origin_ms = int(
+            current.media_started_at_ms
+            if current.media_started_at_ms is not None
+            else current.started_at_ms
+        )
+        current_end_ms = current_origin_ms + int(
+            current.media_duration_ms
+            if current.media_duration_ms is not None
+            else max(0, int(current.ended_at_ms or current_origin_ms) - current_origin_ms)
+        )
+        if direction < 0:
+            adjacent = next(
+                (
+                    segment
+                    for segment in reversed(segments)
+                    if int(segment.ended_at_ms or 0) <= current_origin_ms + frame_ms
+                ),
+                None,
+            )
+        else:
+            adjacent = next(
+                (
+                    segment
+                    for segment in segments
+                    if int(
+                        segment.media_started_at_ms
+                        if segment.media_started_at_ms is not None
+                        else segment.started_at_ms
+                    ) >= current_end_ms - frame_ms
+                ),
+                None,
+            )
+        if adjacent is None:
+            return False
+
+        adjacent_origin_ms = int(
+            adjacent.media_started_at_ms
+            if adjacent.media_started_at_ms is not None
+            else adjacent.started_at_ms
+        )
+        adjacent_duration_ms = int(
+            adjacent.media_duration_ms
+            if adjacent.media_duration_ms is not None
+            else max(0, int(adjacent.ended_at_ms or adjacent_origin_ms) - adjacent_origin_ms)
+        )
+        target_position_ms = (
+            max(0, adjacent_duration_ms - frame_ms) if direction < 0 else 0
+        )
+        target_timestamp_ms = adjacent_origin_ms + target_position_ms
+        lookup = self.timeline_store.locate_passage(
+            target_timestamp_ms,
+            race_id=event.race_id,
+        )
+        target_location = next(
+            (
+                item
+                for item in lookup.locations
+                if item.segment.segment_id == adjacent.segment_id
+                and item.status in _OPENABLE_STATUSES
+            ),
+            None,
+        )
+        if target_location is None:
+            return False
+        initial_delta_ms = target_position_ms - int(target_location.playback_position_ms)
+        pane.set_passage(event, target_location, initial_delta_ms=initial_delta_ms)
+        self._shared_delta_ms = target_position_ms - int(
+            target_location.passage_position_ms
+        )
+        self._update_shared_time_label()
+        return True
 
     def _navigate_video_candidate(
         self,

@@ -65,6 +65,7 @@ class _FakePlaybackWorker(QObject):
     frame_ready = pyqtSignal(object, int, int)
     full_resolution_ready = pyqtSignal(object, int, int)
     playback_finished = pyqtSignal()
+    step_boundary_reached = pyqtSignal(int)
     playback_error = pyqtSignal(str)
     finished = pyqtSignal()
     instances = []
@@ -1977,13 +1978,234 @@ def test_batch_next_across_media_boundary_keeps_current_frame_for_split_riders(
     qapp.processEvents()
     worker.seek_calls.clear()
 
-    dialog._move_selection(1, preserve_current_frame=True)
+    dialog._move_selection(1)
     qapp.processEvents()
 
     assert dialog._selected_event_id == "passage-235"
     assert pane._worker is worker
     assert pane._current_position_ms == 9_500
     assert worker.seek_calls == []
+    dialog.close()
+
+
+def test_enter_confirmation_outside_batch_keeps_frame_across_video_boundary(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-35", sequence=1, passage_time_ms=19_000, bib="35")
+    )
+    passage_store.append(
+        _event(event_id="passage-29", sequence=2, passage_time_ms=21_000, bib="29")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_part1.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_part2.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=20_000,
+        ended_at_ms=30_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.show()
+    dialog.auto_advance_checkbox.setChecked(True)
+    dialog._select_event("passage-35")
+    qapp.processEvents()
+    assert not dialog._batch_mode
+    pane = dialog.regular_pane
+    worker = pane._worker
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 9_500, 475)
+    qapp.processEvents()
+    QTest.mouseClick(
+        pane.video_view.viewport(),
+        Qt.LeftButton,
+        pos=pane.video_view.viewport().rect().center(),
+    )
+    QTest.keyClick(pane.video_view, Qt.Key_Return)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-29"
+    assert pane.location.segment.segment_id == first.segment_id
+    assert pane._worker is worker
+    assert pane._current_position_ms == 9_500
+    assert pane.association is None
+    assert not pane.has_pending_marker
+    assert pane.mark_btn.text() == "标线"
+    assert pane.status_label.text() != "已确认"
+    passage_35_row = next(
+        row
+        for row, event in enumerate(dialog._visible_events)
+        if event.event_id == "passage-35"
+    )
+    passage_29_row = next(
+        row
+        for row, event in enumerate(dialog._visible_events)
+        if event.event_id == "passage-29"
+    )
+    assert dialog.table.item(passage_35_row, 8).text() == "已确认"
+    assert dialog.table.item(passage_29_row, 8).text() != "已确认"
+    dialog.close()
+
+
+def test_previous_frame_crosses_into_adjacent_recording_without_changing_rider(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = _event(
+        event_id="passage-first-in-batch",
+        sequence=2,
+        passage_time_ms=21_000,
+        bib="62",
+    )
+    passage_store.append(event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_archive_0000.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    second = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_archive_0001.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=20_000,
+        ended_at_ms=30_000,
+    )
+    # A short review-buffer clip can overlap the archive boundary. It is not
+    # the previous member of the active archive recording sequence.
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_review_buffer.ts",
+        source_id="camera_01_review_buffer",
+        camera_index=1,
+        started_at_ms=19_500,
+        ended_at_ms=20_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    assert pane.location.segment.segment_id == second.segment_id
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    pane._worker.frame_ready.emit(frame, 0, 0)
+    qapp.processEvents()
+
+    dialog._step_active_pane(-1)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == event.event_id
+    assert pane.location.segment.segment_id == first.segment_id
+    assert pane._worker.video_path == pane.location.video_path
+    assert pane._worker.seek_calls[-1] >= 9_900
+    dialog.close()
+
+
+def test_next_frame_crosses_when_decoder_is_on_last_frame_before_reported_duration(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = _event(
+        event_id="passage-last-in-recording",
+        sequence=1,
+        passage_time_ms=19_000,
+        bib="35",
+    )
+    passage_store.append(event)
+    next_event = _event(
+        event_id="passage-next-same-boundary-batch",
+        sequence=2,
+        passage_time_ms=19_100,
+        bib="29",
+    )
+    passage_store.append(next_event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_archive_0000.mkv",
+        source_id="camera_01_review",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    second = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_archive_0001.mkv",
+        source_id="camera_01_review",
+        camera_index=1,
+        started_at_ms=20_000,
+        ended_at_ms=30_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    assert pane.location.segment.segment_id == first.segment_id
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    # Matroska commonly reports a 10 s duration although its final decodable
+    # frame has an earlier timestamp. Frame index is authoritative at the tail.
+    pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+    pane._worker.frame_ready.emit(frame, 9_900, 249)
+    qapp.processEvents()
+
+    dialog._step_active_pane(1)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == event.event_id
+    assert pane.location.segment.segment_id == second.segment_id
+    assert pane._worker.video_path == pane.location.video_path
+    assert pane._worker.seek_calls[-1] == 0
+
+    # Confirmation in the adjacent segment must count for the selected rider,
+    # even though their official timestamp originally resolved to `first`.
+    pane._worker.frame_ready.emit(frame, 1_240, 31)
+    qapp.processEvents()
+    pane._on_marker_position_selected(0.5, 0.5)
+    assert dialog._confirm_pending_marker(pane)
+    event_row = next(
+        row
+        for row, visible in enumerate(dialog._visible_events)
+        if visible.event_id == event.event_id
+    )
+    assert dialog.table.item(event_row, 8).text() == "已确认"
+
+    current_worker = pane._worker
+    current_position_ms = pane._current_position_ms
+    dialog._move_selection(1, preserve_current_frame=True)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == next_event.event_id
+    assert pane._worker is current_worker
+    assert pane.location.segment.segment_id == second.segment_id
+    assert pane._current_position_ms == current_position_ms
+    assert not pane.has_pending_marker
+    assert pane.association is None
+    assert pane._reference_only is False
+    assert pane._marking_enabled is True
+    assert pane.status_label.text() != "参考"
     dialog.close()
 
 
@@ -4243,7 +4465,7 @@ def test_failed_confirmation_keeps_current_passage_and_pending_marker(
     dialog.close()
 
 
-def test_confirm_and_advance_seeks_only_the_next_passage_once(
+def test_confirm_and_advance_keeps_current_frame_in_same_recording(
     qapp,
     tmp_path,
     fake_playback,
@@ -4284,7 +4506,8 @@ def test_confirm_and_advance_seeks_only_the_next_passage_once(
     qapp.processEvents()
 
     assert dialog._selected_event_id == "passage-15"
-    assert worker.seek_calls[seek_count_before:] == [3_000]
+    assert worker.seek_calls[seek_count_before:] == []
+    assert dialog.regular_pane._current_position_ms == 5_000
     dialog.close()
 
 
