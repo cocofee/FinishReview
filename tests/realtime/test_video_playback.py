@@ -8,6 +8,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 import pytest
+
+import realtime.video_playback as video_playback
 from PyQt5.QtCore import QEventLoop, QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage
 from PyQt5.QtTest import QTest
@@ -252,11 +254,45 @@ class _FakeDialogWorker(QObject):
     def stop(self):
         pass
 
+    def request_stop(self):
+        self.stop()
+
     def set_idle_prefetch_enabled(self, enabled):
         self.idle_prefetch_calls.append(bool(enabled))
 
     def wait(self, _milliseconds):
         return True
+
+
+class _SlowStoppingDialogWorker(_FakeDialogWorker):
+    def __init__(self, video_path, parent=None):
+        super().__init__(video_path, parent)
+        self.stop_requested = False
+        self.wait_calls = 0
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def wait(self, _milliseconds):
+        self.wait_calls += 1
+        return self.wait_calls > 1
+
+
+def test_dialog_retires_slow_worker_without_force_termination(
+    qapp,
+    monkeypatch,
+):
+    retired = []
+    monkeypatch.setattr(video_playback, "retire_qthread", retired.append)
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_SlowStoppingDialogWorker,
+    )
+
+    dialog.close()
+
+    assert dialog.worker.stop_requested
+    assert retired == [dialog.worker]
 
 
 def test_space_pauses_and_resumes_selected_slow_speed(qapp):

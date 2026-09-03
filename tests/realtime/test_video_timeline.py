@@ -102,6 +102,34 @@ def test_locates_passage_with_clock_offset_and_pre_roll(tmp_path):
     assert location.timing_error_ms == 1_500
 
 
+def test_contiguous_archive_split_prefers_previous_file_at_handoff(tmp_path):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first, _ = _segment(
+        store,
+        tmp_path,
+        name="camera_01_archive_0003.mkv",
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        timing_error_ms=2_000,
+    )
+    second, _ = _segment(
+        store,
+        tmp_path,
+        name="camera_01_archive_0004.mkv",
+        started_at_ms=20_000,
+        ended_at_ms=30_000,
+        timing_error_ms=2_000,
+    )
+
+    handoff = store.locate_passage(20_150, race_id="")
+    assert handoff.status == "near_boundary"
+    assert handoff.locations[0].segment.segment_id == first.segment_id
+
+    middle = store.locate_passage(25_000, race_id="")
+    assert middle.status == "located"
+    assert middle.locations[0].segment.segment_id == second.segment_id
+
+
 def test_reports_before_after_and_restart_gap(tmp_path):
     store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
     _segment(

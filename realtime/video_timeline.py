@@ -13,6 +13,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from .time_domain import (
+    ClockOffsetMs,
+    DurationMs,
+    MediaPositionMs,
+    WallClockMs,
+)
+
 
 SCHEMA_VERSION = 1
 DEFAULT_CLOCK_SOURCE = "videopipe_system_clock"
@@ -59,12 +66,12 @@ class RecordingSegment:
     source_id: str
     camera_index: int
     video_path: str
-    started_at_ms: int
-    ended_at_ms: Optional[int] = None
-    media_duration_ms: Optional[int] = None
-    media_started_at_ms: Optional[int] = None
+    started_at_ms: WallClockMs
+    ended_at_ms: Optional[WallClockMs] = None
+    media_duration_ms: Optional[DurationMs] = None
+    media_started_at_ms: Optional[WallClockMs] = None
     clock_source: str = DEFAULT_CLOCK_SOURCE
-    timing_error_ms: int = DEFAULT_TIMING_ERROR_MS
+    timing_error_ms: DurationMs = DurationMs(DEFAULT_TIMING_ERROR_MS)
     end_reason: str = ""
     race_id: str = ""
 
@@ -101,10 +108,10 @@ class RecordingSegment:
 class PassageVideoLocation:
     segment: RecordingSegment
     video_path: Path
-    passage_position_ms: int
-    playback_position_ms: int
-    clock_offset_ms: int
-    timing_error_ms: int
+    passage_position_ms: MediaPositionMs
+    playback_position_ms: MediaPositionMs
+    clock_offset_ms: ClockOffsetMs
+    timing_error_ms: DurationMs
     status: str
     media_locator: str = ""
 
@@ -112,7 +119,7 @@ class PassageVideoLocation:
 @dataclass(frozen=True, slots=True)
 class PassageVideoLookup:
     status: str
-    target_time_ms: int
+    target_time_ms: WallClockMs
     locations: tuple[PassageVideoLocation, ...] = ()
 
 
@@ -161,8 +168,8 @@ class _SegmentIntervalIndex:
 @dataclass(slots=True)
 class _ClosedTimelineBounds:
     count: int = 0
-    earliest_start_ms: Optional[int] = None
-    latest_end_ms: Optional[int] = None
+    earliest_start_ms: Optional[WallClockMs] = None
+    latest_end_ms: Optional[WallClockMs] = None
 
     def add(self, segment: RecordingSegment) -> None:
         if segment.ended_at_ms is None:
@@ -267,7 +274,12 @@ def _looks_like_incomplete_json(value: str) -> bool:
 class VideoTimelineStore:
     """Append-only recording-segment journal scoped to one race directory."""
 
-    def __init__(self, journal_path: str | Path):
+    def __init__(
+        self,
+        journal_path: str | Path,
+        *,
+        recover_incomplete_tail: bool = True,
+    ):
         self.journal_path = Path(journal_path).expanduser().absolute()
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -284,6 +296,7 @@ class VideoTimelineStore:
         self._playability_cache: dict[str, tuple[int, int, float, bool]] = {}
         self._revision = 0
         self._recovered_incomplete_tail = False
+        self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
         self._rebuild_indexes()
 
@@ -327,7 +340,8 @@ class VideoTimelineStore:
                     except UnicodeDecodeError:
                         pass
                 if candidate and _looks_like_incomplete_json(candidate):
-                    self._truncate(offset)
+                    if self._recover_incomplete_tail:
+                        self._truncate(offset)
                     self._recovered_incomplete_tail = True
                     return
                 raise VideoTimelineError(
@@ -861,13 +875,21 @@ class VideoTimelineStore:
         now_ms = int(time.time() * 1000.0) if current_time_ms is None else int(current_time_ms)
         expected_race_id = str(race_id or "").strip()
         with self._lock:
-            candidate_ids = self._candidate_segment_ids(
-                target_time_ms,
-                expected_race_id,
+            candidate_ids = set(
+                self._candidate_segment_ids(target_time_ms, expected_race_id)
+            )
+            candidate_ids.update(
+                self._candidate_segment_ids(
+                    target_time_ms - 5_000,
+                    expected_race_id,
+                )
             )
             segments = tuple(
                 self._segments[segment_id]
-                for segment_id in candidate_ids
+                for segment_id in sorted(
+                    candidate_ids,
+                    key=lambda value: self._segment_order_index[value],
+                )
                 if self._segment_is_relevant(
                     self._segments[segment_id],
                     expected_race_id,
@@ -882,6 +904,37 @@ class VideoTimelineStore:
                 "race_mismatch" if expected_race_id and any_eligible else "no_segments",
                 target_time_ms,
             )
+
+        segments_by_source: dict[tuple[str, int], list[RecordingSegment]] = {}
+        for segment in segments:
+            segments_by_source.setdefault(
+                (segment.source_id, int(segment.camera_index)), []
+            ).append(segment)
+        split_previous_ids: set[str] = set()
+        split_boundary_ids: set[str] = set()
+        for source_segments in segments_by_source.values():
+            source_segments.sort(key=lambda item: (item.started_at_ms, item.segment_id))
+            for previous, following in zip(source_segments, source_segments[1:]):
+                previous_end = (
+                    previous.media_started_at_ms + previous.media_duration_ms
+                    if previous.media_started_at_ms is not None
+                    and previous.media_duration_ms is not None
+                    else previous.ended_at_ms
+                )
+                following_start = (
+                    following.media_started_at_ms
+                    if following.media_started_at_ms is not None
+                    else following.started_at_ms
+                )
+                if previous_end is None or abs(
+                    int(following_start) - int(previous_end)
+                ) > max(
+                    int(previous.timing_error_ms),
+                    int(following.timing_error_ms),
+                ):
+                    continue
+                split_previous_ids.add(following.segment_id)
+                split_boundary_ids.update((previous.segment_id, following.segment_id))
 
         candidates: dict[
             str,
@@ -900,20 +953,32 @@ class VideoTimelineStore:
                 media_start = segment.media_started_at_ms
                 media_end = media_start + segment.media_duration_ms
                 if media_start <= target_time_ms <= media_end:
-                    candidate_key = (0, 0, -segment.started_at_ms)
+                    near_split_start = (
+                        segment.segment_id in split_previous_ids
+                        and 0 < target_time_ms - media_start
+                        < min(1_000, int(segment.timing_error_ms))
+                    )
+                    candidate_key = (
+                        (1, target_time_ms - media_start, segment.started_at_ms)
+                        if near_split_start
+                        else (0, 0, -segment.started_at_ms)
+                    )
                 else:
                     boundary_distance = min(
                         abs(target_time_ms - media_start),
                         abs(target_time_ms - media_end),
                     )
                     if (
-                        segment.clock_source != DEFAULT_CLOCK_SOURCE
-                        and boundary_distance <= segment.timing_error_ms
+                        boundary_distance <= segment.timing_error_ms
+                        and (
+                            segment.clock_source != DEFAULT_CLOCK_SOURCE
+                            or segment.segment_id in split_boundary_ids
+                        )
                     ):
                         candidate_key = (
                             1,
                             boundary_distance,
-                            -segment.started_at_ms,
+                            segment.started_at_ms,
                         )
                     elif process_hit:
                         candidate_key = (
@@ -961,12 +1026,15 @@ class VideoTimelineStore:
                 if segment.media_started_at_ms <= target_time_ms <= media_end_at_ms:
                     status = "located"
                 elif (
-                    segment.clock_source != DEFAULT_CLOCK_SOURCE
-                    and min(
+                    min(
                         abs(target_time_ms - segment.media_started_at_ms),
                         abs(target_time_ms - media_end_at_ms),
                     )
                     <= segment.timing_error_ms
+                    and (
+                        segment.clock_source != DEFAULT_CLOCK_SOURCE
+                        or segment.segment_id in split_boundary_ids
+                    )
                 ):
                     status = "near_boundary"
                 else:

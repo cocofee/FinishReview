@@ -4,15 +4,39 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtGui import QImage
-from PyQt5.QtCore import QPoint, Qt
+from PyQt5.QtCore import QObject, QPoint, Qt, pyqtSignal
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
+import realtime.video_filmstrip as video_filmstrip
 from realtime.video_filmstrip import (
     FilmstripFrame,
+    FILMSTRIP_TILE_GAP,
+    FILMSTRIP_TILE_WIDTH,
     VideoFilmstripWidget,
     filmstrip_positions,
 )
+
+
+class _SlowFilmstripWorker(QObject):
+    frame_ready = pyqtSignal(QImage, int, int)
+    failed = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.stop_requested = False
+        self.wait_calls = 0
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def isRunning(self):
+        return True
+
+    def wait(self, _timeout):
+        self.wait_calls += 1
+        return False
 
 
 def test_filmstrip_positions_include_end_without_duplicates():
@@ -106,7 +130,6 @@ def test_canvas_click_and_drag_emit_one_final_position():
     app.processEvents()
     assert len(spy) == 1
     assert spy[-1][0] == 2_000
-
     spy = QSignalSpy(widget.position_selected)
     QTest.qWait(500)
     QTest.mousePress(widget.content, Qt.LeftButton, pos=QPoint(380, 20))
@@ -130,11 +153,74 @@ def test_canvas_double_click_emits_preview_position():
     app.processEvents()
 
     spy = QSignalSpy(widget.position_selected)
+    double_spy = QSignalSpy(widget.position_double_clicked)
     QTest.mouseDClick(widget.content, Qt.LeftButton, pos=QPoint(380, 20))
     QTest.qWait(QApplication.doubleClickInterval() + 80)
     app.processEvents()
     assert len(spy) == 1
     assert spy[-1][0] == 2_000
+    assert len(double_spy) == 1
+    assert double_spy[-1][0] == 2_000
+    widget.close()
+
+
+def test_canvas_hit_testing_uses_content_coordinates_after_scroll():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    widget._video_path = Path("race.mp4")
+    image = QImage(8, 8, QImage.Format_RGB888)
+    for index in range(8):
+        widget._on_frame_ready(image, index * 2_000, index * 50)
+    widget.resize(500, 320)
+    widget.show()
+    app.processEvents()
+    widget.content.refresh_geometry()
+    app.processEvents()
+
+    step = FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP
+    scroll = widget.scroll.horizontalScrollBar()
+    scroll.setValue(2 * step)
+    content_x = scroll.value() + 180
+
+    assert widget.content._frame_at_x(content_x).position_ms == 4_000
+    widget.close()
+
+
+def test_canvas_scrub_position_interpolates_between_thumbnail_times():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    widget._video_path = Path("race.mp4")
+    image = QImage(8, 8, QImage.Format_RGB888)
+    widget._on_frame_ready(image, 0, 0)
+    widget._on_frame_ready(image, 2_000, 50)
+
+    halfway_x = 4 + (FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP) / 2
+    assert widget.content._position_at_x(halfway_x) == 1_000
+    widget.close()
+
+
+def test_canvas_marker_mode_emits_frame_and_normalized_position():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    widget._video_path = Path("race.mp4")
+    image = QImage(8, 8, QImage.Format_RGB888)
+    widget._on_frame_ready(image, 0, 0)
+    widget._on_frame_ready(image, 2_000, 50)
+    widget.resize(700, 320)
+    widget.show()
+    app.processEvents()
+
+    spy = QSignalSpy(widget.marker_position_selected)
+    widget.mark_button.click()
+    QTest.mouseClick(widget.content, Qt.LeftButton, pos=QPoint(500, 100))
+    app.processEvents()
+
+    assert len(spy) == 1
+    assert spy[-1][0] == 2_000
+    assert 0.0 <= spy[-1][1] <= 1.0
+    assert 0.0 <= spy[-1][2] <= 1.0
+    assert spy[-1][3] == 50
+    assert widget.confirm_button.isEnabled()
     widget.close()
 
 
@@ -149,8 +235,8 @@ def test_filmstrip_load_prioritizes_current_area_and_queues_remaining_positions(
 
     widget.load(path, 0, 30_000)
 
-    assert started == [(10_000, 8_000, 12_000, 6_000, 14_000, 4_000, 16_000, 2_000, 18_000, 0, 20_000, 22_000)]
-    assert len(widget._pending_positions) == 4
+    assert started == [(10_000, 8_000, 12_000, 6_000, 14_000)]
+    assert len(widget._pending_positions) == 11
     widget.close()
 
 
@@ -167,10 +253,12 @@ def test_filmstrip_labels_are_relative_to_current_position():
     assert widget.content._display_time_text(frame) == "0.000s"
     frame = FilmstripFrame(12_000, 0, image)
     assert widget.content._display_time_text(frame) == "+2.000s"
+    widget.set_display_origin(1_756_600_000_000)
+    assert widget.content._display_time_text(frame) == "08:26:52.000"
     widget.close()
 
 
-def test_filmstrip_aligns_current_frame_to_right_edge():
+def test_filmstrip_centers_current_frame_in_viewport():
     app = QApplication.instance() or QApplication([])
     widget = VideoFilmstripWidget()
     widget._video_path = Path("race.mp4")
@@ -186,7 +274,13 @@ def test_filmstrip_aligns_current_frame_to_right_edge():
 
     bar = widget.scroll.horizontalScrollBar()
     assert bar.value() > 0
-    assert bar.value() == min(bar.maximum(), 4 + 2 * (360 + 8) - widget.scroll.viewport().width())
+    step = FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP
+    target_center = 4 + step + FILMSTRIP_TILE_WIDTH / 2.0
+    expected = max(
+        0,
+        int(round(target_center - widget.scroll.viewport().width() / 2.0)),
+    )
+    assert bar.value() == min(bar.maximum(), expected)
     widget.close()
 
 
@@ -205,4 +299,20 @@ def test_filmstrip_releases_old_path_cache_when_switching_recording():
 
     assert first not in widget._frames_by_path
     assert widget._video_path == second
+    widget.close()
+
+
+def test_filmstrip_stop_never_waits_for_slow_decoder_on_gui_thread(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    worker = _SlowFilmstripWorker()
+    retired = []
+    monkeypatch.setattr(video_filmstrip, "retire_qthread", retired.append)
+    widget._worker = worker
+
+    widget.stop()
+
+    assert worker.stop_requested
+    assert worker.wait_calls == 0
+    assert retired == [worker]
     widget.close()

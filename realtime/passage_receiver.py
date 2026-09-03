@@ -26,6 +26,7 @@ from .race_metadata import (
     RaceMetadataIngestResult,
     RaceMetadataStore,
 )
+from .time_domain import WallClockMs
 
 
 logger = logging.getLogger("FinishReview.PassageReceiver")
@@ -77,7 +78,7 @@ class RaceFocus:
     athlete_id: str
     bib: str
     group_id: str
-    emitted_at_ms: int
+    emitted_at_ms: WallClockMs
     schema_version: int = SCHEMA_VERSION
     message_type: str = FOCUS_MESSAGE_TYPE
 
@@ -177,14 +178,14 @@ class PassageEvent:
     sequence: int
     chip_id: str = ""
     bib: str = ""
-    passage_time_ms: int = 0
+    passage_time_ms: WallClockMs = WallClockMs(0)
     lap: int = 0
     source: str = "cyclerace"
-    emitted_at_ms: int = 0
+    emitted_at_ms: WallClockMs = WallClockMs(0)
     revision: int = 1
     schema_version: int = SCHEMA_VERSION
     message_type: str = MESSAGE_TYPE
-    passage_timestamp_ms: Optional[int] = None
+    passage_timestamp_ms: Optional[WallClockMs] = None
     race_name: str = ""
     stage_name: str = ""
     group_name: str = ""
@@ -192,7 +193,7 @@ class PassageEvent:
     athlete_name: str = ""
     team_name: str = ""
     is_active: bool = True
-    received_at_ms: int = 0
+    received_at_ms: WallClockMs = WallClockMs(0)
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -229,10 +230,10 @@ class PassageEvent:
             raise PassageEventError("is_active must be a boolean")
 
     @property
-    def timeline_timestamp_ms(self) -> int:
+    def timeline_timestamp_ms(self) -> WallClockMs:
         if self.passage_timestamp_ms is not None:
-            return int(self.passage_timestamp_ms)
-        return int(self.passage_time_ms)
+            return WallClockMs(self.passage_timestamp_ms)
+        return WallClockMs(self.passage_time_ms)
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PassageEvent":
@@ -331,7 +332,12 @@ def _looks_like_incomplete_json(value: str) -> bool:
 class PassageEventStore:
     """Append-only JSONL store retaining the latest revision per event id."""
 
-    def __init__(self, journal_path: str | Path):
+    def __init__(
+        self,
+        journal_path: str | Path,
+        *,
+        recover_incomplete_tail: bool = True,
+    ):
         self.journal_path = Path(journal_path).expanduser().absolute()
         if not str(self.journal_path):
             raise ValueError("passage event journal path is required")
@@ -341,6 +347,7 @@ class PassageEventStore:
         self._event_order: list[str] = []
         self._race_ids: set[str] = set()
         self._recovered_incomplete_tail = False
+        self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
 
     def _load_existing(self) -> None:
@@ -373,7 +380,8 @@ class PassageEventStore:
                     except UnicodeDecodeError:
                         candidate = ""
                     if candidate and _looks_like_incomplete_json(candidate):
-                        self._truncate(offset)
+                        if self._recover_incomplete_tail:
+                            self._truncate(offset)
                         self._recovered_incomplete_tail = True
                         return
                 raise PassageJournalError(

@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .review_clip import PassageReviewBindingStore
 from .review_recorder import (
     ArchiveTimelinePublisher,
     FfmpegReviewRecorder,
@@ -41,6 +42,7 @@ def start_recording_pipeline(
     review_retention_seconds: int,
     timeline_store: VideoTimelineStore,
     timing_error_ms: int,
+    binding_store: PassageReviewBindingStore | None = None,
     recorder_factory: Callable[..., FfmpegReviewRecorder] = FfmpegReviewRecorder,
     ring_buffer_factory: Callable[..., ReviewRingBuffer] = ReviewRingBuffer,
     coordinator_factory: Callable[..., PassageReviewCoordinator] = (
@@ -75,10 +77,13 @@ def start_recording_pipeline(
         )
         ring_buffer.scan()
         coordinator = coordinator_factory(ring_buffer)
+        publisher_kwargs = {"timing_error_ms": timing_error_ms}
+        if binding_store is not None:
+            publisher_kwargs["binding_store"] = binding_store
         timeline_publisher = timeline_publisher_factory(
             ring_buffer,
             timeline_store,
-            timing_error_ms=timing_error_ms,
+            **publisher_kwargs,
         )
         archive_publisher = archive_publisher_factory(recorder, timeline_store)
     except Exception:
@@ -237,6 +242,7 @@ class RecordingSessionController:
         review_retention_seconds: int,
         timeline_store: VideoTimelineStore,
         timing_error_ms: int,
+        binding_store: PassageReviewBindingStore | None = None,
     ) -> tuple[RecordingPipeline, ...]:
         configured_sources = self._normalize_sources(sources)
         if not configured_sources:
@@ -270,6 +276,7 @@ class RecordingSessionController:
                     review_retention_seconds=review_retention_seconds,
                     timeline_store=timeline_store,
                     timing_error_ms=timing_error_ms,
+                    binding_store=binding_store,
                     recorder_factory=self._recorder_factory,
                     ring_buffer_factory=self._ring_buffer_factory,
                     coordinator_factory=self._coordinator_factory,
@@ -299,6 +306,14 @@ class RecordingSessionController:
             ", ".join(str(camera_index) for camera_index in pipelines),
         )
         return tuple(pipelines.values())
+
+    def replace_pipeline(self, pipeline: RecordingPipeline) -> None:
+        """Adopt a caller-restarted camera pipeline without stopping it."""
+
+        camera_index = int(pipeline.camera_index)
+        self._pending_recorders.pop(camera_index, None)
+        self._pipelines[camera_index] = pipeline
+        self._reset_sources_from_state()
 
     def stop(self) -> tuple[RecordingStopFailure, ...]:
         failures: list[RecordingStopFailure] = []

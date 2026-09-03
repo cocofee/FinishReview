@@ -39,6 +39,9 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from .thread_lifecycle import retire_qthread, track_qthread
+from .time_domain import ClockOffsetMs, MediaPositionMs
+
 logger = logging.getLogger("FinishReview.Playback")
 
 
@@ -294,11 +297,16 @@ class TargetTimelineSlider(QSlider):
 
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
-        self.target_position_ms: Optional[int] = None
+        self.target_position_ms: Optional[MediaPositionMs] = None
 
-    def set_target_position(self, position_ms: Optional[int]) -> None:
+    def set_target_position(
+        self,
+        position_ms: Optional[MediaPositionMs | int],
+    ) -> None:
         self.target_position_ms = (
-            None if position_ms is None else max(0, int(position_ms))
+            None
+            if position_ms is None
+            else MediaPositionMs(max(0, int(position_ms)))
         )
         self.update()
 
@@ -387,6 +395,7 @@ class VideoPlaybackWorker(QThread):
     frame_ready = pyqtSignal(QImage, int, int)
     full_resolution_ready = pyqtSignal(QImage, int, int)
     playback_finished = pyqtSignal()
+    step_boundary_reached = pyqtSignal(int)
     playback_error = pyqtSignal(str)
 
     REVERSE_WINDOW_SECONDS = 0.5
@@ -448,9 +457,9 @@ class VideoPlaybackWorker(QThread):
         self._navigation_boundary_misses = 0
 
     @property
-    def current_position_ms(self) -> int:
+    def current_position_ms(self) -> MediaPositionMs:
         with self._condition:
-            return self._current_position_ms
+            return MediaPositionMs(self._current_position_ms)
 
     @property
     def current_frame_index(self) -> int:
@@ -536,7 +545,7 @@ class VideoPlaybackWorker(QThread):
     def seek_preview(self, milliseconds: int) -> None:
         self.seek(milliseconds)
 
-    def jump(self, delta_ms: int) -> None:
+    def jump(self, delta_ms: ClockOffsetMs | int) -> None:
         delta_frames = int(round(int(delta_ms) * self._fps / 1000.0))
         self.seek_frame(self.current_frame_index + delta_frames)
 
@@ -653,11 +662,19 @@ class VideoPlaybackWorker(QThread):
             )
             self._condition.notify_all()
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Request cooperative shutdown and wake every worker wait."""
+
+        self.requestInterruption()
         with self._condition:
             self._stop_requested = True
             self._reset_reverse_prefetch_locked()
             self._condition.notify_all()
+
+    def stop(self) -> None:
+        """Backward-compatible alias for the shared cancellation protocol."""
+
+        self.request_stop()
 
     def release_cache(self) -> None:
         with self._condition:
@@ -1485,6 +1502,11 @@ class VideoPlaybackWorker(QThread):
                 if step_frame is not None:
                     requested_frame, generation = step_frame
                     target = self._clamp_frame(requested_frame)
+                    direction = 1 if requested_frame > last_frame_index else -1
+                    if target == last_frame_index and requested_frame != target:
+                        if not self._decode_request_cancelled(generation):
+                            self.step_boundary_reached.emit(direction)
+                        continue
                     ok, capture_next_frame = self._decode_target(
                         capture,
                         target,
@@ -1494,6 +1516,8 @@ class VideoPlaybackWorker(QThread):
                     )
                     if ok and not self._decode_request_cancelled(generation):
                         last_frame_index = target
+                    elif not self._decode_request_cancelled(generation):
+                        self.step_boundary_reached.emit(direction)
                     continue
 
                 if full_resolution_frame is not None:
@@ -1620,6 +1644,7 @@ class VideoPlaybackDialog(QDialog):
             set_idle_prefetch(False)
         if not self._playing:
             self.worker.pause()
+        track_qthread(self.worker)
         self.worker.start()
         self._set_playing(self._playing)
         self._set_shuttle_indicator(self._last_playback_speed if self._playing else 0.0)
@@ -1987,8 +2012,9 @@ class VideoPlaybackDialog(QDialog):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
-        self.worker.stop()
+        self.worker.request_stop()
         if not self.worker.wait(3_000):
-            self.worker.terminate()
-            self.worker.wait(1_000)
+            retire_qthread(self.worker)
+        else:
+            self.worker.deleteLater()
         event.accept()

@@ -139,6 +139,7 @@ def test_main_shows_window_before_receiver_failure_message(monkeypatch, tmp_path
     monkeypatch.setattr(review_main.QMessageBox, "warning", warning)
     monkeypatch.setattr(review_main, "discover_auyat_root", lambda: None)
     monkeypatch.setattr(review_main, "install_exception_logging", lambda: None)
+    monkeypatch.setattr(review_main, "install_qthread_shutdown", lambda _app: None)
     monkeypatch.setattr(
         review_main,
         "configure_application_icon",
