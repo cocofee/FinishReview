@@ -1068,12 +1068,14 @@ class PassageEvidencePane(QFrame):
         parent=None,
         *,
         camera_index: int = 0,
+        low_resource_mode: bool = False,
     ):
         super().__init__(parent)
         if source_kind not in {REGULAR_SOURCE, HIGH_SPEED_SOURCE}:
             raise ValueError("source_kind must be regular or high_speed")
         self.source_kind = source_kind
         self.camera_index = max(0, int(camera_index))
+        self._low_resource_mode = bool(low_resource_mode)
         self._event: Optional[PassageEvent] = None
         self._location: Optional[PassageVideoLocation] = None
         self._lookup_status = ""
@@ -1715,11 +1717,25 @@ class PassageEvidencePane(QFrame):
         self.timeline.setRange(0, 0)
         self.timeline.setEnabled(False)
         self.timeline.setProperty("initial_position_ms", int(initial_position_ms))
-        worker = (
-            AuyatRgbPlaybackWorker(location, self)
-            if location.segment.clock_source == AUYAT_CLOCK_SOURCE
-            else VideoPlaybackWorker(location.video_path, self)
-        )
+        if location.segment.clock_source == AUYAT_CLOCK_SOURCE:
+            worker = AuyatRgbPlaybackWorker(location, self)
+        else:
+            try:
+                worker = VideoPlaybackWorker(
+                    location.video_path,
+                    self,
+                    reverse_prefetch=not self._low_resource_mode,
+                    idle_prefetch=not self._low_resource_mode,
+                )
+            except TypeError:
+                # Keep lightweight test doubles and downstream integrations
+                # compatible with the historical two-argument constructor.
+                worker = VideoPlaybackWorker(location.video_path, self)
+                if self._low_resource_mode:
+                    if hasattr(worker, "_reverse_prefetch_enabled"):
+                        worker._reverse_prefetch_enabled = False
+                    if hasattr(worker, "_idle_prefetch_enabled"):
+                        worker._idle_prefetch_enabled = False
         worker.media_locator = str(location.media_locator)
         set_idle_prefetch = getattr(worker, "set_idle_prefetch_enabled", None)
         if callable(set_idle_prefetch):
@@ -2226,7 +2242,7 @@ class PassageEvidencePane(QFrame):
             release_cache()
 
     def set_idle_prefetch_enabled(self, enabled: bool) -> None:
-        self._idle_prefetch_enabled = bool(enabled)
+        self._idle_prefetch_enabled = bool(enabled) and not self._low_resource_mode
         worker = self._worker
         if worker is None:
             return
@@ -2382,6 +2398,7 @@ class PassageReviewSurface(QDialog):
         review_binding_store: Optional[PassageReviewBindingStore] = None,
         video_discovery_store: Optional[VideoDiscoveryStore] = None,
         video_arrival_store: Optional[VideoArrivalCandidateStore] = None,
+        low_resource_mode: bool = False,
     ):
         super().__init__(parent)
         self.setWindowFlags(
@@ -2413,6 +2430,7 @@ class PassageReviewSurface(QDialog):
             for camera, offset in (clock_offset_by_camera or {}).items()
         }
         self.pre_roll_ms = max(0, int(pre_roll_ms))
+        self._low_resource_mode = bool(low_resource_mode)
         self._open_location = open_location
         self._high_speed_locator = high_speed_locator
         requested_high_speed = (
@@ -3196,6 +3214,7 @@ class PassageReviewSurface(QDialog):
             REGULAR_SOURCE,
             self,
             camera_index=camera_index,
+            low_resource_mode=self._low_resource_mode,
         )
         pane.camera_combo.hide()
         self._connect_evidence_pane(pane)
@@ -5980,9 +5999,12 @@ class PassageReviewSurface(QDialog):
             if current_frame_index < 0
             else current_position
         )
-        window_start = (max(0, center) // self.FILMSTRIP_WINDOW_MS) * self.FILMSTRIP_WINDOW_MS
+        filmstrip_window_ms = (
+            120_000 if self._low_resource_mode else self.FILMSTRIP_WINDOW_MS
+        )
+        window_start = (max(0, center) // filmstrip_window_ms) * filmstrip_window_ms
         start_ms = min(window_start, max(0, duration_ms - 1))
-        end_ms = min(duration_ms, start_ms + self.FILMSTRIP_WINDOW_MS)
+        end_ms = min(duration_ms, start_ms + filmstrip_window_ms)
         if end_ms <= start_ms:
             end_ms = min(duration_ms, start_ms + 1_000)
         window_positions = tuple(
@@ -6113,6 +6135,7 @@ class PassageReviewSurface(QDialog):
                 end_ms,
                 positions_ms=anchors,
                 origin_ms=origin_ms,
+                defer_remaining=self._low_resource_mode,
             )
             return
         # The time range is unchanged: keep the existing filmstrip and only

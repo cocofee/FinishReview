@@ -16,8 +16,125 @@ from realtime.video_passage_detector import (
     reconcile_candidates,
     unmatched_passage_times,
     VideoPassageScanWorker,
+    LiveReviewBatchScanWorker,
+    review_batch_range,
+    review_batch_start,
 )
 from realtime.finish_line import FinishLine
+
+
+def test_review_batch_range_is_half_open_with_overlap():
+    batch = review_batch_range(1_200_000, batch_ms=120_000, overlap_ms=2_000)
+    assert batch.core_started_at_ms == 1_200_000
+    assert batch.core_ended_at_ms == 1_320_000
+    assert batch.scan_started_at_ms == 1_198_000
+    assert batch.scan_ended_at_ms == 1_322_000
+    assert review_batch_start(1_319_999, batch_ms=120_000) == 1_200_000
+    assert review_batch_start(1_320_000, batch_ms=120_000) == 1_320_000
+
+
+def test_live_batch_scanner_owns_boundary_candidate_once(tmp_path, monkeypatch):
+    segments = []
+    for index in range(0, 122):
+        start = index * 2_000
+        path = tmp_path / f"segment_{index:03d}.ts"
+        path.write_bytes(b"video")
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"segment-{index}",
+                camera_index=1,
+                started_at_ms=start,
+                ended_at_ms=start + 2_000,
+                video_path=path.name,
+            )
+        )
+    calls = []
+
+    def fake_scan(path, **kwargs):
+        calls.append(Path(path).read_text(encoding="utf-8"))
+        # One event exactly at the 120-second boundary. Both batches see it
+        # through overlap, but only the second core owns the half-open peak.
+        return (
+            VideoPassageCandidate(
+                candidate_id="line-1",
+                camera_index=1,
+                started_at_ms=119_900,
+                ended_at_ms=120_100,
+                peak_at_ms=120_000,
+                peak_score=1.0,
+                changed_area=0.1,
+            ),
+        )
+
+    monkeypatch.setattr(detector_module, "scan_video_file", fake_scan)
+    worker = LiveReviewBatchScanWorker(
+        lambda: tuple(segments),
+        lambda _items: None,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        manifest_dir=tmp_path,
+        batch_ms=120_000,
+        overlap_ms=2_000,
+    )
+    result = worker.scan_once()
+
+    assert len(calls) == 2
+    assert len(result) == 1
+    assert result[0].peak_at_ms == 120_000
+    assert result[0].video_path.endswith("segment_060.ts")
+
+
+def test_live_batch_scanner_does_not_collapse_missing_segment_gap(tmp_path, monkeypatch):
+    segments = []
+    for index in range(61):
+        if index == 30:
+            continue
+        start = index * 2_000
+        path = tmp_path / f"segment_{index:03d}.ts"
+        path.write_bytes(b"video")
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"segment-{index}",
+                camera_index=1,
+                started_at_ms=start,
+                ended_at_ms=start + 2_000,
+                video_path=path.name,
+            )
+        )
+    scan_calls = []
+    monkeypatch.setattr(
+        detector_module,
+        "scan_video_file",
+        lambda *args, **kwargs: scan_calls.append(args[0]) or (),
+    )
+    worker = LiveReviewBatchScanWorker(
+        lambda: tuple(segments),
+        lambda _items: None,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        manifest_dir=tmp_path,
+    )
+
+    assert worker.scan_once() == ()
+    assert scan_calls == []
+
+
+def test_live_batch_scanner_pause_terminates_active_ffmpeg():
+    class _Process:
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    worker = LiveReviewBatchScanWorker(lambda: (), lambda _items: None)
+    process = _Process()
+    worker._set_active_process(process)
+
+    worker.pause()
+
+    assert process.terminated
 
 
 def test_scan_video_file_hides_ffmpeg_console_on_windows(tmp_path, monkeypatch):
@@ -47,11 +164,44 @@ def test_scan_video_file_hides_ffmpeg_console_on_windows(tmp_path, monkeypatch):
         ffmpeg_path="ffmpeg",
     )
 
-    assert calls[0][1]["creationflags"] == getattr(
-        detector_module.subprocess,
-        "CREATE_NO_WINDOW",
-        0,
+    assert calls[0][1]["creationflags"] == (
+        getattr(detector_module.subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(
+            detector_module.subprocess,
+            "BELOW_NORMAL_PRIORITY_CLASS",
+            0x00004000,
+        )
     )
+
+
+def test_scan_video_file_uses_concat_demuxer_for_batch_manifest(tmp_path, monkeypatch):
+    manifest = tmp_path / "batch.ffconcat"
+    manifest.write_text("ffconcat version 1.0\n", encoding="utf-8")
+    calls = []
+
+    class _Process:
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(
+        detector_module.subprocess,
+        "Popen",
+        lambda command, **kwargs: (calls.append(command) or _Process()),
+    )
+    detector_module.scan_video_file(
+        manifest,
+        started_at_ms=0,
+        width=2,
+        height=2,
+        ffmpeg_path="ffmpeg",
+    )
+
+    assert calls[0][1:5] == ["-hide_banner", "-loglevel", "error", "-nostdin"]
+    assert calls[0][5:10] == ["-f", "concat", "-safe", "0", "-i"]
 
 
 def _frame(value: int = 0) -> np.ndarray:

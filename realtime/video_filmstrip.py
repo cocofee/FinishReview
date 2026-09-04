@@ -139,7 +139,27 @@ class FilmstripCanvas(QWidget):
         self.setMinimumHeight(FILMSTRIP_TILE_HEIGHT + 34)
 
     def _visual_frames(self) -> list[FilmstripFrame]:
-        return sorted(self.owner._frames, key=lambda value: value.position_ms, reverse=self.owner._reverse)
+        cached = {
+            int(frame.position_ms): frame for frame in self.owner._frames
+        }
+        if self.owner._target_positions:
+            positions = (
+                tuple(reversed(self.owner._target_positions))
+                if self.owner._reverse
+                else self.owner._target_positions
+            )
+            return [
+                cached.get(
+                    position,
+                    FilmstripFrame(position, -1, QImage()),
+                )
+                for position in positions
+            ]
+        return sorted(
+            self.owner._frames,
+            key=lambda value: value.position_ms,
+            reverse=self.owner._reverse,
+        )
 
     def _frame_at_x(self, x: float) -> FilmstripFrame | None:
         frames = self._visual_frames()
@@ -205,7 +225,7 @@ class FilmstripCanvas(QWidget):
         self.position_released.emit(position_ms)
 
     def refresh_geometry(self) -> None:
-        count = len(self.owner._frames)
+        count = max(len(self.owner._frames), len(self.owner._target_positions))
         viewport_width = self.owner.scroll.viewport().width()
         width = max(viewport_width, 8 + count * (FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP))
         height = max(self.owner.scroll.viewport().height(), FILMSTRIP_TILE_HEIGHT + 34)
@@ -435,6 +455,8 @@ class VideoFilmstripWidget(QFrame):
         self._frames: list[FilmstripFrame] = []
         self._frames_by_path: dict[Path, dict[int, FilmstripFrame]] = {}
         self._requested_positions: set[int] = set()
+        self._target_positions: tuple[int, ...] = ()
+        self._deferred_positions: set[int] = set()
         self._pending_positions: list[int] = []
         self._render_timer_pending = False
         self._video_path: Path | None = None
@@ -503,11 +525,19 @@ class VideoFilmstripWidget(QFrame):
         self.scroll.horizontalScrollBar().valueChanged.connect(
             self._emit_visible_range
         )
-        self.content.position_released.connect(self.position_selected.emit)
+        self.content.position_released.connect(self._on_content_position_selected)
         self.content.position_double_clicked.connect(self.position_double_clicked.emit)
         self.content.scrub_position_changed.connect(self.scrub_position_changed.emit)
         self.marker_position_selected.connect(self._on_marker_position_selected)
         layout.addWidget(self.scroll, 1)
+
+    def _on_content_position_selected(self, position_ms: int) -> None:
+        position_ms = int(position_ms)
+        self._load_deferred_visible_range(
+            position_ms - DEFAULT_FILMSTRIP_INTERVAL_MS,
+            position_ms + DEFAULT_FILMSTRIP_INTERVAL_MS,
+        )
+        self.position_selected.emit(position_ms)
 
     def _on_marker_position_selected(
         self,
@@ -581,22 +611,45 @@ class VideoFilmstripWidget(QFrame):
         self.content.update()
 
     def _emit_visible_range(self) -> None:
-        frames = self.content._visual_frames()
-        if not frames:
+        positions = self._target_positions or tuple(
+            int(frame.position_ms) for frame in self.content._visual_frames()
+        )
+        if self._reverse and self._target_positions:
+            positions = tuple(reversed(positions))
+        if not positions:
             return
         step = FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP
         scroll_left = self.scroll.horizontalScrollBar().value()
         viewport_width = max(1, self.scroll.viewport().width())
-        first_index = max(0, min(len(frames) - 1, int(scroll_left // step)))
+        first_index = max(0, min(len(positions) - 1, int(scroll_left // step)))
         last_index = max(
             first_index,
-            min(len(frames) - 1, int((scroll_left + viewport_width) // step)),
+            min(len(positions) - 1, int((scroll_left + viewport_width) // step)),
         )
-        positions = (
-            int(frames[first_index].position_ms),
-            int(frames[last_index].position_ms),
+        visible_positions = (
+            int(positions[first_index]),
+            int(positions[last_index]),
         )
-        self.visible_range_changed.emit(min(positions), max(positions))
+        self._load_deferred_visible_range(
+            min(visible_positions), max(visible_positions)
+        )
+        self.visible_range_changed.emit(
+            min(visible_positions), max(visible_positions)
+        )
+
+    def _load_deferred_visible_range(self, start_ms: int, end_ms: int) -> None:
+        if not self._deferred_positions:
+            return
+        positions = tuple(
+            position
+            for position in self._target_positions
+            if start_ms <= position <= end_ms
+            and position in self._deferred_positions
+        )
+        if not positions:
+            return
+        self._deferred_positions.difference_update(positions)
+        self.append_positions(self._video_path, positions)
 
     def _align_current_position_to_center(self) -> None:
         if not self._frames or self._current_position_ms < 0:
@@ -621,6 +674,8 @@ class VideoFilmstripWidget(QFrame):
         self._frames.clear()
         self._frames_by_path.clear()
         self._requested_positions.clear()
+        self._target_positions = ()
+        self._deferred_positions.clear()
         self._pending_positions.clear()
         self._video_path = None
         self._display_start_ms = None
@@ -663,6 +718,7 @@ class VideoFilmstripWidget(QFrame):
         *,
         positions_ms: Iterable[int] = (),
         origin_ms: int | None = None,
+        defer_remaining: bool = False,
     ) -> None:
         path = Path(video_path)
         self.stop()
@@ -688,17 +744,31 @@ class VideoFilmstripWidget(QFrame):
         self._requested_positions = {frame.position_ms for frame in self._frames}
         self.mark_button.setEnabled(bool(self._frames))
         self._pending_positions.clear()
+        self._deferred_positions.clear()
         self.status_label.setText("正在生成时间胶卷...")
-        positions = filmstrip_positions(start_ms, end_ms, anchors=positions_ms)
+        positions = tuple(
+            int(value)
+            for value in filmstrip_positions(start_ms, end_ms, anchors=positions_ms)
+        )
+        self._target_positions = positions
+        # The target list defines the full scrollable timeline, including
+        # deferred thumbnails. Refresh after assigning it so the scrollbar
+        # exposes the complete range before the first deferred-load pass.
+        self.content.refresh_geometry()
         missing = tuple(position for position in positions if position not in self._requested_positions)
-        self._requested_positions.update(missing)
         if missing:
             # Prioritize the selected athlete's neighborhood so a usable
             # preview appears quickly; continue the remaining strip later.
             priority = tuple(sorted(missing, key=lambda value: (abs(value - self._current_position_ms), value)))
             self._first_frame_received = False
-            self._start_worker(priority[:FILMSTRIP_INITIAL_BATCH])
-            self._pending_positions.extend(priority[FILMSTRIP_INITIAL_BATCH:])
+            initial_positions = priority[:FILMSTRIP_INITIAL_BATCH]
+            self._requested_positions.update(initial_positions)
+            self._start_worker(initial_positions)
+            if not defer_remaining:
+                self._requested_positions.update(priority[FILMSTRIP_INITIAL_BATCH:])
+                self._pending_positions.extend(priority[FILMSTRIP_INITIAL_BATCH:])
+            else:
+                self._deferred_positions.update(priority[FILMSTRIP_INITIAL_BATCH:])
         else:
             self.status_label.setText(f"{len(self._frames)} 个预览点")
 
@@ -709,6 +779,7 @@ class VideoFilmstripWidget(QFrame):
         if not new_positions:
             return
         self._requested_positions.update(new_positions)
+        self._deferred_positions.difference_update(new_positions)
         if self._worker is not None and self._worker.isRunning():
             self._pending_positions.extend(new_positions)
             return

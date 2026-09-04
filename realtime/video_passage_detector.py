@@ -21,6 +21,16 @@ import numpy as np
 from .finish_line import FinishLine
 
 
+# Python's subprocess module does not expose this Windows creation flag on
+# every supported version. Keep the numeric fallback local so candidate scans
+# remain below the recorder even on older Python builds.
+_BELOW_NORMAL_PRIORITY_CLASS = getattr(
+    subprocess,
+    "BELOW_NORMAL_PRIORITY_CLASS",
+    0x00004000,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class VideoPassageCandidate:
     """One continuous visual passage batch, not an official passage record."""
@@ -95,6 +105,48 @@ class VideoPassageDetectorConfig:
             raise ValueError("global_motion_area must be between zero and one")
         if self.global_motion_confirm_frames <= 0:
             raise ValueError("global_motion_confirm_frames must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewBatchRange:
+    """A core review batch and the small overlap used for detector context."""
+
+    core_started_at_ms: int
+    core_ended_at_ms: int
+    scan_started_at_ms: int
+    scan_ended_at_ms: int
+
+
+def review_batch_range(
+    core_started_at_ms: int,
+    *,
+    batch_ms: int = 120_000,
+    overlap_ms: int = 2_000,
+) -> ReviewBatchRange:
+    """Return one half-open batch range with bounded detector overlap."""
+
+    batch_ms = int(batch_ms)
+    overlap_ms = max(0, int(overlap_ms))
+    if batch_ms <= 0:
+        raise ValueError("batch_ms must be positive")
+    core_started_at_ms = int(core_started_at_ms)
+    core_ended_at_ms = core_started_at_ms + batch_ms
+    return ReviewBatchRange(
+        core_started_at_ms=core_started_at_ms,
+        core_ended_at_ms=core_ended_at_ms,
+        scan_started_at_ms=max(0, core_started_at_ms - overlap_ms),
+        scan_ended_at_ms=core_ended_at_ms + overlap_ms,
+    )
+
+
+def review_batch_start(timestamp_ms: int, *, batch_ms: int = 120_000) -> int:
+    """Align an absolute timeline timestamp to a deterministic batch start."""
+
+    batch_ms = int(batch_ms)
+    if batch_ms <= 0:
+        raise ValueError("batch_ms must be positive")
+    timestamp_ms = int(timestamp_ms)
+    return timestamp_ms // batch_ms * batch_ms
 
 
 @dataclass(slots=True)
@@ -426,9 +478,12 @@ def scan_video_file(
     crop_top, crop_bottom = int(height * top), max(int(height * bottom), 1)
     crop_width = max(1, crop_right - crop_left)
     crop_height = max(1, crop_bottom - crop_top)
+    input_args = ["-i", str(video_path)]
+    if video_path.suffix.lower() == ".ffconcat":
+        input_args = ["-f", "concat", "-safe", "0", *input_args]
     command = [
         str(ffmpeg_path), "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-i", str(video_path), "-vf",
+        *input_args, "-vf",
         f"scale={int(width)}:{int(height)},fps={float(sample_fps):g}",
         "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
     ]
@@ -437,11 +492,14 @@ def scan_video_file(
         "stderr": subprocess.PIPE,
     }
     if os.name == "nt":
+        # Keep candidate scanning below the recorder and the foreground judge.
+        # ``BELOW_NORMAL_PRIORITY_CLASS`` is unavailable on non-Windows test
+        # doubles, so the fallback remains the existing no-console flag.
         process_kwargs["creationflags"] = getattr(
             subprocess,
             "CREATE_NO_WINDOW",
             0,
-        )
+        ) | _BELOW_NORMAL_PRIORITY_CLASS
     process = subprocess.Popen(command, **process_kwargs)
     if process_callback is not None:
         process_callback(process)
@@ -782,6 +840,346 @@ class VideoPassageScanWorker:
             self._wake.clear()
 
 
+class LiveReviewBatchScanWorker:
+    """Low-priority scanner for one continuously recorded camera.
+
+    Completed HLS segments are joined into one temporary concat manifest per
+    120-second core batch. A two-second overlap gives the detector enough
+    context at both edges while half-open core ownership and absolute-time
+    de-duplication ensure that a crossing is published once.
+    """
+
+    def __init__(
+        self,
+        segment_provider: Callable[[], Iterable[object]],
+        result_callback: Callable[[tuple[VideoPassageCandidate, ...]], None],
+        *,
+        camera_index: int = 1,
+        width: int = 480,
+        height: int = 270,
+        ffmpeg_path: str | Path = "ffmpeg",
+        sample_fps: float = 3.0,
+        roi: tuple[float, float, float, float] = (0.35, 0.15, 0.65, 0.95),
+        interval_seconds: float = 2.0,
+        batch_ms: int = 120_000,
+        overlap_ms: int = 2_000,
+        path_resolver: Callable[[object], str | Path] | None = None,
+        finish_line: FinishLine | None = None,
+        line_batch_gap_ms: int = 1_500,
+        manifest_dir: str | Path | None = None,
+        segment_gap_tolerance_ms: int = 250,
+        progress_callback: Callable[[int | None], None] | None = None,
+    ):
+        self.segment_provider = segment_provider
+        self.result_callback = result_callback
+        self.camera_index = max(1, int(camera_index))
+        self.width = int(width)
+        self.height = int(height)
+        self.ffmpeg_path = ffmpeg_path
+        self.sample_fps = float(sample_fps)
+        self.roi = roi
+        self.interval_seconds = max(0.5, float(interval_seconds))
+        self.batch_ms = int(batch_ms)
+        self.overlap_ms = max(0, int(overlap_ms))
+        if self.batch_ms <= 0:
+            raise ValueError("batch_ms must be positive")
+        self.path_resolver = path_resolver or (
+            lambda segment: str(getattr(segment, "video_path", ""))
+        )
+        self.finish_line = finish_line
+        self.line_batch_gap_ms = max(0, int(line_batch_gap_ms))
+        self.manifest_dir = Path(manifest_dir).resolve() if manifest_dir else None
+        self.segment_gap_tolerance_ms = max(0, int(segment_gap_tolerance_ms))
+        self.progress_callback = progress_callback
+        self._stop = threading.Event()
+        self._pause_requested = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._next_batch_start_ms: int | None = None
+        self._emitted_keys: set[tuple[int, int]] = set()
+        self._process_lock = threading.Lock()
+        self._active_process: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="live-review-batch-scan",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def request_scan(self) -> None:
+        self._wake.set()
+
+    def pause(self) -> None:
+        self._pause_requested.set()
+        self._terminate_active_process()
+        self._wake.set()
+
+    def resume(self) -> None:
+        self._pause_requested.clear()
+        self._wake.set()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        self._wake.set()
+        self._terminate_active_process()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=max(0.1, float(timeout)))
+        if thread is None or not thread.is_alive():
+            self._thread = None
+        self._notify_progress(None)
+
+    def _set_active_process(self, process: subprocess.Popen | None) -> None:
+        with self._process_lock:
+            self._active_process = process
+
+    def _terminate_active_process(self) -> None:
+        with self._process_lock:
+            process = self._active_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    def _notify_progress(self, value: int | None) -> None:
+        callback = self.progress_callback
+        if callback is not None:
+            try:
+                callback(value)
+            except Exception:  # noqa: BLE001 - progress must not stop scanning.
+                pass
+
+    def _segments_are_contiguous(self, segments: Sequence[object]) -> bool:
+        previous_end: int | None = None
+        for segment in segments:
+            started = int(getattr(segment, "started_at_ms"))
+            ended = int(getattr(segment, "ended_at_ms"))
+            if ended <= started:
+                return False
+            if (
+                previous_end is not None
+                and started - previous_end > self.segment_gap_tolerance_ms
+            ):
+                return False
+            previous_end = ended
+        return True
+
+    def _batch_has_core_coverage(
+        self,
+        batch: ReviewBatchRange,
+        segments: Sequence[object],
+        ordered: Sequence[object],
+    ) -> bool:
+        """Reject gaps at a batch edge without rejecting an initial partial batch."""
+        if not segments:
+            return False
+        initial_start = review_batch_start(
+            int(getattr(ordered[0], "started_at_ms")), batch_ms=self.batch_ms
+        )
+        if batch.core_started_at_ms == initial_start:
+            return True
+        tolerance = self.segment_gap_tolerance_ms
+        return (
+            int(getattr(segments[0], "started_at_ms"))
+            <= batch.core_started_at_ms + tolerance
+            and int(getattr(segments[-1], "ended_at_ms"))
+            >= batch.core_ended_at_ms - tolerance
+        )
+
+    @staticmethod
+    def _manifest_reference(path: Path) -> str:
+        # FFconcat accepts POSIX separators and single-quote escaping for
+        # Windows paths. The manifest uses absolute paths to avoid staging or
+        # linking large HLS segments on an 8 GB field computer.
+        value = path.resolve().as_posix()
+        return value.replace("'", "'\\''")
+
+    def _write_manifest(
+        self,
+        batch: ReviewBatchRange,
+        segments: Sequence[object],
+    ) -> Path:
+        directory = self.manifest_dir
+        if directory is None:
+            first_path = Path(self.path_resolver(segments[0])).resolve()
+            directory = first_path.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (
+            f".live_review_{self.camera_index}_{batch.core_started_at_ms}.ffconcat"
+        )
+        lines = ["ffconcat version 1.0"]
+        for segment in segments:
+            lines.append(f"file '{self._manifest_reference(Path(self.path_resolver(segment)))}'")
+            lines.append(
+                f"duration {max(1, int(getattr(segment, 'ended_at_ms') - getattr(segment, 'started_at_ms'))) / 1000.0:.6f}"
+            )
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+        return path
+
+    def _ready_batch(self, segments: Sequence[object]) -> tuple[ReviewBatchRange, ...]:
+        if not segments:
+            return ()
+        ordered = tuple(
+            sorted(segments, key=lambda item: (int(getattr(item, "started_at_ms")), str(getattr(item, "segment_id", ""))))
+        )
+        if self._next_batch_start_ms is None:
+            self._next_batch_start_ms = review_batch_start(
+                int(getattr(ordered[0], "started_at_ms")), batch_ms=self.batch_ms
+            )
+        latest_end = max(int(getattr(item, "ended_at_ms")) for item in ordered)
+        ready = []
+        cursor = self._next_batch_start_ms
+        while cursor + self.batch_ms <= latest_end:
+            ready.append(
+                review_batch_range(
+                    cursor,
+                    batch_ms=self.batch_ms,
+                    overlap_ms=self.overlap_ms,
+                )
+            )
+            cursor += self.batch_ms
+        return tuple(ready)
+
+    def scan_once(self) -> tuple[VideoPassageCandidate, ...]:
+        if self._stop.is_set() or self._pause_requested.is_set():
+            return ()
+        segments = tuple(self.segment_provider())
+        ordered = tuple(
+            sorted(segments, key=lambda item: (int(getattr(item, "started_at_ms")), str(getattr(item, "segment_id", ""))))
+        )
+        found: list[VideoPassageCandidate] = []
+        for batch in self._ready_batch(ordered):
+            if self._stop.is_set() or self._pause_requested.is_set():
+                break
+            selected = tuple(
+                item
+                for item in ordered
+                if int(getattr(item, "ended_at_ms")) > batch.scan_started_at_ms
+                and int(getattr(item, "started_at_ms")) < batch.scan_ended_at_ms
+                and Path(self.path_resolver(item)).is_file()
+            )
+            if not selected:
+                break
+            if not self._batch_has_core_coverage(batch, selected, ordered):
+                break
+            if not self._segments_are_contiguous(selected):
+                # Never collapse a timeline gap into the concat stream. Keep
+                # the cursor unchanged and retry after the playlist/file set
+                # becomes complete.
+                break
+            self._notify_progress(batch.core_started_at_ms)
+            try:
+                manifest = self._write_manifest(batch, selected)
+            except (OSError, ValueError):
+                # Leave the batch cursor unchanged so a transient file-system
+                # or playlist race is retried on the next polling cycle.
+                break
+            detector = (
+                FixedCameraLineCrossingDetector(
+                    self.finish_line,
+                    camera_index=self.camera_index,
+                )
+                if self.finish_line is not None
+                else LightweightVideoPassageDetector(
+                    VideoPassageDetectorConfig(camera_index=self.camera_index)
+                )
+            )
+            scan_succeeded = False
+            try:
+                candidates = scan_video_file(
+                    manifest,
+                    started_at_ms=int(getattr(selected[0], "started_at_ms")),
+                    width=self.width,
+                    height=self.height,
+                    ffmpeg_path=self.ffmpeg_path,
+                    sample_fps=self.sample_fps,
+                    roi=self.roi,
+                    detector=detector,
+                    process_callback=self._set_active_process,
+                )
+                scan_succeeded = True
+            except (OSError, RuntimeError, ValueError):
+                candidates = ()
+            finally:
+                try:
+                    manifest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if not scan_succeeded:
+                break
+            merged = (
+                merge_line_crossings(candidates, batch_gap_ms=self.line_batch_gap_ms)
+                if self.finish_line is not None
+                else merge_candidates(candidates)
+            )
+            for candidate in merged:
+                if not (
+                    batch.core_started_at_ms
+                    <= candidate.peak_at_ms
+                    < batch.core_ended_at_ms
+                ):
+                    continue
+                key = (int(candidate.camera_index), int(candidate.peak_at_ms))
+                if key in self._emitted_keys:
+                    continue
+                owner = next(
+                    (
+                        item
+                        for item in selected
+                        if int(getattr(item, "started_at_ms"))
+                        <= candidate.peak_at_ms
+                        < int(getattr(item, "ended_at_ms"))
+                    ),
+                    selected[0],
+                )
+                segment_id = str(getattr(owner, "segment_id", ""))
+                path = Path(self.path_resolver(owner)).resolve()
+                normalized = replace(
+                    candidate,
+                    candidate_id=f"batch:{batch.core_started_at_ms}:{candidate.candidate_id}",
+                    camera_index=self.camera_index,
+                    segment_id=segment_id,
+                    video_path=str(path),
+                    video_position_ms=max(
+                        0,
+                        int(candidate.peak_at_ms - int(getattr(owner, "started_at_ms"))),
+                    ),
+                )
+                self._emitted_keys.add(key)
+                found.append(normalized)
+            self._next_batch_start_ms = batch.core_ended_at_ms
+            self._notify_progress(self._next_batch_start_ms)
+            # Yield between FFmpeg runs when several batches are waiting, so
+            # recording and the foreground judge remain responsive on older
+            # single-camera machines.
+            time.sleep(0)
+        result = tuple(found)
+        if result and not self._stop.is_set() and self.result_callback is not None:
+            self.result_callback(result)
+        return result
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if not self._pause_requested.is_set():
+                try:
+                    self.scan_once()
+                except (OSError, RuntimeError, ValueError):
+                    # HLS playlists and segment files can change underneath a
+                    # polling pass. Keep the recorder independent and retry
+                    # on the next wake-up instead of killing the scanner.
+                    pass
+            self._wake.wait(self.interval_seconds)
+            self._wake.clear()
+
+
 __all__ = [
     "LightweightVideoPassageDetector",
     "FixedCameraLineCrossingDetector",
@@ -791,6 +1189,10 @@ __all__ = [
     "merge_line_crossings",
     "scan_video_file",
     "VideoPassageScanWorker",
+    "ReviewBatchRange",
+    "review_batch_range",
+    "review_batch_start",
+    "LiveReviewBatchScanWorker",
     "match_candidate_counts",
     "VideoPassageReconciliation",
     "reconcile_candidates",

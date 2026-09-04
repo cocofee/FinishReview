@@ -1600,6 +1600,7 @@ class VideoPlaybackDialog(QDialog):
         parent=None,
         *,
         worker_factory: Callable[..., VideoPlaybackWorker] = VideoPlaybackWorker,
+        reverse_prefetch: bool = True,
         initial_position_ms: Optional[int] = None,
         target_position_ms: Optional[int] = None,
         context_text: str = "",
@@ -1634,7 +1635,19 @@ class VideoPlaybackDialog(QDialog):
         self.setMinimumSize(820, 580)
         self._init_ui()
 
-        self.worker = worker_factory(self.video_path, self)
+        try:
+            self.worker = worker_factory(
+                self.video_path,
+                self,
+                reverse_prefetch=bool(reverse_prefetch),
+            )
+        except TypeError:
+            # Preserve compatibility with lightweight worker test doubles.
+            self.worker = worker_factory(self.video_path, self)
+            if not reverse_prefetch and hasattr(
+                self.worker, "_reverse_prefetch_enabled"
+            ):
+                self.worker._reverse_prefetch_enabled = False
         self.worker.metadata_ready.connect(self._on_metadata_ready)
         self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.playback_finished.connect(self._on_playback_finished)

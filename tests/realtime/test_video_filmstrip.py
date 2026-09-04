@@ -240,6 +240,46 @@ def test_filmstrip_load_prioritizes_current_area_and_queues_remaining_positions(
     widget.close()
 
 
+def test_filmstrip_low_resource_load_stops_after_initial_batch():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    path = Path("race.mp4")
+    widget._video_path = path
+    widget.set_current_position(10_000)
+    started: list[tuple[int, ...]] = []
+    widget._start_worker = lambda positions: started.append(tuple(positions))
+
+    widget.load(path, 0, 30_000, defer_remaining=True)
+
+    assert started == [(10_000, 8_000, 12_000, 6_000, 14_000)]
+    assert widget._pending_positions == []
+    widget.close()
+
+
+def test_filmstrip_deferred_positions_load_when_scrolled_into_view():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    path = Path("race.mp4")
+    widget._video_path = path
+    widget.set_current_position(10_000)
+    started: list[tuple[int, ...]] = []
+    widget._start_worker = lambda positions: started.append(tuple(positions))
+    widget.resize(500, 320)
+    widget.show()
+    app.processEvents()
+
+    widget.load(path, 0, 30_000, defer_remaining=True)
+    app.processEvents()
+    widget.scroll.horizontalScrollBar().setValue(
+        widget.scroll.horizontalScrollBar().maximum()
+    )
+    app.processEvents()
+
+    assert len(started) >= 2
+    assert any(position >= 20_000 for position in started[-1])
+    widget.close()
+
+
 def test_filmstrip_labels_are_relative_to_current_position():
     app = QApplication.instance() or QApplication([])
     widget = VideoFilmstripWidget()

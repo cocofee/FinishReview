@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 from collections.abc import Callable
@@ -38,6 +39,7 @@ DEFAULT_REVIEW_RETENTION_SECONDS = 360
 DEFAULT_REVIEW_PRE_ROLL_SECONDS = 3
 DEFAULT_REVIEW_POST_ROLL_SECONDS = 3
 DEFAULT_MAX_SHARED_REVIEW_CLIP_MS = 20_000
+MIN_FREE_BYTES_FOR_SCAN_PROTECTION = 1024**3
 DEFAULT_ARCHIVE_TIMING_ERROR_MS = 3_000
 _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS = 5
 ARCHIVE_SESSION_SCHEMA_VERSION = 1
@@ -830,6 +832,7 @@ class ReviewRingBuffer:
         self._segments: dict[str, ReviewSegment] = {}
         self._pins_by_event: dict[str, set[str]] = {}
         self._pins_by_segment: dict[str, set[str]] = {}
+        self._scan_watermark_ms: int | None = None
         self._load_pin_journal()
 
     @staticmethod
@@ -1019,6 +1022,54 @@ class ReviewRingBuffer:
             line_batch_gap_ms=line_batch_gap_ms,
         )
 
+    def create_live_review_batch_scan_worker(
+        self,
+        result_callback: Callable,
+        *,
+        width: int = 480,
+        height: int = 270,
+        ffmpeg_path: str | Path = "ffmpeg",
+        sample_fps: float = 3.0,
+        roi: tuple[float, float, float, float] = (0.35, 0.15, 0.65, 0.95),
+        interval_seconds: float = 2.0,
+        batch_ms: int = 120_000,
+        overlap_ms: int = 2_000,
+        finish_line=None,
+        line_batch_gap_ms: int = 1_500,
+    ):
+        """Create the single-camera low-resource batch scanner."""
+        from .video_passage_detector import LiveReviewBatchScanWorker
+
+        def provider() -> tuple[ReviewSegment, ...]:
+            self.scan()
+            return self.segments()
+
+        return LiveReviewBatchScanWorker(
+            provider,
+            result_callback,
+            camera_index=self.camera_index,
+            width=width,
+            height=height,
+            ffmpeg_path=ffmpeg_path,
+            sample_fps=sample_fps,
+            roi=roi,
+            interval_seconds=interval_seconds,
+            batch_ms=batch_ms,
+            overlap_ms=overlap_ms,
+            path_resolver=self.resolve_path,
+            finish_line=finish_line,
+            line_batch_gap_ms=line_batch_gap_ms,
+            manifest_dir=self.buffer_dir,
+            progress_callback=self.set_scan_watermark,
+        )
+
+    def set_scan_watermark(self, watermark_ms: int | None) -> None:
+        """Protect unprocessed segments while the live batch scanner catches up."""
+        with self._lock:
+            self._scan_watermark_ms = (
+                None if watermark_ms is None else int(watermark_ms)
+            )
+
     def segments(self) -> tuple[ReviewSegment, ...]:
         with self._lock:
             return tuple(
@@ -1087,10 +1138,25 @@ class ReviewRingBuffer:
         """Delete expired, completed segments that no passage references."""
         cutoff_ms = int(current_time_ms) - self.retention_ms
         deleted = []
+        with self._lock:
+            scan_watermark_ms = self._scan_watermark_ms
+        protect_scan_segments = False
+        if scan_watermark_ms is not None:
+            try:
+                protect_scan_segments = (
+                    shutil.disk_usage(self.buffer_dir).free
+                    >= MIN_FREE_BYTES_FOR_SCAN_PROTECTION
+                )
+            except OSError:
+                protect_scan_segments = False
         for segment in list(self._segments.values()):
             if (
                 segment.ended_at_ms >= cutoff_ms
                 or self._pins_by_segment.get(segment.segment_id)
+                or (
+                    protect_scan_segments
+                    and segment.ended_at_ms >= scan_watermark_ms
+                )
             ):
                 continue
             path = self.resolve_path(segment)

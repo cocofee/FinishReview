@@ -2542,6 +2542,7 @@ class FinishReviewWindow(PassageReviewSurface):
             include_recorded_evidence=False,
             review_binding_store=review_binding_store,
             calibration_store=calibration_store,
+            low_resource_mode=len(regular_camera_indexes) == 1,
         )
 
         self.setWindowTitle(APP_WINDOW_TITLE)
@@ -2687,6 +2688,12 @@ class FinishReviewWindow(PassageReviewSurface):
         """Start advisory crossing detection only for the selected RTSP camera."""
         self._stop_visual_workers()
         self._visual_failed = False
+        # In the single-camera field profile the batch scanner consumes the
+        # completed low-rate HLS preview. Starting a second RTSP decoder would
+        # compete with the recorder and the foreground judge on old CPUs.
+        if len(self._configured_recording_sources()) <= 1:
+            self._visual_status = "disabled_single_camera_batch_scan"
+            return
         if not self._video_assist_enabled():
             self._visual_status = "disabled"
             return
@@ -2857,6 +2864,7 @@ class FinishReviewWindow(PassageReviewSurface):
             target_position_ms=session.target_position_ms,
             context_text=context_text,
             autoplay=True,
+            reverse_prefetch=not self._low_resource_mode,
             window_title=f"定点回放 - {identity}号",
         )
         pause_token = self._pause_video_scan_workers()
@@ -4190,18 +4198,34 @@ class FinishReviewWindow(PassageReviewSurface):
             self._video_scan_workers = {}
             if self._video_assist_enabled():
                 for camera_index, ring_buffer in ring_buffers.items():
-                    worker = ring_buffer.create_video_passage_scan_worker(
-                        self._on_video_candidates,
-                        width=640,
-                        height=360,
-                        ffmpeg_path=self.ffmpeg_path or "ffmpeg",
-                        sample_fps=8.0,
-                        roi=self._finish_line_rois.get(
-                            camera_index, (0.35, 0.15, 0.65, 0.95)
-                        ),
-                        interval_seconds=2.0,
-                        finish_line=self._finish_line_store.get(camera_index),
-                    )
+                    if len(configured_sources) == 1:
+                        worker = ring_buffer.create_live_review_batch_scan_worker(
+                            self._on_video_candidates,
+                            width=480,
+                            height=270,
+                            ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                            sample_fps=3.0,
+                            roi=self._finish_line_rois.get(
+                                camera_index, (0.35, 0.15, 0.65, 0.95)
+                            ),
+                            interval_seconds=2.0,
+                            batch_ms=120_000,
+                            overlap_ms=2_000,
+                            finish_line=self._finish_line_store.get(camera_index),
+                        )
+                    else:
+                        worker = ring_buffer.create_video_passage_scan_worker(
+                            self._on_video_candidates,
+                            width=640,
+                            height=360,
+                            ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                            sample_fps=8.0,
+                            roi=self._finish_line_rois.get(
+                                camera_index, (0.35, 0.15, 0.65, 0.95)
+                            ),
+                            interval_seconds=2.0,
+                            finish_line=self._finish_line_store.get(camera_index),
+                        )
                     self._video_scan_workers[camera_index] = worker
                     worker.start()
             self._start_visual_workers()
@@ -4278,21 +4302,38 @@ class FinishReviewWindow(PassageReviewSurface):
                 binding_store=self.review_binding_store,
             )
             if self._video_assist_enabled():
-                scan_worker = ring_buffer.create_video_passage_scan_worker(
-                    lambda candidates, generation=self._video_scan_generation: self._on_video_candidates(
-                        candidates,
-                        generation,
-                    ),
-                    width=640,
-                    height=360,
-                    ffmpeg_path=self.ffmpeg_path or "ffmpeg",
-                    sample_fps=8.0,
-                    roi=self._finish_line_rois.get(
-                        camera_index, (0.35, 0.15, 0.65, 0.95)
-                    ),
-                    interval_seconds=2.0,
-                    finish_line=self._finish_line_store.get(camera_index),
+                callback = lambda candidates, generation=self._video_scan_generation: self._on_video_candidates(
+                    candidates,
+                    generation,
                 )
+                if len(self._configured_recording_sources()) == 1:
+                    scan_worker = ring_buffer.create_live_review_batch_scan_worker(
+                        callback,
+                        width=480,
+                        height=270,
+                        ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                        sample_fps=3.0,
+                        roi=self._finish_line_rois.get(
+                            camera_index, (0.35, 0.15, 0.65, 0.95)
+                        ),
+                        interval_seconds=2.0,
+                        batch_ms=120_000,
+                        overlap_ms=2_000,
+                        finish_line=self._finish_line_store.get(camera_index),
+                    )
+                else:
+                    scan_worker = ring_buffer.create_video_passage_scan_worker(
+                        callback,
+                        width=640,
+                        height=360,
+                        ffmpeg_path=self.ffmpeg_path or "ffmpeg",
+                        sample_fps=8.0,
+                        roi=self._finish_line_rois.get(
+                            camera_index, (0.35, 0.15, 0.65, 0.95)
+                        ),
+                        interval_seconds=2.0,
+                        finish_line=self._finish_line_store.get(camera_index),
+                    )
                 scan_worker.start()
                 if self._video_scan_pause_tokens:
                     pause = getattr(scan_worker, "pause", None)
@@ -5927,6 +5968,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 f"机位 {getattr(candidate, 'camera_index', '?')}"
             ),
             autoplay=False,
+            reverse_prefetch=not self._low_resource_mode,
             window_title="视频异常复核",
         )
         pause_token = self._pause_video_scan_workers()
@@ -5993,6 +6035,7 @@ class FinishReviewWindow(PassageReviewSurface):
             target_position_ms=session.target_position_ms,
             context_text=f"视觉异常：{getattr(item, 'anomaly', '待复核')}",
             autoplay=False,
+            reverse_prefetch=not self._low_resource_mode,
             window_title="视觉异常复核",
         )
         pause_token = self._pause_video_scan_workers()

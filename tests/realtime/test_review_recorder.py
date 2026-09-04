@@ -478,6 +478,29 @@ def test_releasing_last_passage_allows_expired_segment_cleanup(tmp_path):
     )
 
 
+def test_scan_watermark_preserves_unprocessed_expired_segments(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [
+            ("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0),
+            ("new.ts", "2026-08-21T12:00:02.000+00:00", 2.0),
+        ],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=30)
+    buffer.scan()
+    buffer.set_scan_watermark(1_787_313_600_000)
+
+    assert buffer.cleanup(current_time_ms=1_787_313_700_000) == ()
+    assert (tmp_path / "old.ts").is_file()
+    assert (tmp_path / "new.ts").is_file()
+
+    buffer.set_scan_watermark(None)
+    assert buffer.cleanup(current_time_ms=1_787_313_700_000) == (
+        tmp_path / "old.ts",
+        tmp_path / "new.ts",
+    )
+
+
 def test_passage_window_waits_for_tail_then_becomes_ready(tmp_path):
     playlist = _write_playlist(
         tmp_path,
