@@ -232,6 +232,27 @@ def _add_segment(
     return segment
 
 
+def test_evidence_view_maps_full_resolution_tile_to_source_coordinates(qapp):
+    view = passage_review.EvidenceImageView()
+    preview = QImage(50, 20, QImage.Format_RGB888)
+    preview.fill(0)
+    preview.setText("finishreview.source_span_width", "5000")
+    view.set_frame(preview, source_width=5_000, source_height=20)
+    tile = QImage(100, 20, QImage.Format_RGB888)
+    tile.fill(0)
+    tile.setText("finishreview.source_x_offset", "1000")
+    tile.setText("finishreview.source_span_width", "100")
+
+    view.set_frame(tile, source_width=5_000, source_height=20)
+    view.fit_to_window()
+
+    assert view._scene.sceneRect().width() == 5_000
+    assert view._pixmap_item.pixmap().width() == 50
+    assert view._detail_pixmap_item.pos().x() == 1_000
+    assert view._detail_pixmap_item.transform().m11() == pytest.approx(1.0)
+    view.close()
+
+
 def test_empty_preview_keeps_time_filmstrip_visible(qapp, tmp_path):
     dialog = PassageReviewDialog(
         PassageEventStore(tmp_path / "passages.jsonl"),
@@ -3028,6 +3049,55 @@ def test_race_metadata_populates_context_before_first_passage(qapp, tmp_path):
     assert dialog.athlete_value.text() == "十五号运动员"
     assert dialog.team_value.text() == "示例队"
     assert dialog.selected_time_value.text() == "尚无通过记录"
+    dialog.close()
+
+
+def test_metadata_athlete_index_prioritizes_id_consistently(
+    qapp,
+    tmp_path,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = replace(
+        _event(event_id="indexed-athlete", bib="15"),
+        athlete_id="athlete-b",
+    )
+    passage_store.append(event)
+    metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    athlete_a = RaceAthleteMetadata(
+        athlete_id="athlete-a",
+        bib="15",
+        name="A",
+        team_name="",
+        group_id="men-open",
+    )
+    athlete_b = RaceAthleteMetadata(
+        athlete_id="athlete-b",
+        bib="16",
+        name="B",
+        team_name="",
+        group_id="men-open",
+    )
+
+    def metadata(revision, athletes):
+        return RaceMetadata(
+            race_id=event.race_id,
+            stage_id=event.stage_id,
+            revision=revision,
+            emitted_at_ms=revision,
+            groups=(RaceGroupMetadata("men-open", "男子组"),),
+            athletes=athletes,
+        )
+
+    metadata_store.store(metadata(1, (athlete_a, athlete_b)))
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        metadata_store=metadata_store,
+    )
+
+    assert dialog._metadata_athlete_for_event(event) == athlete_b
+    metadata_store.store(metadata(2, (athlete_b, athlete_a)))
+    assert dialog._metadata_athlete_for_event(event) == athlete_b
     dialog.close()
 
 

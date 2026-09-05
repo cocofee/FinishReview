@@ -90,6 +90,7 @@ from .race_metadata import (
 )
 from .review_selection import ReviewSelectionController, ReviewSelectionPlan
 from .review_clip import PassageReviewBindingStore
+from .runtime_metrics import RuntimeMetrics
 from .thread_lifecycle import retire_qthread, track_qthread
 from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
 from .video_filmstrip import VideoFilmstripWidget
@@ -407,9 +408,14 @@ class EvidenceImageView(QGraphicsView):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self._pixmap_item = QGraphicsPixmapItem()
+        self._detail_pixmap_item = QGraphicsPixmapItem()
+        self._detail_pixmap_item.setZValue(1)
+        self._detail_pixmap_item.hide()
         self._message_item = self._scene.addText("")
         self._message_item.setDefaultTextColor(QColor("#c9d2dc"))
+        self._message_item.setZValue(2)
         self._scene.addItem(self._pixmap_item)
+        self._scene.addItem(self._detail_pixmap_item)
         self.setScene(self._scene)
         self.setAlignment(Qt.AlignCenter)
         self.setBackgroundBrush(QColor("#090b0d"))
@@ -423,6 +429,11 @@ class EvidenceImageView(QGraphicsView):
         self._source_width = 0
         self._source_height = 0
         self._frame_cache_key = 0
+        self._frame_source_x_offset = 0
+        self._frame_source_span_width = 0
+        self._detail_frame_cache_key = 0
+        self._detail_source_x_offset = 0
+        self._detail_source_span_width = 0
         self._fit_mode = True
         self._marker_mode = False
         self._marker: Optional[tuple[float, float, str, bool]] = None
@@ -531,11 +542,71 @@ class EvidenceImageView(QGraphicsView):
         cache_key = int(image.cacheKey())
         expected_source_width = max(image.width(), int(source_width or 0))
         expected_source_height = max(image.height(), int(source_height or 0))
+        try:
+            source_x_offset = max(
+                0,
+                int(image.text("finishreview.source_x_offset") or 0),
+            )
+            source_span_width = max(
+                1,
+                int(
+                    image.text("finishreview.source_span_width")
+                    or expected_source_width
+                ),
+            )
+        except ValueError:
+            source_x_offset = 0
+            source_span_width = expected_source_width
+        is_detail_tile = bool(
+            source_x_offset > 0 or source_span_width < expected_source_width
+        )
+        if is_detail_tile:
+            if (
+                cache_key == self._detail_frame_cache_key
+                and source_x_offset == self._detail_source_x_offset
+                and source_span_width == self._detail_source_span_width
+            ):
+                return
+            pixmap = QPixmap.fromImage(image)
+            if pixmap.isNull():
+                return
+            self._source_width = max(pixmap.width(), expected_source_width)
+            self._source_height = max(pixmap.height(), expected_source_height)
+            self._detail_frame_cache_key = cache_key
+            self._detail_source_x_offset = min(
+                source_x_offset,
+                max(0, self._source_width - 1),
+            )
+            self._detail_source_span_width = min(
+                source_span_width,
+                max(1, self._source_width - self._detail_source_x_offset),
+            )
+            self._detail_pixmap_item.setPixmap(pixmap)
+            self._detail_pixmap_item.setPos(self._detail_source_x_offset, 0)
+            self._detail_pixmap_item.setTransform(
+                QTransform.fromScale(
+                    self._detail_source_span_width / max(1, pixmap.width()),
+                    self._source_height / max(1, pixmap.height()),
+                )
+            )
+            self._detail_pixmap_item.show()
+            self._scene.setSceneRect(
+                QRectF(0, 0, self._source_width, self._source_height)
+            )
+            self._message_item.hide()
+            return
+        self._detail_pixmap_item.setPixmap(QPixmap())
+        self._detail_pixmap_item.hide()
+        self._detail_frame_cache_key = 0
+        self._detail_source_x_offset = 0
+        self._detail_source_span_width = 0
         if (
             self.has_frame
             and cache_key == self._frame_cache_key
             and expected_source_width == self._source_width
             and expected_source_height == self._source_height
+            and source_x_offset == self._frame_source_x_offset
+            and source_span_width == self._frame_source_span_width
         ):
             return
         pixmap = QPixmap.fromImage(image)
@@ -544,10 +615,19 @@ class EvidenceImageView(QGraphicsView):
         self._frame_cache_key = cache_key
         self._source_width = max(pixmap.width(), expected_source_width)
         self._source_height = max(pixmap.height(), expected_source_height)
+        self._frame_source_x_offset = min(
+            source_x_offset,
+            max(0, self._source_width - 1),
+        )
+        self._frame_source_span_width = min(
+            source_span_width,
+            max(1, self._source_width - self._frame_source_x_offset),
+        )
         self._pixmap_item.setPixmap(pixmap)
+        self._pixmap_item.setPos(self._frame_source_x_offset, 0)
         self._pixmap_item.setTransform(
             QTransform.fromScale(
-                self._source_width / max(1, pixmap.width()),
+                self._frame_source_span_width / max(1, pixmap.width()),
                 self._source_height / max(1, pixmap.height()),
             )
         )
@@ -560,7 +640,16 @@ class EvidenceImageView(QGraphicsView):
 
     def clear_frame(self, message: str = "") -> None:
         self._pixmap_item.setPixmap(QPixmap())
+        self._pixmap_item.setPos(0, 0)
+        self._detail_pixmap_item.setPixmap(QPixmap())
+        self._detail_pixmap_item.setPos(0, 0)
+        self._detail_pixmap_item.hide()
         self._frame_cache_key = 0
+        self._frame_source_x_offset = 0
+        self._frame_source_span_width = 0
+        self._detail_frame_cache_key = 0
+        self._detail_source_x_offset = 0
+        self._detail_source_span_width = 0
         self._source_width = 0
         self._source_height = 0
         self.resetTransform()
@@ -1744,6 +1833,8 @@ class PassageEvidencePane(QFrame):
         worker.metadata_ready.connect(self._on_metadata_ready)
         worker.frame_ready.connect(self._on_frame_ready)
         worker.full_resolution_ready.connect(self._on_full_resolution_ready)
+        if hasattr(worker, "full_resolution_error"):
+            worker.full_resolution_error.connect(self._on_full_resolution_error)
         worker.playback_finished.connect(self._on_playback_finished)
         if hasattr(worker, "step_boundary_reached"):
             worker.step_boundary_reached.connect(self._on_step_boundary_reached)
@@ -1940,6 +2031,12 @@ class PassageEvidencePane(QFrame):
         self._update_time_label(position_ms)
         self._update_frame_indicator(position_ms)
         self.preview_frame_ready.emit(image, int(position_ms), int(frame_index))
+
+    def _on_full_resolution_error(self, message: str) -> None:
+        if self.sender() is not self._worker:
+            return
+        self._last_full_resolution_request = -1
+        self._set_status_label(self._availability_status(), str(message))
 
     def _update_time_label(self, position_ms: int) -> None:
         event = self._event
@@ -2365,6 +2462,7 @@ class PassageReviewSurface(QDialog):
     evidence_pane_added = pyqtSignal(object)
     video_review_updated = pyqtSignal(object)
     video_candidates_received = pyqtSignal(object)
+    video_candidate_persistence_failed = pyqtSignal(object)
     video_candidate_requested = pyqtSignal(object)
     video_review_apply_requested = pyqtSignal(object)
     video_review_status_changed = pyqtSignal(str, str, str)
@@ -2411,11 +2509,13 @@ class PassageReviewSurface(QDialog):
         self.passage_store = passage_store
         self.timeline_store = timeline_store
         self.review_binding_store = review_binding_store
+        self.runtime_metrics = RuntimeMetrics()
         self.video_discovery_store = video_discovery_store or VideoDiscoveryStore(
             passage_store.journal_path.with_name("video_discoveries.jsonl")
         )
         self.video_arrival_store = video_arrival_store or VideoArrivalCandidateStore(
-            passage_store.journal_path.with_name("video_arrival_candidates.jsonl")
+            passage_store.journal_path.with_name("video_arrival_candidates.jsonl"),
+            metrics=self.runtime_metrics,
         )
         self.association_store = association_store or PassageEvidenceAssociationStore(
             passage_store.journal_path.with_name("passage_evidence_associations.jsonl")
@@ -2551,6 +2651,9 @@ class PassageReviewSurface(QDialog):
         # large preview in continuous review mode.
         self._top_preview_video_visible = False
         self._metadata_context_key: tuple[str, str] = ("", "")
+        self._indexed_metadata: Optional[RaceMetadata] = None
+        self._metadata_athletes_by_id: dict[str, RaceAthleteMetadata] = {}
+        self._metadata_athletes_by_identity: dict[str, RaceAthleteMetadata] = {}
         self._search_refresh_timer = QTimer(self)
         self._search_refresh_timer.setSingleShot(True)
         self._search_refresh_timer.setInterval(120)
@@ -4501,6 +4604,24 @@ class PassageReviewSurface(QDialog):
             )
         )
 
+    def _ensure_metadata_athlete_index(
+        self,
+        metadata: RaceMetadata,
+    ) -> None:
+        if metadata is self._indexed_metadata:
+            return
+        athletes_by_id: dict[str, RaceAthleteMetadata] = {}
+        athletes_by_identity: dict[str, RaceAthleteMetadata] = {}
+        for athlete in metadata.athletes:
+            athletes_by_id[athlete.athlete_id] = athlete
+            for identity in (athlete.bib, *athlete.chip_ids):
+                key = identity.strip().casefold()
+                if key:
+                    athletes_by_identity.setdefault(key, athlete)
+        self._indexed_metadata = metadata
+        self._metadata_athletes_by_id = athletes_by_id
+        self._metadata_athletes_by_identity = athletes_by_identity
+
     def _metadata_athlete_for_event(
         self,
         event: PassageEvent,
@@ -4508,10 +4629,16 @@ class PassageReviewSurface(QDialog):
         metadata = self._current_metadata()
         if metadata is None:
             return None
-        for athlete in metadata.athletes:
-            if event.athlete_id and athlete.athlete_id == event.athlete_id:
+        self._ensure_metadata_athlete_index(metadata)
+        if event.athlete_id:
+            athlete = self._metadata_athletes_by_id.get(event.athlete_id)
+            if athlete is not None:
                 return athlete
-            if athlete.matches_identity(event.bib or event.chip_id):
+        for identity in (event.bib, event.chip_id):
+            athlete = self._metadata_athletes_by_identity.get(
+                identity.strip().casefold()
+            )
+            if athlete is not None:
                 return athlete
         return None
 

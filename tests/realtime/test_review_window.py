@@ -1,5 +1,6 @@
 import csv
 import os
+import threading
 import time
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -2187,6 +2188,67 @@ def test_two_rtsp_sources_start_independent_review_pipelines(qapp, tmp_path):
     window.close()
 
 
+def test_recording_watchdog_uses_monotonic_segment_progress(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_recording()
+    window._camera_segment_progress.clear()
+
+    assert window._recording_stall_error(1, now=100.0) == ""
+    assert window._recording_stall_error(1, now=159.0) == ""
+    assert "60 秒没有产生新片段" in window._recording_stall_error(
+        1,
+        now=160.0,
+    )
+
+    ring_buffer = window._ring_buffer
+    ring_buffer._segment_revision += 1
+    assert window._recording_stall_error(1, now=161.0) == ""
+    window.close()
+
+
+def test_stalled_live_recorder_is_stopped_before_replacement(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.start_recording()
+    original = _FakeRecorder.instances[0]
+    signature = window._ring_buffer.segment_revision
+    window._camera_segment_progress[1] = (signature, 939.0)
+    monkeypatch.setattr(review_window_module.time, "monotonic", lambda: 1_000.0)
+
+    window._refresh_capture_windows()
+
+    replacement = _FakeRecorder.instances[-1]
+    assert len(_FakeRecorder.instances) == 2
+    assert original.stopped
+    assert not original.is_running
+    assert replacement is window._recorders[1]
+    assert replacement.is_running
+    window.close()
+
+
+def test_explicit_stop_does_not_restart_stalled_camera(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    window.start_recording()
+    recorder = _FakeRecorder.instances[0]
+    reconnect_calls = []
+    monkeypatch.setattr(
+        window,
+        "_restart_recording_camera",
+        lambda *args: reconnect_calls.append(args),
+    )
+    recorder.stop()
+    recorder.check_error = lambda: "process exited"
+
+    window.stop_recording()
+    window._poll_recording_health(now=time.monotonic() + 120)
+
+    assert reconnect_calls == []
+    window.close()
+
+
 def test_failed_secondary_camera_reconnects_without_stopping_primary(qapp, tmp_path):
     _FakeRecorder.instances.clear()
     window = FinishReviewWindow(
@@ -2201,6 +2263,8 @@ def test_failed_secondary_camera_reconnects_without_stopping_primary(qapp, tmp_p
     window.start_recording()
     primary, failed_secondary = _FakeRecorder.instances
     previous_secondary_buffer = window._ring_buffers[2]
+    generation = window._video_scan_generation
+    primary_scan_token = window._video_scan_tokens[1]
     failed_secondary.is_running = False
     failed_secondary.check_error = lambda: "connection lost"
 
@@ -2213,6 +2277,8 @@ def test_failed_secondary_camera_reconnects_without_stopping_primary(qapp, tmp_p
     assert window._recorders[2] is replacement
     assert replacement.is_running
     assert window._ring_buffers[2] is not previous_secondary_buffer
+    assert window._video_scan_generation == generation
+    assert window._video_scan_tokens[1] is primary_scan_token
     assert not window._camera_reconnect_errors
     assert window.camera_status_label.text() == "录像设备: 全部已连接"
     window.close()
@@ -2468,6 +2534,37 @@ def test_cancelled_settings_dialog_does_not_stop_recording(
     window._configure_devices()
 
     assert recorder is not None and recorder.is_running
+    window.close()
+
+
+def test_window_stop_retries_while_recorder_is_still_running(qapp, tmp_path):
+    class _StubbornRecorder(_FakeRecorder):
+        allow_stop = False
+
+        def stop(self):
+            if not type(self).allow_stop:
+                raise OSError("device driver is stuck")
+            super().stop()
+
+    _StubbornRecorder.instances.clear()
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_StubbornRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+    window.start_recording()
+    recorder = _StubbornRecorder.instances[0]
+
+    assert not window.stop()
+    assert recorder.is_running
+    assert window._recorders[1] is recorder
+
+    _StubbornRecorder.allow_stop = True
+    assert window.stop()
+    assert not recorder.is_running
     window.close()
 
 
@@ -3104,6 +3201,88 @@ def test_recording_health_scans_buffer_without_pending_passages(
     window._refresh_capture_windows()
 
     assert scan_calls == 1
+    window.close()
+
+
+def test_periodic_capture_refresh_keeps_one_context_generation(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.start_recording()
+    requests = []
+    monkeypatch.setattr(window._capture_refresh_worker, "submit", requests.append)
+
+    window._request_capture_refresh()
+    window._request_capture_refresh()
+
+    assert len(requests) == 2
+    assert requests[0].generation == requests[1].generation
+    assert requests[0].ring_buffers == (window._ring_buffer,)
+    window.close()
+
+
+def test_stale_capture_refresh_result_is_not_applied(qapp, tmp_path, monkeypatch):
+    from realtime.capture_refresh import CaptureRefreshResult
+
+    window = _window(tmp_path)
+    window.start_recording()
+    applied = []
+    monkeypatch.setattr(
+        window,
+        "_apply_capture_refresh_state",
+        lambda segments=(): applied.append(tuple(segments)) or set(),
+    )
+
+    window._on_capture_refresh_finished(
+        CaptureRefreshResult(window._capture_refresh_generation - 1)
+    )
+    window._on_capture_refresh_finished(
+        CaptureRefreshResult(window._capture_refresh_generation)
+    )
+
+    assert applied == [()]
+    window.close()
+
+
+def test_stale_queued_video_candidates_do_not_enter_new_workspace(qapp, tmp_path):
+    from realtime.video_arrival import VideoArrivalCandidateStore
+
+    window = _window(tmp_path)
+    video_path = tmp_path / "candidate.ts"
+    video_path.write_bytes(b"video")
+    candidate = VideoPassageCandidate(
+        "candidate-old-workspace",
+        1,
+        1_000,
+        1_200,
+        1_100,
+        0.2,
+        0.1,
+        segment_id="segment-old",
+        video_path=str(video_path),
+    )
+    old_store = window.video_arrival_store
+    generation = window._video_scan_generation
+    delivery_thread = threading.Thread(
+        target=window._on_video_candidates,
+        args=((candidate,), generation),
+    )
+    delivery_thread.start()
+    delivery_thread.join(timeout=2)
+    assert not delivery_thread.is_alive()
+    assert old_store.candidates() == (candidate,)
+
+    window._video_scan_generation += 1
+    window.video_arrival_store = VideoArrivalCandidateStore(
+        tmp_path / "new_workspace_candidates.jsonl"
+    )
+    window._video_candidate_cache.clear()
+    qapp.processEvents()
+
+    assert window.video_arrival_store.candidates() == ()
+    assert "candidate-old-workspace" not in window._video_candidate_cache
     window.close()
 
 

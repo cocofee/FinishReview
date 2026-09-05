@@ -547,7 +547,7 @@ class VideoTimelineStore:
         path_key = self._path_key(Path(video_path).expanduser().absolute())
         with self._lock:
             segment_ids = self._segments_by_path.get(path_key, ())
-            return self._segments[segment_ids[0]] if segment_ids else None
+            return self._segments[segment_ids[-1]] if segment_ids else None
 
     def get_segment(self, segment_id: str) -> RecordingSegment | None:
         with self._lock:
@@ -733,6 +733,13 @@ class VideoTimelineStore:
                 raise VideoTimelineError(
                     "media_started_at_ms requires media_duration_ms"
                 )
+            updated = replace(
+                current,
+                ended_at_ms=ended_at_ms,
+                media_duration_ms=media_duration_ms,
+                media_started_at_ms=media_started_at_ms,
+                end_reason=str(end_reason),
+            )
             payload = {
                 "schema_version": SCHEMA_VERSION,
                 "record_type": "segment_ended",
@@ -744,13 +751,6 @@ class VideoTimelineStore:
                 payload["media_duration_ms"] = media_duration_ms
                 payload["media_started_at_ms"] = int(media_started_at_ms)
             self._append_record(payload)
-            updated = replace(
-                current,
-                ended_at_ms=ended_at_ms,
-                media_duration_ms=media_duration_ms,
-                media_started_at_ms=media_started_at_ms,
-                end_reason=str(end_reason),
-            )
             self._segments[current.segment_id] = updated
             self._open_segment_ids_by_race.get(current.race_id, set()).discard(
                 current.segment_id

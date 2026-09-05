@@ -1,5 +1,7 @@
 import io
+import random
 import numpy as np
+import pytest
 from pathlib import Path
 import threading
 import time
@@ -13,6 +15,7 @@ from realtime.video_passage_detector import (
     VideoPassageDetectorConfig,
     merge_candidates,
     merge_line_crossings,
+    match_candidate_counts,
     reconcile_candidates,
     unmatched_passage_times,
     VideoPassageScanWorker,
@@ -49,6 +52,8 @@ def test_live_batch_scanner_owns_boundary_candidate_once(tmp_path, monkeypatch):
             )
         )
     calls = []
+    progress = []
+    leases = []
 
     def fake_scan(path, **kwargs):
         calls.append(Path(path).read_text(encoding="utf-8"))
@@ -74,6 +79,9 @@ def test_live_batch_scanner_owns_boundary_candidate_once(tmp_path, monkeypatch):
         manifest_dir=tmp_path,
         batch_ms=120_000,
         overlap_ms=2_000,
+        progress_callback=progress.append,
+        lease_callback=lambda items: leases.append(("acquire", len(items))) or True,
+        release_callback=lambda items: leases.append(("release", len(items))),
     )
     result = worker.scan_once()
 
@@ -81,10 +89,167 @@ def test_live_batch_scanner_owns_boundary_candidate_once(tmp_path, monkeypatch):
     assert len(result) == 1
     assert result[0].peak_at_ms == 120_000
     assert result[0].video_path.endswith("segment_060.ts")
+    assert progress == [0, 120_000]
+    assert [entry[0] for entry in leases] == [
+        "acquire",
+        "release",
+        "acquire",
+        "release",
+    ]
+
+
+def test_live_batch_scanner_commits_cursor_only_after_candidate_persists(
+    tmp_path,
+    monkeypatch,
+):
+    segments = []
+    for index in range(61):
+        start = index * 2_000
+        path = tmp_path / f"segment_{index:03d}.ts"
+        path.write_bytes(b"video")
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"segment-{index}",
+                camera_index=1,
+                started_at_ms=start,
+                ended_at_ms=start + 2_000,
+                video_path=path.name,
+            )
+        )
+    candidate = VideoPassageCandidate(
+        "line-1",
+        1,
+        59_900,
+        60_100,
+        60_000,
+        1.0,
+        0.1,
+    )
+    monkeypatch.setattr(
+        detector_module,
+        "scan_video_file",
+        lambda *_args, **_kwargs: (candidate,),
+    )
+    callback_calls = []
+
+    def persist(items):
+        callback_calls.append(items)
+        if len(callback_calls) == 1:
+            raise RuntimeError("disk full")
+
+    worker = LiveReviewBatchScanWorker(
+        lambda: tuple(segments),
+        persist,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        manifest_dir=tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        worker.scan_once()
+    assert worker._next_batch_start_ms == 0
+    assert worker._emitted_keys == set()
+
+    result = worker.scan_once()
+    assert len(result) == 1
+    assert worker._next_batch_start_ms == 120_000
+    assert len(worker._emitted_keys) == 1
+
+
+def test_live_batch_scans_core_despite_overlap_only_gap(tmp_path, monkeypatch):
+    segments = []
+    for index in range(60):
+        path = tmp_path / f"core_{index:03d}.ts"
+        path.write_bytes(b"video")
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"core-{index}",
+                camera_index=1,
+                started_at_ms=index * 2_000,
+                ended_at_ms=(index + 1) * 2_000,
+                video_path=path.name,
+            )
+        )
+    right = tmp_path / "right.ts"
+    right.write_bytes(b"video")
+    segments.append(
+        SimpleNamespace(
+            segment_id="right",
+            camera_index=1,
+            started_at_ms=122_000,
+            ended_at_ms=124_000,
+            video_path=right.name,
+        )
+    )
+    scan_calls = []
+    monkeypatch.setattr(
+        detector_module,
+        "scan_video_file",
+        lambda *args, **kwargs: scan_calls.append(args[0]) or (),
+    )
+    permanent_ranges = []
+    worker = LiveReviewBatchScanWorker(
+        lambda: tuple(segments),
+        lambda _items: None,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        manifest_dir=tmp_path,
+        permanent_gap_callback=lambda start, end: permanent_ranges.append(
+            (start, end)
+        )
+        or True,
+    )
+
+    assert worker.scan_once() == ()
+    assert len(scan_calls) == 1
+    assert permanent_ranges == []
+    assert worker._next_batch_start_ms == 120_000
+
+
+def test_live_batch_waits_for_initial_core_tail(tmp_path, monkeypatch):
+    segments = []
+    for index in range(59):
+        path = tmp_path / f"prefix_{index:03d}.ts"
+        path.write_bytes(b"video")
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"prefix-{index}",
+                camera_index=1,
+                started_at_ms=index * 2_000,
+                ended_at_ms=(index + 1) * 2_000,
+                video_path=path.name,
+            )
+        )
+    future = tmp_path / "future.ts"
+    future.write_bytes(b"video")
+    segments.append(
+        SimpleNamespace(
+            segment_id="future",
+            camera_index=1,
+            started_at_ms=130_000,
+            ended_at_ms=132_000,
+            video_path=future.name,
+        )
+    )
+    scan_calls = []
+    monkeypatch.setattr(
+        detector_module,
+        "scan_video_file",
+        lambda *args, **kwargs: scan_calls.append(args[0]) or (),
+    )
+    worker = LiveReviewBatchScanWorker(
+        lambda: tuple(segments),
+        lambda _items: None,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        manifest_dir=tmp_path,
+    )
+
+    assert worker.scan_once() == ()
+    assert scan_calls == []
+    assert worker._next_batch_start_ms == 0
 
 
 def test_live_batch_scanner_does_not_collapse_missing_segment_gap(tmp_path, monkeypatch):
     segments = []
+    progress = []
     for index in range(61):
         if index == 30:
             continue
@@ -111,10 +276,89 @@ def test_live_batch_scanner_does_not_collapse_missing_segment_gap(tmp_path, monk
         lambda _items: None,
         path_resolver=lambda item: tmp_path / item.video_path,
         manifest_dir=tmp_path,
+        progress_callback=progress.append,
+        permanent_gap_callback=lambda _start, _end: True,
     )
 
     assert worker.scan_once() == ()
     assert scan_calls == []
+    assert worker._next_batch_start_ms == 120_000
+    assert progress == [0, 120_000]
+
+
+def test_live_batch_scanner_retries_temporary_segment_gap(tmp_path, monkeypatch):
+    segments = []
+    for index in range(61):
+        start = index * 2_000
+        path = tmp_path / f"segment_{index:03d}.ts"
+        path.write_bytes(b"video")
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"segment-{index}",
+                camera_index=1,
+                started_at_ms=start,
+                ended_at_ms=start + 2_000,
+                video_path=path.name,
+            )
+        )
+    visible = [segment for index, segment in enumerate(segments) if index != 30]
+    scan_calls = []
+    monkeypatch.setattr(
+        detector_module,
+        "scan_video_file",
+        lambda *args, **kwargs: scan_calls.append(args[0]) or (),
+    )
+    worker = LiveReviewBatchScanWorker(
+        lambda: tuple(visible),
+        lambda _items: None,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        manifest_dir=tmp_path,
+    )
+
+    assert worker.scan_once() == ()
+    visible.append(segments[30])
+
+    assert worker.scan_once() == ()
+    assert len(scan_calls) == 1
+    assert worker._next_batch_start_ms == 120_000
+
+
+def test_live_batch_scanner_protects_initial_batch_before_it_is_ready(tmp_path):
+    path = tmp_path / "segment_000.ts"
+    path.write_bytes(b"video")
+    segment = SimpleNamespace(
+        segment_id="segment-0",
+        camera_index=1,
+        started_at_ms=0,
+        ended_at_ms=2_000,
+        video_path=path.name,
+    )
+    progress = []
+    worker = LiveReviewBatchScanWorker(
+        lambda: (segment,),
+        lambda _items: None,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        manifest_dir=tmp_path,
+        progress_callback=progress.append,
+    )
+
+    assert worker.scan_once() == ()
+    assert progress == [0]
+
+
+def test_live_batch_scanner_ignores_late_progress_after_stop():
+    progress = []
+    worker = LiveReviewBatchScanWorker(
+        lambda: (),
+        lambda _items: None,
+        progress_callback=progress.append,
+    )
+    worker._stop.set()
+
+    worker._notify_progress(120_000)
+    worker._notify_progress(None)
+
+    assert progress == [None]
 
 
 def test_live_batch_scanner_pause_terminates_active_ffmpeg():
@@ -433,6 +677,61 @@ def test_unmatched_chip_times_are_kept_as_anomalies():
     assert unmatched_passage_times((candidate,), (1_100, 5_000)) == (5_000,)
 
 
+def test_indexed_candidate_matching_matches_linear_reference():
+    randomizer = random.Random(0)
+    candidates = tuple(
+        VideoPassageCandidate(
+            f"candidate-{index}",
+            1 + index % 2,
+            (started := randomizer.randrange(0, 20_000)),
+            started + randomizer.randrange(0, 1_000),
+            started,
+            0.2,
+            0.1,
+        )
+        for index in range(100)
+    )
+    passage_times = tuple(
+        sorted(randomizer.randrange(0, 20_000) for _ in range(300))
+    )
+    offsets = {1: -250, 2: 400}
+    tolerance = 500
+
+    indexed = match_candidate_counts(
+        candidates,
+        passage_times,
+        tolerance_ms=tolerance,
+        passage_time_offset_by_camera=offsets,
+    )
+    expected_counts = tuple(
+        sum(
+            candidate.started_at_ms - tolerance
+            <= timestamp + offsets[candidate.camera_index]
+            <= candidate.ended_at_ms + tolerance
+            for timestamp in passage_times
+        )
+        for candidate in candidates
+    )
+    expected_unmatched = tuple(
+        timestamp
+        for timestamp in passage_times
+        if not any(
+            candidate.started_at_ms - tolerance
+            <= timestamp + offsets[candidate.camera_index]
+            <= candidate.ended_at_ms + tolerance
+            for candidate in candidates
+        )
+    )
+
+    assert tuple(count for _candidate, count in indexed) == expected_counts
+    assert unmatched_passage_times(
+        candidates,
+        passage_times,
+        tolerance_ms=tolerance,
+        passage_time_offset_by_camera=offsets,
+    ) == expected_unmatched
+
+
 def test_nearby_candidates_are_reported_as_one_group_batch():
     detector = LightweightVideoPassageDetector()
     first = detector._new_candidate(  # noqa: SLF001 - focused merge fixture
@@ -560,6 +859,46 @@ def test_scan_worker_publishes_each_segment_before_archive_scan_finishes(
     assert [batch[0].segment_id for batch in published] == [
         "segment-1",
         "segment-2",
+    ]
+
+
+def test_scan_worker_holds_cleanup_lease_while_scanning(tmp_path, monkeypatch):
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    segment = SimpleNamespace(
+        segment_id="segment-01",
+        camera_index=1,
+        started_at_ms=10_000,
+        video_path="camera_01.ts",
+    )
+    lease_events = []
+
+    def fake_scan(*_args, **_kwargs):
+        lease_events.append("scan")
+        return ()
+
+    monkeypatch.setattr(detector_module, "scan_video_file", fake_scan)
+    worker = VideoPassageScanWorker(
+        lambda: (segment,),
+        lambda _items: None,
+        width=16,
+        height=12,
+        path_resolver=lambda item: tmp_path / item.video_path,
+        lease_callback=lambda items: lease_events.append(
+            ("acquire", items[0].segment_id)
+        )
+        or True,
+        release_callback=lambda items: lease_events.append(
+            ("release", items[0].segment_id)
+        ),
+    )
+
+    worker.scan_once()
+
+    assert lease_events == [
+        ("acquire", "segment-01"),
+        "scan",
+        ("release", "segment-01"),
     ]
 
 

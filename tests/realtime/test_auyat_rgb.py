@@ -17,12 +17,15 @@ from realtime.auyat_rgb import (
     HEADER_SIZE,
     RECORD_SIZE,
     TICKS_PER_DAY,
+    AuyatRgbCapture,
     AuyatRgbCatalog,
     AuyatRgbPlaybackWorker,
     AuyatRgbScanWorker,
     AuyatScanCancelled,
     is_network_share,
     read_capture,
+    read_capture_pixels,
+    read_capture_preview,
     read_channel_order,
     scan_rgb_file,
 )
@@ -131,6 +134,45 @@ def test_catalog_uses_real_header_layout_and_isolates_bad_history(tmp_path):
     assert capture.media_started_at_ms == int(expected.timestamp() * 1000)
     assert capture.media_duration_ms == 2
     assert capture.column_count == 3
+
+
+def test_capture_index_matches_linear_nearest_interval_selection(tmp_path):
+    capture_date = date(2026, 8, 22)
+    captures = tuple(
+        AuyatRgbCapture(
+            file_path=tmp_path / f"capture-{index}.RGB",
+            capture_date=capture_date,
+            start_record=index,
+            end_record=index,
+            start_tick=start_tick,
+            end_tick=end_tick,
+        )
+        for index, (start_tick, end_tick) in enumerate(
+            (
+                (1_000, 1_500),
+                (1_200, 1_700),
+                (2_500, 2_700),
+                (4_000, 4_300),
+            )
+        )
+    )
+    catalog = AuyatRgbCatalog(None)
+    catalog._captures = captures
+    day_start = captures[0].day_started_at_ms
+
+    for relative_ms in (-100, 50, 70, 90, 130, 210, 500):
+        target_ms = day_start + relative_ms
+        expected = min(
+            captures,
+            key=lambda capture: capture.distance_ms(target_ms),
+        )
+        location = catalog.locate(
+            target_ms,
+            race_id="race-1",
+            tolerance_ms=10_000,
+        )
+        assert location is not None
+        assert location.segment.segment_id == expected.segment_id
 
 
 def test_network_share_detection_distinguishes_formal_remote_and_local_test_paths(
@@ -415,6 +457,51 @@ def test_capture_uses_each_column_tick_and_color_order(tmp_path):
     assert frame.pixels_rgb[0, 3].tolist() == [13, 23, 33]
 
 
+def test_capture_preview_sample_indexes_are_unique_at_limit():
+    indexes = auyat_rgb.preview_sample_indexes(8_193, 8_192)
+
+    assert len(indexes) == 8_192
+    assert len(set(indexes)) == 8_192
+    assert indexes[0] == 0
+    assert indexes[-1] == 8_192
+    assert all(right > left for left, right in zip(indexes, indexes[1:]))
+
+
+def test_capture_preview_bounds_pixels_but_keeps_exact_tick_axis(tmp_path):
+    rgb_path = tmp_path / "Photo" / "01_group.RGB"
+    ticks = tuple(100 + index * 20 for index in range(10))
+    _write_rgb(
+        rgb_path,
+        capture_date=date(2026, 8, 22),
+        ticks=ticks,
+        channel_order="bgr",
+    )
+    capture = scan_rgb_file(rgb_path, channel_order="bgr")[0]
+
+    preview = read_capture_preview(capture, max_columns=4)
+    tile = read_capture_pixels(
+        capture,
+        start_column=3,
+        column_count=2,
+    )
+
+    assert preview.width == 10
+    assert preview.image_width == 4
+    assert isinstance(preview.ticks, auyat_rgb.AuyatTickIndex)
+    assert len(preview.ticks.sample_ticks) == 2
+    assert len(preview.ticks) == 10
+    assert [
+        preview.column_for_x((index + 0.5) / preview.image_width)
+        for index in range(preview.image_width)
+    ] == [1, 3, 6, 8]
+    assert preview.position_ms_for_column(9) == 9
+    assert preview.pixels_rgb[0, 0].tolist() == [11, 21, 31]
+    assert preview.pixels_rgb[0, -1].tolist() == [18, 28, 38]
+    assert tile.shape == (1024, 2, 3)
+    assert tile[0, 0].tolist() == [13, 23, 33]
+    assert tile[0, 1].tolist() == [14, 24, 34]
+
+
 def test_channel_order_is_found_when_operator_selects_photo_directory(tmp_path):
     root = tmp_path / "vendor"
     photo = root / "Photo"
@@ -427,7 +514,11 @@ def test_channel_order_is_found_when_operator_selects_photo_directory(tmp_path):
     assert read_channel_order(photo) == "bgr"
 
 
-def test_playback_worker_loads_once_and_seeks_by_real_tick(qapp, tmp_path):
+def test_playback_worker_loads_once_and_seeks_by_real_tick(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
     rgb_path = tmp_path / "Photo" / "01_group.RGB"
     _write_rgb(
         rgb_path,
@@ -440,13 +531,29 @@ def test_playback_worker_loads_once_and_seeks_by_real_tick(qapp, tmp_path):
         race_id="race-1",
         pre_roll_ms=0,
     )
+    monkeypatch.setattr(auyat_rgb, "AUYAT_PREVIEW_MAX_COLUMNS", 2)
+    monkeypatch.setattr(auyat_rgb, "AUYAT_FULL_TILE_COLUMNS", 2)
+    tile_reads = []
+    original_read_pixels = auyat_rgb.read_capture_pixels
+
+    def counted_read_pixels(*args, **kwargs):
+        tile_reads.append((args, kwargs))
+        return original_read_pixels(*args, **kwargs)
+
+    monkeypatch.setattr(auyat_rgb, "read_capture_pixels", counted_read_pixels)
     metadata = []
     frames = []
+    full_resolution = []
     worker = AuyatRgbPlaybackWorker(location)
     worker.metadata_ready.connect(lambda *values: metadata.append(values))
     worker.frame_ready.connect(
         lambda image, position_ms, frame_index: frames.append(
             (image.width(), image.height(), position_ms, frame_index)
+        )
+    )
+    worker.full_resolution_ready.connect(
+        lambda image, position_ms, frame_index: full_resolution.append(
+            (image, position_ms, frame_index)
         )
     )
 
@@ -457,13 +564,70 @@ def test_playback_worker_loads_once_and_seeks_by_real_tick(qapp, tmp_path):
 
     worker.seek(4)
     assert _wait_until(qapp, lambda: bool(frames))
-    assert frames[-1] == (4, 1024, 4, 2)
+    assert frames[-1] == (2, 1024, 4, 2)
+    worker.request_full_resolution()
+    assert _wait_until(qapp, lambda: bool(full_resolution))
+    tile, tile_position_ms, tile_frame_index = full_resolution[-1]
+    assert (tile.width(), tile_position_ms, tile_frame_index) == (2, 4, 2)
+    assert tile.text("finishreview.source_x_offset") == "1"
+    assert tile.text("finishreview.source_span_width") == "2"
+    worker.request_full_resolution()
+    assert _wait_until(qapp, lambda: len(full_resolution) == 2)
+    assert len(tile_reads) == 1
     assert worker.position_ms_for_x(1.0) == 7
     assert worker.x_for_position_ms(4) == pytest.approx(2 / 3)
 
     worker.stop()
     assert worker.wait(2_000)
     assert location.segment.clock_source == AUYAT_CLOCK_SOURCE
+
+
+def test_playback_worker_retries_transient_full_resolution_failure(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    rgb_path = tmp_path / "Photo" / "01_group.RGB"
+    _write_rgb(
+        rgb_path,
+        capture_date=date(2026, 8, 22),
+        ticks=(200, 220, 240, 260),
+    )
+    capture = scan_rgb_file(rgb_path)[0]
+    location = capture.to_location(capture.media_started_at_ms, race_id="race-1")
+    original = auyat_rgb.read_capture_pixels
+    attempts = []
+
+    def flaky_read(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise auyat_rgb.AuyatRgbError("temporary file lock")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(auyat_rgb, "read_capture_pixels", flaky_read)
+    worker = AuyatRgbPlaybackWorker(location)
+    metadata = []
+    frames = []
+    failures = []
+    tiles = []
+    worker.metadata_ready.connect(lambda *values: metadata.append(values))
+    worker.frame_ready.connect(lambda *values: frames.append(values))
+    worker.full_resolution_error.connect(failures.append)
+    worker.full_resolution_ready.connect(lambda *values: tiles.append(values))
+    worker.start()
+    assert _wait_until(qapp, lambda: bool(metadata))
+    worker.seek(0)
+    assert _wait_until(qapp, lambda: bool(frames))
+
+    worker.request_full_resolution()
+    assert _wait_until(qapp, lambda: bool(failures))
+    assert worker.isRunning()
+    worker.request_full_resolution()
+    assert _wait_until(qapp, lambda: bool(tiles))
+    assert len(attempts) == 2
+
+    worker.stop()
+    assert worker.wait(2_000)
 
 
 def test_review_reuses_one_rgb_capture_and_marks_only_selected_identity(

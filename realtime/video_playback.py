@@ -1624,6 +1624,11 @@ class VideoPlaybackDialog(QDialog):
         self._context_text = str(context_text or "").strip()
         self._window_title = str(window_title or "").strip()
         self._slider_dragging = False
+        self._pending_slider_preview_ms: Optional[int] = None
+        self._slider_preview_timer = QTimer(self)
+        self._slider_preview_timer.setSingleShot(True)
+        self._slider_preview_timer.setInterval(80)
+        self._slider_preview_timer.timeout.connect(self._flush_slider_preview)
         self._resume_after_seek = False
         self._resume_speed_after_seek = 1.0
         self._jog_origin_frame = 0
@@ -1911,6 +1916,8 @@ class VideoPlaybackDialog(QDialog):
 
     def _on_slider_pressed(self) -> None:
         self._slider_dragging = True
+        self._slider_preview_timer.stop()
+        self._pending_slider_preview_ms = None
         self._resume_after_seek = self._playing
         self._resume_speed_after_seek = self._last_playback_speed
         self.worker.pause()
@@ -1920,7 +1927,17 @@ class VideoPlaybackDialog(QDialog):
     def _on_slider_moved(self, value: int) -> None:
         self.current_time_label.setText(format_playback_time(value))
         self._update_target_status(value)
-        self.worker.seek(value)
+        self._pending_slider_preview_ms = int(value)
+        if not self._slider_preview_timer.isActive():
+            self._slider_preview_timer.start()
+
+    def _flush_slider_preview(self) -> None:
+        value = self._pending_slider_preview_ms
+        self._pending_slider_preview_ms = None
+        if value is None or not self._slider_dragging:
+            return
+        seek_preview = getattr(self.worker, "seek_preview", self.worker.seek)
+        seek_preview(value)
 
     def _update_target_status(self, current_position_ms: int) -> None:
         parts = []
@@ -1947,6 +1964,8 @@ class VideoPlaybackDialog(QDialog):
 
     def _on_slider_released(self) -> None:
         self._slider_dragging = False
+        self._slider_preview_timer.stop()
+        self._pending_slider_preview_ms = None
         self.worker.seek(self.timeline.value())
         if self._resume_after_seek:
             self.worker.set_shuttle_speed(self._resume_speed_after_seek)
@@ -2025,6 +2044,7 @@ class VideoPlaybackDialog(QDialog):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
+        self._slider_preview_timer.stop()
         self.worker.request_stop()
         if not self.worker.wait(3_000):
             retire_qthread(self.worker)

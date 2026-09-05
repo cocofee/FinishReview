@@ -31,6 +31,9 @@ RECORD_SIZE = 3080
 RECORD_METADATA_SIZE = 8
 PIXEL_BYTES = 3072
 DEFAULT_HEIGHT = 1024
+AUYAT_PREVIEW_MAX_COLUMNS = 8_192
+AUYAT_FULL_TILE_COLUMNS = 4_096
+AUYAT_READ_CHUNK_RECORDS = 256
 TICKS_PER_SECOND = 20_000
 TICKS_PER_MILLISECOND = 20
 TICKS_PER_DAY = 24 * 60 * 60 * TICKS_PER_SECOND
@@ -210,14 +213,127 @@ class AuyatRgbCapture:
         )
 
 
+class _AuyatCaptureIndex:
+    """Immutable nearest-interval index preserving linear-scan tie order."""
+
+    def __init__(self, captures: tuple[AuyatRgbCapture, ...]):
+        self.captures = captures
+        self.starts = tuple(item.media_started_at_ms for item in captures)
+        prefix_max_ends = []
+        prefix_max_indexes = []
+        max_end = -1
+        max_index = -1
+        for index, capture in enumerate(captures):
+            ended_at_ms = capture.media_ended_at_ms
+            if ended_at_ms > max_end:
+                max_end = ended_at_ms
+                max_index = index
+            prefix_max_ends.append(max_end)
+            prefix_max_indexes.append(max_index)
+        self.prefix_max_ends = tuple(prefix_max_ends)
+        self.prefix_max_indexes = tuple(prefix_max_indexes)
+
+    def nearest(self, timestamp_ms: int) -> Optional[AuyatRgbCapture]:
+        if not self.captures:
+            return None
+        target = int(timestamp_ms)
+        cursor = bisect.bisect_right(self.starts, target)
+        candidates: set[int] = set()
+        scan = cursor - 1
+        while scan >= 0 and self.prefix_max_ends[scan] >= target:
+            if self.captures[scan].media_ended_at_ms >= target:
+                candidates.add(scan)
+            scan -= 1
+        if cursor > 0:
+            candidates.add(self.prefix_max_indexes[cursor - 1])
+        if cursor < len(self.captures):
+            candidates.add(cursor)
+        nearest_index = min(
+            candidates,
+            key=lambda index: (
+                self.captures[index].distance_ms(target),
+                index,
+            ),
+        )
+        return self.captures[nearest_index]
+
+
+class AuyatTickIndex:
+    """Sparse, disk-backed exact tick lookup for very wide captures."""
+
+    def __init__(
+        self,
+        capture: AuyatRgbCapture,
+        sample_columns: Iterable[int],
+        sample_ticks: Iterable[int],
+        *,
+        stride: int = AUYAT_READ_CHUNK_RECORDS,
+    ):
+        self.capture = capture
+        self.sample_columns = tuple(int(value) for value in sample_columns)
+        self.sample_ticks = tuple(int(value) for value in sample_ticks)
+        self.stride = max(1, int(stride))
+        self._lock = threading.Lock()
+        self._cached_start = -1
+        self._cached_ticks = np.empty((0,), dtype=np.uint64)
+
+    def __len__(self) -> int:
+        return self.capture.column_count
+
+    def _ticks_near_column(self, column: int) -> tuple[int, np.ndarray]:
+        start = max(0, min(int(column), len(self) - 1)) // self.stride * self.stride
+        with self._lock:
+            if start != self._cached_start:
+                self._cached_ticks = read_capture_ticks(
+                    self.capture,
+                    start_column=start,
+                    column_count=min(self.stride + 1, len(self) - start),
+                )
+                self._cached_start = start
+            return self._cached_start, self._cached_ticks
+
+    def tick_for_column(self, column: int) -> int:
+        column = max(0, min(int(column), len(self) - 1))
+        start, ticks = self._ticks_near_column(column)
+        return int(ticks[column - start])
+
+    def position_ms_for_column(self, column: int) -> int:
+        return _round_tick_ms(
+            self.tick_for_column(column) - int(self.sample_ticks[0])
+        )
+
+    def column_for_position_ms(self, position_ms: int) -> int:
+        target_tick = int(self.sample_ticks[0]) + max(
+            0,
+            int(position_ms),
+        ) * TICKS_PER_MILLISECOND
+        sample = bisect.bisect_right(self.sample_ticks, target_tick) - 1
+        sample = max(0, min(sample, len(self.sample_columns) - 1))
+        start_column = self.sample_columns[sample]
+        start, ticks = self._ticks_near_column(start_column)
+        local = int(np.searchsorted(ticks, target_tick, side="left"))
+        if local <= 0:
+            return start
+        if local >= len(ticks):
+            return min(len(self) - 1, start + len(ticks) - 1)
+        before = int(ticks[local - 1])
+        after = int(ticks[local])
+        nearest = local - 1 if target_tick - before <= after - target_tick else local
+        return min(len(self) - 1, start + nearest)
+
+
 @dataclass(frozen=True, slots=True)
 class AuyatRgbFrame:
     capture: AuyatRgbCapture
-    ticks: np.ndarray
+    ticks: np.ndarray | AuyatTickIndex
     pixels_rgb: np.ndarray
 
     @property
     def width(self) -> int:
+        return int(len(self.ticks))
+
+    @property
+    def image_width(self) -> int:
         return int(self.pixels_rgb.shape[1])
 
     @property
@@ -225,6 +341,8 @@ class AuyatRgbFrame:
         return int(self.pixels_rgb.shape[0])
 
     def column_for_position_ms(self, position_ms: int) -> int:
+        if isinstance(self.ticks, AuyatTickIndex):
+            return self.ticks.column_for_position_ms(position_ms)
         target_tick = int(self.ticks[0]) + max(0, int(position_ms)) * TICKS_PER_MILLISECOND
         column = bisect.bisect_left(self.ticks, target_tick)
         if column <= 0:
@@ -236,6 +354,8 @@ class AuyatRgbFrame:
         return column - 1 if target_tick - before <= after - target_tick else column
 
     def position_ms_for_column(self, column: int) -> int:
+        if isinstance(self.ticks, AuyatTickIndex):
+            return self.ticks.position_ms_for_column(column)
         column = max(0, min(int(column), len(self.ticks) - 1))
         return _round_tick_ms(int(self.ticks[column]) - int(self.ticks[0]))
 
@@ -280,6 +400,7 @@ class AuyatRgbPlaybackWorker(QThread):
     metadata_ready = pyqtSignal(int, float, int, int, int)
     frame_ready = pyqtSignal(QImage, int, int)
     full_resolution_ready = pyqtSignal(QImage, int, int)
+    full_resolution_error = pyqtSignal(str)
     playback_finished = pyqtSignal()
     playback_error = pyqtSignal(str)
 
@@ -299,6 +420,7 @@ class AuyatRgbPlaybackWorker(QThread):
         self._current_frame_index = -1
         self._frame: Optional[AuyatRgbFrame] = None
         self._image = QImage()
+        self._full_resolution_tile: Optional[tuple[int, int, QImage]] = None
 
     @property
     def current_position_ms(self) -> int:
@@ -374,16 +496,36 @@ class AuyatRgbPlaybackWorker(QThread):
     def stop(self) -> None:
         self.request_stop()
 
+    @staticmethod
+    def _image_from_pixels(
+        pixels_rgb: np.ndarray,
+        *,
+        source_x_offset: int,
+        source_span_width: int,
+    ) -> QImage:
+        height, width = pixels_rgb.shape[:2]
+        image = QImage(
+            pixels_rgb.data,
+            width,
+            height,
+            width * 3,
+            QImage.Format_RGB888,
+        ).copy()
+        image.setText("finishreview.source_x_offset", str(int(source_x_offset)))
+        image.setText("finishreview.source_span_width", str(int(source_span_width)))
+        return image
+
     def run(self) -> None:
         try:
-            frame = read_capture(self._capture)
-            image = QImage(
-                frame.pixels_rgb.data,
-                frame.width,
-                frame.height,
-                frame.width * 3,
-                QImage.Format_RGB888,
-            ).copy()
+            frame = read_capture_preview(
+                self._capture,
+                max_columns=AUYAT_PREVIEW_MAX_COLUMNS,
+            )
+            image = self._image_from_pixels(
+                frame.pixels_rgb,
+                source_x_offset=0,
+                source_span_width=frame.width,
+            )
             self._frame = frame
             self._image = image
             duration_ms = frame.position_ms_for_column(frame.width - 1)
@@ -424,10 +566,45 @@ class AuyatRgbPlaybackWorker(QThread):
                     self._emit_column(frame, image, column)
                     continue
                 if full_resolution and self.current_frame_index >= 0:
+                    column = self.current_frame_index
+                    cached_tile = self._full_resolution_tile
+                    if (
+                        cached_tile is not None
+                        and cached_tile[0] <= column < cached_tile[1]
+                    ):
+                        tile_image = cached_tile[2]
+                    else:
+                        tile_count = min(AUYAT_FULL_TILE_COLUMNS, frame.width)
+                        tile_start = max(
+                            0,
+                            min(
+                                frame.width - tile_count,
+                                column - tile_count // 2,
+                            ),
+                        )
+                        try:
+                            tile_pixels = read_capture_pixels(
+                                self._capture,
+                                start_column=tile_start,
+                                column_count=tile_count,
+                            )
+                            tile_image = self._image_from_pixels(
+                                tile_pixels,
+                                source_x_offset=tile_start,
+                                source_span_width=tile_count,
+                            )
+                        except (AuyatRgbError, OSError, ValueError) as error:
+                            self.full_resolution_error.emit(str(error))
+                            continue
+                        self._full_resolution_tile = (
+                            tile_start,
+                            tile_start + tile_count,
+                            tile_image,
+                        )
                     self.full_resolution_ready.emit(
-                        image,
+                        tile_image,
                         self.current_position_ms,
-                        self.current_frame_index,
+                        column,
                     )
                     continue
                 if playing:
@@ -453,6 +630,7 @@ class AuyatRgbPlaybackWorker(QThread):
         finally:
             self._frame = None
             self._image = QImage()
+            self._full_resolution_tile = None
 
     def _emit_position(
         self,
@@ -557,6 +735,7 @@ class AuyatRgbCatalog:
         self._target_dates = frozenset(target_dates)
         self._generation = 0
         self._captures: tuple[AuyatRgbCapture, ...] = ()
+        self._capture_index = _AuyatCaptureIndex(self._captures)
         self._file_cache: dict[Path, _CachedRgbFile] = {}
         self._status = "unavailable" if self._root is None else "checking"
         self._message = ""
@@ -881,10 +1060,13 @@ class AuyatRgbCatalog:
         tolerance_ms: int = 2_000,
     ) -> Optional[PassageVideoLocation]:
         target_ms = int(timestamp_ms) + int(clock_offset_ms)
-        captures = self.captures()
-        if not captures:
+        with self._lock:
+            captures = self._captures
+            if self._capture_index.captures is not captures:
+                self._capture_index = _AuyatCaptureIndex(captures)
+            capture = self._capture_index.nearest(target_ms)
+        if capture is None:
             return None
-        capture = min(captures, key=lambda item: item.distance_ms(target_ms))
         distance_ms = capture.distance_ms(target_ms)
         if distance_ms > max(0, int(tolerance_ms)):
             return None
@@ -917,6 +1099,7 @@ class AuyatRgbCatalog:
                     waiting_file_count=self._waiting_file_count,
                 )
             self._captures = captures
+            self._capture_index = _AuyatCaptureIndex(captures)
             self._status = str(status)
             self._message = str(message)
             self._waiting_file_count = max(0, int(waiting_file_count))
@@ -1200,6 +1383,183 @@ def read_rgb_header(path: str | Path) -> tuple[date, int]:
     return _parse_header(header, file_path)
 
 
+def read_capture_ticks(
+    capture: AuyatRgbCapture,
+    *,
+    start_column: int,
+    column_count: int,
+) -> np.ndarray:
+    start = max(0, min(int(start_column), capture.column_count - 1))
+    count = max(1, min(int(column_count), capture.column_count - start))
+    start_offset = (
+        capture.data_offset + (capture.start_record + start) * RECORD_SIZE
+    )
+    byte_count = count * RECORD_SIZE
+    try:
+        with capture.file_path.open("rb") as source:
+            source.seek(start_offset)
+            raw = source.read(byte_count)
+    except PermissionError as error:
+        raise AuyatRgbBusyError(
+            f"高速图像仍被原厂软件占用，请先完成判读: {capture.file_path}"
+        ) from error
+    except OSError as error:
+        raise AuyatRgbError(f"无法读取高速图像: {capture.file_path}") from error
+    if len(raw) != byte_count:
+        raise AuyatRgbError(f"高速图像采集段尚未完整写入: {capture.file_path}")
+    raw_ticks = np.ndarray(
+        shape=(count,),
+        dtype="<u4",
+        buffer=raw,
+        offset=0,
+        strides=(RECORD_SIZE,),
+    ).astype(np.uint64)
+    deltas = (
+        raw_ticks - np.uint64(capture.start_tick)
+    ) & np.uint64(TICK_COUNTER_SIZE - 1)
+    return deltas + np.uint64(capture.start_tick)
+
+
+def read_capture_pixels(
+    capture: AuyatRgbCapture,
+    *,
+    start_column: int,
+    column_count: int,
+) -> np.ndarray:
+    start = max(0, min(int(start_column), capture.column_count - 1))
+    count = max(1, min(int(column_count), capture.column_count - start))
+    start_offset = (
+        capture.data_offset + (capture.start_record + start) * RECORD_SIZE
+    )
+    byte_count = count * RECORD_SIZE
+    try:
+        with capture.file_path.open("rb") as source:
+            source.seek(start_offset)
+            raw = source.read(byte_count)
+    except PermissionError as error:
+        raise AuyatRgbBusyError(
+            f"高速图像仍被原厂软件占用，请先完成判读: {capture.file_path}"
+        ) from error
+    except OSError as error:
+        raise AuyatRgbError(f"无法读取高速图像: {capture.file_path}") from error
+    if len(raw) != byte_count:
+        raise AuyatRgbError(f"高速图像采集段尚未完整写入: {capture.file_path}")
+    pixels = np.ndarray(
+        shape=(count, capture.height, 3),
+        dtype=np.uint8,
+        buffer=raw,
+        offset=RECORD_METADATA_SIZE,
+        strides=(RECORD_SIZE, 3, 1),
+    ).transpose(1, 0, 2).copy()
+    if capture.channel_order == "bgr":
+        pixels = pixels[:, :, ::-1].copy()
+    return pixels
+
+
+def preview_sample_indexes(
+    source_count: int,
+    preview_count: int,
+) -> tuple[int, ...]:
+    source_count = max(0, int(source_count))
+    preview_count = max(0, min(int(preview_count), source_count))
+    if not source_count or not preview_count:
+        return ()
+    values = (
+        (2 * np.arange(preview_count, dtype=np.int64) + 1) * source_count
+        // (2 * preview_count)
+    )
+    return tuple(int(value) for value in values)
+
+
+def read_capture_preview(
+    capture: AuyatRgbCapture,
+    *,
+    max_columns: int = AUYAT_PREVIEW_MAX_COLUMNS,
+) -> AuyatRgbFrame:
+    count = capture.column_count
+    preview_count = min(count, max(1, int(max_columns)))
+    sample_indexes = np.asarray(
+        preview_sample_indexes(count, preview_count),
+        dtype=np.int64,
+    )
+    tick_sample_columns: list[int] = []
+    tick_samples: list[int] = []
+    pixels = np.empty((capture.height, preview_count, 3), dtype=np.uint8)
+    start_offset = capture.data_offset + capture.start_record * RECORD_SIZE
+    try:
+        with capture.file_path.open("rb") as source:
+            source.seek(start_offset)
+            record_index = 0
+            while record_index < count:
+                chunk_count = min(
+                    AUYAT_READ_CHUNK_RECORDS,
+                    count - record_index,
+                )
+                raw = source.read(chunk_count * RECORD_SIZE)
+                if len(raw) != chunk_count * RECORD_SIZE:
+                    raise AuyatRgbError(
+                        f"高速图像采集段尚未完整写入: {capture.file_path}"
+                    )
+                chunk_ticks = np.ndarray(
+                    shape=(chunk_count,),
+                    dtype="<u4",
+                    buffer=raw,
+                    offset=0,
+                    strides=(RECORD_SIZE,),
+                )
+                tick_sample_columns.append(record_index)
+                tick_samples.append(
+                    int(capture.start_tick)
+                    + _tick_delta(int(chunk_ticks[0]), capture.start_tick)
+                )
+                last_column = record_index + chunk_count - 1
+                if last_column == count - 1 and last_column != record_index:
+                    tick_sample_columns.append(last_column)
+                    tick_samples.append(
+                        int(capture.start_tick)
+                        + _tick_delta(int(chunk_ticks[-1]), capture.start_tick)
+                    )
+                preview_start = int(
+                    np.searchsorted(sample_indexes, record_index, side="left")
+                )
+                preview_end = int(
+                    np.searchsorted(
+                        sample_indexes,
+                        record_index + chunk_count,
+                        side="left",
+                    )
+                )
+                if preview_end > preview_start:
+                    local_indexes = (
+                        sample_indexes[preview_start:preview_end] - record_index
+                    )
+                    chunk_pixels = np.ndarray(
+                        shape=(chunk_count, capture.height, 3),
+                        dtype=np.uint8,
+                        buffer=raw,
+                        offset=RECORD_METADATA_SIZE,
+                        strides=(RECORD_SIZE, 3, 1),
+                    )
+                    selected = chunk_pixels[local_indexes].transpose(1, 0, 2)
+                    if capture.channel_order == "bgr":
+                        selected = selected[:, :, ::-1]
+                    pixels[:, preview_start:preview_end, :] = selected
+                record_index += chunk_count
+    except PermissionError as error:
+        raise AuyatRgbBusyError(
+            f"高速图像仍被原厂软件占用，请先完成判读: {capture.file_path}"
+        ) from error
+    except OSError as error:
+        raise AuyatRgbError(f"无法读取高速图像: {capture.file_path}") from error
+    ticks = AuyatTickIndex(
+        capture,
+        tick_sample_columns,
+        tick_samples,
+        stride=AUYAT_READ_CHUNK_RECORDS,
+    )
+    return AuyatRgbFrame(capture=capture, ticks=ticks, pixels_rgb=pixels)
+
+
 def read_capture(capture: AuyatRgbCapture) -> AuyatRgbFrame:
     count = capture.column_count
     start_offset = capture.data_offset + capture.start_record * RECORD_SIZE
@@ -1266,10 +1626,11 @@ def _unwrap_ticks(raw_ticks: np.ndarray) -> np.ndarray:
     if not len(raw_ticks):
         return np.empty((0,), dtype=np.uint64)
     values = raw_ticks.astype(np.uint64)
-    wraps = np.zeros(values.shape, dtype=np.uint64)
     if len(values) > 1:
-        wraps[1:] = np.cumsum(raw_ticks[1:] < raw_ticks[:-1], dtype=np.uint64)
-    return values + wraps * np.uint64(TICK_COUNTER_SIZE)
+        wrap_indexes = np.flatnonzero(raw_ticks[1:] < raw_ticks[:-1])
+        for wrap_index in wrap_indexes:
+            values[int(wrap_index) + 1 :] += np.uint64(TICK_COUNTER_SIZE)
+    return values
 
 
 def _absolute_optional_path(value: str | Path | None) -> Optional[Path]:
@@ -1327,14 +1688,21 @@ __all__ = [
     "AUYAT_CLOCK_SOURCE",
     "AuyatRgbCapture",
     "AuyatRgbCatalog",
+    "AUYAT_FULL_TILE_COLUMNS",
+    "AUYAT_PREVIEW_MAX_COLUMNS",
     "AuyatRgbError",
     "AuyatRgbFrame",
     "AuyatRgbPlaybackWorker",
+    "AuyatTickIndex",
     "AuyatScanCancelled",
     "AuyatRgbScanWorker",
     "AuyatScanResult",
     "discover_auyat_root",
     "read_capture",
+    "read_capture_pixels",
+    "read_capture_preview",
+    "read_capture_ticks",
+    "preview_sample_indexes",
     "read_channel_order",
     "read_rgb_header",
     "is_network_share",

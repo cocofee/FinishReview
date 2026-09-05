@@ -10,13 +10,20 @@ import re
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable
+import time
+import uuid
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from .durable_jsonl import append_jsonl_records, locked_jsonl
+from .review_buffer_journal import (
+    ReviewBufferJournalProjection,
+    SCHEMA_VERSION as REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+)
 from .stream_recorder import (
     RecordingError,
     find_ffmpeg_executable,
@@ -287,6 +294,25 @@ class PassageReviewWindow:
     ended_at_ms: int
     state: PassageReviewState
     segments: tuple[ReviewSegment, ...] = ()
+    revision: int = 1
+    race_id: str = ""
+
+    @property
+    def window_id(self) -> str:
+        payload = ":".join(
+            (
+                self.event_id,
+                str(self.revision),
+                str(self.passage_timestamp_ms),
+                str(self.started_at_ms),
+                str(self.ended_at_ms),
+            )
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    @property
+    def pin_owner_id(self) -> str:
+        return f"owner:window:{self.window_id}"
 
 
 def _archive_paths(pattern: Path) -> tuple[Path, ...]:
@@ -746,8 +772,50 @@ class ArchiveTimelinePublisher:
         self.timing_error_ms = max(0, int(timing_error_ms))
         self.duration_probe = duration_probe
         self.source_id = f"camera_{recorder.camera_index:02d}_review"
+        self._lock = threading.RLock()
+        self._archive_directory_signature: tuple[str, int] | None = None
+        self._archive_paths_cache: tuple[Path, ...] = ()
+        self._archive_paths_cache_at = 0.0
+        self._last_recording_state: bool | None = None
+
+    def _archive_paths(self, *, force_refresh: bool = False) -> tuple[Path, ...]:
+        archive_paths_reader = getattr(self.recorder, "archive_paths", None)
+        if not callable(archive_paths_reader):
+            return ()
+        pattern = getattr(self.recorder, "archive_pattern", None)
+        if pattern is None:
+            return tuple(archive_paths_reader())
+        directory = Path(pattern).parent
+        try:
+            signature = (str(directory.resolve()), int(directory.stat().st_mtime_ns))
+        except OSError:
+            return tuple(archive_paths_reader())
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and signature == self._archive_directory_signature
+            and now - self._archive_paths_cache_at < 2.0
+        ):
+            return self._archive_paths_cache
+        paths = tuple(archive_paths_reader())
+        self._archive_directory_signature = signature
+        self._archive_paths_cache = paths
+        self._archive_paths_cache_at = now
+        return paths
 
     def publish_completed(
+        self,
+        *,
+        race_id: str,
+        recording: bool,
+    ) -> tuple[RecordingSegment, ...]:
+        with self._lock:
+            return self._publish_completed_unlocked(
+                race_id=race_id,
+                recording=recording,
+            )
+
+    def _publish_completed_unlocked(
         self,
         *,
         race_id: str,
@@ -760,23 +828,18 @@ class ArchiveTimelinePublisher:
         )
         if session_started_at_ms is None:
             return ()
-        archive_paths_reader = getattr(self.recorder, "archive_paths", None)
-        if not callable(archive_paths_reader):
-            return ()
-        archive_paths = tuple(archive_paths_reader())
+        force_refresh = self._last_recording_state is True and not recording
+        archive_paths = self._archive_paths(force_refresh=force_refresh)
+        self._last_recording_state = bool(recording)
         if recording and archive_paths:
             archive_paths = archive_paths[:-1]
         if not archive_paths:
             return ()
 
-        existing_by_path = {
-            self.timeline_store.resolve_video_path(segment).resolve(): segment
-            for segment in self.timeline_store.segments()
-        }
         cursor_ms = int(session_started_at_ms)
         published = []
         for archive_path in archive_paths:
-            existing = existing_by_path.get(archive_path)
+            existing = self.timeline_store.find_segment_by_video_path(archive_path)
             if existing is not None:
                 if (
                     existing.media_started_at_ms is not None
@@ -802,7 +865,6 @@ class ArchiveTimelinePublisher:
                 race_id=str(race_id),
             )
             published.append(segment)
-            existing_by_path[archive_path] = segment
             cursor_ms += int(media_duration_ms)
         return tuple(published)
 
@@ -830,10 +892,112 @@ class ReviewRingBuffer:
         )
         self._lock = threading.RLock()
         self._segments: dict[str, ReviewSegment] = {}
+        self._segment_revision = 0
         self._pins_by_event: dict[str, set[str]] = {}
         self._pins_by_segment: dict[str, set[str]] = {}
+        self._scan_leases_by_segment: dict[str, int] = {}
+        self._cleanup_pending_segments: dict[str, ReviewSegment] = {}
+        self._cleanup_pending_paths: dict[str, tuple[Path, Path]] = {}
+        self._cleanup_deleting_segment_ids: set[str] = set()
+        self._cleanup_deleted_intervals: list[tuple[int, int]] = []
         self._scan_watermark_ms: int | None = None
+        self._journal_projection = ReviewBufferJournalProjection()
         self._load_pin_journal()
+        self._recover_cleanup_transactions()
+        self._recover_cleanup_files()
+
+    def _recover_cleanup_transactions(self) -> None:
+        with locked_jsonl(self.pin_journal_path), self._lock:
+            self._sync_pin_journal_locked()
+            for transaction_id, record in tuple(
+                self._journal_projection.cleanup_intents.items()
+            ):
+                payload = record.get("segment")
+                if not isinstance(payload, dict):
+                    continue
+                try:
+                    segment = self._segment_from_payload(payload)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                original_name = str(record.get("original_name") or "")
+                trash_name = str(record.get("trash_name") or "")
+                if (
+                    not original_name
+                    or not trash_name
+                    or Path(original_name).name != original_name
+                    or Path(trash_name).name != trash_name
+                ):
+                    continue
+                original_path = self.buffer_dir / original_name
+                trash_path = self.buffer_dir / trash_name
+                outcome: dict
+                try:
+                    if original_path.exists():
+                        trash_path.unlink(missing_ok=True)
+                        outcome = self._cleanup_aborted_record(transaction_id)
+                    elif trash_path.exists():
+                        os.replace(trash_path, original_path)
+                        outcome = self._cleanup_aborted_record(transaction_id)
+                    else:
+                        outcome = self._cleanup_committed_record(
+                            transaction_id,
+                            segment,
+                        )
+                except OSError:
+                    continue
+                self._append_pin_records((outcome,), already_locked=True)
+
+    @staticmethod
+    def _cleanup_intent_record(
+        transaction_id: str,
+        segment: ReviewSegment,
+        original_path: Path,
+        trash_path: Path,
+    ) -> dict:
+        return {
+            "schema_version": REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+            "record_type": "cleanup_intent",
+            "transaction_id": str(transaction_id),
+            "segment": asdict(segment),
+            "original_name": original_path.name,
+            "trash_name": trash_path.name,
+        }
+
+    @staticmethod
+    def _cleanup_aborted_record(transaction_id: str) -> dict:
+        return {
+            "schema_version": REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+            "record_type": "cleanup_aborted",
+            "transaction_id": str(transaction_id),
+        }
+
+    @staticmethod
+    def _cleanup_committed_record(
+        transaction_id: str,
+        segment: ReviewSegment,
+    ) -> dict:
+        return {
+            "schema_version": REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+            "record_type": "cleanup_committed",
+            "transaction_id": str(transaction_id),
+            "segment_id": segment.segment_id,
+            "started_at_ms": segment.started_at_ms,
+            "ended_at_ms": segment.ended_at_ms,
+        }
+
+    def _recover_cleanup_files(self) -> None:
+        for trash_path in self.buffer_dir.glob(".*.*.cleanup"):
+            parts = trash_path.name[1:].rsplit(".", 2)
+            if len(parts) != 3 or parts[2] != "cleanup":
+                continue
+            original_path = trash_path.with_name(parts[0])
+            try:
+                if original_path.exists():
+                    trash_path.unlink(missing_ok=True)
+                else:
+                    os.replace(trash_path, original_path)
+            except OSError:
+                continue
 
     @staticmethod
     def _datetime_ms(value: str) -> int:
@@ -854,44 +1018,71 @@ class ReviewRingBuffer:
         )
 
     def _load_pin_journal(self) -> None:
-        path = self.pin_journal_path
-        if not path.is_file():
-            return
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return
-        for raw_line in lines:
-            try:
-                record = json.loads(raw_line)
-            except json.JSONDecodeError:
-                break
-            event_id = str(record.get("event_id") or "")
-            if not event_id:
-                continue
-            if record.get("op") == "release":
-                self._release_in_memory(event_id)
-                continue
-            if record.get("op") != "pin":
-                continue
+        with locked_jsonl(self.pin_journal_path):
+            self._sync_pin_journal_locked()
+
+    def _sync_pin_journal_locked(self) -> None:
+        self._journal_projection.sync(self.pin_journal_path)
+        self._reconcile_journal_projection()
+
+    def _reconcile_journal_projection(self) -> None:
+        pins_by_owner: dict[str, set[str]] = {}
+        pins_by_segment: dict[str, set[str]] = {}
+        for owner_id, payloads in self._journal_projection.owner_segments.items():
             segment_ids = set()
-            for payload in record.get("segments") or ():
+            for payload in payloads:
                 try:
                     segment = self._segment_from_payload(payload)
                 except (KeyError, TypeError, ValueError):
                     continue
-                self._segments[segment.segment_id] = segment
+                if segment.segment_id in self._journal_projection.deleted_segment_ids:
+                    continue
+                path = self.resolve_path(segment)
+                if not path.is_file():
+                    continue
+                self._segments.setdefault(segment.segment_id, segment)
                 segment_ids.add(segment.segment_id)
-            self._set_event_pins(event_id, segment_ids)
+                pins_by_segment.setdefault(segment.segment_id, set()).add(owner_id)
+            if segment_ids:
+                pins_by_owner[owner_id] = segment_ids
+        self._pins_by_event = pins_by_owner
+        self._pins_by_segment = pins_by_segment
+        for segment_id in self._journal_projection.deleted_segment_ids:
+            self._segments.pop(segment_id, None)
+        self._cleanup_deleted_intervals = list(
+            self._journal_projection.deleted_intervals
+        )
 
-    def _append_pin_record(self, record: dict) -> None:
+    def _append_pin_records(
+        self,
+        records: Iterable[dict],
+        *,
+        already_locked: bool = False,
+    ) -> None:
         path = self.pin_journal_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("ab") as output:
-            output.write(json.dumps(record, ensure_ascii=False).encode("utf-8"))
-            output.write(b"\n")
-            output.flush()
-            os.fsync(output.fileno())
+        append_jsonl_records(
+            path,
+            (
+                json.dumps(record, ensure_ascii=False).encode("utf-8")
+                for record in records
+            ),
+            description="review buffer pin journal",
+            already_locked=already_locked,
+        )
+        if already_locked:
+            self._sync_pin_journal_locked()
+        else:
+            with locked_jsonl(path):
+                self._sync_pin_journal_locked()
+
+    def _append_pin_record(
+        self,
+        record: dict,
+        *,
+        already_locked: bool = False,
+    ) -> None:
+        self._append_pin_records((record,), already_locked=already_locked)
 
     def _set_event_pins(self, event_id: str, segment_ids: set[str]) -> None:
         previous = self._pins_by_event.get(event_id, set())
@@ -979,9 +1170,11 @@ class ReviewRingBuffer:
                 started_at_ms=int(started_at_ms),
                 duration_ms=int(duration_ms),
             )
-            if segment.segment_id not in self._segments:
-                discovered.append(segment)
-            self._segments[segment.segment_id] = segment
+            if segment.segment_id not in self._cleanup_pending_segments:
+                if segment.segment_id not in self._segments:
+                    discovered.append(segment)
+                    self._segment_revision += 1
+                self._segments[segment.segment_id] = segment
             running_start_ms = segment.ended_at_ms
             duration_ms = None
             current_start_ms = None
@@ -1020,6 +1213,9 @@ class ReviewRingBuffer:
             path_resolver=self.resolve_path,
             finish_line=finish_line,
             line_batch_gap_ms=line_batch_gap_ms,
+            lease_callback=self.acquire_scan_leases,
+            release_callback=self.release_scan_leases,
+            progress_callback=self.set_scan_watermark,
         )
 
     def create_live_review_batch_scan_worker(
@@ -1061,6 +1257,14 @@ class ReviewRingBuffer:
             line_batch_gap_ms=line_batch_gap_ms,
             manifest_dir=self.buffer_dir,
             progress_callback=self.set_scan_watermark,
+            lease_callback=self.acquire_scan_leases,
+            release_callback=self.release_scan_leases,
+            permanent_gap_callback=self.scan_gap_is_permanent,
+            cursor_reader=lambda scanner_id: self.scan_cursor(scanner_id),
+            cursor_committer=lambda scanner_id, cursor_ms: self.commit_scan_cursor(
+                scanner_id,
+                cursor_ms,
+            ),
         )
 
     def set_scan_watermark(self, watermark_ms: int | None) -> None:
@@ -1069,6 +1273,12 @@ class ReviewRingBuffer:
             self._scan_watermark_ms = (
                 None if watermark_ms is None else int(watermark_ms)
             )
+
+    @property
+    def segment_revision(self) -> int:
+        # Monotonic integer reads are safe under the CPython GIL and must not
+        # block the UI watchdog behind a slow playlist scan holding _lock.
+        return self._segment_revision
 
     def segments(self) -> tuple[ReviewSegment, ...]:
         with self._lock:
@@ -1079,8 +1289,104 @@ class ReviewRingBuffer:
                 )
             )
 
+    def acquire_scan_leases(self, segments: Iterable[ReviewSegment]) -> bool:
+        """Reserve current segments against cleanup for one scanner operation."""
+        values = tuple(segments)
+        with self._lock:
+            if any(
+                self._segments.get(segment.segment_id) != segment
+                or segment.segment_id in self._cleanup_pending_segments
+                for segment in values
+            ):
+                return False
+            for segment in values:
+                self._scan_leases_by_segment[segment.segment_id] = (
+                    self._scan_leases_by_segment.get(segment.segment_id, 0) + 1
+                )
+            return True
+
+    def release_scan_leases(self, segments: Iterable[ReviewSegment]) -> None:
+        with self._lock:
+            for segment in tuple(segments):
+                segment_id = str(segment.segment_id)
+                count = self._scan_leases_by_segment.get(segment_id, 0)
+                if count <= 1:
+                    self._scan_leases_by_segment.pop(segment_id, None)
+                else:
+                    self._scan_leases_by_segment[segment_id] = count - 1
+
     def resolve_path(self, segment: ReviewSegment) -> Path:
         return (self.buffer_dir / segment.video_path).resolve()
+
+    def _abort_overlapping_cleanup_transactions(
+        self,
+        *,
+        started_at_ms: int,
+        ended_at_ms: int,
+    ) -> None:
+        for transaction_id, record in tuple(
+            self._journal_projection.cleanup_intents.items()
+        ):
+            payload = record.get("segment")
+            if not isinstance(payload, dict):
+                continue
+            try:
+                segment = self._segment_from_payload(payload)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                segment.ended_at_ms < int(started_at_ms)
+                or segment.started_at_ms > int(ended_at_ms)
+            ):
+                continue
+            original_name = str(record.get("original_name") or "")
+            trash_name = str(record.get("trash_name") or "")
+            if (
+                not original_name
+                or not trash_name
+                or Path(original_name).name != original_name
+                or Path(trash_name).name != trash_name
+            ):
+                continue
+            original_path = self.buffer_dir / original_name
+            trash_path = self.buffer_dir / trash_name
+            try:
+                if not original_path.exists() and trash_path.exists():
+                    os.replace(trash_path, original_path)
+                if original_path.exists():
+                    self._append_pin_record(
+                        self._cleanup_aborted_record(transaction_id),
+                        already_locked=True,
+                    )
+            except OSError:
+                continue
+            self._sync_pin_journal_locked()
+
+    def _claim_pending_cleanup_segments(
+        self,
+        *,
+        started_at_ms: int,
+        ended_at_ms: int,
+    ) -> None:
+        for segment_id, segment in tuple(self._cleanup_pending_segments.items()):
+            if (
+                segment_id in self._cleanup_deleting_segment_ids
+                or segment.started_at_ms > ended_at_ms
+                or segment.ended_at_ms < started_at_ms
+            ):
+                continue
+            paths = self._cleanup_pending_paths.get(segment_id)
+            if paths is None:
+                continue
+            path, trash_path = paths
+            try:
+                if not path.exists():
+                    os.replace(trash_path, path)
+            except OSError:
+                continue
+            self._cleanup_pending_segments.pop(segment_id, None)
+            self._cleanup_pending_paths.pop(segment_id, None)
+            self._segments.setdefault(segment_id, segment)
 
     def pin_window(
         self,
@@ -1089,6 +1395,11 @@ class ReviewRingBuffer:
         started_at_ms: int,
         ended_at_ms: int,
         scan: bool = True,
+        owner_kind: str = "legacy",
+        logical_event_id: str = "",
+        revision: int = 0,
+        race_id: str = "",
+        window_id: str = "",
     ) -> tuple[ReviewSegment, ...]:
         """Protect completed segments overlapping one passage evidence window."""
         event_id = str(event_id).strip()
@@ -1098,46 +1409,223 @@ class ReviewRingBuffer:
         ended_at_ms = int(ended_at_ms)
         if ended_at_ms < started_at_ms:
             raise ValueError("ended_at_ms cannot precede started_at_ms")
-        if scan:
-            self.scan()
-        matches = {
-            segment.segment_id
-            for segment in self._segments.values()
-            if segment.started_at_ms <= ended_at_ms
-            and segment.ended_at_ms >= started_at_ms
-        }
-        combined = self._pins_by_event.get(event_id, set()) | matches
-        if combined != self._pins_by_event.get(event_id, set()):
-            self._set_event_pins(event_id, combined)
-            pinned_segments = [self._segments[item] for item in sorted(combined)]
-            self._append_pin_record(
-                {
-                    "op": "pin",
-                    "event_id": event_id,
-                    "segments": [asdict(segment) for segment in pinned_segments],
-                }
+        with locked_jsonl(self.pin_journal_path), self._lock:
+            self._sync_pin_journal_locked()
+            self._abort_overlapping_cleanup_transactions(
+                started_at_ms=started_at_ms,
+                ended_at_ms=ended_at_ms,
             )
-        return tuple(
-            sorted(
-                (self._segments[item] for item in combined),
-                key=lambda item: (item.started_at_ms, item.segment_id),
+            if scan:
+                self._scan_unlocked()
+            self._claim_pending_cleanup_segments(
+                started_at_ms=started_at_ms,
+                ended_at_ms=ended_at_ms,
+            )
+            previous = set(self._pins_by_event.get(event_id, set()))
+            matches = {
+                segment.segment_id
+                for segment in self._segments.values()
+                if segment.started_at_ms <= ended_at_ms
+                and segment.ended_at_ms >= started_at_ms
+            }
+            combined = previous | matches
+            if combined != previous:
+                pinned_segments = [
+                    self._segments[item] for item in sorted(combined)
+                ]
+                # Persist before publishing the in-memory state. A failed
+                # append must leave the old protection set intact.
+                self._append_pin_record(
+                    {
+                        "schema_version": REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+                        "record_type": "pin_set",
+                        "op": "pin",
+                        "event_id": event_id,
+                        "owner_id": event_id,
+                        "owner_kind": str(owner_kind),
+                        "logical_event_id": str(logical_event_id or event_id),
+                        "revision": int(revision),
+                        "race_id": str(race_id),
+                        "window_id": str(window_id),
+                        "segments": [asdict(segment) for segment in pinned_segments],
+                    },
+                    already_locked=True,
+                )
+                self._set_event_pins(event_id, combined)
+            return tuple(
+                sorted(
+                    (self._segments[item] for item in combined),
+                    key=lambda item: (item.started_at_ms, item.segment_id),
+                )
+            )
+
+    def release_many(self, event_ids: Iterable[str]) -> tuple[str, ...]:
+        requested = tuple(
+            dict.fromkeys(
+                event_id
+                for value in event_ids
+                if (event_id := str(value).strip())
             )
         )
+        with locked_jsonl(self.pin_journal_path), self._lock:
+            self._sync_pin_journal_locked()
+            released = tuple(
+                event_id
+                for event_id in requested
+                if event_id in self._pins_by_event
+            )
+            if not released:
+                return ()
+            # Keep every durable pin until the complete release batch is stored.
+            self._append_pin_records(
+                (
+                    {
+                        "schema_version": REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+                        "record_type": "pin_release",
+                        "op": "release",
+                        "event_id": event_id,
+                        "owner_id": event_id,
+                    }
+                    for event_id in released
+                ),
+                already_locked=True,
+            )
+            for event_id in released:
+                self._release_in_memory(event_id)
+            return released
 
     def release(self, event_id: str) -> None:
-        event_id = str(event_id).strip()
-        if not event_id or event_id not in self._pins_by_event:
-            return
-        self._release_in_memory(event_id)
-        self._append_pin_record({"op": "release", "event_id": event_id})
+        self.release_many((event_id,))
+
+    def release_event_through(
+        self,
+        event_id: str,
+        revision: int,
+    ) -> tuple[str, ...]:
+        with locked_jsonl(self.pin_journal_path), self._lock:
+            self._sync_pin_journal_locked()
+            owner_ids = self._journal_projection.owner_ids_for_event(
+                event_id,
+                revision,
+            )
+            if not owner_ids:
+                return ()
+            self._append_pin_records(
+                (
+                    {
+                        "schema_version": REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+                        "record_type": "pin_release",
+                        "op": "release",
+                        "event_id": owner_id,
+                        "owner_id": owner_id,
+                    }
+                    for owner_id in owner_ids
+                ),
+                already_locked=True,
+            )
+            return owner_ids
 
     def pinned_event_ids(self, segment_id: str) -> frozenset[str]:
-        return frozenset(self._pins_by_segment.get(str(segment_id), set()))
+        with self._lock:
+            return frozenset(self._pins_by_segment.get(str(segment_id), set()))
+
+    def cleanup_pending_overlaps(
+        self,
+        *,
+        started_at_ms: int,
+        ended_at_ms: int,
+    ) -> bool:
+        """Return whether cleanup temporarily owns an overlapping segment."""
+        start = int(started_at_ms)
+        end = int(ended_at_ms)
+        with self._lock:
+            return any(
+                segment.started_at_ms <= end and segment.ended_at_ms >= start
+                for segment in self._cleanup_pending_segments.values()
+            )
+
+    def _record_cleanup_deleted_interval(self, segment: ReviewSegment) -> None:
+        start = int(segment.started_at_ms)
+        end = int(segment.ended_at_ms)
+        merged = []
+        for current_start, current_end in self._cleanup_deleted_intervals:
+            if current_end + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS < start:
+                merged.append((current_start, current_end))
+            elif end + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS < current_start:
+                merged.append((start, end))
+                start, end = current_start, current_end
+            else:
+                start = min(start, current_start)
+                end = max(end, current_end)
+        merged.append((start, end))
+        self._cleanup_deleted_intervals = merged
+
+    def scan_gap_is_permanent(
+        self,
+        started_at_ms: int,
+        ended_at_ms: int,
+    ) -> bool:
+        start = int(started_at_ms)
+        end = int(ended_at_ms)
+        with self._lock:
+            cursor = start
+            for deleted_start, deleted_end in self._cleanup_deleted_intervals:
+                if deleted_end < cursor:
+                    continue
+                if deleted_start > cursor + _HLS_SEGMENT_CONTIGUITY_TOLERANCE_MS:
+                    return False
+                cursor = max(cursor, deleted_end)
+                if cursor >= end:
+                    return True
+            return cursor >= end
+
+    def scan_cursor(self, scanner_id: str) -> int | None:
+        with locked_jsonl(self.pin_journal_path), self._lock:
+            self._sync_pin_journal_locked()
+            return self._journal_projection.scan_cursors.get(str(scanner_id))
+
+    def commit_scan_cursor(self, scanner_id: str, cursor_ms: int) -> int:
+        scanner_id = str(scanner_id).strip()
+        cursor_ms = int(cursor_ms)
+        if not scanner_id:
+            raise ValueError("scanner_id is required")
+        with locked_jsonl(self.pin_journal_path), self._lock:
+            self._sync_pin_journal_locked()
+            current = self._journal_projection.scan_cursors.get(scanner_id)
+            if current is not None and cursor_ms <= current:
+                return current
+            self._append_pin_record(
+                {
+                    "schema_version": REVIEW_BUFFER_JOURNAL_SCHEMA_VERSION,
+                    "record_type": "live_scan_cursor",
+                    "scanner_id": scanner_id,
+                    "next_core_started_at_ms": cursor_ms,
+                },
+                already_locked=True,
+            )
+            return self._journal_projection.scan_cursors[scanner_id]
+
+    def _restore_pending_cleanup_files(self) -> None:
+        with self._lock:
+            for segment_id, (path, trash_path) in tuple(
+                self._cleanup_pending_paths.items()
+            ):
+                if segment_id in self._cleanup_deleting_segment_ids:
+                    continue
+                try:
+                    if not path.exists():
+                        os.replace(trash_path, path)
+                except OSError:
+                    continue
+                segment = self._cleanup_pending_segments.pop(segment_id, None)
+                self._cleanup_pending_paths.pop(segment_id, None)
+                if segment is not None:
+                    self._segments.setdefault(segment_id, segment)
 
     def cleanup(self, *, current_time_ms: int) -> tuple[Path, ...]:
-        """Delete expired, completed segments that no passage references."""
+        """Delete expired segments through a cross-instance journal transaction."""
+        self._recover_cleanup_transactions()
         cutoff_ms = int(current_time_ms) - self.retention_ms
-        deleted = []
         with self._lock:
             scan_watermark_ms = self._scan_watermark_ms
         protect_scan_segments = False
@@ -1149,23 +1637,106 @@ class ReviewRingBuffer:
                 )
             except OSError:
                 protect_scan_segments = False
-        for segment in list(self._segments.values()):
-            if (
-                segment.ended_at_ms >= cutoff_ms
-                or self._pins_by_segment.get(segment.segment_id)
-                or (
-                    protect_scan_segments
-                    and segment.ended_at_ms >= scan_watermark_ms
+
+        pending: list[tuple[str, ReviewSegment, Path, Path]] = []
+        deleted: list[Path] = []
+        with locked_jsonl(self.pin_journal_path), self._lock:
+            self._sync_pin_journal_locked()
+            current_scan_watermark_ms = self._scan_watermark_ms
+            if scan_watermark_ms is None and current_scan_watermark_ms is not None:
+                protect_scan_segments = True
+            scan_watermark_ms = current_scan_watermark_ms
+            for segment in tuple(self._segments.values()):
+                if (
+                    segment.ended_at_ms >= cutoff_ms
+                    or self._pins_by_segment.get(segment.segment_id)
+                    or self._scan_leases_by_segment.get(segment.segment_id, 0) > 0
+                    or (
+                        protect_scan_segments
+                        and scan_watermark_ms is not None
+                        and segment.ended_at_ms >= scan_watermark_ms
+                    )
+                ):
+                    continue
+                path = self.resolve_path(segment)
+                transaction_id = f"cleanup-{uuid.uuid4().hex}"
+                trash_path = path.with_name(f".{path.name}.{transaction_id}.cleanup")
+                self._append_pin_record(
+                    self._cleanup_intent_record(
+                        transaction_id,
+                        segment,
+                        path,
+                        trash_path,
+                    ),
+                    already_locked=True,
                 )
-            ):
-                continue
-            path = self.resolve_path(segment)
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                continue
-            self._segments.pop(segment.segment_id, None)
-            deleted.append(path)
+                try:
+                    os.replace(path, trash_path)
+                except FileNotFoundError:
+                    self._append_pin_record(
+                        self._cleanup_committed_record(transaction_id, segment),
+                        already_locked=True,
+                    )
+                    self._segments.pop(segment.segment_id, None)
+                    deleted.append(path)
+                    continue
+                except OSError:
+                    self._append_pin_record(
+                        self._cleanup_aborted_record(transaction_id),
+                        already_locked=True,
+                    )
+                    continue
+                self._segments.pop(segment.segment_id, None)
+                self._cleanup_pending_segments[segment.segment_id] = segment
+                self._cleanup_pending_paths[segment.segment_id] = (path, trash_path)
+                pending.append((transaction_id, segment, path, trash_path))
+
+        for transaction_id, segment, path, trash_path in pending:
+            with locked_jsonl(self.pin_journal_path):
+                with self._lock:
+                    self._sync_pin_journal_locked()
+                    if self._pins_by_segment.get(segment.segment_id):
+                        try:
+                            if not path.exists():
+                                os.replace(trash_path, path)
+                        except OSError:
+                            continue
+                        self._append_pin_record(
+                            self._cleanup_aborted_record(transaction_id),
+                            already_locked=True,
+                        )
+                        self._cleanup_pending_segments.pop(segment.segment_id, None)
+                        self._cleanup_pending_paths.pop(segment.segment_id, None)
+                        self._segments.setdefault(segment.segment_id, segment)
+                        continue
+                    self._cleanup_deleting_segment_ids.add(segment.segment_id)
+                try:
+                    trash_path.unlink(missing_ok=True)
+                except OSError:
+                    with self._lock:
+                        self._cleanup_deleting_segment_ids.discard(segment.segment_id)
+                        try:
+                            if not path.exists():
+                                os.replace(trash_path, path)
+                        except OSError:
+                            continue
+                        self._append_pin_record(
+                            self._cleanup_aborted_record(transaction_id),
+                            already_locked=True,
+                        )
+                        self._cleanup_pending_segments.pop(segment.segment_id, None)
+                        self._cleanup_pending_paths.pop(segment.segment_id, None)
+                        self._segments.setdefault(segment.segment_id, segment)
+                    continue
+                with self._lock:
+                    self._append_pin_record(
+                        self._cleanup_committed_record(transaction_id, segment),
+                        already_locked=True,
+                    )
+                    self._cleanup_deleting_segment_ids.discard(segment.segment_id)
+                    self._cleanup_pending_segments.pop(segment.segment_id, None)
+                    self._cleanup_pending_paths.pop(segment.segment_id, None)
+                deleted.append(path)
         return tuple(deleted)
 
 
@@ -1183,6 +1754,7 @@ class PassageReviewCoordinator:
         self.pre_roll_ms = max(0, int(pre_roll_seconds)) * 1000
         self.post_roll_ms = max(0, int(post_roll_seconds)) * 1000
         self._windows: dict[str, PassageReviewWindow] = {}
+        self._latest_window_by_event: dict[str, str] = {}
 
     def register(
         self,
@@ -1190,6 +1762,8 @@ class PassageReviewCoordinator:
         *,
         passage_timestamp_ms: int,
         scan: bool = True,
+        revision: int = 1,
+        race_id: str = "",
     ) -> PassageReviewWindow:
         event_id = str(event_id).strip()
         if not event_id:
@@ -1197,13 +1771,18 @@ class PassageReviewCoordinator:
         passage_timestamp_ms = int(passage_timestamp_ms)
         if passage_timestamp_ms < 0:
             raise ValueError("passage_timestamp_ms must be non-negative")
-        self._windows[event_id] = PassageReviewWindow(
+        revision = max(1, int(revision))
+        window = PassageReviewWindow(
             event_id=event_id,
             passage_timestamp_ms=passage_timestamp_ms,
             started_at_ms=max(0, passage_timestamp_ms - self.pre_roll_ms),
             ended_at_ms=passage_timestamp_ms + self.post_roll_ms,
             state=PassageReviewState.WAITING,
+            revision=revision,
+            race_id=str(race_id),
         )
+        self._windows[window.pin_owner_id] = window
+        self._latest_window_by_event[event_id] = window.pin_owner_id
         return self.refresh_event(event_id, scan=scan)
 
     @staticmethod
@@ -1247,14 +1826,24 @@ class PassageReviewCoordinator:
         scan: bool = True,
     ) -> PassageReviewWindow:
         event_id = str(event_id).strip()
-        window = self._windows.get(event_id)
+        owner_id = (
+            event_id
+            if event_id in self._windows
+            else self._latest_window_by_event.get(event_id, "")
+        )
+        window = self._windows.get(owner_id)
         if window is None:
             raise KeyError(event_id)
         pinned = self.ring_buffer.pin_window(
-            event_id,
+            window.pin_owner_id,
             started_at_ms=window.started_at_ms,
             ended_at_ms=window.ended_at_ms,
             scan=scan,
+            owner_kind="event_window",
+            logical_event_id=window.event_id,
+            revision=window.revision,
+            race_id=window.race_id,
+            window_id=window.window_id,
         )
         current_segments = tuple(
             segment
@@ -1266,7 +1855,11 @@ class PassageReviewCoordinator:
             segment.ended_at_ms >= window.ended_at_ms
             for segment in self.ring_buffer.segments()
         )
-        if not timeline_complete:
+        cleanup_pending = self.ring_buffer.cleanup_pending_overlaps(
+            started_at_ms=window.started_at_ms,
+            ended_at_ms=window.ended_at_ms,
+        )
+        if cleanup_pending or not timeline_complete:
             state = PassageReviewState.WAITING
         elif self._covers_window(
             current_segments,
@@ -1284,31 +1877,54 @@ class PassageReviewCoordinator:
             ended_at_ms=window.ended_at_ms,
             state=state,
             segments=current_segments,
+            revision=window.revision,
+            race_id=window.race_id,
         )
-        self._windows[event_id] = refreshed
+        self._windows[owner_id] = refreshed
         return refreshed
 
     def refresh(self, *, scan: bool = True) -> tuple[PassageReviewWindow, ...]:
-        pending_event_ids = [
-            event_id
-            for event_id, window in self._windows.items()
+        pending_owner_ids = [
+            owner_id
+            for owner_id, window in self._windows.items()
             if window.state is PassageReviewState.WAITING
         ]
-        if pending_event_ids and scan:
+        if pending_owner_ids and scan:
             self.ring_buffer.scan()
-        for event_id in pending_event_ids:
-            self.refresh_event(event_id, scan=False)
+        for owner_id in pending_owner_ids:
+            self.refresh_event(owner_id, scan=False)
         return tuple(self._windows.values())
 
     def get(self, event_id: str) -> PassageReviewWindow | None:
-        return self._windows.get(str(event_id))
+        owner_id = self._latest_window_by_event.get(str(event_id), "")
+        return self._windows.get(owner_id)
 
-    def discard(self, event_id: str) -> None:
+    def discard(self, event_id: str, *, revision: int | None = None) -> None:
         event_id = str(event_id).strip()
         if not event_id:
             return
-        self._windows.pop(event_id, None)
-        self.ring_buffer.release(event_id)
+        if revision is None:
+            owner_id = self._latest_window_by_event.pop(event_id, "")
+            if not owner_id:
+                return
+            self.ring_buffer.release(owner_id)
+            self._windows.pop(owner_id, None)
+            return
+        self.ring_buffer.release_event_through(event_id, int(revision))
+        for owner_id, window in tuple(self._windows.items()):
+            if window.event_id == event_id and window.revision <= int(revision):
+                self._windows.pop(owner_id, None)
+        latest_owner = self._latest_window_by_event.get(event_id, "")
+        if latest_owner not in self._windows:
+            remaining = [
+                (window.revision, owner_id)
+                for owner_id, window in self._windows.items()
+                if window.event_id == event_id
+            ]
+            if remaining:
+                self._latest_window_by_event[event_id] = max(remaining)[1]
+            else:
+                self._latest_window_by_event.pop(event_id, None)
 
 
 class PassageReviewTimelinePublisher:
@@ -1326,7 +1942,7 @@ class PassageReviewTimelinePublisher:
         self.timeline_store = timeline_store
         self.binding_store = binding_store
         self.timing_error_ms = max(0, int(timing_error_ms))
-        self._preview_segments: dict[tuple[str, int], RecordingSegment] = {}
+        self._preview_segments: dict[tuple[str, int, int], RecordingSegment] = {}
 
     def _segment_signature(
         self,
@@ -1461,7 +2077,11 @@ class PassageReviewTimelinePublisher:
     ) -> RecordingSegment | None:
         """Return a read-only preview once the passage segment is sealed."""
 
-        key = (window.event_id, window.passage_timestamp_ms)
+        key = (
+            window.event_id,
+            int(window.revision),
+            window.passage_timestamp_ms,
+        )
         existing = self._preview_segments.get(key)
         if existing is not None:
             return existing
@@ -1538,6 +2158,8 @@ class PassageReviewTimelinePublisher:
             started_at_ms=segments[0].started_at_ms,
             ended_at_ms=segments[-1].ended_at_ms,
             scan=False,
+            owner_kind="published_clip",
+            race_id=str(race_id),
         )
         playlist_path = self.ring_buffer.buffer_dir / self._playlist_name(
             segment_signature
@@ -1585,6 +2207,9 @@ class PassageReviewTimelinePublisher:
                     for window, window_revision in windows
                 )
             )
+        self.ring_buffer.release_many(
+            window.pin_owner_id for window, _revision in windows
+        )
         return segment
 
 

@@ -1,3 +1,6 @@
+import pytest
+
+import realtime.durable_jsonl as durable_jsonl
 from realtime.video_arrival import (
     VideoArrivalCandidateStore,
     build_video_arrival_batches,
@@ -72,6 +75,17 @@ def test_video_arrival_store_persists_and_deduplicates_candidates(tmp_path):
     assert restored.add_many((first,)) == ()
 
 
+def test_video_arrival_stale_store_reloads_ids_inside_append_lock(tmp_path):
+    path = tmp_path / "video_arrival_candidates.jsonl"
+    first_store = VideoArrivalCandidateStore(path)
+    stale_store = VideoArrivalCandidateStore(path)
+    candidate = _candidate("candidate-one", 1_000)
+
+    assert first_store.add_many((candidate,)) == (candidate,)
+    assert stale_store.add_many((candidate,)) == ()
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_video_arrival_store_recovers_incomplete_tail(tmp_path):
     path = tmp_path / "video_arrival_candidates.jsonl"
     first = _candidate("candidate-one", 1_000)
@@ -87,3 +101,61 @@ def test_video_arrival_store_recovers_incomplete_tail(tmp_path):
     second = _candidate("candidate-two", 2_000)
     restored.add_many((second,))
     assert VideoArrivalCandidateStore(path).candidates() == (first, second)
+
+
+def test_video_arrival_store_batches_one_durable_write(tmp_path, monkeypatch):
+    path = tmp_path / "video_arrival_candidates.jsonl"
+    store = VideoArrivalCandidateStore(path)
+    candidates = (
+        _candidate("candidate-one", 1_000),
+        _candidate("candidate-two", 2_000),
+    )
+    fsync_calls = []
+    monkeypatch.setattr(
+        durable_jsonl.os,
+        "fsync",
+        lambda file_descriptor: fsync_calls.append(file_descriptor),
+    )
+
+    assert store.add_many(candidates) == candidates
+    assert len(fsync_calls) == 1
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_video_arrival_store_does_not_write_all_duplicates(tmp_path, monkeypatch):
+    path = tmp_path / "video_arrival_candidates.jsonl"
+    first = _candidate("candidate-one", 1_000)
+    store = VideoArrivalCandidateStore(path)
+    store.add_many((first,))
+    fsync_calls = []
+    monkeypatch.setattr(
+        durable_jsonl.os,
+        "fsync",
+        lambda file_descriptor: fsync_calls.append(file_descriptor),
+    )
+
+    assert store.add_many((first, first)) == ()
+    assert fsync_calls == []
+
+
+def test_video_arrival_store_rolls_back_failed_batch(tmp_path, monkeypatch):
+    path = tmp_path / "video_arrival_candidates.jsonl"
+    store = VideoArrivalCandidateStore(path)
+    first = _candidate("candidate-one", 1_000)
+    second = _candidate("candidate-two", 2_000)
+    calls = 0
+
+    def fail_first_fsync(file_descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("disk full")
+
+    monkeypatch.setattr(durable_jsonl.os, "fsync", fail_first_fsync)
+
+    with pytest.raises(RuntimeError, match="failed to append"):
+        store.add_many((first, second))
+
+    assert store.candidates() == ()
+    assert path.read_bytes() == b""
+    assert store.add_many((first,)) == (first,)

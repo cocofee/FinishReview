@@ -11,8 +11,11 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 from typing import Iterable
 
+from .durable_jsonl import append_jsonl_records, locked_jsonl
+from .runtime_metrics import RuntimeMetrics
 from .video_passage_detector import VideoPassageCandidate
 
 
@@ -126,14 +129,26 @@ def _make_video_arrival_batch(
 class VideoArrivalCandidateStore:
     """Append-only event-workspace index of scanned video candidates."""
 
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        metrics: RuntimeMetrics | None = None,
+    ):
         self.path = Path(path).expanduser().absolute()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._metrics = metrics
         self._candidates: dict[str, VideoPassageCandidate] = {}
         self._load()
 
     def _load(self) -> None:
+        if not self.path.is_file():
+            return
+        with locked_jsonl(self.path):
+            self._load_locked()
+
+    def _load_locked(self) -> None:
         if not self.path.is_file():
             return
         try:
@@ -196,47 +211,84 @@ class VideoArrivalCandidateStore:
         self,
         candidates: Iterable[VideoPassageCandidate],
     ) -> tuple[VideoPassageCandidate, ...]:
-        added = []
-        with self._lock:
-            for candidate in candidates:
+        started = time.perf_counter()
+        values = tuple(candidates)
+        added: list[VideoPassageCandidate] = []
+        with self._lock, locked_jsonl(self.path):
+            # Another store or process may have committed since this instance
+            # loaded. Refresh the ID projection inside the same file lock used
+            # for dedupe and append.
+            self._load_locked()
+            batch_ids: set[str] = set()
+            for candidate in values:
                 candidate_id = str(candidate.candidate_id).strip()
-                if not candidate_id or candidate_id in self._candidates:
+                if (
+                    not candidate_id
+                    or candidate_id in self._candidates
+                    or candidate_id in batch_ids
+                ):
                     continue
-                self._append(candidate)
-                self._candidates[candidate_id] = candidate
+                batch_ids.add(candidate_id)
                 added.append(candidate)
+            if added:
+                try:
+                    self._append_many(tuple(added), already_locked=True)
+                except Exception:
+                    if self._metrics is not None:
+                        self._metrics.observe(
+                            "video_arrival_write",
+                            (time.perf_counter() - started) * 1000.0,
+                            item_count=len(added),
+                            failed=True,
+                        )
+                    raise
+                self._candidates.update(
+                    {
+                        str(candidate.candidate_id).strip(): candidate
+                        for candidate in added
+                    }
+                )
+        if self._metrics is not None:
+            self._metrics.observe(
+                "video_arrival_write",
+                (time.perf_counter() - started) * 1000.0,
+                item_count=len(added),
+            )
         return tuple(added)
 
-    def _append(self, candidate: VideoPassageCandidate) -> None:
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "record_type": "video_arrival_candidate",
-            "candidate": asdict(candidate),
-        }
-        encoded = (
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    @staticmethod
+    def _payload(candidate: VideoPassageCandidate) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "record_type": "video_arrival_candidate",
+                    "candidate": asdict(candidate),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
         ).encode("utf-8")
-        separator = b""
-        if self.path.exists():
-            try:
-                with self.path.open("rb") as journal:
-                    if journal.seek(0, os.SEEK_END) > 0:
-                        journal.seek(-1, os.SEEK_END)
-                        if journal.read(1) not in {b"\n", b"\r"}:
-                            separator = b"\n"
-            except OSError as error:
-                raise RuntimeError(
-                    f"failed to inspect video arrival candidate journal: {self.path}"
-                ) from error
-        try:
-            with self.path.open("ab") as journal:
-                journal.write(separator + encoded)
-                journal.flush()
-                os.fsync(journal.fileno())
-        except OSError as error:
-            raise RuntimeError(
-                f"failed to append video arrival candidate: {self.path}"
-            ) from error
+
+    def _append_many(
+        self,
+        candidates: tuple[VideoPassageCandidate, ...],
+        *,
+        already_locked: bool = False,
+    ) -> None:
+        if not candidates:
+            return
+        append_jsonl_records(
+            self.path,
+            (self._payload(candidate) for candidate in candidates),
+            description="video arrival candidate journal",
+            already_locked=already_locked,
+        )
+
+    def _append(self, candidate: VideoPassageCandidate) -> None:
+        """Keep the historical private helper as a one-item batch wrapper."""
+        self._append_many((candidate,))
 
 
 __all__ = [

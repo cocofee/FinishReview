@@ -9,6 +9,7 @@ import re
 import socket
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -44,6 +45,12 @@ from PyQt5.QtWidgets import (
 )
 
 from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
+from .capture_refresh import (
+    ArchiveRefreshJob,
+    CaptureRefreshRequest,
+    CaptureRefreshResult,
+    CaptureRefreshWorker,
+)
 from .auyat_rgb import (
         AuyatRgbCatalog,
         AuyatRgbScanWorker,
@@ -92,6 +99,7 @@ from .receiver_controller import ReceiverController
 from .recording_controller import (
     RecordingPipeline,
     RecordingSessionController,
+    RecordingStopFailure,
 )
 from .settings import FinishReviewSettings
 from .review_recorder import (
@@ -138,6 +146,19 @@ from .visual_crossing import (
 
 
 logger = logging.getLogger("FinishReview")
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoCandidateDelivery:
+    generation: int
+    candidates: tuple[object, ...]
+    persisted: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoCandidatePersistenceFailure:
+    generation: int
+    message: str
 
 
 @dataclass(frozen=True)
@@ -193,6 +214,7 @@ LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
 CYCLERACE_INBOX_DIRNAME = ".finishreview"
 CAMERA_RECONNECT_BASE_SECONDS = 2.0
 CAMERA_RECONNECT_MAX_SECONDS = 30.0
+CAMERA_STALL_TIMEOUT_SECONDS = 60.0
 _TEST_GROUP_NAMES = frozenset({"test", "testgroup"})
 _TEST_GROUP_MARKERS = ("测试", "检测")
 _INVALID_EVENT_FOLDER_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -2191,6 +2213,7 @@ class _PassageSignalBridge(QObject):
     metadata_accepted = pyqtSignal(object)
     focus_accepted = pyqtSignal(object)
     timing_status = pyqtSignal(object)
+    capture_refresh_finished = pyqtSignal(object)
 
 
 class _ElidedLabel(QLabel):
@@ -2544,6 +2567,7 @@ class FinishReviewWindow(PassageReviewSurface):
             calibration_store=calibration_store,
             low_resource_mode=len(regular_camera_indexes) == 1,
         )
+        self._runtime_metrics_reported = False
 
         self.setWindowTitle(APP_WINDOW_TITLE)
         self.setMinimumSize(1180, 760)
@@ -2568,6 +2592,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._video_candidate_dialogs: set[VideoPlaybackDialog] = set()
         self._video_scan_pause_tokens: set[object] = set()
         self._video_scan_generation = 0
+        self._video_scan_tokens: dict[int, object] = {}
+        self._video_scan_state_lock = threading.RLock()
         self._finish_line_store = FinishLineStore(
             self.output_dir / "finish_lines.json"
         )
@@ -2605,6 +2631,10 @@ class FinishReviewWindow(PassageReviewSurface):
         self._camera_reconnect_attempts: dict[int, int] = {}
         self._camera_reconnect_not_before: dict[int, float] = {}
         self._camera_reconnect_errors: dict[int, str] = {}
+        self._camera_segment_progress: dict[
+            int,
+            tuple[int | None, float],
+        ] = {}
         self._historical_passage_count = len(passage_store)
         self._received_passage_count = 0
         self._last_passage_monotonic = 0.0
@@ -2618,9 +2648,18 @@ class FinishReviewWindow(PassageReviewSurface):
         self._signal_bridge.metadata_accepted.connect(self._on_metadata_received)
         self._signal_bridge.focus_accepted.connect(self._on_focus_received)
         self._signal_bridge.timing_status.connect(self._on_racetiger_status)
+        self._signal_bridge.capture_refresh_finished.connect(
+            self._on_capture_refresh_finished
+        )
+        self._capture_refresh_generation = 0
+        self._capture_refresh_worker = CaptureRefreshWorker(
+            self._signal_bridge.capture_refresh_finished.emit,
+            metrics=self.runtime_metrics,
+        )
+        self._capture_refresh_worker.start()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(max(100, int(refresh_interval_ms)))
-        self._refresh_timer.timeout.connect(self._refresh_capture_windows)
+        self._refresh_timer.timeout.connect(self._request_capture_refresh)
         self._passage_batch_timer = QTimer(self)
         self._passage_batch_timer.setSingleShot(True)
         self._passage_batch_timer.setInterval(
@@ -2629,7 +2668,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._passage_batch_timer.timeout.connect(self._flush_passage_batch)
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(1_000)
-        self._clock_timer.timeout.connect(self._update_runtime_status)
+        self._clock_timer.timeout.connect(self._on_clock_tick)
         self._init_runtime_status()
         self._init_operator_controls()
         self._high_speed_scan_worker = AuyatRgbScanWorker(
@@ -2641,6 +2680,9 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         self.video_candidate_requested.connect(self._open_video_candidate)
         self.video_candidates_received.connect(self._reconcile_video_candidates)
+        self.video_candidate_persistence_failed.connect(
+            self._on_video_candidate_persistence_failed
+        )
         self.video_review_status_changed.connect(self._persist_video_review)
         if self._video_candidate_cache:
             self._reconcile_video_candidates(
@@ -2666,6 +2708,38 @@ class FinishReviewWindow(PassageReviewSurface):
     @property
     def recorder(self) -> FfmpegReviewRecorder | None:
         return self._recorder
+
+    def _observe_runtime_metric(
+        self,
+        operation: str,
+        started_at: float,
+        *,
+        item_count: int = 0,
+        failed: bool = False,
+    ) -> None:
+        self.runtime_metrics.observe(
+            operation,
+            (time.perf_counter() - started_at) * 1000.0,
+            item_count=item_count,
+            failed=failed,
+        )
+
+    def _log_runtime_metrics(self) -> None:
+        if getattr(self, "_runtime_metrics_reported", False):
+            return
+        self._runtime_metrics_reported = True
+        for summary in self.runtime_metrics.snapshots():
+            logger.info(
+                "Runtime metrics operation=%s count=%d items_total=%d failures=%d "
+                "p50=%.1fms p95=%.1fms max=%.1fms",
+                summary.operation,
+                summary.count,
+                summary.item_count,
+                summary.failure_count,
+                summary.p50_ms,
+                summary.p95_ms,
+                summary.max_ms,
+            )
 
     def _configured_recording_sources(self) -> tuple[tuple[int, str], ...]:
         sources = []
@@ -2765,7 +2839,10 @@ class FinishReviewWindow(PassageReviewSurface):
             changed_area=0.0,
             segment_id=f"visual:{event.event_id}",
         )
-        self.video_candidates_received.emit((candidate,))
+        self._on_video_candidates(
+            (candidate,),
+            self._video_scan_generation,
+        )
 
     def _sync_evidence_pane_layout(self, *, include_recorded: bool = False) -> None:
         self.configure_evidence_panes(
@@ -2954,12 +3031,16 @@ class FinishReviewWindow(PassageReviewSurface):
                 return values
 
             generation = self._video_scan_generation
+            token = object()
+            self._video_scan_tokens[camera_index] = token
 
             worker = worker_type(
                 provider,
-                lambda candidates, generation=generation: self._on_video_candidates(
+                lambda candidates, generation=generation,
+                camera_index=camera_index, token=token: self._on_video_candidates(
                     candidates,
                     generation,
+                    worker_token=(camera_index, token),
                 ),
                 camera_index=camera_index,
                 width=640,
@@ -2977,9 +3058,13 @@ class FinishReviewWindow(PassageReviewSurface):
             worker.start()
 
     def _stop_archive_video_scan_workers(self) -> None:
-        self._video_scan_generation += 1
-        workers = tuple(self._archive_video_scan_workers.values())
-        self._archive_video_scan_workers = {}
+        with self._video_scan_state_lock:
+            self._video_scan_generation += 1
+            worker_items = tuple(self._archive_video_scan_workers.items())
+            workers = tuple(worker for _camera_index, worker in worker_items)
+            self._archive_video_scan_workers = {}
+            for camera_index, _worker in worker_items:
+                self._video_scan_tokens.pop(camera_index, None)
         for worker in workers:
             try:
                 worker.stop()
@@ -3396,6 +3481,19 @@ class FinishReviewWindow(PassageReviewSurface):
                 QMessageBox.warning(self, "设置无法应用", self._runtime_error)
                 self._update_runtime_status()
                 return False
+        previous_runtime_settings = self._current_settings()
+        if data_source_changed:
+            self._capture_refresh_generation += 1
+            if not self._capture_refresh_worker.invalidate_and_wait(
+                self._capture_refresh_generation,
+                timeout=5.0,
+            ):
+                QMessageBox.warning(
+                    self,
+                    "设置无法应用",
+                    "后台录像刷新仍在运行，设置未切换。",
+                )
+                return False
         if persist_settings and self._settings_saver is not None:
             try:
                 self._settings_saver(settings)
@@ -3403,10 +3501,23 @@ class FinishReviewWindow(PassageReviewSurface):
                 QMessageBox.warning(self, "设置未保存", str(exc))
                 return False
         if stop_recording:
-            self.stop_recording()
+            failures = self.stop_recording()
+            if any(failure.still_running for failure in failures):
+                if persist_settings and self._settings_saver is not None:
+                    try:
+                        self._settings_saver(previous_runtime_settings)
+                    except Exception:
+                        logger.exception("Failed to roll back settings after stop failure")
+                QMessageBox.warning(
+                    self,
+                    "设置无法应用",
+                    "仍有录像进程未停止，设置未切换。",
+                )
+                return False
         if receiver_restart_needed:
             self.stop_receiver()
         if data_source_changed:
+            self._stop_archive_video_scan_workers()
             self._passage_batch_timer.stop()
             self._pending_passages.clear()
         self.source = str(settings.source).strip()
@@ -3502,7 +3613,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 self.output_dir / "video_review.jsonl"
             )
             self.video_arrival_store = VideoArrivalCandidateStore(
-                self.output_dir / "video_arrival_candidates.jsonl"
+                self.output_dir / "video_arrival_candidates.jsonl",
+                metrics=self.runtime_metrics,
             )
             self._video_reconciliation_by_id.clear()
             self._video_candidate_cache = {
@@ -4152,11 +4264,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_runtime_status()
 
     def start_recording(self) -> None:
-        self._stop_archive_video_scan_workers()
         if self._workspace_mode == "archive":
             raise RecordingError("历史赛事模式不能开始录像，请先返回当前赛事")
         if self._recording_all_active():
             return
+        self._invalidate_capture_refresh()
+        self._stop_archive_video_scan_workers()
         if self._recorders:
             self.stop_recording()
         configured_sources = self._configured_recording_sources()
@@ -4165,6 +4278,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._camera_reconnect_attempts.clear()
         self._camera_reconnect_not_before.clear()
         self._camera_reconnect_errors.clear()
+        self._stop_requested = False
         try:
             free_bytes = shutil.disk_usage(self.output_dir).free
         except OSError as exc:
@@ -4198,9 +4312,22 @@ class FinishReviewWindow(PassageReviewSurface):
             self._video_scan_workers = {}
             if self._video_assist_enabled():
                 for camera_index, ring_buffer in ring_buffers.items():
+                    generation = self._video_scan_generation
+                    token = object()
+                    self._video_scan_tokens[camera_index] = token
+                    callback = (
+                        lambda candidates, generation=generation,
+                        camera_index=camera_index, token=token: (
+                            self._on_video_candidates(
+                                candidates,
+                                generation,
+                                worker_token=(camera_index, token),
+                            )
+                        )
+                    )
                     if len(configured_sources) == 1:
                         worker = ring_buffer.create_live_review_batch_scan_worker(
-                            self._on_video_candidates,
+                            callback,
                             width=480,
                             height=270,
                             ffmpeg_path=self.ffmpeg_path or "ffmpeg",
@@ -4215,7 +4342,7 @@ class FinishReviewWindow(PassageReviewSurface):
                         )
                     else:
                         worker = ring_buffer.create_video_passage_scan_worker(
-                            self._on_video_candidates,
+                            callback,
                             width=640,
                             height=360,
                             ffmpeg_path=self.ffmpeg_path or "ffmpeg",
@@ -4242,7 +4369,12 @@ class FinishReviewWindow(PassageReviewSurface):
             ):
                 self._register_passage(event, scan=False)
             self._started = True
+            self._stop_requested = False
             self._recording_started_at = time.monotonic()
+            self._camera_segment_progress = {
+                camera_index: (None, self._recording_started_at)
+                for camera_index in recorders
+            }
             self._runtime_error = ""
             self._auto_recording_error = ""
             self._capture_error = ""
@@ -4252,19 +4384,25 @@ class FinishReviewWindow(PassageReviewSurface):
             self._lookup_cache.clear()
             self.refresh()
         except Exception:
-            self._recording_controller.stop()
+            rollback_failures = self._recording_controller.stop()
             for worker in self._video_scan_workers.values():
                 worker.stop()
             self._video_scan_workers = {}
             self._stop_visual_workers()
-            self._recorders = {}
-            self._ring_buffers = {}
-            self._coordinators = {}
-            self._publishers = {}
-            self._recorder = None
-            self._ring_buffer = None
-            self._coordinator = None
-            self._publisher = None
+            self._recorders = self._recording_controller.recorders
+            self._ring_buffers = self._recording_controller.ring_buffers
+            self._coordinators = self._recording_controller.coordinators
+            self._publishers = self._recording_controller.timeline_publishers
+            self._recorder = self._recorders.get(self.camera_index)
+            self._ring_buffer = self._ring_buffers.get(self.camera_index)
+            self._coordinator = self._coordinators.get(self.camera_index)
+            self._publisher = self._publishers.get(self.camera_index)
+            retained_publishers = self._recording_controller.archive_publishers
+            for archive_publisher in retained_publishers:
+                if archive_publisher not in self._archive_publishers:
+                    self._archive_publishers.append(archive_publisher)
+            if any(failure.still_running for failure in rollback_failures):
+                self._runtime_error = "录像启动失败，且部分录像进程仍在运行"
             for archive_publisher in archive_publishers:
                 if archive_publisher in self._archive_publishers:
                     self._archive_publishers.remove(archive_publisher)
@@ -4277,7 +4415,14 @@ class FinishReviewWindow(PassageReviewSurface):
         camera_index: int,
         source: str,
     ) -> None:
+        self._invalidate_capture_refresh()
         camera_index = max(1, int(camera_index))
+        token = object()
+        with self._video_scan_state_lock:
+            self._video_scan_tokens[camera_index] = token
+        previous_worker = self._video_scan_workers.pop(camera_index, None)
+        if previous_worker is not None:
+            previous_worker.stop()
         recorder = self._recorder_factory(
             source,
             self.output_dir,
@@ -4302,9 +4447,13 @@ class FinishReviewWindow(PassageReviewSurface):
                 binding_store=self.review_binding_store,
             )
             if self._video_assist_enabled():
-                callback = lambda candidates, generation=self._video_scan_generation: self._on_video_candidates(
-                    candidates,
-                    generation,
+                callback = (
+                    lambda candidates, generation=self._video_scan_generation,
+                    camera_index=camera_index, token=token: self._on_video_candidates(
+                        candidates,
+                        generation,
+                        worker_token=(camera_index, token),
+                    )
                 )
                 if len(self._configured_recording_sources()) == 1:
                     scan_worker = ring_buffer.create_live_review_batch_scan_worker(
@@ -4368,18 +4517,18 @@ class FinishReviewWindow(PassageReviewSurface):
                     event_id,
                     passage_timestamp_ms=timestamp_ms,
                     scan=False,
+                    revision=event.revision,
+                    race_id=event.race_id,
                 )
         except Exception:
-            scan_worker.stop()
+            if scan_worker is not None:
+                scan_worker.stop()
             try:
                 recorder.stop()
             except Exception:  # noqa: BLE001 - retain the registration error.
                 pass
             raise
 
-        previous_worker = self._video_scan_workers.get(camera_index)
-        if previous_worker is not None:
-            previous_worker.stop()
         archive_publisher = ArchiveTimelinePublisher(recorder, self.timeline_store)
         self._recording_controller.replace_pipeline(
             RecordingPipeline(
@@ -4396,8 +4545,10 @@ class FinishReviewWindow(PassageReviewSurface):
         self._ring_buffers = self._recording_controller.ring_buffers
         self._coordinators = self._recording_controller.coordinators
         self._publishers = self._recording_controller.timeline_publishers
-        self._video_scan_workers[camera_index] = scan_worker
+        if scan_worker is not None:
+            self._video_scan_workers[camera_index] = scan_worker
         self._capture_windows_by_camera[camera_index] = replacement_windows
+        self._camera_segment_progress[camera_index] = (None, time.monotonic())
         self._archive_publishers.append(archive_publisher)
         if camera_index == self.camera_index:
             self._recorder = recorder
@@ -4406,6 +4557,49 @@ class FinishReviewWindow(PassageReviewSurface):
             self._publisher = publisher
             self._capture_windows = replacement_windows
         self._lookup_cache.clear()
+
+    def _recording_stall_error(
+        self,
+        camera_index: int,
+        *,
+        now: float,
+    ) -> str:
+        ring_buffer = self._ring_buffers.get(int(camera_index))
+        if ring_buffer is None:
+            return ""
+        signature = ring_buffer.segment_revision
+        previous = self._camera_segment_progress.get(int(camera_index))
+        if previous is None or previous[0] != signature:
+            self._camera_segment_progress[int(camera_index)] = (signature, now)
+            return ""
+        stalled_seconds = max(0.0, now - previous[1])
+        if stalled_seconds < CAMERA_STALL_TIMEOUT_SECONDS:
+            return ""
+        return f"录像进程仍在运行，但 {stalled_seconds:.0f} 秒没有产生新片段"
+
+    def _poll_recording_health(self, *, now: float | None = None) -> None:
+        if self._stop_requested or not self._started:
+            return
+        current_time = time.monotonic() if now is None else float(now)
+        for camera_index, recorder in tuple(self._recorders.items()):
+            recorder_error = recorder.check_error()
+            if not recorder_error and camera_index in self._camera_reconnect_errors:
+                recorder_error = self._camera_reconnect_errors[camera_index]
+            if not recorder_error and recorder.is_running:
+                recorder_error = self._recording_stall_error(
+                    camera_index,
+                    now=current_time,
+                )
+            if recorder_error:
+                self._recover_failed_camera(
+                    camera_index,
+                    recorder_error,
+                    now=current_time,
+                )
+
+    def _on_clock_tick(self) -> None:
+        self._poll_recording_health()
+        self._update_runtime_status()
 
     def _recover_failed_camera(
         self,
@@ -4421,9 +4615,28 @@ class FinishReviewWindow(PassageReviewSurface):
         if not source:
             return False
         attempt = self._camera_reconnect_attempts.get(camera_index, 0) + 1
+        reconnect_started = time.perf_counter()
         try:
+            current_recorder = self._recorders.get(camera_index)
+            if current_recorder is not None and current_recorder.is_running:
+                try:
+                    current_recorder.stop()
+                except Exception:  # noqa: BLE001 - only a live process blocks replacement.
+                    if current_recorder.is_running:
+                        raise
+                    logger.warning(
+                        "Camera %s stopped with an error before reconnect",
+                        camera_index,
+                        exc_info=True,
+                    )
             self._restart_recording_camera(camera_index, source)
         except Exception as exc:  # noqa: BLE001 - reconnect remains operator-visible.
+            self._observe_runtime_metric(
+                "camera_reconnect",
+                reconnect_started,
+                item_count=1,
+                failed=True,
+            )
             delay_seconds = min(
                 CAMERA_RECONNECT_MAX_SECONDS,
                 CAMERA_RECONNECT_BASE_SECONDS * (2 ** min(attempt - 1, 10)),
@@ -4451,6 +4664,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self._camera_reconnect_attempts.pop(camera_index, None)
         self._camera_reconnect_not_before.pop(camera_index, None)
         self._camera_reconnect_errors.pop(camera_index, None)
+        self._observe_runtime_metric(
+            "camera_reconnect",
+            reconnect_started,
+            item_count=1,
+        )
         if self._runtime_error.startswith(f"机位{camera_index}"):
             self._runtime_error = ""
         logger.warning("Camera %s recording automatically reconnected", camera_index)
@@ -4498,6 +4716,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 event.event_id,
                 passage_timestamp_ms=timestamp_ms,
                 scan=scan,
+                revision=event.revision,
+                race_id=event.race_id,
             )
             self._capture_windows_by_camera.setdefault(camera_index, {})[
                 event.event_id
@@ -4510,7 +4730,7 @@ class FinishReviewWindow(PassageReviewSurface):
         revision: int | None = None,
     ) -> None:
         for coordinator in self._coordinators.values():
-            coordinator.discard(event_id)
+            coordinator.discard(event_id, revision=revision)
         for windows in self._capture_windows_by_camera.values():
             windows.pop(event_id, None)
         self._unsupported_event_ids.discard(event_id)
@@ -5152,56 +5372,168 @@ class FinishReviewWindow(PassageReviewSurface):
             tuple(locations),
         )
 
-    def _refresh_capture_windows(self) -> None:
+    def _invalidate_capture_refresh(self) -> None:
+        self._capture_refresh_generation += 1
+        self._capture_refresh_worker.invalidate(
+            self._capture_refresh_generation
+        )
+
+    def _request_capture_refresh(self) -> None:
         if not self._coordinators or not self._ring_buffers:
             self._update_runtime_status()
             return
+        try:
+            race_id = self._current_archive_race_id()
+        except ExternalClipImportError:
+            race_id = ""
+        recording = self._recording_any_active()
+        active_recorders = {
+            recorder
+            for recorder in self._recorders.values()
+            if recorder.is_running
+        }
+        archive_jobs = tuple(
+            ArchiveRefreshJob(
+                publisher=publisher,
+                race_id=str(race_id),
+                recording=bool(
+                    recording and publisher.recorder in active_recorders
+                ),
+            )
+            for publisher in self._archive_publishers
+            if race_id
+        )
+        now = time.monotonic()
+        cleanup = now - self._last_cleanup_at >= 5.0
+        if cleanup:
+            self._last_cleanup_at = now
+        self._capture_refresh_worker.submit(
+            CaptureRefreshRequest(
+                generation=self._capture_refresh_generation,
+                ring_buffers=tuple(self._ring_buffers.values()),
+                archive_jobs=archive_jobs,
+                cleanup=False,
+                current_time_ms=int(time.time() * 1000.0),
+                cleanup_after_apply=cleanup,
+            )
+        )
+
+    def _on_capture_refresh_finished(self, result: CaptureRefreshResult) -> None:
+        if (
+            not isinstance(result, CaptureRefreshResult)
+            or result.generation != self._capture_refresh_generation
+        ):
+            return
+        apply_started = time.perf_counter()
+        failed = bool(result.error)
+        apply_failed = False
+        changed_event_ids: set[str] = set()
+        if result.apply_state:
+            try:
+                changed_event_ids = self._apply_capture_refresh_state(
+                    result.archive_segments
+                )
+            except Exception as exc:
+                failed = True
+                apply_failed = True
+                self._capture_error = sanitize_recording_message(exc)
+                logger.exception("Failed to apply background capture refresh")
+        if result.error:
+            self._capture_error = sanitize_recording_message(result.error)
+        if result.cleanup_after_apply and not apply_failed:
+            self._capture_refresh_worker.submit(
+                CaptureRefreshRequest(
+                    generation=self._capture_refresh_generation,
+                    ring_buffers=tuple(self._ring_buffers.values()),
+                    archive_jobs=(),
+                    cleanup=True,
+                    current_time_ms=int(time.time() * 1000.0),
+                    scan=False,
+                    apply_state=False,
+                )
+            )
+        self._observe_runtime_metric(
+            "capture_refresh_apply",
+            apply_started,
+            item_count=len(changed_event_ids),
+            failed=failed,
+        )
+        self._update_operator_controls()
+        self._update_runtime_status()
+
+    def _apply_capture_refresh_state(
+        self,
+        archive_segments=(),
+    ) -> set[str]:
+        changed_event_ids: set[str] = set()
+        timeline_changed = (
+            self._timeline_cache_signature() != self._timeline_signature
+        )
+        if archive_segments:
+            changed_event_ids.update(
+                self._event_ids_for_archive_segments(archive_segments)
+            )
+        for camera_index, coordinator in self._coordinators.items():
+            windows = self._capture_windows_by_camera.setdefault(
+                camera_index,
+                {},
+            )
+            for window in coordinator.refresh(scan=False):
+                previous = windows.get(window.event_id)
+                windows[window.event_id] = window
+                if previous is not None and previous.state is not window.state:
+                    changed_event_ids.add(window.event_id)
+                elif previous is not None and previous.segments != window.segments:
+                    changed_event_ids.add(window.event_id)
+            changed_event_ids.update(self._publish_ready_windows(camera_index))
+        self._poll_recording_health(now=time.monotonic())
+        if changed_event_ids:
+            self.refresh_events(changed_event_ids)
+        elif timeline_changed:
+            # A cancelled background request may have committed an idempotent
+            # archive record before its result was discarded. Force lookup
+            # reconciliation even when no publisher returns that path again.
+            self._lookup_cache.clear()
+            self.refresh()
+        return changed_event_ids
+
+    def _refresh_capture_windows(self) -> None:
+        """Synchronous refresh retained for startup, shutdown, and tests."""
+        if not self._coordinators or not self._ring_buffers:
+            self._update_runtime_status()
+            return
+        refresh_started = time.perf_counter()
+        refresh_failed = False
         changed_event_ids: set[str] = set()
         try:
-            # Keep indexing completed camera segments even when no passage is
-            # waiting, so device health and retention remain current.
             for ring_buffer in self._ring_buffers.values():
-                ring_buffer.scan()
+                with self.runtime_metrics.measure("ring_buffer_scan"):
+                    ring_buffer.scan()
+            archive_started = time.perf_counter()
             archive_segments = self._publish_archive_segments()
-            if archive_segments:
-                changed_event_ids.update(
-                    self._event_ids_for_archive_segments(archive_segments)
-                )
-            for camera_index, coordinator in self._coordinators.items():
-                windows = self._capture_windows_by_camera.setdefault(
-                    camera_index,
-                    {},
-                )
-                for window in coordinator.refresh(scan=False):
-                    previous = windows.get(window.event_id)
-                    windows[window.event_id] = window
-                    if previous is not None and previous.state is not window.state:
-                        changed_event_ids.add(window.event_id)
-                    elif previous is not None and previous.segments != window.segments:
-                        changed_event_ids.add(window.event_id)
-                changed_event_ids.update(
-                    self._publish_ready_windows(camera_index)
-                )
+            self._observe_runtime_metric(
+                "archive_publish",
+                archive_started,
+                item_count=len(archive_segments),
+            )
+            changed_event_ids = self._apply_capture_refresh_state(archive_segments)
             now = time.monotonic()
             if now - self._last_cleanup_at >= 5.0:
                 current_time_ms = int(time.time() * 1000.0)
                 for ring_buffer in self._ring_buffers.values():
-                    ring_buffer.cleanup(current_time_ms=current_time_ms)
+                    with self.runtime_metrics.measure("ring_buffer_cleanup"):
+                        ring_buffer.cleanup(current_time_ms=current_time_ms)
                 self._last_cleanup_at = now
-            now = time.monotonic()
-            for camera_index, recorder in tuple(self._recorders.items()):
-                recorder_error = recorder.check_error()
-                if recorder_error:
-                    self._recover_failed_camera(
-                        camera_index,
-                        recorder_error,
-                        now=now,
-                    )
-            if changed_event_ids:
-                self.refresh_events(changed_event_ids)
         except Exception as exc:
+            refresh_failed = True
             self._capture_error = sanitize_recording_message(exc)
             logger.exception("Failed to refresh passage review capture")
+        self._observe_runtime_metric(
+            "capture_refresh",
+            refresh_started,
+            item_count=len(changed_event_ids),
+            failed=refresh_failed,
+        )
         self._update_operator_controls()
         self._update_runtime_status()
 
@@ -5820,13 +6152,60 @@ class FinishReviewWindow(PassageReviewSurface):
                 worker.request_scan()
         self._update_runtime_status()
 
-    def _on_video_candidates(self, candidates, generation: int | None = None) -> None:
-        """Receive worker results and marshal them to the Qt main thread."""
+    def _on_video_candidates(
+        self,
+        candidates,
+        generation: int | None = None,
+        *,
+        worker_token: tuple[int, object] | None = None,
+    ) -> None:
+        """Persist worker results before marshalling them to the Qt main thread."""
         if not self._video_assist_enabled():
             return
-        if generation is not None and generation != self._video_scan_generation:
-            return
-        self.video_candidates_received.emit(tuple(candidates))
+        with self._video_scan_state_lock:
+            if worker_token is not None:
+                camera_index, token = worker_token
+                if self._video_scan_tokens.get(int(camera_index)) is not token:
+                    return
+            delivery_generation = (
+                self._video_scan_generation if generation is None else int(generation)
+            )
+            if delivery_generation != self._video_scan_generation:
+                return
+            arrival_store = self.video_arrival_store
+        values = tuple(candidates)
+        persistent = tuple(
+            candidate
+            for candidate in values
+            if not str(getattr(candidate, "candidate_id", "")).startswith("visual:")
+            and str(getattr(candidate, "segment_id", "")).strip()
+            and str(getattr(candidate, "video_path", "")).strip()
+        )
+        if persistent:
+            try:
+                arrival_store.add_many(persistent)
+            except Exception as error:  # noqa: BLE001 - report persistence failures to Qt.
+                self.video_candidate_persistence_failed.emit(
+                    _VideoCandidatePersistenceFailure(
+                        delivery_generation,
+                        str(error),
+                    )
+                )
+                raise RuntimeError("video candidate persistence failed") from error
+        self.video_candidates_received.emit(
+            _VideoCandidateDelivery(delivery_generation, values, persisted=True)
+        )
+
+    def _on_video_candidate_persistence_failed(self, failure) -> None:
+        if isinstance(failure, _VideoCandidatePersistenceFailure):
+            with self._video_scan_state_lock:
+                if failure.generation != self._video_scan_generation:
+                    return
+                message = failure.message
+        else:
+            message = str(failure)
+        self._capture_error = str(message)
+        self._update_runtime_status()
 
     def _pause_video_scan_workers(self) -> object:
         """Pause background video scans while a playback window is open."""
@@ -5863,6 +6242,13 @@ class FinishReviewWindow(PassageReviewSurface):
     def _reconcile_video_candidates(self, candidates) -> None:
         if not self._video_assist_enabled():
             return
+        already_persisted = False
+        if isinstance(candidates, _VideoCandidateDelivery):
+            if candidates.generation != self._video_scan_generation:
+                return
+            already_persisted = candidates.persisted
+            candidates = candidates.candidates
+
         def is_visual(value: object) -> bool:
             return str(getattr(value, "candidate_id", "")).startswith("visual:")
 
@@ -5878,19 +6264,24 @@ class FinishReviewWindow(PassageReviewSurface):
             )
 
         values = tuple(candidates)
-        persistent_candidates = tuple(
+        reconcile_started = time.perf_counter()
+        self.runtime_metrics.observe(
+            "video_candidate_received",
+            0.0,
+            item_count=len(values),
+        )
+        persistent = tuple(
             candidate
             for candidate in values
             if not is_visual(candidate)
             and str(getattr(candidate, "segment_id", "")).strip()
             and str(getattr(candidate, "video_path", "")).strip()
         )
-        if persistent_candidates:
+        if persistent and not already_persisted:
             try:
-                self.video_arrival_store.add_many(persistent_candidates)
-            except RuntimeError as error:
-                self._capture_error = str(error)
-                self._update_runtime_status()
+                self.video_arrival_store.add_many(persistent)
+            except Exception as error:  # noqa: BLE001 - direct callers need the same report.
+                self._on_video_candidate_persistence_failed(str(error))
 
         for candidate in values:
             matching_visual_ids = {
@@ -5916,14 +6307,28 @@ class FinishReviewWindow(PassageReviewSurface):
         tools = importlib.import_module(
             ".video_passage_det" + "ector", __package__
         )
-        reconciliation = tools.reconcile_candidates(
-            tuple(self._video_candidate_cache.values()),
-            times,
-            passage_time_offset_by_camera=getattr(
-                self,
-                "_clock_offset_by_camera",
-                None,
-            ),
+        try:
+            reconciliation = tools.reconcile_candidates(
+                tuple(self._video_candidate_cache.values()),
+                times,
+                passage_time_offset_by_camera=getattr(
+                    self,
+                    "_clock_offset_by_camera",
+                    None,
+                ),
+            )
+        except Exception:
+            self._observe_runtime_metric(
+                "video_candidate_reconcile",
+                reconcile_started,
+                item_count=len(values),
+                failed=True,
+            )
+            raise
+        self._observe_runtime_metric(
+            "video_candidate_reconcile",
+            reconcile_started,
+            item_count=len(values),
         )
         self.video_review_apply_requested.emit(reconciliation)
 
@@ -6045,8 +6450,13 @@ class FinishReviewWindow(PassageReviewSurface):
             session.cleanup()
             self._resume_video_scan_workers(pause_token)
 
-    def stop_recording(self) -> None:
-        self._video_scan_generation += 1
+    def stop_recording(self) -> tuple[RecordingStopFailure, ...]:
+        self._stop_requested = True
+        self._started = False
+        self._invalidate_capture_refresh()
+        with self._video_scan_state_lock:
+            self._video_scan_generation += 1
+            self._video_scan_tokens.clear()
         for worker in self._video_scan_workers.values():
             worker.stop()
         self._video_scan_workers = {}
@@ -6055,7 +6465,14 @@ class FinishReviewWindow(PassageReviewSurface):
         failures = self._recording_controller.stop()
         if had_recorders:
             try:
-                self._publish_archive_segments(recording=False)
+                running_recorders = {
+                    recorder
+                    for recorder in self._recorders.values()
+                    if recorder.is_running
+                }
+                self._publish_archive_segments(
+                    recording=bool(running_recorders)
+                )
                 self._refresh_capture_windows()
             except Exception:
                 logger.exception("Failed to publish final review segments")
@@ -6069,17 +6486,29 @@ class FinishReviewWindow(PassageReviewSurface):
         self._ring_buffers = self._recording_controller.ring_buffers
         self._coordinators = self._recording_controller.coordinators
         self._publishers = self._recording_controller.timeline_publishers
-        self._recorder = None
-        self._ring_buffer = None
-        self._coordinator = None
-        self._publisher = None
-        self._started = False
-        self._recording_started_at = 0.0
-        self._camera_reconnect_attempts.clear()
-        self._camera_reconnect_not_before.clear()
-        self._camera_reconnect_errors.clear()
-        self._start_archive_video_scan_workers()
+        still_running = any(
+            failure.still_running for failure in failures
+        )
+        if still_running:
+            # Keep every authoritative reference while a retryable recorder is
+            # alive; never hand its archive publisher to a sealed-file scanner.
+            self._recorder = self._recorders.get(self.camera_index)
+            self._ring_buffer = self._ring_buffers.get(self.camera_index)
+            self._coordinator = self._coordinators.get(self.camera_index)
+            self._publisher = self._publishers.get(self.camera_index)
+        else:
+            self._recorder = None
+            self._ring_buffer = None
+            self._coordinator = None
+            self._publisher = None
+            self._recording_started_at = 0.0
+            self._camera_reconnect_attempts.clear()
+            self._camera_reconnect_not_before.clear()
+            self._camera_reconnect_errors.clear()
+            self._camera_segment_progress.clear()
+            self._start_archive_video_scan_workers()
         self._update_runtime_status()
+        return failures
 
     def stop_receiver(self) -> None:
         errors = self._receiver_controller.stop()
@@ -6091,6 +6520,8 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def stop(self) -> bool:
         self._refresh_timer.stop()
+        if not self._capture_refresh_worker.stop(timeout=0.1):
+            return False
         self._passage_batch_timer.stop()
         self._pending_passages.clear()
         worker = getattr(self, "_high_speed_scan_worker", None)
@@ -6098,13 +6529,16 @@ class FinishReviewWindow(PassageReviewSurface):
             worker.stop()
             if not worker.wait(1_000):
                 return False
-        self.stop_recording()
+        recording_failures = self.stop_recording()
+        if any(failure.still_running for failure in recording_failures):
+            return False
         self._stop_archive_video_scan_workers()
         self.stop_receiver()
         for dialog in tuple(self._video_candidate_dialogs):
             dialog.close()
         self._video_candidate_dialogs.clear()
         self._update_runtime_status()
+        self._log_runtime_metrics()
         return True
 
     def closeEvent(self, event) -> None:
@@ -6112,7 +6546,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if not self.stop():
             event.ignore()
             self.setEnabled(False)
-            self.setWindowTitle(f"{APP_WINDOW_TITLE} - 正在停止高速目录扫描")
+            self.setWindowTitle(f"{APP_WINDOW_TITLE} - 正在停止后台扫描")
             QTimer.singleShot(100, self.close)
             return
         self._export_review_summary()

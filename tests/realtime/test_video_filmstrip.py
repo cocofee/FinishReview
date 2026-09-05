@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtGui import QImage
@@ -14,6 +16,7 @@ from realtime.video_filmstrip import (
     FILMSTRIP_TILE_GAP,
     FILMSTRIP_TILE_WIDTH,
     VideoFilmstripWidget,
+    VideoFilmstripWorker,
     filmstrip_positions,
 )
 
@@ -61,6 +64,107 @@ def test_filmstrip_positions_keep_base_sampling_with_anchors():
         2_000,
         3_000,
     )
+
+
+def test_filmstrip_worker_prioritizes_first_frame_then_decodes_forward(monkeypatch):
+    class _Capture:
+        def __init__(self):
+            self.position = 0
+            self.seek_calls = []
+            self.grab_calls = 0
+
+        def isOpened(self):
+            return True
+
+        def get(self, property_id):
+            if property_id == video_filmstrip.cv2.CAP_PROP_FPS:
+                return 25.0
+            return self.position
+
+        def set(self, _property_id, value):
+            self.position = int(value)
+            self.seek_calls.append(int(value))
+            return True
+
+        def grab(self):
+            self.position += 1
+            self.grab_calls += 1
+            return True
+
+        def read(self):
+            self.position += 1
+            return True, np.zeros((12, 16, 3), dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    capture = _Capture()
+    monkeypatch.setattr(
+        video_filmstrip.cv2,
+        "VideoCapture",
+        lambda _path: capture,
+    )
+    worker = VideoFilmstripWorker(
+        Path("race.mp4"),
+        (4_000, 0, 2_000, 6_000),
+    )
+    emitted = []
+    worker.frame_ready.connect(
+        lambda _image, position_ms, _frame_index: emitted.append(position_ms)
+    )
+
+    worker.run()
+
+    assert emitted == [4_000, 0, 2_000, 6_000]
+    assert capture.seek_calls == [100, 0]
+    assert capture.grab_calls == 148
+
+
+def test_filmstrip_worker_decodes_hls_forward_without_frame_seek(monkeypatch):
+    class _Capture:
+        def __init__(self):
+            self.position = 0
+            self.set_calls = 0
+
+        def isOpened(self):
+            return True
+
+        def get(self, property_id):
+            if property_id == video_filmstrip.cv2.CAP_PROP_FPS:
+                return 25.0
+            return self.position
+
+        def set(self, _property_id, _value):
+            self.set_calls += 1
+            return False
+
+        def grab(self):
+            self.position += 1
+            return True
+
+        def read(self):
+            self.position += 1
+            return True, np.zeros((12, 16, 3), dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    capture = _Capture()
+    monkeypatch.setattr(
+        video_filmstrip.cv2,
+        "VideoCapture",
+        lambda _path: capture,
+    )
+    worker = VideoFilmstripWorker(Path("race.m3u8"), (0, 2_000))
+    emitted = []
+    worker.frame_ready.connect(
+        lambda _image, position_ms, _frame_index: emitted.append(position_ms)
+    )
+
+    worker.run()
+
+    assert emitted == [0, 2_000]
+    assert capture.set_calls == 0
 
 
 def test_filmstrip_reverses_visual_order_without_changing_positions():
@@ -221,6 +325,28 @@ def test_canvas_marker_mode_emits_frame_and_normalized_position():
     assert 0.0 <= spy[-1][2] <= 1.0
     assert spy[-1][3] == 50
     assert widget.confirm_button.isEnabled()
+    widget.close()
+
+
+def test_placeholder_tile_loads_before_marker_can_be_confirmed():
+    app = QApplication.instance() or QApplication([])
+    widget = VideoFilmstripWidget()
+    widget._video_path = Path("race.mp4")
+    widget._target_positions = (0, 2_000)
+    widget.content.refresh_geometry()
+    widget.resize(700, 320)
+    widget.show()
+    app.processEvents()
+    selected = QSignalSpy(widget.position_selected)
+    markers = QSignalSpy(widget.marker_position_selected)
+    widget._marker_mode = True
+
+    QTest.mouseClick(widget.content, Qt.LeftButton, pos=QPoint(100, 100))
+    app.processEvents()
+
+    assert len(selected) == 1
+    assert len(markers) == 0
+    assert not widget.confirm_button.isEnabled()
     widget.close()
 
 

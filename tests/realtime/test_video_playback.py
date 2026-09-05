@@ -358,6 +358,31 @@ def test_dialog_timeline_click_jumps_and_previews_immediately(qapp):
     dialog.close()
 
 
+def test_dialog_coalesces_timeline_drag_to_latest_preview_and_exact_release(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        autoplay=False,
+    )
+    qapp.processEvents()
+    dialog.worker.seek_calls.clear()
+    dialog._on_slider_pressed()
+
+    for value in (1_000, 2_000, 3_000):
+        dialog._on_slider_moved(value)
+
+    assert dialog.worker.seek_calls == []
+    dialog._flush_slider_preview()
+    assert dialog.worker.seek_calls == [3_000]
+
+    dialog.timeline.setValue(4_000)
+    dialog._on_slider_moved(4_000)
+    dialog._on_slider_released()
+    assert dialog.worker.seek_calls[-1] == 4_000
+    assert dialog._pending_slider_preview_ms is None
+    dialog.close()
+
+
 def test_dialog_coalesces_pending_frames_to_latest_for_rendering(qapp):
     dialog = VideoPlaybackDialog(
         Path("recording.mkv"),

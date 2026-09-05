@@ -24,6 +24,7 @@ FILMSTRIP_TILE_GAP = 8
 # Decode only the selected athlete's immediate neighborhood first. This keeps
 # random thumbnail seeks from competing with the primary judgment frame.
 FILMSTRIP_INITIAL_BATCH = 5
+FILMSTRIP_SEQUENTIAL_GAP_FRAMES = 125
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -84,6 +85,19 @@ class VideoFilmstripWorker(QThread):
     def stop(self) -> None:
         self.request_stop()
 
+    @staticmethod
+    def _reported_frame_index(capture, expected: int) -> int:
+        try:
+            reported_next = float(
+                capture.get(cv2.CAP_PROP_POS_FRAMES) or 0.0
+            )
+        except (TypeError, ValueError):
+            return int(expected)
+        rounded = round(reported_next)
+        if reported_next <= 0 or abs(reported_next - rounded) > 0.01:
+            return int(expected)
+        return max(0, int(rounded) - 1)
+
     def run(self) -> None:
         capture = cv2.VideoCapture(str(self.video_path))
         if not capture.isOpened():
@@ -91,14 +105,74 @@ class VideoFilmstripWorker(QThread):
             return
         try:
             fps = max(0.1, float(capture.get(cv2.CAP_PROP_FPS) or 0.0))
-            for position_ms in self.positions_ms:
+            positions = self.positions_ms
+            sequential_source = self.video_path.suffix.lower() == ".m3u8"
+            ordered_positions = (
+                tuple(sorted(set(positions)))
+                if sequential_source
+                else (
+                    (positions[0], *sorted(set(positions[1:]) - {positions[0]}))
+                    if positions
+                    else ()
+                )
+            )
+            capture_next_frame = 0 if sequential_source else -1
+            for position_ms in ordered_positions:
                 if self._stop_requested:
                     return
                 frame_index = max(0, int(round(position_ms * fps / 1000.0)))
-                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                forward_gap = frame_index - capture_next_frame
+                needs_reposition = bool(
+                    capture_next_frame < 0
+                    or frame_index < capture_next_frame
+                    or forward_gap > FILMSTRIP_SEQUENTIAL_GAP_FRAMES
+                )
+                if sequential_source and frame_index < capture_next_frame:
+                    continue
+                if needs_reposition and not sequential_source:
+                    if capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index):
+                        capture_next_frame = frame_index
+                    elif capture_next_frame < 0:
+                        # Some HLS/OpenCV backends reject POS_FRAMES but still
+                        # open at frame zero. Fall back to forward decoding.
+                        capture_next_frame = 0
+                    else:
+                        continue
+                sequential_failed = False
+                while capture_next_frame < frame_index:
+                    if self._stop_requested:
+                        return
+                    if not capture.grab():
+                        sequential_failed = True
+                        break
+                    capture_next_frame += 1
+                if sequential_failed:
+                    if not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index):
+                        capture_next_frame = -1
+                        continue
+                    capture_next_frame = frame_index
                 ok, frame = capture.read()
                 if not ok or frame is None:
+                    capture_next_frame = -1
                     continue
+                actual_frame_index = self._reported_frame_index(
+                    capture,
+                    frame_index,
+                )
+                while actual_frame_index < frame_index:
+                    if self._stop_requested:
+                        return
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        break
+                    actual_frame_index = self._reported_frame_index(
+                        capture,
+                        actual_frame_index + 1,
+                    )
+                if not ok or frame is None or actual_frame_index != frame_index:
+                    capture_next_frame = -1
+                    continue
+                capture_next_frame = actual_frame_index + 1
                 height, width = frame.shape[:2]
                 if width <= 0 or height <= 0:
                     continue
@@ -396,25 +470,29 @@ class FilmstripCanvas(QWidget):
             if self._moved or abs(event.pos().x() - self._press_x) >= 4:
                 self.position_released.emit(frame.position_ms)
             elif self.owner._marker_mode:
-                frames = self._visual_frames()
-                step = FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP
-                index = frames.index(frame)
-                tile_left = 4 + index * step
-                x_normalized = max(
-                    0.0,
-                    min(1.0, (event.pos().x() - tile_left) / FILMSTRIP_TILE_WIDTH),
-                )
-                y_normalized = max(
-                    0.0,
-                    min(1.0, (event.pos().y() - 4) / FILMSTRIP_TILE_HEIGHT),
-                )
                 self.position_released.emit(frame.position_ms)
-                self.owner.marker_position_selected.emit(
-                    frame.position_ms,
-                    x_normalized,
-                    y_normalized,
-                    frame.frame_index,
-                )
+                if frame.frame_index >= 0 and not frame.image.isNull():
+                    frames = self._visual_frames()
+                    step = FILMSTRIP_TILE_WIDTH + FILMSTRIP_TILE_GAP
+                    index = frames.index(frame)
+                    tile_left = 4 + index * step
+                    x_normalized = max(
+                        0.0,
+                        min(
+                            1.0,
+                            (event.pos().x() - tile_left) / FILMSTRIP_TILE_WIDTH,
+                        ),
+                    )
+                    y_normalized = max(
+                        0.0,
+                        min(1.0, (event.pos().y() - 4) / FILMSTRIP_TILE_HEIGHT),
+                    )
+                    self.owner.marker_position_selected.emit(
+                        frame.position_ms,
+                        x_normalized,
+                        y_normalized,
+                        frame.frame_index,
+                    )
             else:
                 self._pending_click_position = frame.position_ms
                 self._click_timer.start()

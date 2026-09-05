@@ -1,4 +1,6 @@
+import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -6,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import realtime.durable_jsonl as durable_jsonl
+import realtime.review_recorder as review_recorder
 from realtime.review_clip import PassageReviewBindingStore
 from realtime.review_recorder import (
     ArchiveTimelinePublisher,
@@ -173,6 +177,41 @@ def test_review_recorder_uses_one_input_for_archive_and_short_hls(tmp_path):
 
     recorder.stop()
     assert factory.process.stdin.getvalue() == b"q\n"
+
+
+def test_archive_path_cache_rechecks_zero_byte_file_growth(tmp_path, monkeypatch):
+    pattern = tmp_path / "camera_archive_%04d.mkv"
+    first = tmp_path / "camera_archive_0000.mkv"
+    active = tmp_path / "camera_archive_0001.mkv"
+    first.write_bytes(b"sealed")
+    active.write_bytes(b"")
+
+    class _ArchiveSource:
+        camera_index = 1
+        session_started_at_ms = 1
+        archive_pattern = pattern
+
+        @staticmethod
+        def archive_paths():
+            return tuple(
+                path
+                for path in sorted(tmp_path.glob("camera_archive_*.mkv"))
+                if path.stat().st_size > 0
+            )
+
+    clock = [10.0]
+    monkeypatch.setattr(review_recorder.time, "monotonic", lambda: clock[0])
+    publisher = ArchiveTimelinePublisher(
+        _ArchiveSource(),
+        VideoTimelineStore(tmp_path / "timeline.jsonl"),
+    )
+
+    assert publisher._archive_paths() == (first,)
+    active.write_bytes(b"active")
+    clock[0] = 11.0
+    assert publisher._archive_paths() == (first,)
+    clock[0] = 12.1
+    assert publisher._archive_paths() == (first, active)
 
 
 def test_sealed_archive_remains_locatable_after_review_segments_expire(
@@ -458,6 +497,108 @@ def test_pin_journal_restores_protected_segments_after_restart(tmp_path):
     assert (tmp_path / "finish.ts").is_file()
 
 
+def test_stale_ring_instance_reloads_pin_state_before_release(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    first = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    stale = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    first.pin_window(
+        "passage-15",
+        started_at_ms=1_787_313_600_000,
+        ended_at_ms=1_787_313_602_000,
+    )
+
+    stale.release("passage-15")
+
+    restored = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    assert restored.pinned_event_ids("finish.ts") == frozenset()
+
+
+def test_stale_ring_cleanup_reloads_other_instance_pin(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    pinned = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        retention_seconds=30,
+        pin_journal_path=journal,
+    )
+    stale = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        retention_seconds=30,
+        pin_journal_path=journal,
+    )
+    stale.scan()
+    pinned.pin_window(
+        "passage-15",
+        started_at_ms=1_787_313_600_000,
+        ended_at_ms=1_787_313_602_000,
+    )
+
+    assert stale.cleanup(current_time_ms=1_787_313_700_000) == ()
+    assert (tmp_path / "finish.ts").is_file()
+
+
+def test_pin_journal_recovers_torn_tail_before_later_append(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    first = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    first.pin_window(
+        "passage-15",
+        started_at_ms=1_787_313_600_000,
+        ended_at_ms=1_787_313_602_000,
+    )
+    with journal.open("ab") as output:
+        output.write(b'{"op":"pin","event_id":')
+
+    recovered = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    assert journal.read_bytes().endswith(b"\n")
+    recovered.pin_window(
+        "passage-16",
+        started_at_ms=1_787_313_600_000,
+        ended_at_ms=1_787_313_602_000,
+    )
+
+    restored = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    assert restored.pinned_event_ids("finish.ts") == frozenset(
+        {"passage-15", "passage-16"}
+    )
+
+
 def test_releasing_last_passage_allows_expired_segment_cleanup(tmp_path):
     playlist = _write_playlist(
         tmp_path,
@@ -476,6 +617,347 @@ def test_releasing_last_passage_allows_expired_segment_cleanup(tmp_path):
     assert buffer.cleanup(current_time_ms=1_787_313_700_000) == (
         tmp_path / "finish.ts",
     )
+
+
+def test_pin_failure_leaves_memory_state_unchanged(tmp_path, monkeypatch):
+    playlist = _write_playlist(
+        tmp_path,
+        [("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    buffer = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    monkeypatch.setattr(
+        buffer,
+        "_append_pin_record",
+        lambda _record, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        buffer.pin_window(
+            "passage-15",
+            started_at_ms=1_787_313_600_000,
+            ended_at_ms=1_787_313_602_000,
+        )
+
+    assert buffer.pinned_event_ids("finish.ts") == frozenset()
+    assert not journal.exists()
+
+
+def test_pin_journal_rolls_back_failed_fsync(tmp_path, monkeypatch):
+    playlist = _write_playlist(
+        tmp_path,
+        [("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    buffer = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    calls = 0
+
+    def fail_first_fsync(file_descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("disk full")
+
+    monkeypatch.setattr(durable_jsonl.os, "fsync", fail_first_fsync)
+
+    with pytest.raises(RuntimeError, match="failed to append"):
+        buffer.pin_window(
+            "passage-15",
+            started_at_ms=1_787_313_600_000,
+            ended_at_ms=1_787_313_602_000,
+        )
+
+    assert journal.read_bytes() == b""
+    assert buffer.pinned_event_ids("finish.ts") == frozenset()
+    pinned = buffer.pin_window(
+        "passage-15",
+        started_at_ms=1_787_313_600_000,
+        ended_at_ms=1_787_313_602_000,
+    )
+    assert [segment.segment_id for segment in pinned] == ["finish.ts"]
+
+
+def test_release_failure_keeps_existing_pin(tmp_path, monkeypatch):
+    playlist = _write_playlist(
+        tmp_path,
+        [("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    buffer.pin_window(
+        "passage-15",
+        started_at_ms=1_787_313_600_000,
+        ended_at_ms=1_787_313_602_000,
+    )
+    monkeypatch.setattr(
+        buffer,
+        "_append_pin_records",
+        lambda _records, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        buffer.release("passage-15")
+
+    assert buffer.pinned_event_ids("finish.ts") == frozenset({"passage-15"})
+
+
+def test_cleanup_accepts_equal_segment_snapshot_after_concurrent_scan(
+    tmp_path,
+    monkeypatch,
+):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=30)
+    buffer.scan()
+    buffer.set_scan_watermark(1_787_313_700_000)
+
+    def scan_during_disk_check(_path):
+        buffer.scan()
+        return SimpleNamespace(free=0)
+
+    monkeypatch.setattr(
+        review_recorder.shutil,
+        "disk_usage",
+        scan_during_disk_check,
+    )
+
+    assert buffer.cleanup(current_time_ms=1_787_313_700_000) == (
+        tmp_path / "old.ts",
+    )
+
+
+def test_ring_buffer_recovers_cleanup_file_after_process_restart(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.part.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    original = tmp_path / "old.part.ts"
+    trash = tmp_path / ".old.part.ts.deadbeef.cleanup"
+    os.replace(original, trash)
+
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+
+    assert original.is_file()
+    assert not trash.exists()
+    assert buffer.scan()[0].segment_id == "old.part.ts"
+
+
+def test_cleanup_wal_restores_renamed_file_after_restart(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    ring = ReviewRingBuffer(playlist, camera_index=1, pin_journal_path=journal)
+    segment = ring.scan()[0]
+    original = tmp_path / "old.ts"
+    trash = tmp_path / ".old.ts.cleanup-test.cleanup"
+    ring._append_pin_record(
+        ring._cleanup_intent_record("tx-restore", segment, original, trash)
+    )
+    os.replace(original, trash)
+
+    restored = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+
+    assert original.is_file()
+    assert not trash.exists()
+    assert restored._journal_projection.cleanup_intents == {}
+    assert restored.scan()[0].segment_id == "old.ts"
+
+
+def test_cleanup_wal_commits_missing_file_and_restores_gap_after_restart(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    ring = ReviewRingBuffer(playlist, camera_index=1, pin_journal_path=journal)
+    segment = ring.scan()[0]
+    original = tmp_path / "old.ts"
+    trash = tmp_path / ".old.ts.cleanup-test.cleanup"
+    ring._append_pin_record(
+        ring._cleanup_intent_record("tx-commit", segment, original, trash)
+    )
+    original.unlink()
+
+    restored = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+
+    assert segment.segment_id in restored._journal_projection.deleted_segment_ids
+    assert restored.scan_gap_is_permanent(
+        segment.started_at_ms,
+        segment.ended_at_ms,
+    )
+    assert restored.scan() == ()
+
+
+def test_live_scan_cursor_is_durable_and_monotonic(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    journal = tmp_path / "pins.jsonl"
+    ring = ReviewRingBuffer(playlist, camera_index=1, pin_journal_path=journal)
+
+    assert ring.commit_scan_cursor("camera-1:live_batch_v2", 120_000) == 120_000
+    assert ring.commit_scan_cursor("camera-1:live_batch_v2", 60_000) == 120_000
+    restored = ReviewRingBuffer(
+        playlist,
+        camera_index=1,
+        pin_journal_path=journal,
+    )
+    assert restored.scan_cursor("camera-1:live_batch_v2") == 120_000
+
+
+def test_cleanup_preserves_segment_with_active_scan_lease(tmp_path):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=30)
+    segment = buffer.scan()[0]
+    assert buffer.acquire_scan_leases((segment,))
+
+    assert buffer.cleanup(current_time_ms=1_787_313_700_000) == ()
+    assert (tmp_path / "old.ts").is_file()
+
+    buffer.release_scan_leases((segment,))
+    assert buffer.cleanup(current_time_ms=1_787_313_700_000) == (
+        tmp_path / "old.ts",
+    )
+
+
+def test_cleanup_restores_segment_when_delete_fails(tmp_path, monkeypatch):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=30)
+    buffer.scan()
+    original_unlink = Path.unlink
+
+    def fail_old_segment(path, *args, **kwargs):
+        if ".old.ts." in path.name and path.name.endswith(".cleanup"):
+            raise OSError("file busy")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_old_segment)
+
+    assert buffer.cleanup(current_time_ms=1_787_313_700_000) == ()
+    assert [segment.segment_id for segment in buffer.segments()] == ["old.ts"]
+
+
+def test_cleanup_does_not_hold_ring_lock_during_delete(tmp_path, monkeypatch):
+    playlist = _write_playlist(
+        tmp_path,
+        [("old.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=30)
+    buffer.scan()
+    unlink_started = threading.Event()
+    allow_unlink = threading.Event()
+    cleanup_result = []
+    original_unlink = Path.unlink
+
+    def delayed_unlink(path, *args, **kwargs):
+        if ".old.ts." in path.name and path.name.endswith(".cleanup"):
+            unlink_started.set()
+            assert allow_unlink.wait(2)
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", delayed_unlink)
+    cleanup_thread = threading.Thread(
+        target=lambda: cleanup_result.extend(
+            buffer.cleanup(current_time_ms=1_787_313_700_000)
+        )
+    )
+    cleanup_thread.start()
+    assert unlink_started.wait(2)
+
+    scan_thread = threading.Thread(target=buffer.scan)
+    scan_thread.start()
+    scan_thread.join(timeout=1)
+    assert not scan_thread.is_alive()
+
+    allow_unlink.set()
+    cleanup_thread.join(timeout=2)
+    assert not cleanup_thread.is_alive()
+    assert cleanup_result == [tmp_path / "old.ts"]
+
+
+def test_pending_cleanup_keeps_passage_waiting_until_failed_delete_restores(
+    tmp_path,
+    monkeypatch,
+):
+    base_ms = 1_787_313_600_000
+    playlist = _write_playlist(
+        tmp_path,
+        [
+            ("old.ts", "2026-08-21T12:00:00.000+00:00", 6.0),
+            ("tail.ts", "2026-08-21T12:00:06.000+00:00", 2.0),
+        ],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=30)
+    buffer.scan()
+    coordinator = PassageReviewCoordinator(buffer)
+    unlink_started = threading.Event()
+    allow_unlink = threading.Event()
+    original_unlink = Path.unlink
+
+    def delayed_failed_unlink(path, *args, **kwargs):
+        if ".old.ts." in path.name and path.name.endswith(".cleanup"):
+            unlink_started.set()
+            assert allow_unlink.wait(2)
+            raise OSError("file busy")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", delayed_failed_unlink)
+    cleanup_thread = threading.Thread(
+        target=lambda: buffer.cleanup(current_time_ms=base_ms + 37_000)
+    )
+    cleanup_thread.start()
+    assert unlink_started.wait(2)
+
+    registered = []
+    pin_finished = threading.Event()
+
+    def register_passage():
+        registered.append(
+            coordinator.register(
+                "passage-15",
+                passage_timestamp_ms=base_ms + 1_000,
+                scan=False,
+            )
+        )
+        pin_finished.set()
+
+    pin_thread = threading.Thread(target=register_passage)
+    pin_thread.start()
+    assert not pin_finished.wait(0.05)
+
+    allow_unlink.set()
+    cleanup_thread.join(timeout=2)
+    pin_thread.join(timeout=2)
+    assert not cleanup_thread.is_alive()
+    assert not pin_thread.is_alive()
+    assert registered[0].state is PassageReviewState.READY
+    assert buffer.pinned_event_ids("old.ts") == frozenset({coordinator.get("passage-15").pin_owner_id})
 
 
 def test_scan_watermark_preserves_unprocessed_expired_segments(tmp_path):
@@ -540,7 +1022,7 @@ def test_passage_window_waits_for_tail_then_becomes_ready(tmp_path):
         "finish.ts",
         "after.ts",
     ]
-    assert buffer.pinned_event_ids("after.ts") == frozenset({"passage-15"})
+    assert buffer.pinned_event_ids("after.ts") == frozenset({coordinator.get("passage-15").pin_owner_id})
 
 
 def test_passage_window_tolerates_hls_timestamp_rounding_gaps(tmp_path):
@@ -671,6 +1153,42 @@ def test_passage_window_reports_partial_after_timeline_crosses_a_gap(tmp_path):
     assert [segment.segment_id for segment in window.segments] == ["finish.ts"]
 
 
+def test_corrected_windows_use_distinct_pin_owners_and_revision_release(
+    tmp_path,
+):
+    playlist = _write_playlist(
+        tmp_path,
+        [
+            ("first.ts", "2026-08-21T12:00:00.000+00:00", 2.0),
+            ("second.ts", "2026-08-21T12:00:10.000+00:00", 2.0),
+            ("tail.ts", "2026-08-21T12:00:12.000+00:00", 2.0),
+        ],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    coordinator = PassageReviewCoordinator(buffer, pre_roll_seconds=0, post_roll_seconds=1)
+    first = coordinator.register(
+        "passage-15",
+        passage_timestamp_ms=1_787_313_600_500,
+        revision=1,
+        race_id="race-1",
+    )
+    second = coordinator.register(
+        "passage-15",
+        passage_timestamp_ms=1_787_313_610_500,
+        revision=2,
+        race_id="race-1",
+    )
+
+    assert first.pin_owner_id != second.pin_owner_id
+    assert buffer.pinned_event_ids("first.ts") == frozenset({first.pin_owner_id})
+    assert buffer.pinned_event_ids("second.ts") == frozenset({second.pin_owner_id})
+
+    coordinator.discard("passage-15", revision=2)
+
+    assert buffer.pinned_event_ids("first.ts") == frozenset()
+    assert buffer.pinned_event_ids("second.ts") == frozenset()
+
+
 def test_corrected_passage_window_keeps_old_evidence_but_returns_current_window(
     tmp_path,
 ):
@@ -688,7 +1206,7 @@ def test_corrected_passage_window_keeps_old_evidence_but_returns_current_window(
         pre_roll_seconds=0,
         post_roll_seconds=1,
     )
-    coordinator.register(
+    original = coordinator.register(
         "passage-15",
         passage_timestamp_ms=1_787_313_600_500,
     )
@@ -699,7 +1217,7 @@ def test_corrected_passage_window_keeps_old_evidence_but_returns_current_window(
     )
 
     assert [segment.segment_id for segment in corrected.segments] == ["second.ts"]
-    assert buffer.pinned_event_ids("first.ts") == frozenset({"passage-15"})
+    assert buffer.pinned_event_ids("first.ts") == frozenset({original.pin_owner_id})
 
 
 def test_ready_window_publishes_one_idempotent_playable_timeline(
@@ -886,13 +1404,21 @@ def test_fifty_passages_in_five_seconds_publish_one_shared_clip(
     timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
     binding_store = PassageReviewBindingStore(tmp_path / "review_clips.jsonl")
     append_sizes = []
+    pin_append_sizes = []
     original_append = binding_store._append_records
+    original_pin_append = ring_buffer._append_pin_records
 
     def counted_append(payloads):
         append_sizes.append(len(payloads))
         original_append(payloads)
 
+    def counted_pin_append(records, **kwargs):
+        values = tuple(records)
+        pin_append_sizes.append(len(values))
+        original_pin_append(values, **kwargs)
+
     monkeypatch.setattr(binding_store, "_append_records", counted_append)
+    monkeypatch.setattr(ring_buffer, "_append_pin_records", counted_pin_append)
     publisher = PassageReviewTimelinePublisher(
         ring_buffer,
         timeline,
@@ -906,6 +1432,11 @@ def test_fifty_passages_in_five_seconds_publish_one_shared_clip(
 
     assert len(timeline.segments()) == 1
     assert append_sizes == [1, 50]
+    assert pin_append_sizes == [1, 50]
+    assert all(
+        all(pin_id.startswith("published:") for pin_id in ring_buffer.pinned_event_ids(name))
+        for name in (f"s{index}.ts" for index in range(6))
+    )
     clip_ids = {
         binding_store.active_bindings(window.event_id, 1)[0].clip_id
         for window in windows

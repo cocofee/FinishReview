@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 import cv2
+import pytest
 import realtime.video_timeline as video_timeline
 from realtime.video_timeline import VideoTimelineStore
 
@@ -80,6 +81,30 @@ def _segment(
             **finish_kwargs,
         )
     return segment, path
+
+
+def test_finish_segment_validates_before_appending_end_record(tmp_path):
+    journal = tmp_path / "video_timeline.jsonl"
+    store = VideoTimelineStore(journal)
+    segment = store.start_segment(
+        source_id="camera-1",
+        camera_index=1,
+        video_path=tmp_path / "camera.mkv",
+        started_at_ms=1_000,
+    )
+    before = journal.read_bytes()
+
+    with pytest.raises(video_timeline.VideoTimelineError):
+        store.finish_segment(
+            segment.segment_id,
+            ended_at_ms=2_000,
+            media_duration_ms=0,
+        )
+
+    assert journal.read_bytes() == before
+    assert store.get_segment(segment.segment_id).ended_at_ms is None
+    restored = VideoTimelineStore(journal)
+    assert restored.get_segment(segment.segment_id).ended_at_ms is None
 
 
 def test_locates_passage_with_clock_offset_and_pre_roll(tmp_path):
@@ -451,6 +476,39 @@ def test_path_index_and_revision_survive_restart(tmp_path):
 
     assert restored.revision == 2
     assert restored.find_segment_by_video_path(path).segment_id == segment.segment_id
+
+
+def test_path_index_returns_latest_duplicate_journal_entry(tmp_path):
+    path = tmp_path / "videos" / "camera.mkv"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"video")
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = store.add_completed_segment(
+        source_id="camera-1",
+        camera_index=1,
+        video_path=path,
+        media_started_at_ms=1_000,
+        media_duration_ms=1_000,
+        clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="first",
+    )
+    second = store.add_completed_segment(
+        source_id="camera-1",
+        camera_index=1,
+        video_path=path,
+        media_started_at_ms=2_000,
+        media_duration_ms=1_000,
+        clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="second",
+    )
+
+    assert first.segment_id != second.segment_id
+    assert store.find_segment_by_video_path(path) == second
+    assert VideoTimelineStore(
+        tmp_path / "video_timeline.jsonl"
+    ).find_segment_by_video_path(path).segment_id == second.segment_id
 
 
 def test_repeated_lookup_reuses_playability_check(tmp_path, monkeypatch):
