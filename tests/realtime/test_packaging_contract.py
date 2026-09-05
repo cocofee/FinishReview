@@ -18,7 +18,7 @@ def test_project_and_runtime_versions_match_release_version():
 
     assert project_version is not None
     assert runtime_version is not None
-    assert project_version.group(1) == "0.24.5"
+    assert project_version.group(1) == "0.24.3"
     assert runtime_version.group(1) == project_version.group(1)
 
 
@@ -31,10 +31,10 @@ def test_windows_executable_version_matches_release_version():
     )
 
     assert 'version=str(ROOT / "packaging" / "version_info.txt")' in spec
-    assert 'StringStruct("FileVersion", "0.24.5")' in version_info
-    assert 'StringStruct("ProductVersion", "0.24.5")' in version_info
-    assert "filevers=(0, 24, 5, 0)" in version_info
-    assert "prodvers=(0, 24, 5, 0)" in version_info
+    assert 'StringStruct("FileVersion", "0.24.3")' in version_info
+    assert 'StringStruct("ProductVersion", "0.24.3")' in version_info
+    assert "filevers=(0, 24, 3, 0)" in version_info
+    assert "prodvers=(0, 24, 3, 0)" in version_info
 
 
 def test_finish_review_package_excludes_detection_and_ocr_runtimes():
