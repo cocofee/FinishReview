@@ -6077,6 +6077,27 @@ class PassageReviewSurface(QDialog):
         else:
             self._update_filmstrip()
 
+    def _focus_video_candidate_in_review(self, candidate: object) -> bool:
+        """Use the nearest chip row as the review anchor for a visual arrival."""
+
+        if not self._visible_events:
+            self.refresh()
+        if not self._visible_events:
+            return False
+        camera_index = max(1, int(getattr(candidate, "camera_index", 1)))
+        offset_ms = self._clock_offset_for_camera(camera_index)
+        candidate_time_ms = int(getattr(candidate, "peak_at_ms", 0))
+        nearest = min(
+            self._visible_events,
+            key=lambda event: abs(
+                int(event.timeline_timestamp_ms) + int(offset_ms) - candidate_time_ms
+            ),
+        )
+        if nearest.event_id != self._selected_event_id:
+            self._select_event(nearest.event_id)
+        self._update_filmstrip()
+        return True
+
     def _filmstrip_context_for_active_pane(
         self,
     ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:

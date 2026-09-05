@@ -6330,6 +6330,25 @@ class FinishReviewWindow(PassageReviewSurface):
             reconcile_started,
             item_count=len(values),
         )
+        # A visual arrival without a chip still needs a judgeable context.
+        # Anchor the main review pane to the nearest known chip window while
+        # keeping the official passage journal unchanged.
+        for item in reversed(reconciliation):
+            candidate = item.candidate
+            candidate_id = str(getattr(candidate, "candidate_id", "")).strip()
+            if (
+                candidate_id in {
+                    str(getattr(value, "candidate_id", "")).strip()
+                    for value in values
+                }
+                and int(item.chip_count) == 0
+                and not bool(getattr(candidate, "is_camera_motion", False))
+                and candidate_id
+            ):
+                if getattr(self, "_last_auto_video_candidate_id", "") != candidate_id:
+                    self._last_auto_video_candidate_id = candidate_id
+                    self._focus_video_candidate_in_review(candidate)
+                break
         self.video_review_apply_requested.emit(reconciliation)
 
     def _persist_video_review(self, candidate_id: str, status: str, bib: str) -> None:
