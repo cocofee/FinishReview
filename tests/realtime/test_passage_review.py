@@ -964,6 +964,8 @@ def test_review_uses_consistent_laptop_typography(qapp, tmp_path):
     assert f'font-family: "{passage_review.UI_FONT_FAMILY}"' in style
     assert f"font-size: {passage_review.UI_BASE_FONT_POINT_SIZE}pt" in style
     assert dialog.table.verticalHeader().defaultSectionSize() == 34
+    assert dialog.transport.minimumHeight() == 42
+    assert dialog.transport.maximumHeight() == 42
     assert "font-size: 12pt" in dialog.current_passage_label.styleSheet()
     assert "font-size: 9pt" in dialog.summary_label.styleSheet()
     assert dialog.info_panel.minimumWidth() == passage_review.UI_INFO_PANEL_MIN_WIDTH

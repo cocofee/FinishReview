@@ -2660,6 +2660,9 @@ class PassageReviewSurface(QDialog):
         self._search_refresh_timer.timeout.connect(self._refresh_filtered_view)
         self._filmstrip_context: tuple[Path, int, int] | None = None
         self._filmstrip_absolute_window: tuple[int, int] | None = None
+        self._filmstrip_candidate_override: Optional[
+            tuple[Path, int, int, int, tuple[int, ...], int, int]
+        ] = None
         self._review_split_resize_pending = False
         self._pending_filmstrip_position: int | None = None
         self._filmstrip_seek_pending = False
@@ -2843,7 +2846,7 @@ class PassageReviewSurface(QDialog):
         filters.addWidget(self.video_arrival_button)
         self.video_review_apply_requested.connect(self.set_video_reconciliation)
         self.video_review_button = QPushButton("视频异常：0")
-        self.video_review_button.setToolTip("打开视频辅助异常列表")
+        self.video_review_button.setToolTip("直接定位下一个视频异常到上方时间胶卷和预览")
         self.video_review_button.setVisible(False)
         self.video_review_button.clicked.connect(self._open_video_anomaly_list)
         filters.addWidget(self.video_review_button)
@@ -2957,6 +2960,9 @@ class PassageReviewSurface(QDialog):
 
         transport = QFrame(self)
         transport.setObjectName("reviewPanel")
+        # This is a single-line control strip.  Keep it compact so an inflated
+        # size hint cannot consume the vertical space needed by the evidence.
+        transport.setFixedHeight(42)
         self.transport = transport
         self.transport_layout = QHBoxLayout(transport)
         self.transport_layout.setContentsMargins(10, 4, 10, 4)
@@ -3448,7 +3454,9 @@ class PassageReviewSurface(QDialog):
             if pending_count
             else f"视频异常记录：{total_count}"
         )
-        self.video_review_button.setVisible(bool(total_count))
+        # Candidates are shown as anchors in the main filmstrip; no separate
+        # anomaly queue button is needed for one-by-one operator review.
+        self.video_review_button.setVisible(False)
         if self._video_anomaly_dialog_refresh is not None:
             self._video_anomaly_dialog_refresh()
         has_active = bool(self._active_video_anomaly_id)
@@ -3592,6 +3600,80 @@ class PassageReviewSurface(QDialog):
         self._video_anomaly_cursor = current
         self._activate_video_anomaly(self._video_reconciliation[current], current)
 
+    def _video_candidate_filmstrip_context(
+        self,
+        candidate: object,
+    ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:
+        """Build a top-filmstrip context for a candidate without a chip row."""
+
+        segment_id = str(getattr(candidate, "segment_id", "")).strip()
+        segment = self.timeline_store.get_segment(segment_id) if segment_id else None
+        video_path = Path(str(getattr(candidate, "video_path", ""))).expanduser()
+        if not video_path.is_file() and segment is not None:
+            video_path = self.timeline_store.resolve_video_path(segment)
+        if not video_path.is_file():
+            return None
+        center = max(0, int(getattr(candidate, "video_position_ms", 0)))
+        duration_ms = int(getattr(segment, "media_duration_ms", 0) or 0)
+        if duration_ms <= center:
+            duration_ms = center + 1_000
+        window_ms = 120_000 if self._low_resource_mode else self.FILMSTRIP_WINDOW_MS
+        start_ms = min((center // window_ms) * window_ms, max(0, duration_ms - 1))
+        end_ms = min(duration_ms, start_ms + window_ms)
+        if end_ms <= start_ms:
+            end_ms = min(duration_ms, start_ms + 1_000)
+        origin_ms = int(
+            getattr(
+                segment,
+                "media_started_at_ms",
+                None,
+            )
+            or getattr(segment, "started_at_ms", 0)
+            or getattr(candidate, "started_at_ms", 0)
+        )
+        return (
+            video_path,
+            start_ms,
+            end_ms,
+            center,
+            (center,),
+            origin_ms + start_ms,
+            origin_ms + end_ms,
+        )
+
+    def _show_video_candidate_in_filmstrip(self, item: object) -> bool:
+        candidate = getattr(item, "candidate", None)
+        if candidate is None:
+            return False
+        context = self._video_candidate_filmstrip_context(candidate)
+        if context is None:
+            return False
+        self._active_video_anomaly_id = str(getattr(candidate, "candidate_id", ""))
+        self.video_review_done_button.setVisible(True)
+        self.video_review_ignore_button.setVisible(True)
+        self.video_review_bib_edit.setVisible(True)
+        self.video_review_bib_edit.setText(
+            self._video_review_bibs.get(self._active_video_anomaly_id, "")
+        )
+        self._filmstrip_candidate_override = context
+        self._update_filmstrip()
+        pane = (
+            self._active_pane
+            if self._active_pane in self.regular_panes
+            else self.regular_pane
+        )
+        candidate_path, _start_ms, _end_ms, position_ms, _anchors, *_ = context
+        pane_path = pane.location.video_path if pane.location is not None else None
+        if pane_path is not None and pane_path.resolve() == candidate_path.resolve():
+            self._activate_pane(pane, align=False)
+            pane.seek_passage_delta(
+                position_ms - int(getattr(pane, "_target_position_ms", 0)),
+                preview=True,
+            )
+        self.video_filmstrip.set_current_position(position_ms)
+        self._pending_filmstrip_preview_position = position_ms
+        return True
+
     def _activate_video_anomaly(self, item: object, index: int | None = None) -> None:
         candidate = getattr(item, "candidate", None)
         candidate_id = str(getattr(candidate, "candidate_id", ""))
@@ -3617,28 +3699,28 @@ class PassageReviewSurface(QDialog):
             return
         if not self._visible_events:
             self.refresh()
-        if not self._visible_events or int(getattr(item, "chip_count", 0)) == 0:
-            self.video_candidate_requested.emit(item)
+        if self._visible_events:
+            camera_index = int(getattr(candidate, "camera_index", 1))
+            offset = self._clock_offset_for_camera(camera_index)
+            nearest = min(
+                self._visible_events,
+                key=lambda event: abs(
+                    event.timeline_timestamp_ms + offset - int(timestamp)
+                ),
+            )
+            self._enter_batch_mode(nearest.event_id)
+            self._select_event(nearest.event_id)
+            position = self._video_anomaly_cursor + 1
+            total = len(self._video_reconciliation)
             self.summary_label.setToolTip(
-                "视频异常已发现，已发出独立视频复核请求"
+                f"视频异常 {position}/{total}："
+                f"已定位到最接近的芯片记录（{getattr(item, 'anomaly', '待复核')}）"
+            )
+        if self._show_video_candidate_in_filmstrip(item):
+            self.summary_label.setToolTip(
+                "视频异常已定位到上方时间胶卷和预览画面；芯片数为 0 时可直接判断是否漏读。"
             )
             return
-        camera_index = int(getattr(candidate, "camera_index", 1))
-        offset = self._clock_offset_for_camera(camera_index)
-        nearest = min(
-            self._visible_events,
-            key=lambda event: abs(
-                event.timeline_timestamp_ms + offset - int(timestamp)
-            ),
-        )
-        self._enter_batch_mode(nearest.event_id)
-        self._select_event(nearest.event_id)
-        position = self._video_anomaly_cursor + 1
-        total = len(self._video_reconciliation)
-        self.summary_label.setToolTip(
-            f"视频异常 {position}/{total}："
-            f"已定位到最接近的芯片记录（{getattr(item, 'anomaly', '待复核')}）"
-        )
         self.video_candidate_requested.emit(item)
 
     @staticmethod
@@ -3924,11 +4006,13 @@ class PassageReviewSurface(QDialog):
     def _open_video_anomaly_list(self) -> None:
         if not self._video_reconciliation_by_id:
             return
+        # Video anomalies are reviewed in the main filmstrip and preview now;
+        # do not interrupt the operator with a separate queue dialog.
         dialog = self._video_anomaly_dialog
         if dialog is not None:
-            dialog.raise_()
-            dialog.activateWindow()
-            return
+            dialog.close()
+        self._open_next_video_anomaly()
+        return
         dialog = QDialog(self)
         dialog.setObjectName("videoAnomalyDialog")
         dialog.setWindowTitle("视频辅助异常列表")
@@ -4013,7 +4097,13 @@ class PassageReviewSurface(QDialog):
             self._activate_video_anomaly(records[row][1])
             dialog.close()
 
+        def preview_selected() -> None:
+            row = table.currentRow()
+            if 0 <= row < len(records):
+                self._activate_video_anomaly(records[row][1])
+
         open_button.clicked.connect(open_selected)
+        table.itemSelectionChanged.connect(preview_selected)
         table.cellDoubleClicked.connect(lambda _row, _column: open_selected())
         close_button.clicked.connect(dialog.close)
         def clear_dialog_reference(_result: int) -> None:
@@ -5801,6 +5891,7 @@ class PassageReviewSurface(QDialog):
             active_pane = self._active_playback_pane()
             if getattr(active_pane, "_current_frame_index", -1) >= 0:
                 preserve_current_frame = active_pane
+        self._filmstrip_candidate_override = None
         self.selection_controller.select(
             event_id,
             preserve_current_frame=preserve_current_frame,
@@ -6082,6 +6173,8 @@ class PassageReviewSurface(QDialog):
     ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:
         if not self._batch_mode and not self.FILMSTRIP_ALWAYS_AVAILABLE:
             return None
+        if self._filmstrip_candidate_override is not None:
+            return self._filmstrip_candidate_override
         pane = (
             self._active_pane
             if self._active_pane in self.regular_panes
@@ -6205,6 +6298,7 @@ class PassageReviewSurface(QDialog):
             else self.regular_pane
         )
         location = pane.location
+        target_position_ms = int(current_position_ms)
         if location is not None:
             session_key = self._recording_session_key(location)
             offset_ms = self._continuous_clock_offsets.get(
@@ -6214,6 +6308,7 @@ class PassageReviewSurface(QDialog):
             # Filmstrip positions are media-local. Convert them to the same
             # calibrated race clock used by the lower camera panes.
             origin_ms -= int(offset_ms)
+            target_position_ms = int(pane._target_position_ms)
         was_visible = self.video_filmstrip.isVisible()
         self.video_filmstrip.setVisible(True)
         if not was_visible and not self._review_split_resize_pending:
@@ -6226,8 +6321,8 @@ class PassageReviewSurface(QDialog):
         self._schedule_activity_analysis(video_path, start_ms, end_ms)
         self.preview_timeline.setRange(int(start_ms), int(end_ms))
         self.preview_timeline.set_target_position(
-            int(pane._target_position_ms)
-            if int(start_ms) <= int(pane._target_position_ms) <= int(end_ms)
+            target_position_ms
+            if int(start_ms) <= target_position_ms <= int(end_ms)
             else None
         )
         self.preview_timeline.setValue(

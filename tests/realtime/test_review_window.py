@@ -3083,7 +3083,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.24.3 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.24.5 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -3097,7 +3097,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.24.3"
+    assert window.product_title_label.text() == "FinishReview v0.24.5"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()
@@ -3317,16 +3317,10 @@ def test_video_anomaly_queue_accumulates_and_can_be_closed_as_verified(
 
     assert len(window.video_reconciliation()) == 1
     assert window.video_review_button.text() == "视频异常：1"
-    window.video_review_button.click()
-    dialog = window.findChild(QDialog, "videoAnomalyDialog")
-    assert dialog is not None
-    table = dialog.findChild(QTableWidget, "videoAnomalyTable")
-    assert table is not None and table.rowCount() == 1
-    table.selectRow(0)
-    open_button = dialog.findChild(QPushButton, "videoAnomalyOpenButton")
-    assert open_button is not None
-    open_button.click()
-    assert requested == [item]
+    assert not window.video_review_button.isVisible()
+    assert window._show_video_candidate_in_filmstrip(item)
+    assert window._filmstrip_candidate_override is not None
+    assert requested == []
     window.video_review_done_button.click()
     assert window.video_review_status(candidate.candidate_id) == "verified"
     assert window.video_reconciliation() == ()
@@ -3369,7 +3363,7 @@ def test_video_arrival_candidates_persist_across_workspace_reopen(
     restored.close()
 
 
-def test_video_anomaly_list_refreshes_status_while_open(qapp, tmp_path):
+def test_video_anomaly_status_updates_without_a_queue_dialog(qapp, tmp_path):
     window = _window(tmp_path)
     video_path = tmp_path / "camera_01.ts"
     video_path.write_bytes(b"video")
@@ -3386,15 +3380,11 @@ def test_video_anomaly_list_refreshes_status_while_open(qapp, tmp_path):
     )
     item = VideoPassageReconciliation(candidate, 0, "瑙嗛鍊欏緟澶嶆牳")
     window.set_video_reconciliation((item,))
-    window.video_review_button.click()
-    dialog = window.findChild(QDialog, "videoAnomalyDialog")
-    table = dialog.findChild(QTableWidget, "videoAnomalyTable")
-    assert table.item(0, 6).text() == window._video_review_status_label("pending")
-
+    assert not window.video_review_button.isVisible()
     window._active_video_anomaly_id = candidate.candidate_id
     window._mark_current_video_anomaly("verified")
 
-    assert table.item(0, 6).text() == window._video_review_status_label("verified")
+    assert window.video_review_status(candidate.candidate_id) == "verified"
     window.close()
 
 
@@ -3462,20 +3452,23 @@ def test_video_anomaly_can_quickly_focus_roster_bib_without_creating_passage(
         ),
     )
     window.metadata_store.store(metadata)
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
     candidate = VideoPassageCandidate(
-        "video-321", 1, 1_000, 1_200, 1_100, 0.2, 0.1
+        "video-321",
+        1,
+        1_000,
+        1_200,
+        1_100,
+        0.2,
+        0.1,
+        video_path=str(video_path),
+        video_position_ms=100,
     )
     item = VideoPassageReconciliation(candidate, 0, "视频候选无芯片记录")
     window.set_video_reconciliation((item,))
-    window.video_review_button.click()
-    dialog = window.findChild(QDialog, "videoAnomalyDialog")
-    assert dialog is not None
-    table = dialog.findChild(QTableWidget, "videoAnomalyTable")
-    assert table is not None and table.rowCount() == 1
-    table.selectRow(0)
-    open_button = dialog.findChild(QPushButton, "videoAnomalyOpenButton")
-    assert open_button is not None
-    open_button.click()
+    assert not window.video_review_button.isVisible()
+    assert window._show_video_candidate_in_filmstrip(item)
     window.video_review_bib_edit.setText("321")
     window.video_review_bib_edit.returnPressed.emit()
 
