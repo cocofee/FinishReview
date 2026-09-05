@@ -2838,7 +2838,7 @@ class PassageReviewSurface(QDialog):
         self.video_arrival_button.setToolTip(
             "打开由视频自动扫描生成的到达批次；候选独立于芯片记录"
         )
-        self.video_arrival_button.setVisible(bool(self._video_arrival_batches))
+        self.video_arrival_button.setVisible(False)
         self.video_arrival_button.clicked.connect(self._open_video_arrival_list)
         filters.addWidget(self.video_arrival_button)
         self.video_review_apply_requested.connect(self.set_video_reconciliation)
@@ -3448,7 +3448,7 @@ class PassageReviewSurface(QDialog):
             if pending_count
             else f"视频异常记录：{total_count}"
         )
-        self.video_review_button.setVisible(bool(total_count))
+        self.video_review_button.setVisible(False)
         if self._video_anomaly_dialog_refresh is not None:
             self._video_anomaly_dialog_refresh()
         has_active = bool(self._active_video_anomaly_id)
@@ -3535,7 +3535,7 @@ class PassageReviewSurface(QDialog):
                 f"到达候选：{len(self._video_arrival_batches)}批/"
                 f"{len(self._video_navigation_candidates)}点"
             )
-            self.video_arrival_button.setVisible(bool(self._video_arrival_batches))
+            self.video_arrival_button.setVisible(False)
         if self._video_arrival_dialog_refresh is not None:
             self._video_arrival_dialog_refresh()
 
