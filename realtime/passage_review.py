@@ -2841,7 +2841,9 @@ class PassageReviewSurface(QDialog):
         self.video_arrival_button.setToolTip(
             "打开由视频自动扫描生成的到达批次；候选独立于芯片记录"
         )
-        self.video_arrival_button.setVisible(bool(self._video_arrival_batches))
+        # Arrival candidates are represented by anchor marks in the main
+        # filmstrip; keep the separate batch-list entry point hidden.
+        self.video_arrival_button.setVisible(False)
         self.video_arrival_button.clicked.connect(self._open_video_arrival_list)
         filters.addWidget(self.video_arrival_button)
         self.video_review_apply_requested.connect(self.set_video_reconciliation)
@@ -3532,6 +3534,7 @@ class PassageReviewSurface(QDialog):
             candidate_id = str(getattr(candidate, "candidate_id", "")).strip()
             if candidate_id:
                 self._video_review_statuses.setdefault(candidate_id, "pending")
+        had_candidates = bool(self._video_navigation_candidates)
         self._video_navigation_candidates = tuple(ordered)
         self._video_arrival_batches = build_video_arrival_batches(
             self._video_navigation_candidates,
@@ -3543,9 +3546,25 @@ class PassageReviewSurface(QDialog):
                 f"到达候选：{len(self._video_arrival_batches)}批/"
                 f"{len(self._video_navigation_candidates)}点"
             )
-            self.video_arrival_button.setVisible(bool(self._video_arrival_batches))
+            # Arrival candidates are represented by anchor marks in the main
+            # filmstrip; keep the separate batch-list entry point hidden.
+            self.video_arrival_button.setVisible(False)
         if self._video_arrival_dialog_refresh is not None:
             self._video_arrival_dialog_refresh()
+        if (
+            ordered
+            and not had_candidates
+            and hasattr(self, "video_filmstrip")
+        ):
+            first_item = SimpleNamespace(
+                candidate=ordered[0],
+                chip_count=0,
+                anomaly="视频候选待核实",
+            )
+            if self._show_video_candidate_in_filmstrip(first_item):
+                return
+        if hasattr(self, "video_filmstrip"):
+            self._update_filmstrip()
 
     def video_navigation_candidates(self) -> tuple[object, ...]:
         """Return visual candidates used by Ctrl+Left/Right."""
@@ -3622,6 +3641,24 @@ class PassageReviewSurface(QDialog):
         end_ms = min(duration_ms, start_ms + window_ms)
         if end_ms <= start_ms:
             end_ms = min(duration_ms, start_ms + 1_000)
+        candidate_positions = {center}
+        video_path_resolved = video_path.resolve()
+        for value in self._video_navigation_candidates:
+            if int(getattr(value, "camera_index", 0)) != int(
+                getattr(candidate, "camera_index", 0)
+            ):
+                continue
+            value_path = str(getattr(value, "video_path", "")).strip()
+            if not value_path:
+                continue
+            try:
+                if Path(value_path).expanduser().resolve() != video_path_resolved:
+                    continue
+            except OSError:
+                continue
+            value_position = int(getattr(value, "video_position_ms", 0))
+            if start_ms <= value_position <= end_ms:
+                candidate_positions.add(value_position)
         origin_ms = int(
             getattr(
                 segment,
@@ -3636,7 +3673,7 @@ class PassageReviewSurface(QDialog):
             start_ms,
             end_ms,
             center,
-            (center,),
+            tuple(sorted(candidate_positions)),
             origin_ms + start_ms,
             origin_ms + end_ms,
         )
@@ -3656,7 +3693,6 @@ class PassageReviewSurface(QDialog):
             self._video_review_bibs.get(self._active_video_anomaly_id, "")
         )
         self._filmstrip_candidate_override = context
-        self._update_filmstrip()
         pane = (
             self._active_pane
             if self._active_pane in self.regular_panes
@@ -3664,12 +3700,49 @@ class PassageReviewSurface(QDialog):
         )
         candidate_path, _start_ms, _end_ms, position_ms, _anchors, *_ = context
         pane_path = pane.location.video_path if pane.location is not None else None
+        if pane_path is None or pane_path.resolve() != candidate_path.resolve():
+            event = self.passage_store.get(self._selected_event_id)
+            candidate_segment_id = str(getattr(candidate, "segment_id", "")).strip()
+            if event is not None:
+                lookup = self.timeline_store.locate_passage(
+                    int(getattr(candidate, "peak_at_ms", 0)),
+                    race_id=event.race_id,
+                )
+                target_location = next(
+                    (
+                        location
+                        for location in lookup.locations
+                        if int(location.segment.camera_index) == int(pane.camera_index)
+                        and (
+                            not candidate_segment_id
+                            or location.segment.segment_id == candidate_segment_id
+                        )
+                        and location.status in _OPENABLE_STATUSES
+                    ),
+                    None,
+                )
+                if target_location is not None:
+                    self._activate_pane(pane, align=False)
+                    pane.set_passage(
+                        event,
+                        target_location,
+                        initial_delta_ms=(
+                            int(position_ms)
+                            - int(target_location.passage_position_ms)
+                        ),
+                    )
+                    self._shared_delta_ms = int(
+                        position_ms - target_location.passage_position_ms
+                    )
+                    self._update_shared_time_label()
+                    pane_path = target_location.video_path
         if pane_path is not None and pane_path.resolve() == candidate_path.resolve():
             self._activate_pane(pane, align=False)
             pane.seek_passage_delta(
                 position_ms - int(getattr(pane, "_target_position_ms", 0)),
                 preview=True,
             )
+        self._update_filmstrip()
         self.video_filmstrip.set_current_position(position_ms)
         self._pending_filmstrip_preview_position = position_ms
         return True
@@ -6168,6 +6241,18 @@ class PassageReviewSurface(QDialog):
         else:
             self._update_filmstrip()
 
+    def _fallback_candidate_filmstrip_context(
+        self,
+        camera_index: int,
+    ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:
+        for candidate in self._video_navigation_candidates:
+            if int(getattr(candidate, "camera_index", 0)) != int(camera_index):
+                continue
+            context = self._video_candidate_filmstrip_context(candidate)
+            if context is not None:
+                return context
+        return None
+
     def _filmstrip_context_for_active_pane(
         self,
     ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:
@@ -6182,7 +6267,7 @@ class PassageReviewSurface(QDialog):
         )
         location = pane.location
         if location is None or not location.video_path.is_file():
-            return None
+            return self._fallback_candidate_filmstrip_context(pane.camera_index)
         duration_ms = int(
             location.segment.media_duration_ms
             or getattr(pane, "_duration_ms", 0)
@@ -6198,12 +6283,30 @@ class PassageReviewSurface(QDialog):
             if projected.segment.segment_id != location.segment.segment_id:
                 continue
             positions.append(int(projected.passage_position_ms))
+        location_path = location.video_path.resolve()
+        candidate_matched = False
         for candidate in self._video_navigation_candidates:
             if int(getattr(candidate, "camera_index", 0)) != int(pane.camera_index):
                 continue
-            if str(getattr(candidate, "segment_id", "")) != location.segment.segment_id:
+            candidate_segment_id = str(getattr(candidate, "segment_id", "")).strip()
+            candidate_path_text = str(getattr(candidate, "video_path", "")).strip()
+            same_segment = candidate_segment_id == location.segment.segment_id
+            same_path = False
+            if candidate_path_text:
+                try:
+                    same_path = Path(candidate_path_text).expanduser().resolve() == location_path
+                except OSError:
+                    same_path = False
+            if not (same_segment or same_path):
                 continue
-            positions.append(int(getattr(candidate, "video_position_ms", 0)))
+            candidate_matched = True
+            position = int(getattr(candidate, "video_position_ms", 0))
+            if position >= 0:
+                positions.append(position)
+        if self._video_navigation_candidates and not candidate_matched:
+            fallback = self._fallback_candidate_filmstrip_context(pane.camera_index)
+            if fallback is not None:
+                return fallback
         if not positions:
             positions.append(int(location.passage_position_ms))
         # Before the playback worker emits its first frame, the pane reports
