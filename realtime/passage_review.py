@@ -2445,7 +2445,8 @@ class PassageReviewSurface(QDialog):
     concrete windows are siblings so neither owns the other's lifecycle.
     """
     INACTIVE_CAMERA_START_DELAY_MS = 120
-    FILMSTRIP_WINDOW_MS = 300_000
+    # Keep the locating surface aligned with the two-minute visual scan core.
+    FILMSTRIP_WINDOW_MS = 120_000
     FILMSTRIP_ALWAYS_AVAILABLE = True
     VIDEO_ASSIST_ENABLED = True
     # Automatic gap seeking can hide riders whose chips were not read. Keep it
@@ -2991,6 +2992,18 @@ class PassageReviewSurface(QDialog):
         self.preview_confirm_btn = QPushButton("预览确认", self)
         self.preview_confirm_btn.setToolTip("确认顶部预览画面上的当前标线")
         self.preview_confirm_btn.setEnabled(False)
+        self.previous_batch_btn = QPushButton("上一批")
+        self.previous_batch_btn.setToolTip("上一段 2 分钟视频")
+        self.previous_batch_btn.setFixedWidth(58)
+        self.previous_batch_btn.clicked.connect(
+            lambda: self._move_filmstrip_batch(-1)
+        )
+        self.next_batch_btn = QPushButton("下一批")
+        self.next_batch_btn.setToolTip("下一段 2 分钟视频")
+        self.next_batch_btn.setFixedWidth(58)
+        self.next_batch_btn.clicked.connect(
+            lambda: self._move_filmstrip_batch(1)
+        )
         self.previous_passage_btn = QPushButton("▲")
         self.previous_passage_btn.setToolTip("上一条")
         self.previous_frame_btn = QPushButton("|◀")
@@ -3040,6 +3053,8 @@ class PassageReviewSurface(QDialog):
         self.transport_layout.addWidget(self.play_both_btn)
         self.transport_layout.addWidget(self.next_frame_btn)
         self.transport_layout.addWidget(self.auto_advance_checkbox)
+        self.transport_layout.addWidget(self.previous_batch_btn)
+        self.transport_layout.addWidget(self.next_batch_btn)
         self.transport_layout.addWidget(self.previous_passage_btn)
         self.transport_layout.addWidget(self.next_passage_btn)
         self.transport_layout.addWidget(self.fullscreen_btn)
@@ -5797,6 +5812,7 @@ class PassageReviewSurface(QDialog):
         *,
         preserve_current_frame: Optional[PassageEvidencePane] = None,
     ) -> None:
+        self._video_candidate_anchor_time_ms = None
         if preserve_current_frame is None and self._batch_mode:
             active_pane = self._active_playback_pane()
             if getattr(active_pane, "_current_frame_index", -1) >= 0:
@@ -6087,6 +6103,7 @@ class PassageReviewSurface(QDialog):
         camera_index = max(1, int(getattr(candidate, "camera_index", 1)))
         offset_ms = self._clock_offset_for_camera(camera_index)
         candidate_time_ms = int(getattr(candidate, "peak_at_ms", 0))
+        self._video_candidate_anchor_time_ms = candidate_time_ms
         nearest = min(
             self._visible_events,
             key=lambda event: abs(
@@ -6097,6 +6114,40 @@ class PassageReviewSurface(QDialog):
             self._select_event(nearest.event_id)
         self._update_filmstrip()
         return True
+
+    def _archive_location_for_filmstrip(
+        self,
+        pane: PassageEvidencePane,
+        anchor_time_ms: int,
+    ) -> Optional[PassageVideoLocation]:
+        event = self.passage_store.get(self._selected_event_id)
+        metadata = self._current_metadata()
+        race_id = (
+            event.race_id
+            if event is not None
+            else metadata.race_id if metadata is not None else None
+        )
+        try:
+            lookup = self.timeline_store.locate_passage(
+                int(anchor_time_ms),
+                race_id=race_id,
+                prefer_continuous_media=True,
+            )
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return next(
+            (
+                location
+                for location in lookup.locations
+                if int(location.segment.camera_index) == int(pane.camera_index)
+                and location.segment.clock_source == DEFAULT_CLOCK_SOURCE
+                and not str(location.segment.segment_id).startswith("preview-")
+                and location.status
+                in {"located", "near_boundary", "unverified", "recording"}
+                and self.timeline_store.video_path_is_playable(location.video_path)
+            ),
+            None,
+        )
 
     def _filmstrip_context_for_active_pane(
         self,
@@ -6109,6 +6160,43 @@ class PassageReviewSurface(QDialog):
             else self.regular_pane
         )
         location = pane.location
+        selected_event = self.passage_store.get(self._selected_event_id)
+        offset_ms = self._clock_offset_for_camera(int(pane.camera_index))
+        event_anchor_ms = (
+            int(selected_event.timeline_timestamp_ms) + int(offset_ms)
+            if selected_event is not None
+            else None
+        )
+        candidate_anchor_ms = getattr(
+            self,
+            "_video_candidate_anchor_time_ms",
+            None,
+        )
+        anchor_time_ms = (
+            int(candidate_anchor_ms)
+            if candidate_anchor_ms is not None
+            else event_anchor_ms
+        )
+        is_preview_location = bool(
+            location is not None
+            and (
+                str(getattr(location.segment, "segment_id", "")).startswith(
+                    "preview-"
+                )
+                or location.video_path.suffix.lower() == ".m3u8"
+            )
+        )
+        if (
+            anchor_time_ms is not None
+            and (location is None or is_preview_location)
+            and not str(getattr(location, "media_locator", "")).strip()
+        ):
+            archive_location = self._archive_location_for_filmstrip(
+                pane,
+                anchor_time_ms,
+            )
+            if archive_location is not None:
+                location = archive_location
         if location is None or not location.video_path.is_file():
             return None
         duration_ms = int(
@@ -6118,20 +6206,17 @@ class PassageReviewSurface(QDialog):
         )
         if duration_ms <= 0:
             return None
-        positions: list[int] = []
-        for event in self._visible_events:
-            projected = self._location_on_current_media(event, pane)
-            if projected is None:
-                continue
-            if projected.segment.segment_id != location.segment.segment_id:
-                continue
-            positions.append(int(projected.passage_position_ms))
         media_start_ms = (
             int(location.segment.media_started_at_ms)
             if location.segment.media_started_at_ms is not None
             else int(location.segment.started_at_ms)
         )
         media_end_ms = media_start_ms + duration_ms
+        positions: list[int] = []
+        for event in self._visible_events:
+            event_time_ms = int(event.timeline_timestamp_ms) + int(offset_ms)
+            if media_start_ms <= event_time_ms <= media_end_ms:
+                positions.append(event_time_ms - media_start_ms)
         for candidate in self._video_navigation_candidates:
             if int(getattr(candidate, "camera_index", 0)) != int(pane.camera_index):
                 continue
@@ -6155,11 +6240,17 @@ class PassageReviewSurface(QDialog):
         current_frame_index = int(getattr(pane, "_current_frame_index", -1))
         current_position = int(getattr(pane, "_current_position_ms", 0))
         target_position = int(getattr(pane, "_target_position_ms", 0))
-        center = (
-            target_position
-            if current_frame_index < 0
-            else current_position
-        )
+        if anchor_time_ms is not None:
+            center = max(
+                0,
+                min(duration_ms - 1, int(anchor_time_ms) - media_start_ms),
+            )
+        else:
+            center = (
+                target_position
+                if current_frame_index < 0
+                else current_position
+            )
         filmstrip_window_ms = (
             120_000 if self._low_resource_mode else self.FILMSTRIP_WINDOW_MS
         )
@@ -6490,6 +6581,50 @@ class PassageReviewSurface(QDialog):
         else:
             self._preview_both_delta(target_delta_ms)
 
+    def _move_filmstrip_batch(self, direction: int) -> None:
+        """Advance the locating surface by one two-minute video batch."""
+
+        context = self._filmstrip_context
+        absolute_window = self._filmstrip_absolute_window
+        if context is None or absolute_window is None:
+            return
+        step_ms = max(1, int(self.FILMSTRIP_WINDOW_MS))
+        target_start_ms = int(absolute_window[0]) + (
+            step_ms if int(direction) >= 0 else -step_ms
+        )
+        target_anchor_ms = target_start_ms + step_ms // 2
+        pane = (
+            self._active_pane
+            if self._active_pane in self.regular_panes
+            else self.regular_pane
+        )
+        if self._archive_location_for_filmstrip(pane, target_anchor_ms) is None:
+            return
+        events = tuple(
+            event
+            for event in self._visible_events
+            if target_start_ms
+            <= int(event.timeline_timestamp_ms)
+            + self._clock_offset_for_camera(int(pane.camera_index))
+            < target_start_ms + step_ms
+        )
+        if events:
+            nearest = min(
+                events,
+                key=lambda event: abs(
+                    int(event.timeline_timestamp_ms)
+                    + self._clock_offset_for_camera(int(pane.camera_index))
+                    - target_anchor_ms
+                ),
+            )
+            self._select_event(nearest.event_id, preserve_current_frame=pane)
+        self._video_candidate_anchor_time_ms = target_anchor_ms
+        self._update_filmstrip()
+        next_context = self._filmstrip_context
+        if next_context is not None:
+            self._rebind_pane_to_filmstrip_archive(pane, int(next_context[3]))
+            self.video_filmstrip.set_current_position(int(next_context[3]))
+
     def _seek_filmstrip_position(self, position_ms: int) -> None:
         self._filmstrip_preview_timer.stop()
         self._pending_filmstrip_preview_position = None
@@ -6531,6 +6666,63 @@ class PassageReviewSurface(QDialog):
         )
         QTimer.singleShot(60, lambda: self._toggle_maximized_pane(pane))
 
+    def _rebind_pane_to_filmstrip_archive(
+        self,
+        pane: PassageEvidencePane,
+        position_ms: int,
+    ) -> bool:
+        """Move the judge pane from a chip clip to the two-minute archive batch."""
+
+        context = self._filmstrip_context
+        if context is None:
+            return False
+        event = self.passage_store.get(self._selected_event_id)
+        if event is None:
+            return False
+        filmstrip_path, _start_ms, _end_ms = context
+        absolute_window = self._filmstrip_absolute_window
+        if absolute_window is None:
+            return False
+        media_origin_ms = int(absolute_window[0]) - int(_start_ms)
+        target_absolute_ms = media_origin_ms + int(position_ms)
+        location = self._archive_location_for_filmstrip(
+            pane,
+            target_absolute_ms,
+        )
+        if location is None or location.video_path.resolve() != filmstrip_path.resolve():
+            return False
+        current_path = (
+            pane.location.video_path.resolve()
+            if pane.location is not None
+            else None
+        )
+        current_duration = int(
+            getattr(pane.location.segment, "media_duration_ms", 0)
+            if pane.location is not None
+            else 0
+        )
+        current_position = int(getattr(pane, "_current_position_ms", 0))
+        if (
+            current_path == filmstrip_path.resolve()
+            and 0 <= current_position <= current_duration
+            and current_duration >= int(location.segment.media_duration_ms or 0)
+        ):
+            return False
+        pane.set_passage(
+            event,
+            location,
+            initial_delta_ms=(
+                int(position_ms) - int(location.playback_position_ms)
+            ),
+            lookup_status=location.status,
+        )
+        offset_ms = self._clock_offset_for_camera(int(pane.camera_index))
+        self._shared_delta_ms = target_absolute_ms - (
+            int(event.timeline_timestamp_ms) + int(offset_ms)
+        )
+        self._update_shared_time_label()
+        return True
+
     def _flush_filmstrip_position(self) -> None:
         self._filmstrip_seek_pending = False
         position_ms = self._pending_filmstrip_position
@@ -6567,6 +6759,9 @@ class PassageReviewSurface(QDialog):
             self._pending_filmstrip_position = None
             return
         self._filmstrip_seek_retry_count = 0
+        if self._rebind_pane_to_filmstrip_archive(seek_pane, position_ms):
+            self.video_filmstrip.set_current_position(int(position_ms))
+            return
         target_delta_ms = int(position_ms) - int(seek_pane._target_position_ms)
         # The filmstrip represents the shared race timeline.  Move every
         # visible camera together so each pane applies its own calibrated
