@@ -6126,8 +6126,21 @@ class PassageReviewSurface(QDialog):
             if projected.segment.segment_id != location.segment.segment_id:
                 continue
             positions.append(int(projected.passage_position_ms))
+        media_start_ms = (
+            int(location.segment.media_started_at_ms)
+            if location.segment.media_started_at_ms is not None
+            else int(location.segment.started_at_ms)
+        )
+        media_end_ms = media_start_ms + duration_ms
         for candidate in self._video_navigation_candidates:
             if int(getattr(candidate, "camera_index", 0)) != int(pane.camera_index):
+                continue
+            candidate_time_ms = int(getattr(candidate, "peak_at_ms", 0))
+            if media_start_ms <= candidate_time_ms <= media_end_ms:
+                # Candidate files are short HLS pieces, while the judgment pane
+                # commonly plays a chip-centered preview playlist. Map by the
+                # shared absolute recorder clock instead of segment IDs.
+                positions.append(candidate_time_ms - media_start_ms)
                 continue
             if str(getattr(candidate, "segment_id", "")) != location.segment.segment_id:
                 continue

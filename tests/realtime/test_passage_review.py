@@ -3555,6 +3555,51 @@ def test_video_arrival_queue_defaults_to_active_camera(qapp, tmp_path):
     dialog.close()
 
 
+def test_video_candidate_maps_into_chip_preview_by_absolute_clock(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=15_000))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    video_path = tmp_path / "videos" / "camera_01.mkv"
+    segment = _add_segment(
+        timeline_store,
+        video_path,
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=30_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.show()
+    qapp.processEvents()
+    dialog.set_video_navigation_candidates(
+        (
+            VideoPassageCandidate(
+                "hls-candidate",
+                1,
+                15_900,
+                16_100,
+                16_000,
+                0.3,
+                0.2,
+                segment_id="hls-segment",
+                video_path=str(tmp_path / "review" / "segment.ts"),
+                video_position_ms=200,
+            ),
+        )
+    )
+    dialog._select_event("passage-1")
+    qapp.processEvents()
+
+    context = dialog._filmstrip_context_for_active_pane()
+    assert context is not None
+    assert 6_000 in context[4]
+    dialog.close()
+
+
 def test_ctrl_step_falls_back_to_frame_step_without_visual_candidates(
     qapp,
     tmp_path,
