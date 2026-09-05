@@ -131,6 +131,7 @@ from .video_timeline import (
         DEFAULT_TIMING_ERROR_MS,
         PassageVideoLocation,
         PassageVideoLookup,
+        RecordingSegment,
         VideoTimelineStore,
     )
 from .thread_lifecycle import retire_qthread, track_qthread
@@ -4557,6 +4558,63 @@ class FinishReviewWindow(PassageReviewSurface):
             self._publisher = publisher
             self._capture_windows = replacement_windows
         self._lookup_cache.clear()
+
+    def _live_location_for_filmstrip(
+        self,
+        pane,
+        anchor_time_ms: int,
+    ) -> PassageVideoLocation | None:
+        """Expose the current rolling HLS window before archive sealing."""
+
+        ring_buffers = getattr(self, "_ring_buffers", {})
+        ring_buffer = ring_buffers.get(int(getattr(pane, "camera_index", 0)))
+        if ring_buffer is None:
+            return None
+        playlist_path = Path(ring_buffer.playlist_path)
+        if not playlist_path.is_file():
+            return None
+        segments = tuple(ring_buffer.segments())
+        if not segments:
+            return None
+        first = segments[0]
+        last = segments[-1]
+        media_started_at_ms = int(first.started_at_ms)
+        media_ended_at_ms = int(last.ended_at_ms)
+        anchor_time_ms = int(anchor_time_ms)
+        if not media_started_at_ms <= anchor_time_ms <= media_ended_at_ms:
+            return None
+        duration_ms = media_ended_at_ms - media_started_at_ms
+        if duration_ms <= 0:
+            return None
+        event = self.passage_store.get(self._selected_event_id)
+        race_id = event.race_id if event is not None else ""
+        segment = RecordingSegment(
+            segment_id=(
+                f"live-filmstrip-{ring_buffer.camera_index}-"
+                f"{ring_buffer.segment_revision}"
+            ),
+            source_id=ring_buffer.source_id,
+            camera_index=ring_buffer.camera_index,
+            video_path=str(playlist_path),
+            started_at_ms=media_started_at_ms,
+            ended_at_ms=media_ended_at_ms,
+            media_duration_ms=duration_ms,
+            media_started_at_ms=media_started_at_ms,
+            clock_source=DEFAULT_CLOCK_SOURCE,
+            timing_error_ms=DEFAULT_TIMING_ERROR_MS,
+            end_reason="live_filmstrip_batch",
+            race_id=race_id,
+        )
+        position_ms = anchor_time_ms - media_started_at_ms
+        return PassageVideoLocation(
+            segment=segment,
+            video_path=playlist_path,
+            passage_position_ms=position_ms,
+            playback_position_ms=max(0, position_ms - self.pre_roll_ms),
+            clock_offset_ms=0,
+            timing_error_ms=DEFAULT_TIMING_ERROR_MS,
+            status="unverified",
+        )
 
     def _recording_stall_error(
         self,

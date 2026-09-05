@@ -6115,6 +6115,15 @@ class PassageReviewSurface(QDialog):
         self._update_filmstrip()
         return True
 
+    def _live_location_for_filmstrip(
+        self,
+        pane: PassageEvidencePane,
+        anchor_time_ms: int,
+    ) -> Optional[PassageVideoLocation]:
+        """Return a live rolling source when a concrete window provides one."""
+
+        return None
+
     def _archive_location_for_filmstrip(
         self,
         pane: PassageEvidencePane,
@@ -6191,11 +6200,21 @@ class PassageReviewSurface(QDialog):
             and (location is None or is_preview_location)
             and not str(getattr(location, "media_locator", "")).strip()
         ):
-            archive_location = self._archive_location_for_filmstrip(
+            live_location = self._live_location_for_filmstrip(
                 pane,
                 anchor_time_ms,
             )
-            if archive_location is not None:
+            archive_location = (
+                None
+                if live_location is not None
+                else self._archive_location_for_filmstrip(
+                    pane,
+                    anchor_time_ms,
+                )
+            )
+            if live_location is not None:
+                location = live_location
+            elif archive_location is not None:
                 location = archive_location
         if location is None or not location.video_path.is_file():
             return None
@@ -6598,7 +6617,10 @@ class PassageReviewSurface(QDialog):
             if self._active_pane in self.regular_panes
             else self.regular_pane
         )
-        if self._archive_location_for_filmstrip(pane, target_anchor_ms) is None:
+        if (
+            self._live_location_for_filmstrip(pane, target_anchor_ms) is None
+            and self._archive_location_for_filmstrip(pane, target_anchor_ms) is None
+        ):
             return
         events = tuple(
             event
@@ -6685,7 +6707,10 @@ class PassageReviewSurface(QDialog):
             return False
         media_origin_ms = int(absolute_window[0]) - int(_start_ms)
         target_absolute_ms = media_origin_ms + int(position_ms)
-        location = self._archive_location_for_filmstrip(
+        location = self._live_location_for_filmstrip(
+            pane,
+            target_absolute_ms,
+        ) or self._archive_location_for_filmstrip(
             pane,
             target_absolute_ms,
         )
