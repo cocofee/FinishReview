@@ -5,6 +5,7 @@ from urllib.request import Request
 import pytest
 
 from realtime import racetiger_source as racetiger_source_module
+from realtime.racetiger_source import split_racetiger_endpoint
 from realtime.passage_receiver import PassageEvent, PassageEventStore
 from realtime.racetiger_source import (
     RaceTigerClient,
@@ -472,6 +473,26 @@ def test_racetiger_client_reports_closed_event_data_interface():
 def test_racetiger_client_rejects_insecure_or_invalid_base_url(base_url):
     with pytest.raises(ValueError):
         RaceTigerClient(base_url, "placeholder")
+
+
+def test_split_racetiger_endpoint_accepts_legacy_pasted_link():
+    assert split_racetiger_endpoint(
+        "https://rqs.racetigertiming.com/Dif/info?pc=000001&rid=105834&token=secret"
+    ) == (
+        "https://rqs.racetigertiming.com",
+        "000001",
+        "105834",
+        "secret",
+    )
+
+
+def test_split_racetiger_endpoint_leaves_plain_base_url_unchanged():
+    assert split_racetiger_endpoint("https://rqs.racetigertiming.com") == (
+        "https://rqs.racetigertiming.com",
+        "",
+        "",
+        "",
+    )
 
 
 @pytest.mark.parametrize(

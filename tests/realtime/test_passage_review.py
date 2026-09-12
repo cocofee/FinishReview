@@ -265,6 +265,39 @@ def test_empty_preview_keeps_time_filmstrip_visible(qapp, tmp_path):
     dialog.close()
 
 
+def test_reused_filmstrip_window_does_not_restart_activity_analysis(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    video_path = tmp_path / "continuous.mkv"
+    video_path.write_bytes(b"video")
+    dialog._filmstrip_context = (video_path, 0, 10_000)
+    dialog._filmstrip_absolute_window = (100_000, 110_000)
+    monkeypatch.setattr(
+        dialog,
+        "_filmstrip_context_for_active_pane",
+        lambda: (
+            video_path,
+            1_000,
+            11_000,
+            5_000,
+            (5_000,),
+            101_000,
+            111_000,
+        ),
+    )
+    dialog._update_filmstrip()
+
+    assert dialog._filmstrip_context == (video_path, 0, 10_000)
+    assert not hasattr(dialog, "activity_timeline")
+    dialog.close()
+
+
 def test_review_uses_one_row_per_passage_and_opens_regular_video(
     qapp,
     tmp_path,
@@ -306,6 +339,63 @@ def test_review_uses_one_row_per_passage_and_opens_regular_video(
     assert opened[0][0].event_id == "passage-1"
     assert opened[0][1].passage_position_ms == 5_500
     assert opened[0][1].playback_position_ms == 2_500
+    dialog.close()
+
+
+def test_double_click_relocates_passage_after_row_selection_preserved_old_frame(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-1", sequence=1, passage_time_ms=15_000, bib="1")
+    )
+    passage_store.append(
+        _event(event_id="passage-2", sequence=2, passage_time_ms=35_000, bib="2")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    video_path = tmp_path / "videos" / "camera_01.mkv"
+    _add_segment(
+        timeline_store,
+        video_path,
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=50_000,
+    )
+    opened = []
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        pre_roll_ms=3_000,
+        open_location=lambda event, location: opened.append((event, location)),
+    )
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    worker = pane._worker
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 35_000, 1_750)
+    qapp.processEvents()
+
+    dialog.table.setCurrentCell(1, 1)
+    dialog.table.selectRow(1)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-2"
+    assert dialog._shared_delta_ms == 10_000
+    assert pane._current_position_ms == 35_000
+
+    dialog._open_preferred_source(1, 1)
+    qapp.processEvents()
+
+    assert dialog._shared_delta_ms == 0
+    assert pane._target_position_ms == 25_000
+    assert worker.seek_calls[-1] == 23_000
+    # A roster double-click locates the continuous camera timeline in-place;
+    # it no longer opens the legacy short evidence clip.
+    assert opened == []
     dialog.close()
 
 

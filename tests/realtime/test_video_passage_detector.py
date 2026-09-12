@@ -862,6 +862,46 @@ def test_scan_worker_publishes_each_segment_before_archive_scan_finishes(
     ]
 
 
+def test_scan_worker_can_run_once_and_exit_after_archive_scan(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    segment = SimpleNamespace(
+        segment_id="segment-01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=11_000,
+        video_path=video_path.name,
+    )
+    scan_calls = []
+    monkeypatch.setattr(
+        detector_module,
+        "scan_video_file",
+        lambda *_args, **_kwargs: scan_calls.append(True) or (),
+    )
+    worker = VideoPassageScanWorker(
+        lambda: (segment,),
+        lambda _items: None,
+        width=16,
+        height=12,
+        interval_seconds=0.5,
+        continuous=False,
+        path_resolver=lambda item: tmp_path / item.video_path,
+    )
+
+    worker.start()
+    for _ in range(100):
+        if not worker.is_running:
+            break
+        time.sleep(0.01)
+
+    assert scan_calls == [True]
+    assert not worker.is_running
+    worker.stop()
+
+
 def test_scan_worker_holds_cleanup_lease_while_scanning(tmp_path, monkeypatch):
     video_path = tmp_path / "camera_01.ts"
     video_path.write_bytes(b"video")

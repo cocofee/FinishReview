@@ -1,10 +1,31 @@
 import json
 
 from realtime.passage_evidence import (
+    ContinuousMarkerStore,
     HIGH_SPEED_SOURCE,
     REGULAR_SOURCE,
     PassageEvidenceAssociationStore,
 )
+
+
+def test_continuous_marker_store_persists_unknown_markers(tmp_path):
+    journal_path = tmp_path / "continuous_markers.jsonl"
+    store = ContinuousMarkerStore(journal_path)
+
+    marker = store.create(
+        camera_index=1,
+        segment_id="segment-camera-1",
+        frame_index=42,
+        position_ms=3_200,
+        marker_x_normalized=0.4,
+        marker_y_normalized=0.6,
+        confirmed_at_ms=1_000,
+    )
+
+    reopened = ContinuousMarkerStore(journal_path)
+    assert reopened.markers() == (marker,)
+    assert reopened.clear(marker.marker_id, confirmed_at_ms=2_000)
+    assert reopened.markers() == ()
 
 
 def _confirm(store, *, source=REGULAR_SOURCE, x=0.25, confirmed_at_ms=1_000):

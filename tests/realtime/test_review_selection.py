@@ -87,3 +87,31 @@ def test_prepare_reuses_same_media_during_batch_switch(tmp_path):
     assert plan.same_batch_media is True
     assert plan.preserve_media is True
     assert plan.switching_batch_event is True
+
+
+def test_prepare_locate_target_does_not_preserve_current_media(tmp_path):
+    video_path = tmp_path / "continuous.mkv"
+    video_path.touch()
+    location = _location(video_path)
+    stale_location = _location(tmp_path / "stale.mkv")
+    review = _Review({1: location}, batch_mode=True)
+    review.regular_panes[0].location = location
+    review._selected_event_id = "new"
+    review._location_on_current_media = lambda _event, _pane: stale_location
+    controller = ReviewSelectionController(
+        review,
+        high_speed_location=lambda _lookup: None,
+        openable_statuses=frozenset({"located"}),
+    )
+
+    plan = controller.prepare(
+        SimpleNamespace(event_id="new"),
+        SimpleNamespace(),
+        preserve_current_frame=review.regular_panes[0],
+        locate_target=True,
+    )
+
+    assert plan.regular_locations[1] is location
+    assert plan.reuse_continuous_media is False
+    assert plan.same_batch_media is False
+    assert plan.preserve_media is False

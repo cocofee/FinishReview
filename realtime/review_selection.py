@@ -18,6 +18,7 @@ class ReviewSelectionPlan:
     same_batch_media: bool
     preserve_media: bool
     switching_batch_event: bool
+    locate_target: bool = False
 
 
 class ReviewSelectionController:
@@ -34,7 +35,13 @@ class ReviewSelectionController:
         self._high_speed_location = high_speed_location
         self._openable_statuses = openable_statuses
 
-    def select(self, event_id: str, *, preserve_current_frame: Any = None) -> None:
+    def select(
+        self,
+        event_id: str,
+        *,
+        preserve_current_frame: Any = None,
+        locate_target: bool = False,
+    ) -> None:
         review = self._review
         if review._active_video_discovered_entry_id:
             review._active_video_discovered_entry_id = ""
@@ -50,6 +57,7 @@ class ReviewSelectionController:
             event,
             lookup,
             preserve_current_frame=preserve_current_frame,
+            locate_target=locate_target,
         )
         review._apply_selection_plan(
             plan,
@@ -62,16 +70,34 @@ class ReviewSelectionController:
         lookup: Any,
         *,
         preserve_current_frame: Any = None,
+        locate_target: bool = False,
     ) -> ReviewSelectionPlan:
         review = self._review
-        regular_locations = {
-            pane.camera_index: review._regular_location_for_camera(
-                lookup,
-                pane.camera_index,
+        regular_locations = {}
+        for pane in review.regular_panes:
+            if locate_target and hasattr(review, "_continuous_lookup_for_camera"):
+                # A roster double-click means "locate this passage on the
+                # continuous recording".  The normal lookup may still point
+                # at a short evidence clip (or an old saved association), so
+                # deliberately bypass it for the regular camera panes.
+                continuous_lookup = review._continuous_lookup_for_camera(
+                    event,
+                    pane.camera_index,
+                )
+                location = review._regular_location_for_camera(
+                    continuous_lookup,
+                    pane.camera_index,
+                )
+                if location is not None:
+                    regular_locations[pane.camera_index] = location
+                    continue
+            regular_locations[pane.camera_index] = (
+                review._regular_location_for_camera(
+                    lookup,
+                    pane.camera_index,
+                )
             )
-            for pane in review.regular_panes
-        }
-        if preserve_current_frame is not None:
+        if preserve_current_frame is not None and not locate_target:
             # Changing the roster identity must not move either linked camera
             # to that identity's nominal recording. Keep every loaded regular
             # pane on its current media; the operator advances video explicitly.
@@ -82,7 +108,7 @@ class ReviewSelectionController:
 
         regular = review._regular_summary_location(event.event_id, lookup)
         high_speed = self._high_speed_location(lookup)
-        reuse_continuous_media = (
+        reuse_continuous_media = not locate_target and (
             review._batch_mode or preserve_current_frame is not None
         ) and any(
             pane.location is not None
@@ -94,22 +120,41 @@ class ReviewSelectionController:
             reuse_continuous_media
             and review._selected_event_id != event.event_id
         )
-        preserve_media = (
-            review._selected_event_id == event.event_id
-            and all(
-                pane.matches_passage_context(
+        primary_pane = getattr(review, "regular_pane", review.regular_panes[0])
+        preserve_media = not locate_target and (
+            (
+                review._selected_event_id == event.event_id
+                # Camera 1 is the authoritative continuous review surface.
+                # Missing/late secondary-camera media must not cause a roster
+                # click to reload or seek the current judgment frame.
+                and primary_pane.matches_passage_context(
                     event,
-                    regular_locations.get(pane.camera_index),
+                    regular_locations.get(primary_pane.camera_index),
                 )
-                for pane in review.regular_panes
             )
-            and (
-                not review._show_high_speed_pane
-                or review.high_speed_pane.matches_passage_context(event, high_speed)
-            )
-        ) or reuse_continuous_media
+            or reuse_continuous_media
+        )
 
         active_pane = review._active_pane
+        if locate_target:
+            # The locate command is defined by ordinary camera-1 time.  Make
+            # that pane the visible judgment surface even if the operator was
+            # previously looking at a high-speed pane.
+            continuous_pane = next(
+                (
+                    pane
+                    for pane in review.regular_panes
+                    if (
+                        regular_locations.get(pane.camera_index) is not None
+                        and regular_locations[pane.camera_index].status
+                        in self._openable_statuses
+                        and regular_locations[pane.camera_index].video_path.is_file()
+                    )
+                ),
+                None,
+            )
+            if continuous_pane is not None:
+                active_pane = continuous_pane
         active_location = (
             regular_locations.get(active_pane.camera_index)
             if active_pane in review.regular_panes
@@ -156,4 +201,5 @@ class ReviewSelectionController:
             same_batch_media=same_batch_media,
             preserve_media=preserve_media,
             switching_batch_event=switching_batch_event,
+            locate_target=bool(locate_target),
         )

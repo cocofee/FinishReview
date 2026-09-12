@@ -16,6 +16,10 @@ from .thread_lifecycle import retire_qthread, track_qthread
 from .time_domain import DurationMs, MediaPositionMs, WallClockMs
 
 DEFAULT_FILMSTRIP_INTERVAL_MS = 2_000
+# Continuous camera review uses a denser rail because several riders can cross
+# between adjacent two-second overview thumbnails. The generic widget keeps
+# its historical default; the review surface opts into this interval explicitly.
+CONTINUOUS_FILMSTRIP_INTERVAL_MS = 500
 FILMSTRIP_TILE_WIDTH = 360
 # Leave room within the 320px filmstrip panel for the timestamp caption and
 # horizontal scrollbar. At 240px the caption was clipped on scaled displays.
@@ -72,10 +76,18 @@ class VideoFilmstripWorker(QThread):
     frame_ready = pyqtSignal(QImage, int, int)
     failed = pyqtSignal(str)
 
-    def __init__(self, video_path: Path, positions_ms: Iterable[int], parent=None):
+    def __init__(
+        self,
+        video_path: Path,
+        positions_ms: Iterable[int],
+        parent=None,
+        *,
+        sequential_window: bool = False,
+    ):
         super().__init__(parent)
         self.video_path = Path(video_path)
         self.positions_ms = tuple(int(value) for value in positions_ms)
+        self.sequential_window = bool(sequential_window)
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -98,6 +110,72 @@ class VideoFilmstripWorker(QThread):
             return int(expected)
         return max(0, int(rounded) - 1)
 
+    def _emit_thumbnail(self, frame, position_ms: int, frame_index: int) -> None:
+        height, width = frame.shape[:2]
+        if width <= 0 or height <= 0:
+            return
+        scale = min(1.0, FILMSTRIP_TILE_WIDTH / float(width))
+        size = (
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        )
+        if size != (width, height):
+            frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = QImage(
+            rgb.data,
+            rgb.shape[1],
+            rgb.shape[0],
+            rgb.strides[0],
+            QImage.Format_RGB888,
+        ).copy()
+        self.frame_ready.emit(image, int(position_ms), int(frame_index))
+
+    def _run_sequential_window(self, capture, fps: float) -> None:
+        positions = tuple(sorted(set(self.positions_ms)))
+        if not positions:
+            return
+        first_frame = max(0, int(round(positions[0] * fps / 1000.0)))
+        last_frame = max(first_frame, int(round(positions[-1] * fps / 1000.0)))
+        sequential_source = self.video_path.suffix.lower() == ".m3u8"
+        next_frame = 0 if sequential_source else first_frame
+        if not sequential_source and not capture.set(
+            cv2.CAP_PROP_POS_FRAMES,
+            first_frame,
+        ):
+            # Some backends reject frame seeks. Fall back to decoding from the
+            # beginning while retaining the same completeness check.
+            next_frame = 0
+        target_index = 0
+        while target_index < len(positions):
+            if self._stop_requested:
+                return
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                self.failed.emit(
+                    "当前窗口在视频位置 "
+                    f"{next_frame * 1000.0 / max(0.1, fps):.0f} ms 解码中断"
+                )
+                return
+            actual_frame = self._reported_frame_index(capture, next_frame)
+            if actual_frame < next_frame:
+                actual_frame = next_frame
+            while (
+                target_index < len(positions)
+                and int(round(positions[target_index] * fps / 1000.0)) <= actual_frame
+            ):
+                self._emit_thumbnail(
+                    frame,
+                    positions[target_index],
+                    actual_frame,
+                )
+                target_index += 1
+            next_frame = max(next_frame + 1, actual_frame + 1)
+            if actual_frame >= last_frame and target_index >= len(positions):
+                break
+        if target_index < len(positions):
+            self.failed.emit("当前窗口存在未解码的录像位置")
+
     def run(self) -> None:
         capture = cv2.VideoCapture(str(self.video_path))
         if not capture.isOpened():
@@ -105,6 +183,9 @@ class VideoFilmstripWorker(QThread):
             return
         try:
             fps = max(0.1, float(capture.get(cv2.CAP_PROP_FPS) or 0.0))
+            if self.sequential_window:
+                self._run_sequential_window(capture, fps)
+                return
             positions = self.positions_ms
             sequential_source = self.video_path.suffix.lower() == ".m3u8"
             ordered_positions = (
@@ -173,16 +254,7 @@ class VideoFilmstripWorker(QThread):
                     capture_next_frame = -1
                     continue
                 capture_next_frame = actual_frame_index + 1
-                height, width = frame.shape[:2]
-                if width <= 0 or height <= 0:
-                    continue
-                scale = min(1.0, FILMSTRIP_TILE_WIDTH / float(width))
-                size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-                if size != (width, height):
-                    frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format_RGB888).copy()
-                self.frame_ready.emit(image, position_ms, frame_index)
+                self._emit_thumbnail(frame, position_ms, frame_index)
         except Exception as error:  # pragma: no cover
             self.failed.emit(str(error))
         finally:
@@ -371,7 +443,30 @@ class FilmstripCanvas(QWidget):
                     int(4 + FILMSTRIP_TILE_HEIGHT),
                 )
                 painter.drawEllipse(int(marker_x - 5), int(marker_y - 5), 10, 10)
-        # The active frame is usually between two 2-second thumbnails. Draw a
+        # Historical markers are part of the continuous timeline, not the
+        # currently selected athlete. Draw them across the visible strip so
+        # nearby riders remain distinguishable while the operator scans.
+        if frames and self.owner._history_markers:
+            for marker_position, marker_label in self.owner._history_markers:
+                if marker_position < int(frames[0].position_ms) or marker_position > int(frames[-1].position_ms):
+                    continue
+                nearest = min(
+                    range(len(frames)),
+                    key=lambda index: abs(int(frames[index].position_ms) - marker_position),
+                )
+                marker_x = 4.0 + nearest * step + FILMSTRIP_TILE_WIDTH / 2.0
+                painter.setPen(QPen(QColor("#2563eb"), 2))
+                painter.drawLine(
+                    int(marker_x), 4,
+                    int(marker_x), 4 + FILMSTRIP_TILE_HEIGHT,
+                )
+                painter.setPen(QColor("#1d4ed8"))
+                painter.drawText(
+                    QRectF(marker_x - 34, 4, 68, 18),
+                    Qt.AlignCenter,
+                    marker_label,
+                )
+        # The active frame is usually between two filmstrip thumbnails. Draw a
         # continuous playhead so the operator can see the exact frame while
         # the lower camera pane is being scrubbed for the next rider.
         playhead_x = None
@@ -526,12 +621,19 @@ class VideoFilmstripWidget(QFrame):
     direction_changed = pyqtSignal(bool)
     visible_range_changed = pyqtSignal(int, int)
     reload_requested = pyqtSignal()
+    ready_changed = pyqtSignal(bool, str)
+    prefetch_finished = pyqtSignal(bool, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._worker: VideoFilmstripWorker | None = None
+        self._prefetch_worker: VideoFilmstripWorker | None = None
+        self._prefetch_path: Path | None = None
+        self._prefetch_error = ""
+        self._operator_busy = False
         self._frames: list[FilmstripFrame] = []
         self._frames_by_path: dict[Path, dict[int, FilmstripFrame]] = {}
+        self._prefetch_positions_by_path: dict[Path, set[int]] = {}
         self._requested_positions: set[int] = set()
         self._target_positions: tuple[int, ...] = ()
         self._deferred_positions: set[int] = set()
@@ -545,9 +647,13 @@ class VideoFilmstripWidget(QFrame):
         self._display_origin_ms: int | None = None
         self._current_position_ms = -1
         self._first_frame_received = False
+        self._expected_positions: set[int] = set()
+        self._decode_error = ""
+        self._ready = False
         self._align_pending = False
         self._marker_mode = False
         self._marker: tuple[int, float, float, int] | None = None
+        self._history_markers: tuple[tuple[int, str], ...] = ()
         self.setObjectName("videoFilmstrip")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumHeight(220)
@@ -604,18 +710,41 @@ class VideoFilmstripWidget(QFrame):
             self._emit_visible_range
         )
         self.content.position_released.connect(self._on_content_position_selected)
-        self.content.position_double_clicked.connect(self.position_double_clicked.emit)
+        self.content.position_double_clicked.connect(
+            self._on_content_position_double_clicked
+        )
         self.content.scrub_position_changed.connect(self.scrub_position_changed.emit)
         self.marker_position_selected.connect(self._on_marker_position_selected)
         layout.addWidget(self.scroll, 1)
 
     def _on_content_position_selected(self, position_ms: int) -> None:
+        if self._expected_positions and not self._ready:
+            return
         position_ms = int(position_ms)
         self._load_deferred_visible_range(
             position_ms - DEFAULT_FILMSTRIP_INTERVAL_MS,
             position_ms + DEFAULT_FILMSTRIP_INTERVAL_MS,
         )
         self.position_selected.emit(position_ms)
+
+    def _on_content_position_double_clicked(self, position_ms: int) -> None:
+        if self._expected_positions and not self._ready:
+            return
+        self.position_double_clicked.emit(int(position_ms))
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self._ready)
+
+    def _set_ready(self, ready: bool, message: str) -> None:
+        next_ready = bool(ready)
+        changed = next_ready != self._ready
+        self._ready = next_ready
+        if message:
+            self.status_label.setText(str(message))
+        self.mark_button.setEnabled(next_ready and bool(self._frames))
+        if changed or message:
+            self.ready_changed.emit(next_ready, str(message))
 
     def _on_marker_position_selected(
         self,
@@ -663,8 +792,17 @@ class VideoFilmstripWidget(QFrame):
         self.mark_button.setChecked(False)
         self.confirm_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
-        self.mark_button.setEnabled(bool(self._frames))
+        self.mark_button.setEnabled(self._ready and bool(self._frames))
         self.content.setCursor(Qt.OpenHandCursor)
+        self.content.update()
+
+    def set_history_markers(self, markers: Iterable[tuple[int, str]]) -> None:
+        """Render confirmed timeline markers without replacing the edit marker."""
+
+        self._history_markers = tuple(
+            (max(0, int(position_ms)), str(label or "待补录"))
+            for position_ms, label in markers
+        )
         self.content.update()
 
     def _on_direction_changed(self, index: int) -> None:
@@ -749,8 +887,11 @@ class VideoFilmstripWidget(QFrame):
 
     def clear(self, message: str = "选择连续判读时间窗") -> None:
         self.stop()
+        self.stop_prefetch()
+        self._prefetch_error = ""
         self._frames.clear()
         self._frames_by_path.clear()
+        self._prefetch_positions_by_path.clear()
         self._requested_positions.clear()
         self._target_positions = ()
         self._deferred_positions.clear()
@@ -761,6 +902,10 @@ class VideoFilmstripWidget(QFrame):
         self._display_reference_ms = None
         self._display_origin_ms = None
         self._first_frame_received = False
+        self._expected_positions.clear()
+        self._decode_error = ""
+        self._history_markers = ()
+        self._set_ready(False, message)
         self._align_pending = False
         self.clear_marker()
         self.content.refresh_geometry()
@@ -788,6 +933,111 @@ class VideoFilmstripWidget(QFrame):
         # destroy a QThread that is still unwinding its decoder call.
         retire_qthread(worker)
 
+    def stop_prefetch(self) -> None:
+        worker = self._prefetch_worker
+        self._prefetch_worker = None
+        self._prefetch_path = None
+        if worker is None:
+            return
+        worker.request_stop()
+        for signal in (worker.frame_ready, worker.failed, worker.finished):
+            try:
+                signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        if worker.isRunning():
+            retire_qthread(worker)
+        else:
+            worker.deleteLater()
+
+    def set_operator_busy(self, busy: bool) -> None:
+        """Pause low-priority future-window decoding during active review."""
+
+        self._operator_busy = bool(busy)
+        if self._operator_busy:
+            self.stop_prefetch()
+
+    def prefetch(
+        self,
+        video_path: Path,
+        start_ms: int,
+        end_ms: int,
+    ) -> None:
+        """Decode a future window into cache without touching the active strip."""
+
+        if self._operator_busy:
+            return
+        path = Path(video_path)
+        positions = tuple(
+            int(value)
+            for value in filmstrip_positions(start_ms, end_ms)
+        )
+        self._prefetch_positions_by_path[path] = set(positions)
+        cache = self._frames_by_path.setdefault(path, {})
+        missing = tuple(sorted(position for position in positions if position not in cache))
+        self.stop_prefetch()
+        self._prefetch_error = ""
+        if not missing:
+            self.prefetch_finished.emit(True, "后续窗口已预取")
+            return
+        self._prefetch_path = path
+        worker = VideoFilmstripWorker(
+            path,
+            missing,
+            self,
+            sequential_window=True,
+        )
+        worker.frame_ready.connect(
+            lambda image, position_ms, frame_index, target=path:
+            self._on_prefetch_frame_ready(
+                target,
+                image,
+                position_ms,
+                frame_index,
+            )
+        )
+        worker.failed.connect(
+            lambda message, target=worker: self._on_prefetch_failed(target, message)
+        )
+        worker.finished.connect(
+            lambda target=worker: self._on_prefetch_worker_finished(target)
+        )
+        self._prefetch_worker = worker
+        track_qthread(worker)
+        worker.start(QThread.LowPriority)
+
+    def _on_prefetch_frame_ready(
+        self,
+        path: Path,
+        image: QImage,
+        position_ms: int,
+        frame_index: int,
+    ) -> None:
+        cache = self._frames_by_path.setdefault(Path(path), {})
+        cache.setdefault(
+            int(position_ms),
+            FilmstripFrame(MediaPositionMs(int(position_ms)), int(frame_index), image),
+        )
+
+    def _on_prefetch_failed(self, worker, message: str) -> None:
+        if worker is not self._prefetch_worker:
+            return
+        self._prefetch_error = str(message)
+        self.prefetch_finished.emit(False, str(message))
+
+    def _on_prefetch_worker_finished(self, worker) -> None:
+        if worker is not self._prefetch_worker:
+            return
+        path = self._prefetch_path
+        self._prefetch_worker = None
+        self._prefetch_path = None
+        if path is None:
+            return
+        worker.deleteLater()
+        if self._prefetch_error:
+            return
+        self.prefetch_finished.emit(True, "后续窗口已预取")
+
     def load(
         self,
         video_path: Path,
@@ -797,13 +1047,32 @@ class VideoFilmstripWidget(QFrame):
         positions_ms: Iterable[int] = (),
         origin_ms: int | None = None,
         defer_remaining: bool = False,
+        require_complete: bool = False,
+        interval_ms: int = DEFAULT_FILMSTRIP_INTERVAL_MS,
     ) -> None:
         path = Path(video_path)
         self.stop()
+        prefetched_path = self._prefetch_path
+        self.stop_prefetch()
+        self._set_ready(False, "正在准备当前两分钟胶卷...")
+        self._decode_error = ""
         if self._video_path != path:
-            # Retain only the active recording file to bound memory across a
-            # long race with many recording segments.
-            self._frames_by_path.clear()
+            # Retain the active and one prefetched recording only. This keeps
+            # the future window warm without allowing a long race to grow the
+            # thumbnail cache without bounds.
+            keep_paths = {path}
+            if prefetched_path is not None:
+                keep_paths.add(prefetched_path)
+            self._frames_by_path = {
+                cached_path: frames
+                for cached_path, frames in self._frames_by_path.items()
+                if cached_path in keep_paths
+            }
+            self._prefetch_positions_by_path = {
+                cached_path: values
+                for cached_path, values in self._prefetch_positions_by_path.items()
+                if cached_path in keep_paths
+            }
             self._frames.clear()
             self._video_path = path
             self._display_origin_ms = (
@@ -814,41 +1083,98 @@ class VideoFilmstripWidget(QFrame):
         self._frames = sorted(self._frames_by_path.get(path, {}).values(), key=lambda value: value.position_ms)
         self._display_start_ms = max(0, int(start_ms))
         self._display_end_ms = max(self._display_start_ms, int(end_ms))
+        cached = self._frames_by_path.get(path, {})
+        allowed = set(self._prefetch_positions_by_path.get(path, set()))
+        allowed.update(
+            position
+            for position in cached
+            if self._display_start_ms <= int(position) <= self._display_end_ms
+        )
+        if len(cached) > len(allowed):
+            cached = {
+                position: frame
+                for position, frame in cached.items()
+                if position in allowed
+            }
+            self._frames_by_path[path] = cached
+            self._frames = sorted(
+                cached.values(), key=lambda value: value.position_ms
+            )
         if self._current_position_ms < 0:
             self._display_reference_ms = self._display_start_ms
         self.content.refresh_geometry()
         self._align_pending = True
         self._schedule_render_pending()
         self._requested_positions = {frame.position_ms for frame in self._frames}
-        self.mark_button.setEnabled(bool(self._frames))
+        self.mark_button.setEnabled(self._ready and bool(self._frames))
         self._pending_positions.clear()
         self._deferred_positions.clear()
-        self.status_label.setText("正在生成时间胶卷...")
         positions = tuple(
             int(value)
-            for value in filmstrip_positions(start_ms, end_ms, anchors=positions_ms)
+            for value in filmstrip_positions(
+                start_ms,
+                end_ms,
+                interval_ms=interval_ms,
+                anchors=positions_ms,
+            )
         )
         self._target_positions = positions
+        self._expected_positions = set(positions) if require_complete else set()
         # The target list defines the full scrollable timeline, including
         # deferred thumbnails. Refresh after assigning it so the scrollbar
         # exposes the complete range before the first deferred-load pass.
         self.content.refresh_geometry()
-        missing = tuple(position for position in positions if position not in self._requested_positions)
-        if missing:
-            # Prioritize the selected athlete's neighborhood so a usable
-            # preview appears quickly; continue the remaining strip later.
-            priority = tuple(sorted(missing, key=lambda value: (abs(value - self._current_position_ms), value)))
-            self._first_frame_received = False
-            initial_positions = priority[:FILMSTRIP_INITIAL_BATCH]
-            self._requested_positions.update(initial_positions)
-            self._start_worker(initial_positions)
-            if not defer_remaining:
-                self._requested_positions.update(priority[FILMSTRIP_INITIAL_BATCH:])
-                self._pending_positions.extend(priority[FILMSTRIP_INITIAL_BATCH:])
-            else:
-                self._deferred_positions.update(priority[FILMSTRIP_INITIAL_BATCH:])
+        if require_complete:
+            missing = tuple(
+                sorted(
+                    position
+                    for position in positions
+                    if position not in self._requested_positions
+                )
+            )
         else:
-            self.status_label.setText(f"{len(self._frames)} 个预览点")
+            missing = tuple(
+                position
+                for position in positions
+                if position not in self._requested_positions
+            )
+        if missing:
+            if require_complete:
+                self._first_frame_received = False
+                # Prepare the active window as one complete batch. A first
+                # handful of thumbnails is not enough to claim readiness.
+                self._requested_positions.update(missing)
+                self._start_worker(missing, sequential_window=True)
+            else:
+                priority = tuple(
+                    sorted(
+                        missing,
+                        key=lambda value: (
+                            abs(value - self._current_position_ms),
+                            value,
+                        ),
+                    )
+                )
+                self._first_frame_received = False
+                initial_positions = priority[:FILMSTRIP_INITIAL_BATCH]
+                self._requested_positions.update(initial_positions)
+                self._start_worker(initial_positions)
+                if not defer_remaining:
+                    self._requested_positions.update(
+                        priority[FILMSTRIP_INITIAL_BATCH:]
+                    )
+                    self._pending_positions.extend(
+                        priority[FILMSTRIP_INITIAL_BATCH:]
+                    )
+                else:
+                    self._deferred_positions.update(
+                        priority[FILMSTRIP_INITIAL_BATCH:]
+                    )
+        else:
+            if require_complete:
+                self._set_ready(True, "当前两分钟胶卷已就绪，可以处理")
+            else:
+                self._set_ready(True, f"{len(self._frames)} 个预览点")
 
     def append_positions(self, video_path: Path, positions_ms: Iterable[int]) -> None:
         if self._video_path != Path(video_path):
@@ -863,10 +1189,20 @@ class VideoFilmstripWidget(QFrame):
             return
         self._start_worker(new_positions)
 
-    def _start_worker(self, positions: Iterable[int]) -> None:
+    def _start_worker(
+        self,
+        positions: Iterable[int],
+        *,
+        sequential_window: bool = False,
+    ) -> None:
         if self._video_path is None:
             return
-        worker = VideoFilmstripWorker(self._video_path, positions, self)
+        worker = VideoFilmstripWorker(
+            self._video_path,
+            positions,
+            self,
+            sequential_window=sequential_window,
+        )
         worker.frame_ready.connect(self._on_frame_ready)
         worker.failed.connect(self._on_worker_failed)
         worker.finished.connect(self._on_worker_finished)
@@ -875,7 +1211,8 @@ class VideoFilmstripWidget(QFrame):
         worker.start()
 
     def _on_worker_failed(self, message: str) -> None:
-        self.status_label.setText(str(message))
+        self._decode_error = str(message)
+        self._set_ready(False, f"胶卷解码失败：{self._decode_error}")
 
     def _on_worker_finished(self) -> None:
         if self.sender() is not self._worker:
@@ -886,7 +1223,18 @@ class VideoFilmstripWidget(QFrame):
             self._pending_positions.clear()
             self._start_worker(pending)
             return
-        self.status_label.setText(f"{len(self._frames)} 个预览点")
+        decoded_positions = set(
+            self._frames_by_path.get(self._video_path, {})
+        )
+        if not self._expected_positions:
+            self._set_ready(True, f"{len(self._frames)} 个预览点")
+            return
+        missing = self._expected_positions.difference(decoded_positions)
+        if self._decode_error or missing:
+            detail = self._decode_error or f"仍有 {len(missing)} 个预览点未解码"
+            self._set_ready(False, f"当前窗口不完整：{detail}")
+            return
+        self._set_ready(True, "当前两分钟胶卷已就绪，可以处理")
 
     def _on_frame_ready(self, image: QImage, position_ms: int, frame_index: int) -> None:
         if self._video_path is None:
@@ -901,10 +1249,17 @@ class VideoFilmstripWidget(QFrame):
             return
         frame_cache[frame.position_ms] = frame
         self._frames = sorted(frame_cache.values(), key=lambda value: value.position_ms)
-        self.mark_button.setEnabled(True)
+        if not self._expected_positions:
+            self._ready = True
+        else:
+            decoded_count = len(self._expected_positions.intersection(frame_cache))
+            self.status_label.setText(
+                f"正在准备当前两分钟胶卷：{decoded_count} / "
+                f"{len(self._expected_positions)}"
+            )
+        self.mark_button.setEnabled(self._ready)
         if not self._first_frame_received:
             self._first_frame_received = True
-            self.status_label.setText("预览已就绪，后台生成剩余胶卷...")
         self._schedule_render_pending()
 
     def _schedule_render_pending(self) -> None:
@@ -924,7 +1279,16 @@ class VideoFilmstripWidget(QFrame):
 
     def closeEvent(self, event) -> None:
         self.stop()
+        self.stop_prefetch()
         super().closeEvent(event)
 
 
-__all__ = ["DEFAULT_FILMSTRIP_INTERVAL_MS", "FILMSTRIP_INITIAL_BATCH", "FilmstripFrame", "FilmstripCanvas", "VideoFilmstripWidget", "filmstrip_positions"]
+__all__ = [
+    "DEFAULT_FILMSTRIP_INTERVAL_MS",
+    "CONTINUOUS_FILMSTRIP_INTERVAL_MS",
+    "FILMSTRIP_INITIAL_BATCH",
+    "FilmstripFrame",
+    "FilmstripCanvas",
+    "VideoFilmstripWidget",
+    "filmstrip_positions",
+]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import uuid
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -45,6 +46,233 @@ def _looks_like_incomplete_json(value: str) -> bool:
 
 class PassageEvidenceError(RuntimeError):
     """Raised when the evidence-association journal is invalid or unavailable."""
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuousMarker:
+    """A marker on the continuous camera timeline, optionally unassigned."""
+
+    marker_id: str
+    camera_index: int
+    segment_id: str
+    frame_index: int
+    position_ms: int
+    marker_x_normalized: float
+    marker_y_normalized: float
+    label: str = "待补录"
+    passage_event_id: str = ""
+    bib: str = ""
+    confirmed_at_ms: int = 0
+    confirmation_status: str = CONFIRMED
+    revision: int = 1
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise ValueError("unsupported continuous marker schema_version")
+        if not self.marker_id.strip():
+            raise ValueError("marker_id is required")
+        if self.camera_index <= 0:
+            raise ValueError("camera_index must be positive")
+        if not self.segment_id.strip():
+            raise ValueError("segment_id is required")
+        if self.frame_index < 0:
+            raise ValueError("frame_index must be non-negative")
+        if self.position_ms < 0:
+            raise ValueError("position_ms must be non-negative")
+        if not 0.0 <= self.marker_x_normalized <= 1.0:
+            raise ValueError("marker_x_normalized must be between 0 and 1")
+        if not 0.0 <= self.marker_y_normalized <= 1.0:
+            raise ValueError("marker_y_normalized must be between 0 and 1")
+        if not self.label.strip():
+            raise ValueError("label is required")
+        if self.confirmed_at_ms < 0:
+            raise ValueError("confirmed_at_ms must be non-negative")
+        if self.confirmation_status not in _STATUSES:
+            raise ValueError("confirmation_status must be confirmed or deleted")
+        if self.revision <= 0:
+            raise ValueError("revision must be positive")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ContinuousMarker":
+        if not isinstance(payload, Mapping):
+            raise ValueError("continuous marker must be a JSON object")
+        return cls(
+            schema_version=int(payload.get("schema_version", 0)),
+            marker_id=str(payload.get("marker_id", "")),
+            camera_index=int(payload.get("camera_index", 0)),
+            segment_id=str(payload.get("segment_id", "")),
+            frame_index=int(payload.get("frame_index", -1)),
+            position_ms=int(payload.get("position_ms", -1)),
+            marker_x_normalized=float(payload.get("marker_x_normalized", -1.0)),
+            marker_y_normalized=float(payload.get("marker_y_normalized", -1.0)),
+            label=str(payload.get("label", "待补录")),
+            passage_event_id=str(payload.get("passage_event_id", "")),
+            bib=str(payload.get("bib", "")),
+            confirmed_at_ms=int(payload.get("confirmed_at_ms", -1)),
+            confirmation_status=str(payload.get("confirmation_status", "")),
+            revision=int(payload.get("revision", 0)),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class ContinuousMarkerStore:
+    """Append-only store for camera-1 timeline markers, including unknown ones."""
+
+    def __init__(
+        self,
+        journal_path: str | Path,
+        *,
+        recover_incomplete_tail: bool = True,
+    ):
+        self.journal_path = Path(journal_path).expanduser().absolute()
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._latest: dict[str, ContinuousMarker] = {}
+        self._recover_incomplete_tail = bool(recover_incomplete_tail)
+        self._recovered_incomplete_tail = False
+        self._load_existing()
+
+    def _load_existing(self) -> None:
+        if not self.journal_path.exists():
+            return
+        try:
+            content = self.journal_path.read_bytes()
+        except OSError as error:
+            raise PassageEvidenceError(
+                f"failed to read continuous marker journal: {self.journal_path}"
+            ) from error
+        offset = 0
+        lines = content.splitlines(keepends=True)
+        for line_number, raw_line in enumerate(lines, start=1):
+            terminated = raw_line.endswith(b"\n") or raw_line.endswith(b"\r")
+            stripped = raw_line.rstrip(b"\r\n")
+            if not stripped:
+                offset += len(raw_line)
+                continue
+            try:
+                marker = ContinuousMarker.from_payload(
+                    json.loads(stripped.decode("utf-8"))
+                )
+            except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as error:
+                is_tail = line_number == len(lines) and not terminated
+                if is_tail and self._recover_incomplete_tail:
+                    try:
+                        candidate = stripped.decode("utf-8")
+                    except UnicodeDecodeError:
+                        candidate = ""
+                    if candidate and _looks_like_incomplete_json(candidate):
+                        self._truncate(offset)
+                        self._recovered_incomplete_tail = True
+                        return
+                raise PassageEvidenceError(
+                    f"invalid continuous marker journal line {line_number}: {error}"
+                ) from error
+            current = self._latest.get(marker.marker_id)
+            if current is None or marker.revision > current.revision:
+                self._latest[marker.marker_id] = marker
+            elif marker.revision == current.revision and marker != current:
+                raise PassageEvidenceError(
+                    f"conflicting continuous marker revision at line {line_number}"
+                )
+            offset += len(raw_line)
+
+    def _truncate(self, size: int) -> None:
+        try:
+            with self.journal_path.open("r+b") as journal:
+                journal.truncate(size)
+                journal.flush()
+                os.fsync(journal.fileno())
+        except OSError as error:
+            raise PassageEvidenceError(
+                f"failed to recover continuous marker journal: {self.journal_path}"
+            ) from error
+
+    def _append(self, marker: ContinuousMarker) -> None:
+        record = json.dumps(
+            marker.to_payload(), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+        original_size = self.journal_path.stat().st_size if self.journal_path.exists() else 0
+        separator = b""
+        if original_size:
+            with self.journal_path.open("rb") as journal:
+                journal.seek(-1, os.SEEK_END)
+                if journal.read(1) not in {b"\n", b"\r"}:
+                    separator = b"\n"
+        try:
+            with self.journal_path.open("ab") as journal:
+                journal.write(separator)
+                journal.write(record)
+                journal.flush()
+                os.fsync(journal.fileno())
+        except OSError as error:
+            try:
+                self._truncate(original_size)
+            except PassageEvidenceError:
+                pass
+            raise PassageEvidenceError(
+                f"failed to append continuous marker journal: {self.journal_path}"
+            ) from error
+        self._latest[marker.marker_id] = marker
+
+    def create(
+        self,
+        *,
+        camera_index: int,
+        segment_id: str,
+        frame_index: int,
+        position_ms: int,
+        marker_x_normalized: float,
+        marker_y_normalized: float,
+        label: str = "待补录",
+        passage_event_id: str = "",
+        bib: str = "",
+        confirmed_at_ms: int,
+    ) -> ContinuousMarker:
+        with self._lock:
+            marker = ContinuousMarker(
+                marker_id=f"marker-{uuid.uuid4().hex}",
+                camera_index=int(camera_index),
+                segment_id=str(segment_id),
+                frame_index=int(frame_index),
+                position_ms=int(position_ms),
+                marker_x_normalized=float(marker_x_normalized),
+                marker_y_normalized=float(marker_y_normalized),
+                label=str(label or "待补录"),
+                passage_event_id=str(passage_event_id),
+                bib=str(bib),
+                confirmed_at_ms=int(confirmed_at_ms),
+            )
+            self._append(marker)
+            return marker
+
+    def markers(self) -> tuple[ContinuousMarker, ...]:
+        with self._lock:
+            return tuple(
+                marker
+                for marker in sorted(
+                    self._latest.values(),
+                    key=lambda item: (item.camera_index, item.position_ms, item.marker_id),
+                )
+                if marker.confirmation_status != DELETED
+            )
+
+    def clear(self, marker_id: str, *, confirmed_at_ms: int) -> bool:
+        with self._lock:
+            current = self._latest.get(str(marker_id))
+            if current is None or current.confirmation_status == DELETED:
+                return False
+            self._append(
+                replace(
+                    current,
+                    confirmation_status=DELETED,
+                    confirmed_at_ms=int(confirmed_at_ms),
+                    revision=current.revision + 1,
+                )
+            )
+            return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -526,6 +754,8 @@ class PassageEvidenceAssociationStore:
 
 __all__ = [
     "CONFIRMED",
+    "ContinuousMarker",
+    "ContinuousMarkerStore",
     "DELETED",
     "HIGH_SPEED_SOURCE",
     "PassageEvidenceAssociation",

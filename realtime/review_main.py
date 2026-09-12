@@ -27,6 +27,7 @@ from realtime.review_recorder import (
     make_directshow_source,
 )
 from realtime.review_window import FinishReviewWindow
+from realtime.racetiger_source import split_racetiger_endpoint
 from realtime.runtime_paths import (
     application_dir,
     resource_dir,
@@ -366,6 +367,14 @@ def load_review_settings(
     racetiger_base_url = str(payload.get("racetiger_base_url") or "").strip()
     racetiger_pc = str(payload.get("racetiger_pc") or "").strip()
     racetiger_rid = str(payload.get("racetiger_rid") or "").strip()
+    (
+        racetiger_base_url,
+        embedded_pc,
+        embedded_rid,
+        embedded_token,
+    ) = split_racetiger_endpoint(racetiger_base_url)
+    racetiger_pc = racetiger_pc or embedded_pc
+    racetiger_rid = racetiger_rid or embedded_rid
     finishreview_ip = str(payload.get("finishreview_ip") or finishreview_ip).strip()
     cyclerace_ip = str(payload.get("cyclerace_ip") or cyclerace_ip).strip()
     high_speed_pc_ip = str(
@@ -380,6 +389,7 @@ def load_review_settings(
             "racetiger_token",
             secret_unprotector,
         )
+        racetiger_token = racetiger_token or embedded_token
     except (TypeError, ValueError) as error:
         _warn_invalid_setting("racetiger_token", error)
 
@@ -477,6 +487,15 @@ def save_review_settings(
         secondary_rtsp_username,
         secondary_rtsp_password,
     ) = split_rtsp_credentials(settings.secondary_source)
+    (
+        racetiger_base_url,
+        embedded_pc,
+        embedded_rid,
+        embedded_token,
+    ) = split_racetiger_endpoint(settings.racetiger_base_url)
+    racetiger_pc = str(settings.racetiger_pc or "").strip() or embedded_pc
+    racetiger_rid = str(settings.racetiger_rid or "").strip() or embedded_rid
+    racetiger_token = str(settings.racetiger_token or "") or embedded_token
     payload = dict(existing_payload)
     payload.update({
         "schema_version": 8,
@@ -508,13 +527,13 @@ def save_review_settings(
         "high_speed_pc_ip": settings.high_speed_pc_ip,
         "switch_ip": settings.switch_ip,
         "timing_provider": settings.timing_provider,
-        "racetiger_base_url": settings.racetiger_base_url,
-        "racetiger_pc": settings.racetiger_pc,
-        "racetiger_rid": settings.racetiger_rid,
+        "racetiger_base_url": racetiger_base_url,
+        "racetiger_pc": racetiger_pc,
+        "racetiger_rid": racetiger_rid,
         "racetiger_token_protected": _protected_secret_for_save(
             existing_payload,
             "racetiger_token_protected",
-            settings.racetiger_token,
+            racetiger_token,
             secret_protector,
             secret_unprotector,
         ),

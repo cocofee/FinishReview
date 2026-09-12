@@ -61,6 +61,7 @@ from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
 from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
 from .external_clip_import import EXTERNAL_CLOCK_SOURCE
 from .passage_evidence import (
+    ContinuousMarkerStore,
     HIGH_SPEED_SOURCE,
     REGULAR_SOURCE,
     PassageEvidenceAssociation,
@@ -93,8 +94,10 @@ from .review_clip import PassageReviewBindingStore
 from .runtime_metrics import RuntimeMetrics
 from .thread_lifecycle import retire_qthread, track_qthread
 from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
-from .video_filmstrip import VideoFilmstripWidget
-from .video_activity import ActivityTimelineWidget
+from .video_filmstrip import (
+    CONTINUOUS_FILMSTRIP_INTERVAL_MS,
+    VideoFilmstripWidget,
+)
 from .video_timeline import (
     DEFAULT_CLOCK_SOURCE,
     PassageVideoLocation,
@@ -438,6 +441,9 @@ class EvidenceImageView(QGraphicsView):
         self._marker_mode = False
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
+        self._history_markers: tuple[
+            tuple[float, float, str, bool, bool], ...
+        ] = ()
         self._show_marker_label = True
         self._show_identity_badge = True
         self._mouse_press_position: Optional[QPoint] = None
@@ -812,6 +818,24 @@ class EvidenceImageView(QGraphicsView):
         self._marker_simple = False
         self.viewport().update()
 
+    def set_history_markers(
+        self,
+        markers: Iterable[tuple[float, float, str, bool, bool]],
+    ) -> None:
+        """Show confirmed markers from nearby passages without replacing the active marker."""
+
+        self._history_markers = tuple(
+            (
+                max(0.0, min(1.0, float(x_normalized))),
+                max(0.0, min(1.0, float(y_normalized))),
+                str(label),
+                bool(confirmed),
+                bool(simple),
+            )
+            for x_normalized, y_normalized, label, confirmed, simple in markers
+        )
+        self.viewport().update()
+
     def fit_to_window(self) -> None:
         if not self.has_frame:
             return
@@ -1009,13 +1033,50 @@ class EvidenceImageView(QGraphicsView):
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
-        if self._marker is None or self._source_width <= 0 or self._source_height <= 0:
+        if self._source_width <= 0 or self._source_height <= 0:
+            return
+        scale = max(0.001, abs(self.transform().m11()))
+        painter.save()
+        for index, (x_normalized, y_normalized, label, confirmed, simple) in enumerate(
+            self._history_markers
+        ):
+            x = x_normalized * self._source_width
+            y = y_normalized * self._source_height
+            color = QColor("#1bbf83" if confirmed else "#c0372b")
+            pen = QPen(color, 2)
+            pen.setCosmetic(True)
+            if not confirmed and not simple:
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(int(x), 0, int(x), self._source_height)
+            if not self._show_marker_label:
+                continue
+            margin = 6.0 / scale
+            tag_width = max(52.0, 18.0 + len(label) * 18.0) / scale
+            tag_height = 30.0 / scale
+            tag_x = x + margin
+            if tag_x + tag_width > self._source_width - margin:
+                tag_x = x - tag_width - margin
+            tag_x = max(margin, min(tag_x, self._source_width - tag_width - margin))
+            tag_y = margin + index * (tag_height + margin)
+            tag_y = min(tag_y, max(margin, self._source_height - tag_height - margin))
+            tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(tag_rect, 2.0 / scale, 2.0 / scale)
+            painter.setPen(QColor("#07120e" if confirmed else "#231703"))
+            font = QFont(self.font())
+            font.setPixelSize(max(1, int(round(18.0 / scale))))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(tag_rect, Qt.AlignCenter, label)
+        painter.restore()
+        if self._marker is None:
             return
         x_normalized, y_normalized, label, confirmed = self._marker
         simple = self._marker_simple
         x = x_normalized * self._source_width
         y = y_normalized * self._source_height
-        scale = max(0.001, abs(self.transform().m11()))
         color = QColor("#1bbf83" if confirmed else "#c0372b")
         pen = QPen(color, 3)
         pen.setCosmetic(True)
@@ -1171,6 +1232,8 @@ class PassageEvidencePane(QFrame):
         self._association: Optional[PassageEvidenceAssociation] = None
         self._reference_only = False
         self._pending_marker: Optional[tuple[float, float, int, int]] = None
+        self._pending_marker_unknown = False
+        self._pending_marker_label = ""
         self._marking_enabled = False
         self._identity = ""
         self._worker: Optional[object] = None
@@ -1440,6 +1503,8 @@ class PassageEvidencePane(QFrame):
 
     def cancel_marker_edit(self) -> None:
         self._pending_marker = None
+        self._pending_marker_unknown = False
+        self._pending_marker_label = ""
         self._marking_enabled = (
             self._association is None
             and self._location is not None
@@ -1460,6 +1525,8 @@ class PassageEvidencePane(QFrame):
         if association is not None:
             self._reference_only = False
         self._pending_marker = None
+        self._pending_marker_unknown = False
+        self._pending_marker_label = ""
         self._marking_enabled = (
             association is None
             and self._location is not None
@@ -1497,6 +1564,8 @@ class PassageEvidencePane(QFrame):
             "position_ms": position_ms,
             "marker_x_normalized": x_normalized,
             "marker_y_normalized": y_normalized,
+            "unknown_marker": self._pending_marker_unknown,
+            "marker_label": self._pending_marker_label or self._identity,
         }
 
     def set_external_pending_marker(
@@ -1506,6 +1575,8 @@ class PassageEvidencePane(QFrame):
         position_ms: int,
         marker_x_normalized: float,
         marker_y_normalized: float,
+        unknown_marker: bool = False,
+        marker_label: str = "",
     ) -> None:
         """Accept a marker selected on the primary time-film interface."""
 
@@ -1515,6 +1586,8 @@ class PassageEvidencePane(QFrame):
             int(frame_index),
             int(position_ms),
         )
+        self._pending_marker_unknown = bool(unknown_marker)
+        self._pending_marker_label = str(marker_label).strip()
         self._marking_enabled = True
         self.confirm_btn.setEnabled(True)
         self._render_marker()
@@ -1550,6 +1623,9 @@ class PassageEvidencePane(QFrame):
             frame_index,
             position_ms,
         )
+        normalized_identity = self._identity.strip().casefold()
+        self._pending_marker_unknown = normalized_identity in {"", "unknown", "未知", "待补录"}
+        self._pending_marker_label = "待补录" if self._pending_marker_unknown else ""
         self.confirm_btn.setEnabled(True)
         self._render_marker()
 
@@ -1713,6 +1789,8 @@ class PassageEvidencePane(QFrame):
             association = None
         self._association = association
         self._pending_marker = None
+        self._pending_marker_unknown = False
+        self._pending_marker_label = ""
         self._marking_enabled = (
             association is None
             and location is not None
@@ -1878,6 +1956,8 @@ class PassageEvidencePane(QFrame):
         # athlete's marker/confirmation state even though the frame is kept.
         self._association = association
         self._pending_marker = None
+        self._pending_marker_unknown = False
+        self._pending_marker_label = ""
         self._marking_enabled = association is None
         self._reference_only = False
         self.mark_btn.setText("重标" if association is not None else "标线")
@@ -1926,6 +2006,8 @@ class PassageEvidencePane(QFrame):
         self._association = None
         self._reference_only = False
         self._pending_marker = None
+        self._pending_marker_unknown = False
+        self._pending_marker_label = ""
         self._marking_enabled = False
         self._identity = ""
         self._target_position_ms = 0
@@ -2447,6 +2529,7 @@ class PassageReviewSurface(QDialog):
     INACTIVE_CAMERA_START_DELAY_MS = 120
     # Keep the locating surface aligned with the two-minute visual scan core.
     FILMSTRIP_WINDOW_MS = 120_000
+    FILMSTRIP_COVERAGE_TOLERANCE_MS = 250
     FILMSTRIP_ALWAYS_AVAILABLE = True
     VIDEO_ASSIST_ENABLED = True
     # Automatic gap seeking can hide riders whose chips were not read. Keep it
@@ -2483,6 +2566,7 @@ class PassageReviewSurface(QDialog):
         clock_offset_by_camera: Optional[Mapping[int, int]] = None,
         pre_roll_ms: int = 3_000,
         association_store: Optional[PassageEvidenceAssociationStore] = None,
+        continuous_marker_store: Optional[ContinuousMarkerStore] = None,
         calibration_store: Optional[VideoClockCalibrationStore] = None,
         metadata_store: Optional[RaceMetadataStore] = None,
         open_location: Optional[
@@ -2520,6 +2604,9 @@ class PassageReviewSurface(QDialog):
         )
         self.association_store = association_store or PassageEvidenceAssociationStore(
             passage_store.journal_path.with_name("passage_evidence_associations.jsonl")
+        )
+        self.continuous_marker_store = continuous_marker_store or ContinuousMarkerStore(
+            passage_store.journal_path.with_name("continuous_markers.jsonl")
         )
         self.calibration_store = calibration_store or VideoClockCalibrationStore(
             passage_store.journal_path.with_name("video_clock_calibrations.jsonl")
@@ -2661,6 +2748,12 @@ class PassageReviewSurface(QDialog):
         self._search_refresh_timer.timeout.connect(self._refresh_filtered_view)
         self._filmstrip_context: tuple[Path, int, int] | None = None
         self._filmstrip_absolute_window: tuple[int, int] | None = None
+        # A batch button press is an explicit operator navigation request. It
+        # must be allowed to replace the active strip even when the next
+        # archive segment computes a temporarily overlapping local window.
+        self._filmstrip_batch_navigation_pending = False
+        self._filmstrip_requested_window_start_ms: int | None = None
+        self._filmstrip_gap_message = ""
         self._review_split_resize_pending = False
         self._pending_filmstrip_position: int | None = None
         self._filmstrip_seek_pending = False
@@ -2678,6 +2771,18 @@ class PassageReviewSurface(QDialog):
         self._filmstrip_anchor_timer.setInterval(100)
         self._filmstrip_anchor_timer.timeout.connect(
             self._flush_filmstrip_anchor
+        )
+        self._filmstrip_prefetch_timer = QTimer(self)
+        self._filmstrip_prefetch_timer.setSingleShot(True)
+        self._filmstrip_prefetch_timer.setInterval(800)
+        self._filmstrip_prefetch_timer.timeout.connect(
+            self._prefetch_next_filmstrip_window
+        )
+        self._filmstrip_operator_idle_timer = QTimer(self)
+        self._filmstrip_operator_idle_timer.setSingleShot(True)
+        self._filmstrip_operator_idle_timer.setInterval(1_200)
+        self._filmstrip_operator_idle_timer.timeout.connect(
+            self._on_filmstrip_operator_idle
         )
         self.playback_coordinator: PlaybackCoordinator | None = None
 
@@ -2934,7 +3039,10 @@ class PassageReviewSurface(QDialog):
                 _StatusColorDelegate(self.table),
             )
         self.table.verticalHeader().setVisible(False)
-        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        # ``itemSelectionChanged`` can fire while Qt still exposes the previous
+        # current row. Use the current-cell signal so the highlighted row,
+        # selected event and evidence pane always change atomically.
+        self.table.currentCellChanged.connect(self._on_table_selection_changed)
         self.table.cellDoubleClicked.connect(self._open_preferred_source)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
@@ -3144,30 +3252,19 @@ class PassageReviewSurface(QDialog):
             self._clear_filmstrip_marker
         )
         self.video_filmstrip.reload_requested.connect(self._update_filmstrip)
-        # The header, enlarged activity overview, thumbnails, timestamps and
-        # horizontal scrollbar need the full height. Keep divider dragging
-        # from clipping the timestamp row at the bottom of the filmstrip.
+        # The header, thumbnails, timestamps and horizontal scrollbar need the
+        # full height. Keep divider dragging from clipping the timestamp row.
         self.video_filmstrip.setMinimumHeight(340)
         self.video_filmstrip.setMaximumHeight(340)
-        self.activity_timeline = ActivityTimelineWidget(self)
         self.playback_coordinator = PlaybackCoordinator(
-            self.activity_timeline,
+            None,
             self,
             filmstrip_update_delay_ms=self.INACTIVE_CAMERA_START_DELAY_MS + 80,
         )
         self.playback_coordinator.filmstrip_update_requested.connect(
             self._update_filmstrip
         )
-        self.activity_timeline.position_selected.connect(
-            self._seek_filmstrip_position
-        )
-        self.video_filmstrip.visible_range_changed.connect(
-            self.activity_timeline.set_visible_range
-        )
-        self.activity_timeline.hide()
-        # Activity is part of the filmstrip, not a separate preview panel:
-        # title -> activity overview -> chronological thumbnails.
-        self.video_filmstrip.layout().insertWidget(1, self.activity_timeline)
+        self.video_filmstrip.ready_changed.connect(self._on_filmstrip_ready)
         preview_layout.addWidget(self.video_filmstrip, 1)
         self.preview_timeline = TargetTimelineSlider(Qt.Horizontal, self)
         self.preview_timeline.setInvertedAppearance(True)
@@ -4088,6 +4185,35 @@ class PassageReviewSurface(QDialog):
             )
         )
 
+    def _camera_one_pane(self) -> PassageEvidencePane:
+        """Return the authoritative continuous-review pane (camera 1)."""
+
+        by_camera = getattr(self, "_regular_panes_by_camera", {})
+        pane = by_camera.get(1)
+        if pane is not None:
+            return pane
+        # A camera-1 pane is the normal layout. Keep a safe fallback for
+        # camera-less or legacy layouts used by integrations and tests.
+        regular_panes = getattr(self, "regular_panes", ())
+        if regular_panes:
+            return regular_panes[0]
+        return self.regular_pane
+
+    def _continuous_offset_for_location(
+        self,
+        location: Optional[PassageVideoLocation],
+    ) -> int:
+        if location is None:
+            return self._clock_offset_for_camera(1)
+        camera_index = max(1, int(location.segment.camera_index))
+        session_key = self._recording_session_key(location)
+        return int(
+            self._continuous_clock_offsets.get(
+                (camera_index, session_key),
+                int(location.clock_offset_ms),
+            )
+        )
+
     def _on_group_changed(self) -> None:
         if self._batch_mode:
             self._exit_batch_mode()
@@ -4548,7 +4674,47 @@ class PassageReviewSurface(QDialog):
             )
             if associated is not None:
                 return associated
+            if not high_speed:
+                saved_location = self._saved_regular_location(association)
+                if saved_location is not None:
+                    return saved_location
         return source_location(lookup, high_speed=high_speed)
+
+    def _saved_regular_location(
+        self,
+        association: PassageEvidenceAssociation,
+    ) -> Optional[PassageVideoLocation]:
+        """Resolve the exact recording segment stored by a confirmation."""
+
+        segment = self.timeline_store.get_segment(association.segment_id)
+        if segment is None or segment.clock_source == AUYAT_CLOCK_SOURCE:
+            return None
+        video_path = self.timeline_store.resolve_video_path(segment)
+        duration_ms = int(
+            segment.media_duration_ms
+            if segment.media_duration_ms is not None
+            else max(
+                0,
+                int(segment.ended_at_ms or segment.started_at_ms)
+                - int(segment.started_at_ms),
+            )
+        )
+        position_ms = max(0, int(association.position_ms))
+        if duration_ms > 0:
+            position_ms = min(position_ms, duration_ms)
+        return PassageVideoLocation(
+            segment=segment,
+            video_path=video_path,
+            passage_position_ms=position_ms,
+            playback_position_ms=max(0, position_ms - self.pre_roll_ms),
+            clock_offset_ms=self._clock_offset_for_camera(segment.camera_index),
+            timing_error_ms=segment.timing_error_ms,
+            status=(
+                "located"
+                if self.timeline_store.video_path_is_playable(video_path)
+                else "missing_file"
+            ),
+        )
 
     @staticmethod
     def _confirmation_status(
@@ -4826,7 +4992,18 @@ class PassageReviewSurface(QDialog):
 
         self._render_summary()
         if selected_row >= 0:
-            self._select_event(self._visible_events[selected_row].event_id)
+            selected_event_id = self._visible_events[selected_row].event_id
+            active_pane = self._camera_one_pane()
+            preserve_current_frame = (
+                active_pane
+                if selected_event_id == self._selected_event_id
+                and getattr(active_pane, "_current_frame_index", -1) >= 0
+                else None
+            )
+            self._select_event(
+                selected_event_id,
+                preserve_current_frame=preserve_current_frame,
+            )
         else:
             self._clear_selection_details()
 
@@ -5606,7 +5783,16 @@ class PassageReviewSurface(QDialog):
         self._update_navigation_controls()
         self._render_summary()
         if selected_event_changed and selected_event_id:
-            self._select_event(selected_event_id)
+            active_pane = self._camera_one_pane()
+            preserve_current_frame = (
+                active_pane
+                if getattr(active_pane, "_current_frame_index", -1) >= 0
+                else None
+            )
+            self._select_event(
+                selected_event_id,
+                preserve_current_frame=preserve_current_frame,
+            )
         elif not self._visible_events:
             self._clear_selection_details()
 
@@ -5634,8 +5820,14 @@ class PassageReviewSurface(QDialog):
         })
         item.setFont(font)
 
-    def _on_table_selection_changed(self) -> None:
-        row = self.table.currentRow()
+    def _on_table_selection_changed(
+        self,
+        current_row: int | None = None,
+        _current_column: int = -1,
+        _previous_row: int = -1,
+        _previous_column: int = -1,
+    ) -> None:
+        row = self.table.currentRow() if current_row is None else int(current_row)
         if 0 <= row < len(self._visible_events):
             event_id = self._visible_events[row].event_id
             active_pane = self._active_playback_pane()
@@ -5811,15 +6003,17 @@ class PassageReviewSurface(QDialog):
         event_id: str,
         *,
         preserve_current_frame: Optional[PassageEvidencePane] = None,
+        locate_target: bool = False,
     ) -> None:
         self._video_candidate_anchor_time_ms = None
-        if preserve_current_frame is None and self._batch_mode:
+        if preserve_current_frame is None and self._batch_mode and not locate_target:
             active_pane = self._active_playback_pane()
             if getattr(active_pane, "_current_frame_index", -1) >= 0:
                 preserve_current_frame = active_pane
         self.selection_controller.select(
             event_id,
             preserve_current_frame=preserve_current_frame,
+            locate_target=locate_target,
         )
 
     def _apply_selection_plan(
@@ -5838,6 +6032,11 @@ class PassageReviewSurface(QDialog):
         preserve_media = plan.preserve_media
         active_pane = plan.active_pane
         switching_batch_event = plan.switching_batch_event
+        # A double-click locate can explicitly choose camera 1 even when the
+        # operator was previously focused on another pane. Apply that choice
+        # before scheduling linked playback or filmstrip work.
+        if active_pane in self.evidence_panes:
+            self._activate_pane(active_pane, align=False)
         if switching_batch_event:
             # Identity changes must leave the displayed frame stable. Do not
             # start deferred workers merely to pause them.
@@ -5859,6 +6058,11 @@ class PassageReviewSurface(QDialog):
                 regular_association,
                 high_speed_association,
             )
+            if plan.locate_target:
+                # A roster double-click is an absolute locate command.  Do
+                # not replay an old saved evidence offset on the continuous
+                # camera timeline.
+                self._shared_delta_ms = 0
         self._selected_event_id = event.event_id
         if self._batch_mode:
             batch = self._review_batch_by_event_id.get(event.event_id)
@@ -6068,6 +6272,8 @@ class PassageReviewSurface(QDialog):
                     )
                 elif self.high_speed_pane.association != high_speed_association:
                     self.high_speed_pane.set_association(high_speed_association)
+        if active_pane in self.evidence_panes:
+            self._activate_pane(active_pane, align=False)
         self._update_reference_states(event.event_id)
         if preserve_current_frame is not None:
             # In continuous judging the operator-selected current recording is
@@ -6158,19 +6364,116 @@ class PassageReviewSurface(QDialog):
             None,
         )
 
+    def _filmstrip_window_coverage(
+        self,
+        pane: PassageEvidencePane,
+        location: PassageVideoLocation,
+        absolute_start_ms: int,
+        absolute_end_ms: int,
+    ) -> tuple[bool, str]:
+        """Validate the requested continuous window before decoding it.
+
+        A timeline lookup can locate an athlete at either side of a recorder
+        gap, but that must never make the missing middle look like ordinary
+        empty video.  Build the camera/source interval union from the durable
+        timeline journal and reject an internal gap.  We currently decode one
+        media path per active filmstrip; contiguous entries on another path
+        therefore remain an explicit incomplete-evidence state instead of
+        being silently stitched by the UI.
+        """
+
+        start = int(absolute_start_ms)
+        end = max(start, int(absolute_end_ms))
+        if end <= start:
+            return True, ""
+        selected = location.segment
+        tolerance = max(
+            int(self.FILMSTRIP_COVERAGE_TOLERANCE_MS),
+            int(getattr(selected, "timing_error_ms", 0) or 0),
+        )
+        intervals: list[tuple[int, int, Path, object]] = []
+        for segment in self.timeline_store.segments():
+            if int(segment.camera_index) != int(pane.camera_index):
+                continue
+            if str(segment.source_id) != str(selected.source_id):
+                continue
+            if selected.race_id and not (
+                segment.race_id == selected.race_id
+                or (
+                    not segment.race_id
+                    and segment.clock_source == DEFAULT_CLOCK_SOURCE
+                )
+            ):
+                continue
+            if segment.media_started_at_ms is None or segment.media_duration_ms is None:
+                continue
+            interval_start = int(segment.media_started_at_ms)
+            interval_end = interval_start + int(segment.media_duration_ms)
+            if interval_end <= start - tolerance or interval_start >= end + tolerance:
+                continue
+            try:
+                path = self.timeline_store.resolve_video_path(segment)
+            except (OSError, RuntimeError, ValueError):
+                path = Path(segment.video_path)
+            intervals.append((interval_start, interval_end, Path(path), segment))
+        # Live rolling HLS locations are synthetic and therefore are not yet
+        # present in the durable journal.  Their own interval is still valid
+        # for the active window; later archive publication will replace it.
+        if (
+            selected.media_started_at_ms is not None
+            and selected.media_duration_ms is not None
+            and not any(item[3] is selected for item in intervals)
+        ):
+            selected_start = int(selected.media_started_at_ms)
+            selected_end = selected_start + int(selected.media_duration_ms)
+            intervals.append(
+                (selected_start, selected_end, Path(location.video_path), selected)
+            )
+        if not intervals:
+            return False, "当前窗口没有可验证的连续录像时间线"
+        intervals.sort(key=lambda item: (item[0], item[1]))
+        cursor = start
+        selected_path = Path(location.video_path)
+        for interval_start, interval_end, path, _segment in intervals:
+            # Segments ending exactly at the cursor are already exhausted and
+            # must not be compared as a new path; otherwise a clean boundary
+            # is falsely reported as a cross-file gap.
+            if interval_end <= cursor:
+                continue
+            if interval_start > cursor + tolerance:
+                return (
+                    False,
+                    f"录像断点：{cursor} ms 至 {interval_start} ms 未覆盖",
+                )
+            if path != selected_path:
+                return (
+                    False,
+                    "当前两分钟窗口跨越多个录像文件，尚未安全连续拼接",
+                )
+            cursor = max(cursor, interval_end)
+            if cursor >= end - tolerance:
+                return True, ""
+        if cursor >= end - tolerance:
+            return True, ""
+        # A final, naturally shorter tail is safe to show as a partial window;
+        # an internal gap would have returned above when a following segment
+        # existed.  The caller labels this state instead of claiming a full
+        # two-minute window.
+        latest_end = max(item[1] for item in intervals)
+        if latest_end <= cursor + tolerance:
+            return True, "录像已到末尾，当前窗口不足两分钟"
+        return False, f"录像断点：{cursor} ms 至 {end} ms 未覆盖"
+
     def _filmstrip_context_for_active_pane(
         self,
     ) -> Optional[tuple[Path, int, int, int, tuple[int, ...], int, int]]:
+        self._filmstrip_gap_message = ""
         if not self._batch_mode and not self.FILMSTRIP_ALWAYS_AVAILABLE:
             return None
-        pane = (
-            self._active_pane
-            if self._active_pane in self.regular_panes
-            else self.regular_pane
-        )
+        pane = self._camera_one_pane()
         location = pane.location
         selected_event = self.passage_store.get(self._selected_event_id)
-        offset_ms = self._clock_offset_for_camera(int(pane.camera_index))
+        offset_ms = self._continuous_offset_for_location(location)
         event_anchor_ms = (
             int(selected_event.timeline_timestamp_ms) + int(offset_ms)
             if selected_event is not None
@@ -6195,10 +6498,25 @@ class PassageReviewSurface(QDialog):
                 or location.video_path.suffix.lower() == ".m3u8"
             )
         )
+        # The top rail is a continuous camera-1 locator. A persisted short
+        # evidence clip (non-preview media_locator) must never become its
+        # source merely because it is the current pane binding.
+        is_short_evidence_clip = bool(
+            location is not None
+            and str(getattr(location, "media_locator", "")).strip()
+            and not is_preview_location
+        )
         if (
             anchor_time_ms is not None
-            and (location is None or is_preview_location)
-            and not str(getattr(location, "media_locator", "")).strip()
+            and (location is None or is_preview_location or is_short_evidence_clip)
+            # Directly bound review clips are intentionally kept self-contained
+            # outside continuous batch mode; do not trigger a timeline scan in
+            # that workflow just to populate an optional top rail.
+            and not (
+                is_short_evidence_clip
+                and not self._batch_mode
+                and self.review_binding_store is not None
+            )
         ):
             live_location = self._live_location_for_filmstrip(
                 pane,
@@ -6273,44 +6591,75 @@ class PassageReviewSurface(QDialog):
         filmstrip_window_ms = (
             120_000 if self._low_resource_mode else self.FILMSTRIP_WINDOW_MS
         )
-        window_start = (max(0, center) // filmstrip_window_ms) * filmstrip_window_ms
-        start_ms = min(window_start, max(0, duration_ms - 1))
-        end_ms = min(duration_ms, start_ms + filmstrip_window_ms)
+        requested_window_start = self._filmstrip_requested_window_start_ms
+        requested_local_start = (
+            int(requested_window_start) - media_start_ms
+            if requested_window_start is not None
+            else None
+        )
+        # The batch buttons request an exact absolute two-minute successor.
+        # Honour that request when this media file contains the whole window;
+        # otherwise retain the normal anchor-based window and let coverage
+        # validation report a real cross-file/gap condition.
+        if (
+            requested_local_start is not None
+            and duration_ms >= filmstrip_window_ms
+            and 0 <= requested_local_start <= duration_ms - filmstrip_window_ms
+        ):
+            start_ms = requested_local_start
+            end_ms = start_ms + filmstrip_window_ms
+        else:
+            window_start = (
+                max(0, center) // filmstrip_window_ms
+            ) * filmstrip_window_ms
+            # Keep a full two-minute window whenever the media contains one.
+            # The old duration clamp could silently shrink a window at a
+            # segment boundary and make a recorder gap look like an empty
+            # stretch.
+            if duration_ms >= filmstrip_window_ms:
+                start_ms = min(window_start, duration_ms - filmstrip_window_ms)
+                end_ms = start_ms + filmstrip_window_ms
+            else:
+                start_ms = min(window_start, max(0, duration_ms - 1))
+                end_ms = duration_ms
         if end_ms <= start_ms:
             end_ms = min(duration_ms, start_ms + 1_000)
-        window_positions = tuple(
-            position for position in positions if start_ms <= position <= end_ms
-        )
-        if not window_positions:
-            window_positions = (max(start_ms, min(end_ms, center)),)
         origin_ms = int(
             location.segment.media_started_at_ms
             if location.segment.media_started_at_ms is not None
             else location.segment.started_at_ms
         )
+        absolute_window_start = (
+            int(requested_window_start)
+            if requested_local_start is not None
+            and start_ms == requested_local_start
+            else origin_ms + int(start_ms)
+        )
+        absolute_window_end = origin_ms + int(end_ms)
+        covered, coverage_message = self._filmstrip_window_coverage(
+            pane,
+            location,
+            absolute_window_start,
+            absolute_window_start + int(filmstrip_window_ms),
+        )
+        if not covered:
+            self._filmstrip_gap_message = coverage_message
+            return None
+        self._filmstrip_gap_message = coverage_message
+        window_positions = tuple(
+            position for position in positions if start_ms <= position <= end_ms
+        )
+        if not window_positions:
+            window_positions = (max(start_ms, min(end_ms, center)),)
         return (
             location.video_path,
             start_ms,
             end_ms,
             center,
             window_positions,
-            origin_ms + start_ms,
-            origin_ms + end_ms,
+            absolute_window_start,
+            absolute_window_end,
         )
-
-    def _stop_activity_analysis(self) -> None:
-        if self.playback_coordinator is not None:
-            self.playback_coordinator.stop_activity()
-
-    def _schedule_activity_analysis(
-        self, video_path: Path, start_ms: int, end_ms: int
-    ) -> None:
-        if self.playback_coordinator is not None:
-            self.playback_coordinator.schedule_activity(video_path, start_ms, end_ms)
-
-    def _set_activity_paused(self, paused: bool) -> None:
-        if self.playback_coordinator is not None:
-            self.playback_coordinator.set_operator_busy(paused)
 
     def _update_filmstrip(self) -> None:
         if not hasattr(self, "video_filmstrip"):
@@ -6321,12 +6670,16 @@ class PassageReviewSurface(QDialog):
             self._pending_filmstrip_anchor = None
             self._filmstrip_context = None
             self._filmstrip_absolute_window = None
-            if self.playback_coordinator is not None:
-                self.playback_coordinator.clear_activity()
-            self.activity_timeline.set_target_position(None)
-            self.activity_timeline.hide()
+            if self._filmstrip_gap_message:
+                self.video_filmstrip.status_label.setText(
+                    self._filmstrip_gap_message
+                )
             self.video_filmstrip.setVisible(True)
             self.video_filmstrip.clear("当前没有可用视频胶卷")
+            if self._filmstrip_gap_message:
+                self.video_filmstrip.status_label.setText(
+                    self._filmstrip_gap_message
+                )
             self.preview_timeline.setRange(0, 0)
             self.preview_timeline.setEnabled(False)
             self.preview_mark_btn.setChecked(False)
@@ -6343,31 +6696,26 @@ class PassageReviewSurface(QDialog):
             absolute_end_ms,
         ) = context
         origin_ms = int(absolute_start_ms) - int(start_ms)
-        pane = (
-            self._active_pane
-            if self._active_pane in self.regular_panes
-            else self.regular_pane
-        )
+        pane = self._camera_one_pane()
         location = pane.location
         if location is not None:
-            session_key = self._recording_session_key(location)
-            offset_ms = self._continuous_clock_offsets.get(
-                (int(pane.camera_index), session_key),
-                int(location.clock_offset_ms),
-            )
             # Filmstrip positions are media-local. Convert them to the same
             # calibrated race clock used by the lower camera panes.
-            origin_ms -= int(offset_ms)
+            origin_ms -= int(self._continuous_offset_for_location(location))
         was_visible = self.video_filmstrip.isVisible()
         self.video_filmstrip.setVisible(True)
         if not was_visible and not self._review_split_resize_pending:
             self._review_split_resize_pending = True
             QTimer.singleShot(0, self._finish_review_content_split_resize)
         self.video_filmstrip.set_display_origin(origin_ms)
+        self.video_filmstrip.set_history_markers(
+            self._continuous_marker_positions_for_filmstrip(
+                pane,
+                int(absolute_start_ms),
+                int(absolute_end_ms),
+            )
+        )
         self.video_filmstrip.set_current_position(current_position_ms)
-        self.activity_timeline.set_current_position(current_position_ms)
-        self.activity_timeline.set_target_position(current_position_ms)
-        self._schedule_activity_analysis(video_path, start_ms, end_ms)
         self.preview_timeline.setRange(int(start_ms), int(end_ms))
         self.preview_timeline.set_target_position(
             int(pane._target_position_ms)
@@ -6392,9 +6740,14 @@ class PassageReviewSurface(QDialog):
                 < self._filmstrip_absolute_window[1]
             ):
                 # Adjacent athletes can resolve through overlapping recording
-                # metadata. Keep the active five-minute filmstrip until the
-                # review time leaves its absolute window.
-                return
+                # metadata. Keep the active two-minute filmstrip until the
+                # review time leaves its absolute window. An explicit batch
+                # navigation request is the exception: it is the operator's
+                # instruction to replace the window now.
+                if self._filmstrip_batch_navigation_pending:
+                    pass
+                else:
+                    return
             self._filmstrip_context = signature
             self._filmstrip_absolute_window = (
                 absolute_start_ms,
@@ -6406,22 +6759,221 @@ class PassageReviewSurface(QDialog):
                 end_ms,
                 positions_ms=anchors,
                 origin_ms=origin_ms,
-                defer_remaining=self._low_resource_mode,
+                require_complete=True,
+                interval_ms=CONTINUOUS_FILMSTRIP_INTERVAL_MS,
             )
             return
         # The time range is unchanged: keep the existing filmstrip and only
         # decode newly discovered arrival positions.
         self.video_filmstrip.append_positions(video_path, anchors)
 
-    def _filmstrip_judgment_pane(self) -> Optional[PassageEvidencePane]:
-        pane = (
-            self._active_pane
-            if self._active_pane in self.regular_panes
-            else self.regular_pane
+    def _on_filmstrip_ready(self, ready: bool, _message: str) -> None:
+        self._filmstrip_prefetch_timer.stop()
+        if ready:
+            if self._filmstrip_gap_message:
+                self.video_filmstrip.status_label.setText(
+                    f"{self._filmstrip_gap_message}；当前可处理"
+                )
+            # Let the operator receive the ready state first. The next window
+            # is deliberately prepared later and never replaces the active one.
+            if not self._filmstrip_operator_idle_timer.isActive():
+                self._filmstrip_prefetch_timer.start()
+
+    def _mark_filmstrip_operator_busy(self) -> None:
+        if not hasattr(self, "video_filmstrip") or not hasattr(
+            self, "_filmstrip_operator_idle_timer"
+        ):
+            return
+        self.video_filmstrip.set_operator_busy(True)
+        self._filmstrip_prefetch_timer.stop()
+        self._filmstrip_operator_idle_timer.start()
+
+    def _on_filmstrip_operator_idle(self) -> None:
+        if not hasattr(self, "video_filmstrip"):
+            return
+        pane = self._active_playback_pane()
+        if pane is not None and (
+            bool(getattr(pane, "is_playing", False))
+            or bool(getattr(pane, "_video_scrubbing", False))
+        ):
+            self._filmstrip_operator_idle_timer.start()
+            return
+        self.video_filmstrip.set_operator_busy(False)
+        if self.video_filmstrip.is_ready:
+            self._filmstrip_prefetch_timer.start()
+
+    def _prefetch_next_filmstrip_window(self) -> None:
+        if not hasattr(self, "video_filmstrip") or not self.video_filmstrip.is_ready:
+            return
+        context = self._filmstrip_context
+        absolute_window = self._filmstrip_absolute_window
+        if context is None or absolute_window is None:
+            return
+        pane = self._camera_one_pane()
+        next_start_ms = int(absolute_window[1])
+        next_end_ms = next_start_ms + int(self.FILMSTRIP_WINDOW_MS)
+        location = self._live_location_for_filmstrip(
+            pane,
+            next_start_ms + int(self.FILMSTRIP_WINDOW_MS) // 2,
+        ) or self._archive_location_for_filmstrip(
+            pane,
+            next_start_ms + int(self.FILMSTRIP_WINDOW_MS) // 2,
         )
+        if location is None:
+            return
+        origin_ms = int(
+            location.segment.media_started_at_ms
+            if location.segment.media_started_at_ms is not None
+            else location.segment.started_at_ms
+        )
+        duration_ms = int(location.segment.media_duration_ms or 0)
+        if duration_ms <= 0:
+            return
+        start_position_ms = max(0, next_start_ms - origin_ms)
+        end_position_ms = min(duration_ms, next_end_ms - origin_ms)
+        if end_position_ms <= start_position_ms:
+            return
+        self.video_filmstrip.prefetch(
+            location.video_path,
+            start_position_ms,
+            end_position_ms,
+        )
+
+    def _filmstrip_judgment_pane(self) -> Optional[PassageEvidencePane]:
+        pane = self._camera_one_pane()
         if pane.location is None or pane.location.status not in _OPENABLE_STATUSES:
             return None
         return pane
+
+    def _continuous_marker_positions_for_filmstrip(
+        self,
+        pane: PassageEvidencePane,
+        absolute_start_ms: int,
+        absolute_end_ms: int,
+    ) -> tuple[tuple[int, str], ...]:
+        """Return all confirmed/unknown markers inside the current strip window."""
+
+        location = pane.location
+        if location is None or pane.source_kind != REGULAR_SOURCE:
+            return ()
+        media_origin_ms = int(
+            location.segment.media_started_at_ms
+            if location.segment.media_started_at_ms is not None
+            else location.segment.started_at_ms
+        )
+        values: list[tuple[int, str]] = []
+        for association in self.association_store.associations():
+            if association.confirmed_source != REGULAR_SOURCE:
+                continue
+            segment = self.timeline_store.get_segment(association.segment_id)
+            if segment is None or segment.media_started_at_ms is None:
+                continue
+            marker_time_ms = int(segment.media_started_at_ms) + int(association.position_ms)
+            if absolute_start_ms <= marker_time_ms <= absolute_end_ms:
+                event = self.passage_store.get(association.passage_event_id)
+                values.append((marker_time_ms - media_origin_ms, event.bib.strip() if event else association.bib.strip() or "待补录"))
+        for marker in self.continuous_marker_store.markers():
+            if int(marker.camera_index) != int(pane.camera_index):
+                continue
+            segment = self.timeline_store.get_segment(marker.segment_id)
+            if segment is None or segment.media_started_at_ms is None:
+                continue
+            marker_time_ms = int(segment.media_started_at_ms) + int(marker.position_ms)
+            if absolute_start_ms <= marker_time_ms <= absolute_end_ms:
+                values.append((marker_time_ms - media_origin_ms, marker.label))
+        return tuple(sorted(values, key=lambda item: (item[0], item[1])))
+
+    def _continuous_marker_overlays(
+        self,
+        pane: PassageEvidencePane,
+    ) -> tuple[tuple[float, float, str, bool, bool], ...]:
+        """Return nearby confirmed camera-1 markers on the continuous timeline."""
+
+        location = pane.location
+        if (
+            pane.source_kind != REGULAR_SOURCE
+            or location is None
+            or location.segment.media_started_at_ms is None
+            or pane._current_frame_index < 0
+        ):
+            return ()
+        session_key = self._recording_session_key(location)
+        offset_ms = self._continuous_clock_offsets.get(
+            (int(pane.camera_index), session_key),
+            int(location.clock_offset_ms),
+        )
+        current_recorder_time_ms = (
+            int(location.segment.media_started_at_ms)
+            + int(pane._current_position_ms)
+        )
+        tolerance_ms = max(200, int(pane.frame_duration_ms()) * 3)
+        overlays: list[tuple[float, float, str, bool, bool]] = []
+        for association in self.association_store.associations():
+            if (
+                association.confirmed_source != REGULAR_SOURCE
+                or (
+                    association.passage_event_id == self._selected_event_id
+                    and pane.association is not None
+                )
+            ):
+                continue
+            event = self.passage_store.get(association.passage_event_id)
+            segment = self.timeline_store.get_segment(association.segment_id)
+            if (
+                event is None
+                or segment is None
+                or int(segment.camera_index) != int(pane.camera_index)
+            ):
+                continue
+            if (
+                segment.media_started_at_ms is not None
+                and association.position_ms is not None
+            ):
+                # Persisted marks belong to the recorder timeline of the
+                # segment on which they were confirmed.  Using the chip event
+                # timestamp here reintroduces the very 149/67 collision that
+                # the continuous review rail is meant to prevent.
+                event_recorder_time_ms = (
+                    int(segment.media_started_at_ms)
+                    + int(association.position_ms)
+                )
+            else:
+                event_recorder_time_ms = int(event.timeline_timestamp_ms) + int(
+                    offset_ms
+                )
+            if abs(event_recorder_time_ms - current_recorder_time_ms) > tolerance_ms:
+                continue
+            label = event.bib.strip() or association.bib.strip() or "未知"
+            overlays.append(
+                (
+                    float(association.marker_x_normalized),
+                    float(association.marker_y_normalized),
+                    label,
+                    True,
+                    pane.is_auyat_rgb,
+                )
+            )
+        # Unknown/待补录 markers live on their own continuous timeline and
+        # must remain visible independently of the selected roster identity.
+        for marker in self.continuous_marker_store.markers():
+            if int(marker.camera_index) != int(pane.camera_index):
+                continue
+            segment = self.timeline_store.get_segment(marker.segment_id)
+            if segment is None or segment.media_started_at_ms is None:
+                continue
+            marker_recorder_time_ms = int(segment.media_started_at_ms) + int(marker.position_ms)
+            if abs(marker_recorder_time_ms - current_recorder_time_ms) > tolerance_ms:
+                continue
+            overlays.append(
+                (
+                    float(marker.marker_x_normalized),
+                    float(marker.marker_y_normalized),
+                    marker.label,
+                    True,
+                    pane.is_auyat_rgb,
+                )
+            )
+        return tuple(overlays)
 
     def _on_preview_frame_ready(
         self,
@@ -6430,6 +6982,8 @@ class PassageReviewSurface(QDialog):
         position_ms: int,
         frame_index: int,
     ) -> None:
+        history_markers = self._continuous_marker_overlays(pane)
+        pane.video_view.set_history_markers(history_markers)
         if pane is not self._active_playback_pane():
             return
         self.preview_video_view.set_frame(
@@ -6440,6 +6994,7 @@ class PassageReviewSurface(QDialog):
         self.preview_video_view.set_frame_indicator(
             pane.frame_indicator_label.text()
         )
+        self.preview_video_view.set_history_markers(history_markers)
         self.preview_video_view.set_marker_mode(
             self.preview_mark_btn.isChecked()
         )
@@ -6530,11 +7085,21 @@ class PassageReviewSurface(QDialog):
         self.preview_mark_btn.setChecked(True)
         self.preview_mark_btn.setEnabled(True)
         self.preview_confirm_btn.setEnabled(True)
+        selected_event = self.passage_store.get(self._selected_event_id)
+        nearby_event_id = self._filmstrip_event_id_at_position(int(position_ms))
+        unknown_marker = (
+            selected_event is None
+            or not selected_event.bib.strip()
+            or selected_event.bib.strip().casefold() in {"unknown", "未知", "待补录"}
+            or not nearby_event_id
+        )
         pane.set_external_pending_marker(
             frame_index=int(frame_index),
             position_ms=int(position_ms),
             marker_x_normalized=float(marker_x_normalized),
             marker_y_normalized=float(marker_y_normalized),
+            unknown_marker=unknown_marker,
+            marker_label="待补录" if unknown_marker else "",
         )
         self.video_filmstrip.set_marker(
             int(position_ms),
@@ -6555,6 +7120,9 @@ class PassageReviewSurface(QDialog):
         return confirmed
 
     def _clear_filmstrip_marker(self) -> None:
+        pane = self._filmstrip_judgment_pane()
+        if pane is not None:
+            pane.cancel_marker_edit()
         self.video_filmstrip.clear_marker()
         self.preview_mark_btn.setChecked(False)
         self.preview_confirm_btn.setEnabled(False)
@@ -6562,6 +7130,7 @@ class PassageReviewSurface(QDialog):
     def _preview_filmstrip_position(self, position_ms: int) -> None:
         """Preview the latest drag position without queuing every mouse move."""
 
+        self._mark_filmstrip_operator_busy()
         self._pending_filmstrip_preview_position = int(position_ms)
         self.video_filmstrip.set_current_position(int(position_ms))
         if hasattr(self, "preview_timeline") and self.preview_timeline.maximum() > self.preview_timeline.minimum():
@@ -6612,11 +7181,7 @@ class PassageReviewSurface(QDialog):
             step_ms if int(direction) >= 0 else -step_ms
         )
         target_anchor_ms = target_start_ms + step_ms // 2
-        pane = (
-            self._active_pane
-            if self._active_pane in self.regular_panes
-            else self.regular_pane
-        )
+        pane = self._camera_one_pane()
         if (
             self._live_location_for_filmstrip(pane, target_anchor_ms) is None
             and self._archive_location_for_filmstrip(pane, target_anchor_ms) is None
@@ -6627,7 +7192,7 @@ class PassageReviewSurface(QDialog):
             for event in self._visible_events
             if target_start_ms
             <= int(event.timeline_timestamp_ms)
-            + self._clock_offset_for_camera(int(pane.camera_index))
+            + self._continuous_offset_for_location(pane.location)
             < target_start_ms + step_ms
         )
         if events:
@@ -6635,33 +7200,33 @@ class PassageReviewSurface(QDialog):
                 events,
                 key=lambda event: abs(
                     int(event.timeline_timestamp_ms)
-                    + self._clock_offset_for_camera(int(pane.camera_index))
+                    + self._continuous_offset_for_location(pane.location)
                     - target_anchor_ms
                 ),
             )
             self._select_event(nearest.event_id, preserve_current_frame=pane)
         self._video_candidate_anchor_time_ms = target_anchor_ms
-        self._update_filmstrip()
-        next_context = self._filmstrip_context
-        if next_context is not None:
-            self._rebind_pane_to_filmstrip_archive(pane, int(next_context[3]))
-            self.video_filmstrip.set_current_position(int(next_context[3]))
+        self._filmstrip_requested_window_start_ms = target_start_ms
+        self._filmstrip_batch_navigation_pending = True
+        try:
+            self._update_filmstrip()
+            next_context = self._filmstrip_context
+            if next_context is not None:
+                self._rebind_pane_to_filmstrip_archive(pane, int(next_context[3]))
+                self.video_filmstrip.set_current_position(int(next_context[3]))
+        finally:
+            self._filmstrip_requested_window_start_ms = None
+            self._filmstrip_batch_navigation_pending = False
 
     def _seek_filmstrip_position(self, position_ms: int) -> None:
+        self._mark_filmstrip_operator_busy()
         self._filmstrip_preview_timer.stop()
         self._pending_filmstrip_preview_position = None
         pane = self._filmstrip_judgment_pane()
-        if not bool(getattr(self.video_filmstrip, "_marker_mode", False)):
-            event_id = self._filmstrip_event_id_at_position(int(position_ms))
-            if event_id and event_id != self._selected_event_id:
-                # Changing the roster row must not first seek to that athlete's
-                # target frame. Keep the currently displayed media frame; the
-                # exact filmstrip position is applied below after the row is
-                # rebound, preventing a visible intermediate jump.
-                self._select_event(
-                    event_id,
-                    preserve_current_frame=pane,
-                )
+        # The filmstrip is a continuous-camera locating surface, not an
+        # identity selector.  Clicking a nearby thumbnail must seek camera 1
+        # while leaving the selected roster identity unchanged; otherwise a
+        # missing-chip rider could be silently reassigned to its neighbour.
         self._pending_filmstrip_position = int(position_ms)
         self._filmstrip_seek_retry_count = 0
         self.video_filmstrip.set_current_position(int(position_ms))
@@ -6681,11 +7246,7 @@ class PassageReviewSurface(QDialog):
         """Seek the linked cameras and enlarge the active pane for marking."""
 
         self._seek_filmstrip_position(position_ms)
-        pane = (
-            self._active_pane
-            if self._active_pane in self.regular_panes
-            else self.regular_pane
-        )
+        pane = self._camera_one_pane()
         QTimer.singleShot(60, lambda: self._toggle_maximized_pane(pane))
 
     def _rebind_pane_to_filmstrip_archive(
@@ -6741,7 +7302,7 @@ class PassageReviewSurface(QDialog):
             ),
             lookup_status=location.status,
         )
-        offset_ms = self._clock_offset_for_camera(int(pane.camera_index))
+        offset_ms = self._continuous_offset_for_location(location)
         self._shared_delta_ms = target_absolute_ms - (
             int(event.timeline_timestamp_ms) + int(offset_ms)
         )
@@ -6754,11 +7315,7 @@ class PassageReviewSurface(QDialog):
         self._pending_filmstrip_position = None
         if position_ms is None:
             return
-        preferred_pane = (
-            self._active_pane
-            if self._active_pane in self.evidence_panes
-            else self.regular_pane
-        )
+        preferred_pane = self._camera_one_pane()
         seek_pane = next(
             (
                 pane
@@ -6815,11 +7372,7 @@ class PassageReviewSurface(QDialog):
     def _filmstrip_event_id_at_position(self, position_ms: int) -> str:
         """Resolve a normal filmstrip click to the nearest visible athlete."""
 
-        pane = (
-            self._active_pane
-            if self._active_pane in self.regular_panes
-            else self.regular_pane
-        )
+        pane = self._camera_one_pane()
         location = pane.location
         if location is None:
             return ""
@@ -7133,7 +7686,42 @@ class PassageReviewSurface(QDialog):
     def _confirm_pending_marker(self, pane: PassageEvidencePane) -> bool:
         event = self.passage_store.get(self._selected_event_id)
         pending = pane.pending_confirmation()
-        if event is None or pending is None:
+        if pending is None:
+            return False
+        if bool(pending.get("unknown_marker")):
+            location = pane.location
+            if location is None:
+                return False
+            try:
+                self.continuous_marker_store.create(
+                    camera_index=max(1, int(location.segment.camera_index)),
+                    segment_id=str(pending["segment_id"]),
+                    frame_index=int(pending["frame_index"]),
+                    position_ms=int(pending["position_ms"]),
+                    marker_x_normalized=float(pending["marker_x_normalized"]),
+                    marker_y_normalized=float(pending["marker_y_normalized"]),
+                    label=str(pending.get("marker_label") or "待补录"),
+                    passage_event_id=(event.event_id if event is not None else ""),
+                    bib=(event.bib.strip() if event is not None else ""),
+                    confirmed_at_ms=int(time.time() * 1000.0),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                QMessageBox.critical(self, "保存失败", f"无法保存待补录标记：{error}")
+                return False
+            pane.cancel_marker_edit()
+            self.video_filmstrip.clear_marker()
+            self.preview_mark_btn.setChecked(False)
+            self.preview_confirm_btn.setEnabled(False)
+            return True
+        if event is None:
+            return False
+        pane_event = getattr(pane, "_event", None)
+        if pane_event is None or pane_event.event_id != event.event_id:
+            logger.error(
+                "Refused mismatched confirmation selected=%s pane=%s",
+                event.event_id,
+                getattr(pane_event, "event_id", ""),
+            )
             return False
         identity = event.bib.strip() or "未知"
         try:
@@ -7475,11 +8063,25 @@ class PassageReviewSurface(QDialog):
             if segment is not None
             else self._active_playback_pane()
         )
-        if (
-            pane.location is None
-            or pane.location.segment.segment_id != association.segment_id
-        ):
-            return False
+        if pane.location is None or pane.location.segment.segment_id != association.segment_id:
+            event = self.passage_store.get(event_id)
+            location = self._saved_regular_location(association)
+            if (
+                event is None
+                or location is None
+                or location.status not in _OPENABLE_STATUSES
+            ):
+                return False
+            self._activate_pane(pane, align=False)
+            pane.set_passage(event, location, association)
+            self._shared_delta_ms = 0
+            self._update_reference_states(event_id)
+            self._update_shared_time_label()
+            if self.playback_coordinator is not None:
+                self.playback_coordinator.request_filmstrip_update(deferred=True)
+            else:
+                self._update_filmstrip()
+            return True
         self._activate_pane(pane, align=False)
         self._shared_delta_ms = (
             int(association.position_ms) - int(pane._target_position_ms)
@@ -7568,7 +8170,6 @@ class PassageReviewSurface(QDialog):
         self._toggle_pane(self._active_playback_pane())
 
     def _toggle_pane(self, pane: PassageEvidencePane) -> None:
-        self._set_activity_paused(not pane.is_playing)
         was_sync_playing = self._sync_playing
         if was_sync_playing:
             self._set_sync_playing(False, seek_final=False)
@@ -7905,7 +8506,7 @@ class PassageReviewSurface(QDialog):
         self._update_shared_time_label()
 
     def _on_pane_scrub_started(self, pane: PassageEvidencePane) -> None:
-        self._set_activity_paused(True)
+        self._mark_filmstrip_operator_busy()
         if self._sync_playing:
             self._set_sync_playing(False, seek_final=False)
         self._active_pane = pane
@@ -7917,6 +8518,7 @@ class PassageReviewSurface(QDialog):
         pane: PassageEvidencePane,
         delta_ms: int,
     ) -> None:
+        self._mark_filmstrip_operator_busy()
         if self._sync_playing or pane is not self._active_pane:
             return
         self._shared_delta_ms = int(delta_ms)
@@ -7942,12 +8544,6 @@ class PassageReviewSurface(QDialog):
             self._update_filmstrip()
             return
         self.video_filmstrip.set_current_position(position_ms)
-        self.activity_timeline.set_current_position(position_ms)
-        if self.playback_coordinator is not None:
-            self.playback_coordinator.set_operator_busy(
-                pane.is_playing
-                or bool(getattr(pane, "_video_scrubbing", False))
-            )
         # When the operator stops on a lower-pane frame, decode that exact
         # frame as a temporary filmstrip anchor. During playback/scrubbing we
         # deliberately avoid per-frame thumbnail generation.
@@ -8032,8 +8628,8 @@ class PassageReviewSurface(QDialog):
         *,
         seek_final: bool = True,
     ) -> None:
+        self._mark_filmstrip_operator_busy()
         playing = bool(playing) and self._sync_delta_bounds() is not None
-        self._set_activity_paused(playing)
         if playing == self._sync_playing:
             return
         if playing:
@@ -8422,22 +9018,29 @@ class PassageReviewSurface(QDialog):
         if not (0 <= row < len(self._visible_events)):
             return
         event = self._visible_events[row]
-        lookup = self._lookups.get(event.event_id)
-        if lookup is None:
-            return
-        regular = source_location(lookup, high_speed=False)
-        high_speed = source_location(lookup, high_speed=True)
-        location = next(
-            (
-                candidate
-                for candidate in (regular, high_speed)
-                if candidate is not None
-                and candidate.status in _OPENABLE_STATUSES
-            ),
-            None,
-        )
-        if location is not None:
-            self._open_location_if_available(event, location)
+        # A single row selection deliberately keeps the current frame so an
+        # operator can scan continuously without skipping an unchipped rider.
+        # A double-click is an explicit request to locate this passage on the
+        # continuous camera recording.  It must not open the old short
+        # evidence clip; that remains an explicit pane-button action.
+        self._select_event(event.event_id, locate_target=True)
+        # A race configured with no ordinary camera has no continuous target
+        # to locate.  Preserve the established high-speed-only affordance by
+        # maximising that pane, without invoking the generic short-clip
+        # callback used by the ordinary-camera workflow.
+        if not any(
+            pane.location is not None
+            and pane.location.status in _OPENABLE_STATUSES
+            for pane in self.regular_panes
+        ):
+            lookup = self._lookups.get(event.event_id)
+            high_speed = (
+                source_location(lookup, high_speed=True)
+                if lookup is not None
+                else None
+            )
+            if high_speed is not None and high_speed.status in _OPENABLE_STATUSES:
+                self._toggle_maximized_pane(self.high_speed_pane)
 
     def _open_location_if_available(
         self,
@@ -8491,8 +9094,13 @@ class PassageReviewSurface(QDialog):
         self._restore_maximized_pane()
         self._sync_playing = False
         self._sync_timer.stop()
+        if hasattr(self, "_filmstrip_prefetch_timer"):
+            self._filmstrip_prefetch_timer.stop()
+        if hasattr(self, "_filmstrip_operator_idle_timer"):
+            self._filmstrip_operator_idle_timer.stop()
         if hasattr(self, "video_filmstrip"):
             self.video_filmstrip.stop()
+            self.video_filmstrip.stop_prefetch()
         if self.playback_coordinator is not None:
             self.playback_coordinator.shutdown()
         for pane in self.all_evidence_panes:

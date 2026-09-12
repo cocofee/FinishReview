@@ -102,6 +102,7 @@ from .recording_controller import (
     RecordingStopFailure,
 )
 from .settings import FinishReviewSettings
+from .racetiger_source import split_racetiger_endpoint
 from .review_recorder import (
     ArchiveTimelinePublisher,
     DEFAULT_MAX_SHARED_REVIEW_CLIP_MS,
@@ -824,6 +825,9 @@ class FinishReviewLaunchDialog(QDialog):
         self.racetiger_token_edit.setEchoMode(QLineEdit.Password)
         self.racetiger_token_edit.setPlaceholderText("本机保存，不显示明文")
         form.addRow("赛虎令牌", self.racetiger_token_edit)
+        self.racetiger_base_url_edit.editingFinished.connect(
+            self._normalize_racetiger_endpoint_fields
+        )
 
         self.racetiger_poll_interval_spin = QDoubleSpinBox(self)
         self.racetiger_poll_interval_spin.setRange(0.5, 60.0)
@@ -2001,6 +2005,7 @@ class FinishReviewLaunchDialog(QDialog):
         self.camera_status_label.setStyleSheet(f"color: {color}; font-weight: 600;")
 
     def _accept_settings(self) -> None:
+        self._normalize_racetiger_endpoint_fields()
         try:
             settings = self.settings
             if settings.secondary_source and not is_supported_review_source(
@@ -2027,6 +2032,21 @@ class FinishReviewLaunchDialog(QDialog):
             QMessageBox.warning(self, "设置不完整", str(error))
             return
         self.accept()
+
+    def _normalize_racetiger_endpoint_fields(self) -> None:
+        """Accept legacy pasted RaceTiger links and split their parameters."""
+
+        raw = self.racetiger_base_url_edit.text().strip()
+        base, embedded_pc, embedded_rid, embedded_token = split_racetiger_endpoint(raw)
+        if base == raw and not any((embedded_pc, embedded_rid, embedded_token)):
+            return
+        self.racetiger_base_url_edit.setText(base)
+        if embedded_pc and not self.racetiger_pc_edit.text().strip():
+            self.racetiger_pc_edit.setText(embedded_pc)
+        if embedded_rid and not self.racetiger_rid_edit.text().strip():
+            self.racetiger_rid_edit.setText(embedded_rid)
+        if embedded_token and not self.racetiger_token_edit.text():
+            self.racetiger_token_edit.setText(embedded_token)
 
     def _browse_output_dir(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -2489,6 +2509,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self._settings_saver = settings_saver
         self._workspace_mode = "live"
         self._archive_background_passage_count = 0
+        # The base review surface starts timers while the production window is
+        # still being assembled. Initialise health-check state before that
+        # happens so an early clock tick cannot observe half-built state.
+        self._started = False
+        self._stop_requested = False
 
         inbox_dir = self.workspace_root / CYCLERACE_INBOX_DIRNAME
         self._receiver_passage_store = PassageEventStore(
@@ -2626,7 +2651,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self._receiver_error = ""
         self._racetiger_status: RaceTigerStatus | None = None
         self._racetiger_generation = 0
-        self._started = False
         self._last_cleanup_at = 0.0
         self._recording_started_at = 0.0
         self._camera_reconnect_attempts: dict[int, int] = {}
@@ -2695,8 +2719,6 @@ class FinishReviewWindow(PassageReviewSurface):
             if self._publish_archive_segments():
                 self._lookup_cache.clear()
                 self.refresh()
-            if self._video_assist_enabled():
-                self._start_archive_video_scan_workers()
         except Exception as exc:  # noqa: BLE001 - recovery remains operator-visible.
             self._capture_error = sanitize_recording_message(exc)
             logger.exception("Failed to recover archived recording sessions")
@@ -2994,10 +3016,12 @@ class FinishReviewWindow(PassageReviewSurface):
         event_id: str,
         *,
         preserve_current_frame: PassageEvidencePane | None = None,
+        locate_target: bool = False,
     ) -> None:
         super()._select_event(
             event_id,
             preserve_current_frame=preserve_current_frame,
+            locate_target=locate_target,
         )
 
     def _start_archive_video_scan_workers(self) -> None:
@@ -3048,6 +3072,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 height=360,
                 ffmpeg_path=self.ffmpeg_path or "ffmpeg",
                 sample_fps=4.0,
+                continuous=False,
                 roi=self._finish_line_rois.get(
                     camera_index, (0.35, 0.15, 0.65, 0.95)
                 ),
@@ -3074,6 +3099,38 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_operator_controls()
         if hasattr(self, "high_speed_status_label"):
             self._update_runtime_status()
+
+    def _reap_finished_archive_video_scan_workers(self) -> None:
+        """Drop completed one-shot archive scanners from runtime state."""
+
+        finished: list[tuple[int, object]] = []
+        for camera_index, worker in tuple(self._archive_video_scan_workers.items()):
+            if not bool(getattr(worker, "is_running", False)):
+                finished.append((camera_index, worker))
+        if not finished:
+            return
+        for camera_index, worker in finished:
+            self._archive_video_scan_workers.pop(camera_index, None)
+            self._video_scan_tokens.pop(camera_index, None)
+            stop = getattr(worker, "stop", None)
+            if callable(stop):
+                stop(timeout=0.1)
+
+    def _toggle_archive_video_scan(self) -> None:
+        """Start or stop the optional, one-shot historical video scan."""
+
+        if (
+            self._workspace_mode != "archive"
+            or self._recording_any_active()
+            or not self._video_assist_enabled()
+        ):
+            return
+        self._reap_finished_archive_video_scan_workers()
+        if self._archive_video_scan_workers:
+            self._stop_archive_video_scan_workers()
+        else:
+            self._start_archive_video_scan_workers()
+        self._update_runtime_status()
 
     def _clear_selection_details(self) -> None:
         super()._clear_selection_details()
@@ -3839,6 +3896,15 @@ class FinishReviewWindow(PassageReviewSurface):
         self.record_button.setMinimumWidth(88)
         self.record_button.clicked.connect(self._toggle_recording)
         top_layout.addWidget(self.record_button)
+        self.archive_scan_button = QPushButton("分析历史视频", panel)
+        self.archive_scan_button.setObjectName("finishArchiveScanButton")
+        self.archive_scan_button.setMinimumWidth(104)
+        self.archive_scan_button.setToolTip(
+            "仅在历史比赛中手动启动一次性视频候选分析"
+        )
+        self.archive_scan_button.clicked.connect(self._toggle_archive_video_scan)
+        self.archive_scan_button.setVisible(False)
+        top_layout.addWidget(self.archive_scan_button)
         panel_layout.addLayout(top_layout)
 
         status_strip = QFrame(panel)
@@ -5630,6 +5696,7 @@ class FinishReviewWindow(PassageReviewSurface):
         return tuple(published)
 
     def _collect_runtime_status(self) -> RuntimeStatusSnapshot:
+        self._reap_finished_archive_video_scan_workers()
         configured_sources = tuple(self._configured_recording_sources())
         recording_active = self._recording_any_active()
         segments_by_camera = {
@@ -5681,11 +5748,18 @@ class FinishReviewWindow(PassageReviewSurface):
                 if recorder.is_running
             ),
             auto_recording_error=self._auto_recording_error,
-            archive_scan_active=bool(self._archive_video_scan_workers),
+            archive_scan_active=any(
+                bool(getattr(worker, "is_running", False))
+                for worker in self._archive_video_scan_workers.values()
+            ),
             anomaly_count=len(self.video_reconciliation()),
             archive_candidate_count=(
                 len(self.video_navigation_candidates())
-                if not recording_active and self._archive_video_scan_workers
+                if not recording_active
+                and any(
+                    bool(getattr(worker, "is_running", False))
+                    for worker in self._archive_video_scan_workers.values()
+                )
                 else 0
             ),
             visual_failed=self._visual_failed,
@@ -5847,6 +5921,16 @@ class FinishReviewWindow(PassageReviewSurface):
         self.video_assist_status_label.setStatus(video_text, video_state)
         self.video_assist_status_label.setToolTip(video_tip)
         self.video_assist_status_label.setVisible(self._video_assist_enabled())
+        if hasattr(self, "archive_scan_button"):
+            archive_mode = snapshot.workspace_mode == "archive" and not recording_active
+            archive_scan_available = archive_mode and self._video_assist_enabled()
+            self.archive_scan_button.setVisible(archive_scan_available)
+            self.archive_scan_button.setEnabled(archive_scan_available)
+            self.archive_scan_button.setText(
+                "停止视频分析"
+                if snapshot.archive_scan_active
+                else "分析历史视频"
+            )
 
         if snapshot.workspace_mode == "archive" and not recording_active:
             recording_text, recording_color = "普通录像: 历史查看", "#667085"
@@ -6388,25 +6472,9 @@ class FinishReviewWindow(PassageReviewSurface):
             reconcile_started,
             item_count=len(values),
         )
-        # A visual arrival without a chip still needs a judgeable context.
-        # Anchor the main review pane to the nearest known chip window while
-        # keeping the official passage journal unchanged.
-        for item in reversed(reconciliation):
-            candidate = item.candidate
-            candidate_id = str(getattr(candidate, "candidate_id", "")).strip()
-            if (
-                candidate_id in {
-                    str(getattr(value, "candidate_id", "")).strip()
-                    for value in values
-                }
-                and int(item.chip_count) == 0
-                and not bool(getattr(candidate, "is_camera_motion", False))
-                and candidate_id
-            ):
-                if getattr(self, "_last_auto_video_candidate_id", "") != candidate_id:
-                    self._last_auto_video_candidate_id = candidate_id
-                    self._focus_video_candidate_in_review(candidate)
-                break
+        # Video analysis is advisory. Never replace the operator's current
+        # passage from a background callback; explicit candidate actions below
+        # are the only path that may change the selected athlete or frame.
         self.video_review_apply_requested.emit(reconciliation)
 
     def _persist_video_review(self, candidate_id: str, status: str, bib: str) -> None:
@@ -6583,7 +6651,6 @@ class FinishReviewWindow(PassageReviewSurface):
             self._camera_reconnect_not_before.clear()
             self._camera_reconnect_errors.clear()
             self._camera_segment_progress.clear()
-            self._start_archive_video_scan_workers()
         self._update_runtime_status()
         return failures
 

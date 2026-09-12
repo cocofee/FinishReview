@@ -298,23 +298,32 @@ def test_concrete_review_windows_are_sibling_types():
     )
 
 
-def test_select_event_forwards_preserved_video_frame(qapp, tmp_path, monkeypatch):
+def test_select_event_forwards_selection_options(qapp, tmp_path, monkeypatch):
     window = _window(tmp_path)
     captured = {}
 
-    def select_event(_self, event_id, *, preserve_current_frame=None):
+    def select_event(
+        _self,
+        event_id,
+        *,
+        preserve_current_frame=None,
+        locate_target=False,
+    ):
         captured["event_id"] = event_id
         captured["pane"] = preserve_current_frame
+        captured["locate_target"] = locate_target
 
     monkeypatch.setattr(passage_review.PassageReviewSurface, "_select_event", select_event)
     window._select_event(
         "passage-1",
         preserve_current_frame=window.regular_pane,
+        locate_target=True,
     )
 
     assert captured == {
         "event_id": "passage-1",
         "pane": window.regular_pane,
+        "locate_target": True,
     }
     window.close()
 
@@ -3367,6 +3376,121 @@ def test_video_arrival_candidates_persist_across_workspace_reopen(
     ]
     assert restored.video_arrival_button.text() == "到达候选：1批/1点"
     restored.close()
+
+
+def test_background_video_candidate_does_not_change_current_passage(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.passage_store.append(
+        _event(
+            event_id="passage-149",
+            sequence=149,
+            bib="149",
+            passage_timestamp_ms=1_000,
+        )
+    )
+    window.passage_store.append(
+        _event(
+            event_id="passage-67",
+            sequence=67,
+            bib="67",
+            passage_timestamp_ms=2_000,
+        )
+    )
+    window.refresh()
+    selected_event_id = window._selected_event_id
+    selected_row = window.table.currentRow()
+    focused = []
+    monkeypatch.setattr(
+        window,
+        "_focus_video_candidate_in_review",
+        lambda candidate: focused.append(candidate) or True,
+    )
+    candidate = VideoPassageCandidate(
+        "visual:candidate-1",
+        1,
+        1_900,
+        2_100,
+        2_000,
+        0.3,
+        0.1,
+    )
+
+    window._reconcile_video_candidates((candidate,))
+    qapp.processEvents()
+
+    assert focused == []
+    assert window._selected_event_id == selected_event_id
+    assert window.table.currentRow() == selected_row
+    window.close()
+
+
+def test_archive_video_scan_is_manual_and_returns_to_idle_after_completion(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    from realtime import video_passage_detector as detector_module
+
+    video_path = tmp_path / "camera_01.ts"
+    video_path.write_bytes(b"video")
+    VideoTimelineStore(tmp_path / "video_timeline.jsonl").add_completed_segment(
+        source_id="camera_01",
+        camera_index=1,
+        video_path=video_path,
+        media_started_at_ms=1_000,
+        media_duration_ms=2_000,
+        clock_source=DEFAULT_CLOCK_SOURCE,
+        timing_error_ms=0,
+        end_reason="test",
+        race_id="race-1",
+    )
+
+    class _ScanWorker:
+        instances = []
+
+        def __init__(self, provider, callback, **kwargs):
+            self.provider = provider
+            self.callback = callback
+            self.kwargs = kwargs
+            self.is_running = False
+            self.stop_calls = []
+            type(self).instances.append(self)
+
+        def start(self):
+            self.is_running = True
+
+        def stop(self, timeout=2.0):
+            self.stop_calls.append(timeout)
+            self.is_running = False
+
+    monkeypatch.setattr(detector_module, "VideoPassageScanWorker", _ScanWorker)
+    window = _window(tmp_path)
+
+    assert _ScanWorker.instances == []
+    assert window._archive_video_scan_workers == {}
+
+    window._workspace_mode = "archive"
+    window._update_runtime_status()
+    assert not window.archive_scan_button.isHidden()
+    assert window.archive_scan_button.text() == "分析历史视频"
+
+    window.archive_scan_button.click()
+    qapp.processEvents()
+    worker = _ScanWorker.instances[-1]
+    assert worker.is_running
+    assert worker.kwargs["continuous"] is False
+    assert window.archive_scan_button.text() == "停止视频分析"
+
+    worker.is_running = False
+    window._update_runtime_status()
+    assert window._archive_video_scan_workers == {}
+    assert worker.stop_calls == [0.1]
+    assert window.archive_scan_button.text() == "分析历史视频"
+    window.close()
 
 
 def test_video_anomaly_list_refreshes_status_while_open(qapp, tmp_path):

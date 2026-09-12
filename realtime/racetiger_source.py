@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .passage_receiver import PassageEvent, PassageEventStore
@@ -26,6 +26,39 @@ UNEXPECTED_ERROR_LOG_INTERVAL_SECONDS = 60.0
 
 class RaceTigerError(RuntimeError):
     """Raised when RaceTiger cannot provide a valid finish snapshot."""
+
+
+def split_racetiger_endpoint(value: object) -> tuple[str, str, str, str]:
+    """Split a pasted RaceTiger link into base URL and query credentials.
+
+    Older RaceTiger setup links put ``pc``, ``rid`` and ``token`` in the
+    query string (for example ``/Dif/info?...``).  The client itself expects
+    the transport origin and sends those values on every endpoint request.
+    Accepting both forms keeps existing links usable while ensuring the token
+    is not persisted as part of a URL.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return "", "", "", ""
+    parsed = urlsplit(text)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return text, "", "", ""
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    normalized = {
+        str(key).strip().lower(): str(values[0]).strip()
+        for key, values in query.items()
+        if values
+    }
+    pc = normalized.get("pc", "")
+    rid = normalized.get("rid", "")
+    token = normalized.get("token", "")
+    if not any((pc, rid, token)):
+        return text.rstrip("/"), "", "", ""
+    # The endpoint path in a pasted link (usually /Dif/info) is not the API
+    # base; RaceTigerSource appends Dif/info, Dif/bio and Dif/score itself.
+    base = urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
+    return base, pc, rid, token
 
 
 def _url_origin(url: str) -> tuple[str, str, int | None]:
@@ -843,4 +876,5 @@ __all__ = [
     "RaceTigerSource",
     "RaceTigerStatus",
     "parse_beijing_timestamp",
+    "split_racetiger_endpoint",
 ]

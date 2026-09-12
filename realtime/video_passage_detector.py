@@ -684,6 +684,7 @@ class VideoPassageScanWorker:
         sample_fps: float = 8.0,
         roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
         interval_seconds: float = 2.0,
+        continuous: bool = True,
         path_resolver: Callable[[object], str | Path] | None = None,
         finish_line: FinishLine | None = None,
         line_batch_gap_ms: int = 1_500,
@@ -700,6 +701,7 @@ class VideoPassageScanWorker:
         self.sample_fps = float(sample_fps)
         self.roi = roi
         self.interval_seconds = max(0.5, float(interval_seconds))
+        self.continuous = bool(continuous)
         self.path_resolver = path_resolver or (
             lambda segment: str(getattr(segment, "video_path", ""))
         )
@@ -729,6 +731,13 @@ class VideoPassageScanWorker:
             daemon=True,
         )
         self._thread.start()
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the scanner thread is still processing or polling."""
+
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     def request_scan(self) -> None:
         self._wake.set()
@@ -915,6 +924,8 @@ class VideoPassageScanWorker:
             except (OSError, RuntimeError, ValueError):
                 # Persistence and mutable media failures are retried next poll.
                 pass
+            if not self.continuous:
+                break
             self._wake.wait(self.interval_seconds)
             self._wake.clear()
 
