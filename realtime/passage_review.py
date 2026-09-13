@@ -7182,29 +7182,76 @@ class PassageReviewSurface(QDialog):
         )
         target_anchor_ms = target_start_ms + step_ms // 2
         pane = self._camera_one_pane()
+
+        # Most batch moves stay inside the same five-minute archive file. In
+        # that case navigate the filmstrip directly instead of asking the
+        # passage locator to find an athlete at the midpoint. The locator is
+        # intentionally passage-oriented and may return no result in an empty
+        # interval, which used to make the button appear to do nothing.
+        filmstrip_path, local_start, _local_end = context
+        media_origin_ms = int(absolute_window[0]) - int(local_start)
+        target_local_start = target_start_ms - media_origin_ms
+        target_local_end = target_local_start + step_ms
+        matching_duration = 0
+        for segment in self.timeline_store.segments():
+            if int(segment.camera_index) != int(pane.camera_index):
+                continue
+            if segment.media_started_at_ms is None or segment.media_duration_ms is None:
+                continue
+            try:
+                segment_path = self.timeline_store.resolve_video_path(segment)
+            except (OSError, RuntimeError, ValueError):
+                segment_path = Path(segment.video_path)
+            if Path(segment_path).resolve() == Path(filmstrip_path).resolve():
+                matching_duration = max(matching_duration, int(segment.media_duration_ms))
+        coverage_ok = True
+        if pane.location is not None and Path(pane.location.video_path).resolve() == Path(filmstrip_path).resolve():
+            coverage_ok = self._filmstrip_window_coverage(
+                pane,
+                pane.location,
+                target_start_ms,
+                target_start_ms + step_ms,
+            )[0]
+        if (
+            0 <= target_local_start
+            and target_local_end <= matching_duration
+            and coverage_ok
+        ):
+            offset_ms = self._continuous_offset_for_location(pane.location)
+            anchors = tuple(
+                int(event.timeline_timestamp_ms) + int(offset_ms) - media_origin_ms
+                for event in self._visible_events
+                if target_start_ms
+                <= int(event.timeline_timestamp_ms) + int(offset_ms)
+                <= target_start_ms + step_ms
+            )
+            display_origin_ms = media_origin_ms - int(offset_ms)
+            self._filmstrip_context = (
+                filmstrip_path,
+                target_local_start,
+                target_local_end,
+            )
+            self._filmstrip_absolute_window = (
+                target_start_ms,
+                target_start_ms + step_ms,
+            )
+            self.video_filmstrip.set_display_origin(display_origin_ms)
+            self.video_filmstrip.load(
+                filmstrip_path,
+                target_local_start,
+                target_local_end,
+                positions_ms=anchors,
+                origin_ms=display_origin_ms,
+                require_complete=True,
+                interval_ms=CONTINUOUS_FILMSTRIP_INTERVAL_MS,
+            )
+            self.video_filmstrip.set_current_position(step_ms // 2)
+            return
         if (
             self._live_location_for_filmstrip(pane, target_anchor_ms) is None
             and self._archive_location_for_filmstrip(pane, target_anchor_ms) is None
         ):
             return
-        events = tuple(
-            event
-            for event in self._visible_events
-            if target_start_ms
-            <= int(event.timeline_timestamp_ms)
-            + self._continuous_offset_for_location(pane.location)
-            < target_start_ms + step_ms
-        )
-        if events:
-            nearest = min(
-                events,
-                key=lambda event: abs(
-                    int(event.timeline_timestamp_ms)
-                    + self._continuous_offset_for_location(pane.location)
-                    - target_anchor_ms
-                ),
-            )
-            self._select_event(nearest.event_id, preserve_current_frame=pane)
         self._video_candidate_anchor_time_ms = target_anchor_ms
         self._filmstrip_requested_window_start_ms = target_start_ms
         self._filmstrip_batch_navigation_pending = True
