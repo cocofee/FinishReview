@@ -634,6 +634,8 @@ class VideoFilmstripWidget(QFrame):
         self._frames: list[FilmstripFrame] = []
         self._frames_by_path: dict[Path, dict[int, FilmstripFrame]] = {}
         self._prefetch_positions_by_path: dict[Path, set[int]] = {}
+        # Bounded ring for previous/current/next two-minute windows.
+        self._retained_windows: list[tuple[Path, int, int]] = []
         self._requested_positions: set[int] = set()
         self._target_positions: tuple[int, ...] = ()
         self._deferred_positions: set[int] = set()
@@ -867,6 +869,47 @@ class VideoFilmstripWidget(QFrame):
         self._deferred_positions.difference_update(positions)
         self.append_positions(self._video_path, positions)
 
+    def _remember_window(self, video_path: Path, start_ms: int, end_ms: int) -> None:
+        """Retain at most three neighbouring windows and evict older frames."""
+        window = (Path(video_path), max(0, int(start_ms)), max(0, int(end_ms)))
+        self._retained_windows = [item for item in self._retained_windows if item != window]
+        self._retained_windows.append(window)
+        active_window = None
+        if self._video_path is not None and self._display_end_ms is not None:
+            active_window = (
+                Path(self._video_path),
+                max(0, int(self._display_start_ms or 0)),
+                max(0, int(self._display_end_ms)),
+            )
+        if active_window is not None and active_window in self._retained_windows:
+            # Prefetch may add a fourth window, but it must never evict the
+            # currently displayed judgment window.
+            others = [item for item in self._retained_windows if item != active_window]
+            self._retained_windows = others[-2:] + [active_window]
+        else:
+            self._retained_windows = self._retained_windows[-3:]
+        ranges_by_path: dict[Path, list[tuple[int, int]]] = {}
+        for path, start, end in self._retained_windows:
+            ranges_by_path.setdefault(path, []).append((start, end))
+        for path, frames in tuple(self._frames_by_path.items()):
+            ranges = ranges_by_path.get(path)
+            if not ranges:
+                self._frames_by_path.pop(path, None)
+                continue
+            self._frames_by_path[path] = {
+                position: frame for position, frame in frames.items()
+                if any(start <= int(position) <= end for start, end in ranges)
+            }
+        for path, positions in tuple(self._prefetch_positions_by_path.items()):
+            ranges = ranges_by_path.get(path)
+            if not ranges:
+                self._prefetch_positions_by_path.pop(path, None)
+                continue
+            self._prefetch_positions_by_path[path] = {
+                position for position in positions
+                if any(start <= int(position) <= end for start, end in ranges)
+            }
+
     def _align_current_position_to_center(self) -> None:
         if not self._frames or self._current_position_ms < 0:
             return
@@ -892,6 +935,7 @@ class VideoFilmstripWidget(QFrame):
         self._frames.clear()
         self._frames_by_path.clear()
         self._prefetch_positions_by_path.clear()
+        self._retained_windows.clear()
         self._requested_positions.clear()
         self._target_positions = ()
         self._deferred_positions.clear()
@@ -972,6 +1016,7 @@ class VideoFilmstripWidget(QFrame):
             int(value)
             for value in filmstrip_positions(start_ms, end_ms)
         )
+        self._remember_window(path, int(start_ms), int(end_ms))
         self._prefetch_positions_by_path[path] = set(positions)
         cache = self._frames_by_path.setdefault(path, {})
         missing = tuple(sorted(position for position in positions if position not in cache))
@@ -1051,28 +1096,17 @@ class VideoFilmstripWidget(QFrame):
         interval_ms: int = DEFAULT_FILMSTRIP_INTERVAL_MS,
     ) -> None:
         path = Path(video_path)
+        if self._video_path is not None and self._display_end_ms is not None:
+            self._remember_window(
+                self._video_path,
+                int(self._display_start_ms or 0),
+                int(self._display_end_ms),
+            )
         self.stop()
-        prefetched_path = self._prefetch_path
         self.stop_prefetch()
         self._set_ready(False, "正在准备当前两分钟胶卷...")
         self._decode_error = ""
         if self._video_path != path:
-            # Retain the active and one prefetched recording only. This keeps
-            # the future window warm without allowing a long race to grow the
-            # thumbnail cache without bounds.
-            keep_paths = {path}
-            if prefetched_path is not None:
-                keep_paths.add(prefetched_path)
-            self._frames_by_path = {
-                cached_path: frames
-                for cached_path, frames in self._frames_by_path.items()
-                if cached_path in keep_paths
-            }
-            self._prefetch_positions_by_path = {
-                cached_path: values
-                for cached_path, values in self._prefetch_positions_by_path.items()
-                if cached_path in keep_paths
-            }
             self._frames.clear()
             self._video_path = path
             self._display_origin_ms = (
@@ -1080,26 +1114,11 @@ class VideoFilmstripWidget(QFrame):
             )
         elif origin_ms is not None:
             self._display_origin_ms = int(origin_ms)
-        self._frames = sorted(self._frames_by_path.get(path, {}).values(), key=lambda value: value.position_ms)
         self._display_start_ms = max(0, int(start_ms))
         self._display_end_ms = max(self._display_start_ms, int(end_ms))
+        self._remember_window(path, self._display_start_ms, self._display_end_ms)
         cached = self._frames_by_path.get(path, {})
-        allowed = set(self._prefetch_positions_by_path.get(path, set()))
-        allowed.update(
-            position
-            for position in cached
-            if self._display_start_ms <= int(position) <= self._display_end_ms
-        )
-        if len(cached) > len(allowed):
-            cached = {
-                position: frame
-                for position, frame in cached.items()
-                if position in allowed
-            }
-            self._frames_by_path[path] = cached
-            self._frames = sorted(
-                cached.values(), key=lambda value: value.position_ms
-            )
+        self._frames = sorted(cached.values(), key=lambda value: value.position_ms)
         if self._current_position_ms < 0:
             self._display_reference_ms = self._display_start_ms
         self.content.refresh_geometry()
