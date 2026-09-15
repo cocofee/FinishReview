@@ -13,6 +13,8 @@ from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPolygon
 from PyQt5.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from .thread_lifecycle import retire_qthread, track_qthread
+from .camera_judgments import CameraJudgmentTrack
+from .race_filmstrip import RaceFilmstripPanel
 from .time_domain import DurationMs, MediaPositionMs, WallClockMs
 
 DEFAULT_FILMSTRIP_INTERVAL_MS = 2_000
@@ -665,6 +667,7 @@ class VideoFilmstripWidget(QFrame):
         layout.setSpacing(4)
         header = QHBoxLayout()
         title = QLabel("时间胶卷")
+        self.title_label = title
         title.setStyleSheet("font-weight: 700; color: #334155;")
         header.addWidget(title)
         self.status_label = QLabel("选择连续判读时间窗")
@@ -718,6 +721,27 @@ class VideoFilmstripWidget(QFrame):
         self.content.scrub_position_changed.connect(self.scrub_position_changed.emit)
         self.marker_position_selected.connect(self._on_marker_position_selected)
         layout.addWidget(self.scroll, 1)
+        self.full_race = RaceFilmstripPanel(self)
+        self.full_race.hide()
+        layout.addWidget(self.full_race, 1)
+
+        # Saved judgments belong to the whole camera timeline, so keep this
+        # track independent of thumbnail loading, clearing and window changes.
+        self.judgment_track = CameraJudgmentTrack(self)
+        self.judgment_track.hide()
+        layout.addWidget(self.judgment_track)
+
+    def enable_full_race(self) -> None:
+        self.scroll.hide()
+        self.status_label.hide()
+        self.title_label.hide()
+        self.full_race.show()
+
+    def closeEvent(self, event) -> None:
+        self.full_race.stop()
+        self.stop()
+        self.stop_prefetch()
+        super().closeEvent(event)
 
     def _on_content_position_selected(self, position_ms: int) -> None:
         if self._expected_positions and not self._ready:

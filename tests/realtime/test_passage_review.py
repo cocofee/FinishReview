@@ -232,6 +232,264 @@ def _add_segment(
     return segment
 
 
+def test_retained_image_exact_frame_seek_waits_for_metadata(qapp, tmp_path, fake_playback):
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01", camera_index=1,
+                 started_at_ms=10_000, ended_at_ms=20_000)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    dialog = PassageReviewDialog(passages, timeline)
+    qapp.processEvents()
+    pane = dialog._camera_one_pane()
+    worker = pane._worker
+    exact = []
+    worker.seek_frame = exact.append
+    pane._fps = 0
+    pane.seek_media_frame(33, 1)
+    assert not exact
+    worker.metadata_ready.emit(10000, 29.97, 2560, 1920, 300)
+    assert exact == [1]
+    pane.seek_media_frame(66, 2)
+    assert exact == [1, 2]
+    dialog.close()
+
+
+def test_camera_one_judgments_survive_identity_changes_and_reopen(
+    qapp, tmp_path, fake_playback,
+):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="rider-149", bib="149", passage_time_ms=15_000))
+    passages.append(_event(event_id="rider-67", bib="67", passage_time_ms=15_262,
+                           sequence=2, group_id="women"))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10_000, ended_at_ms=70_000)
+    dialog = PassageReviewDialog(passages, timeline)
+    dialog.show()
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    for row, position in enumerate((5_000, 5_262)):
+        dialog.table.setCurrentCell(row, 1)
+        pane._worker.frame_ready.emit(frame, position, position // 20)
+        pane._on_marker_position_selected(0.5, 0.5)
+        assert dialog._confirm_pending_marker(pane)
+        assert dialog.video_filmstrip.judgment_track.list.count() == row + 1
+
+    worker = pane._worker
+    worker.frame_ready.emit(frame, 40_000, 2_000)
+    seeks = list(worker.seek_calls)
+    dialog.table.setCurrentCell(0, 1)
+    qapp.processEvents()
+    assert worker.seek_calls == seeks
+    assert pane._current_position_ms == 40_000
+    assert dialog.video_filmstrip.judgment_track.list.count() == 2
+    assert "149" in dialog.video_filmstrip.judgment_track.list.item(0).text()
+    assert "67" in dialog.video_filmstrip.judgment_track.list.item(1).text()
+    assert dialog.video_filmstrip.judgment_track.list.item(0).isSelected()
+    assert "08:00:15.262" in dialog.video_filmstrip.judgment_track.list.item(1).text()
+
+    dialog.group_combo.setCurrentIndex(dialog.group_combo.findData("women"))
+    qapp.processEvents()
+    assert dialog.table.rowCount() == 1
+    assert dialog.video_filmstrip.judgment_track.list.count() == 2
+    dialog.close()
+
+    reopened = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    assert reopened.video_filmstrip.judgment_track.list.count() == 2
+    assert "149" in reopened.video_filmstrip.judgment_track.list.item(0).text()
+    reopened.close()
+
+
+def test_rejudging_same_frame_keeps_roster_tie_order_and_current_athlete(
+    qapp, tmp_path, fake_playback,
+):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    # The later rider has the earlier internal ID, as in the real 149/67 case.
+    passages.append(_event(event_id="passage-5", bib="149", passage_time_ms=15_000))
+    passages.append(_event(event_id="passage-4", bib="67", passage_time_ms=15_262,
+                           sequence=2))
+    passages.append(_event(event_id="passage-6", bib="49", passage_time_ms=18_000,
+                           sequence=3))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    segment = _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01",
+                           camera_index=1, started_at_ms=10_000, ended_at_ms=70_000)
+    associations = PassageEvidenceAssociationStore(tmp_path / "passage_evidence_associations.jsonl")
+    for event_id, bib, position in (("passage-5", "149", 5_000), ("passage-4", "67", 5_200)):
+        associations.confirm(
+            passage_event_id=event_id, bib=bib, confirmed_source=REGULAR_SOURCE,
+            segment_id=segment.segment_id, frame_index=position // 20, position_ms=position,
+            marker_x_normalized=0.5, marker_y_normalized=0.5, confirmed_at_ms=99_000,
+        )
+    dialog = PassageReviewDialog(passages, timeline, association_store=associations)
+    dialog.show()
+    dialog._enter_batch_mode("passage-4")
+    dialog.auto_advance_checkbox.setChecked(False)
+    pane = dialog.regular_pane
+    worker = pane._worker
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_000, 250)
+    pane._on_marker_position_selected(0.6, 0.5)
+    seeks = list(worker.seek_calls)
+    assert dialog._confirm_pending_marker(pane)
+    qapp.processEvents()
+
+    assert [record.label for record in dialog.video_filmstrip.judgment_track._records] == ["149", "67"]
+    assert dialog._selected_event_id == "passage-4"
+    assert pane._current_position_ms == 5_000
+    assert worker.seek_calls == seeks
+    assert associations.get("passage-4", REGULAR_SOURCE).position_ms == 5_000
+    assert associations.get("passage-4", REGULAR_SOURCE).revision == 2
+    dialog.close()
+
+    reopened = PassageReviewDialog(passages, timeline)
+    assert [record.label for record in reopened.video_filmstrip.judgment_track._records] == ["149", "67"]
+    reopened.close()
+
+
+def test_camera_judgment_click_returns_to_saved_recording_and_time(
+    qapp, tmp_path, fake_playback,
+):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="first", bib="149", passage_time_ms=15_000))
+    passages.append(_event(event_id="later", bib="67", passage_time_ms=85_000, sequence=2))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first_path = tmp_path / "camera_01_archive_0000.mkv"
+    first = _add_segment(timeline, first_path, source_id="camera_01", camera_index=1,
+                         started_at_ms=10_000, ended_at_ms=70_000)
+    _add_segment(timeline, tmp_path / "camera_01_archive_0001.mkv",
+                 source_id="camera_01", camera_index=1,
+                 started_at_ms=70_000, ended_at_ms=130_000)
+    associations = PassageEvidenceAssociationStore(tmp_path / "passage_evidence_associations.jsonl")
+    associations.confirm(passage_event_id="first", bib="149", confirmed_source=REGULAR_SOURCE,
+                         segment_id=first.segment_id, frame_index=312, position_ms=6_240,
+                         marker_x_normalized=0.5, marker_y_normalized=0.5,
+                         confirmed_at_ms=99_000)
+    dialog = PassageReviewDialog(passages, timeline, association_store=associations)
+    dialog.show()
+    dialog._open_preferred_source(1, 1)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    assert pane.location.segment.segment_id != first.segment_id
+    track = dialog.video_filmstrip.judgment_track.list
+    QTest.mouseClick(track.viewport(), Qt.LeftButton,
+                     pos=track.visualItemRect(track.item(0)).center())
+    qapp.processEvents()
+    assert dialog._selected_event_id == "first"
+    assert pane._worker.video_path == first_path
+    assert pane._worker.seek_calls[-1] == 6_240
+    assert dialog._shared_delta_ms == 1_240
+    assert dialog.current_passage_label.text() == "149"
+    assert track.count() == 1
+    assert associations.get("first", REGULAR_SOURCE).position_ms == 6_240
+    dialog.close()
+
+
+def test_camera_judgment_track_and_filmstrip_exclude_other_cameras(
+    qapp, tmp_path, fake_playback,
+):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="camera-one-rider", bib="149"))
+    passages.append(_event(event_id="camera-two-rider", bib="67", sequence=2))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    associations = PassageEvidenceAssociationStore(tmp_path / "passage_evidence_associations.jsonl")
+    for camera, event_id in ((1, "camera-one-rider"), (2, "camera-two-rider")):
+        segment = _add_segment(timeline, tmp_path / f"camera_{camera}.mkv",
+                               source_id=f"camera_{camera}", camera_index=camera,
+                               started_at_ms=10_000, ended_at_ms=70_000)
+        associations.confirm(passage_event_id=event_id, bib="149" if camera == 1 else "67",
+                             confirmed_source=REGULAR_SOURCE, segment_id=segment.segment_id,
+                             frame_index=250, position_ms=5_000, marker_x_normalized=0.5,
+                             marker_y_normalized=0.5, confirmed_at_ms=99_000)
+    dialog = PassageReviewDialog(passages, timeline, association_store=associations)
+    pane = dialog.regular_pane
+    assert dialog.video_filmstrip.judgment_track.list.count() == 1
+    assert dialog._continuous_marker_positions_for_filmstrip(pane, 10_000, 70_000) == (
+        (5_000, "149"),
+    )
+    assert not hasattr(dialog.regular_panes[1], "judgment_track")
+    dialog.close()
+
+
+def test_unknown_camera_judgment_can_be_revisited_without_assigning_a_rider(
+    qapp, tmp_path, fake_playback,
+):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="rider-149", bib="149"))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    segment = _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01",
+                           camera_index=1, started_at_ms=10_000, ended_at_ms=70_000)
+    dialog = PassageReviewDialog(passages, timeline)
+    pane = dialog.regular_pane
+    marker = dialog.continuous_marker_store.create(
+        camera_index=1, segment_id=segment.segment_id, frame_index=400, position_ms=8_000,
+        marker_x_normalized=0.6, marker_y_normalized=0.5, confirmed_at_ms=99_000,
+    )
+    dialog.refresh()
+    assert dialog.video_filmstrip.judgment_track.list.count() == 1
+    dialog._open_camera_judgment(f"marker:{marker.marker_id}")
+    assert dialog._selected_event_id == ""
+    assert pane._identity == "待补录"
+    assert pane._worker.seek_calls[-1] == 8_000
+    assert dialog.association_store.associations() == ()
+    assert dialog.continuous_marker_store.markers() == (marker,)
+    dialog.close()
+
+
+def test_camera_judgment_restores_calibrated_time_and_keeps_missing_evidence_record(
+    qapp, tmp_path, fake_playback, monkeypatch,
+):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(bib="149"))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    path = tmp_path / "camera_01.mkv"
+    segment = _add_segment(timeline, path, source_id="camera_01", camera_index=1,
+                           started_at_ms=10_000, ended_at_ms=70_000)
+    associations = PassageEvidenceAssociationStore(tmp_path / "passage_evidence_associations.jsonl")
+    saved = associations.confirm(
+        passage_event_id="passage-1", bib="149", confirmed_source=REGULAR_SOURCE,
+        segment_id=segment.segment_id, frame_index=300, position_ms=6_000,
+        marker_x_normalized=0.5, marker_y_normalized=0.5, confirmed_at_ms=99_000,
+    )
+    calibration = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl")
+    calibration.record(
+        camera_index=1,
+        session_key=PassageReviewDialog._recording_session_key_from_path("camera_01", path),
+        offset_ms=1_000, anchor_event_id="passage-1", anchor_bib="149",
+        calibrated_at_ms=99_000,
+    )
+    dialog = PassageReviewDialog(passages, timeline, clock_offset_ms=200)
+    pane = dialog.regular_pane
+    assert "08:00:15.000" in dialog.video_filmstrip.judgment_track.list.item(0).text()
+    dialog._open_camera_judgment("event:passage-1")
+    assert pane.location.clock_offset_ms == 1_000
+    assert pane._worker.seek_calls[-1] == 6_000
+    assert dialog._shared_delta_ms == 0
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    pane._worker.frame_ready.emit(frame, 6_000, 300)
+    assert "08:00:15.000" in pane.frame_indicator_label.text()
+
+    # Simulate unavailable media without racing a filmstrip decoder's Windows
+    # file handle. The navigator must leave the saved record and cursor intact.
+    monkeypatch.setattr(timeline, "video_path_is_playable", lambda path: False)
+    notices = []
+    monkeypatch.setattr(passage_review.QMessageBox, "information",
+                        lambda *args: notices.append(args[2]))
+    seeks = list(pane._worker.seek_calls)
+    dialog._open_camera_judgment("event:passage-1")
+    assert notices
+    assert pane._worker.seek_calls == seeks
+    assert dialog.video_filmstrip.judgment_track.list.count() == 1
+    assert dialog.association_store.get("passage-1", REGULAR_SOURCE) == saved
+    dialog.close()
+
+
 def test_evidence_view_maps_full_resolution_tile_to_source_coordinates(qapp):
     view = passage_review.EvidenceImageView()
     preview = QImage(50, 20, QImage.Format_RGB888)
@@ -265,36 +523,249 @@ def test_empty_preview_keeps_time_filmstrip_visible(qapp, tmp_path):
     dialog.close()
 
 
-def test_reused_filmstrip_window_does_not_restart_activity_analysis(
-    qapp,
-    tmp_path,
-    monkeypatch,
-):
-    dialog = PassageReviewDialog(
-        PassageEventStore(tmp_path / "passages.jsonl"),
-        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
-    )
-    video_path = tmp_path / "continuous.mkv"
-    video_path.write_bytes(b"video")
-    dialog._filmstrip_context = (video_path, 0, 10_000)
-    dialog._filmstrip_absolute_window = (100_000, 110_000)
-    monkeypatch.setattr(
-        dialog,
-        "_filmstrip_context_for_active_pane",
-        lambda: (
-            video_path,
-            1_000,
-            11_000,
-            5_000,
-            (5_000,),
-            101_000,
-            111_000,
-        ),
-    )
-    dialog._update_filmstrip()
-
-    assert dialog._filmstrip_context == (video_path, 0, 10_000)
+def test_whole_race_filmstrip_works_without_roster_and_extends_on_archive(qapp, tmp_path):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01_archive_first.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10000, ended_at_ms=40000)
+    dialog = PassageReviewDialog(passages, timeline)
+    panel = dialog.video_filmstrip.full_race
+    assert not panel.isHidden()
+    assert dialog.video_filmstrip.scroll.isHidden()
+    assert not hasattr(dialog.video_filmstrip, "mode_combo")
+    assert (panel.index.start_ms, panel.index.end_ms) == (10000, 40000)
+    panel.browse_to(25000)
+    left = panel.visible_times()[0]
+    _add_segment(timeline, tmp_path / "camera_01_archive_second.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=40000, ended_at_ms=80000)
+    dialog.refresh()
+    assert (panel.index.start_ms, panel.index.end_ms) == (10000, 80000)
+    assert panel.visible_times()[0] == left
+    assert not passages.events()
     assert not hasattr(dialog, "activity_timeline")
+    dialog.close()
+
+
+def test_filmstrip_inspection_context_restores_when_dialog_reopens(qapp, tmp_path):
+    from realtime.filmstrip_checks import FilmstripCheckStore
+
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="first", bib="149", passage_time_ms=15000))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01_archive.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10000, ended_at_ms=40000)
+    race_id = passages.events()[0].race_id
+    store = FilmstripCheckStore(tmp_path / "filmstrip_checks.jsonl", race_id, 1)
+    store.set_checked(((12000, 14000),), True)
+    for _ in range(2):
+        dialog = PassageReviewDialog(passages, timeline)
+        panel = dialog.video_filmstrip.full_race
+        assert panel.checked_ranges() == ((12000, 14000),)
+        panel.browse_to(13000)
+        scroll = panel.canvas.horizontalScrollBar().value()
+        dialog.refresh()
+        assert panel.checked_ranges() == ((12000, 14000),)
+        assert panel.canvas.horizontalScrollBar().value() == scroll
+        assert not dialog.association_store.associations()
+        dialog.close()
+
+
+def test_filmstrip_height_grows_with_divider_and_restores(qapp, tmp_path):
+    dialog = PassageReviewDialog(PassageEventStore(tmp_path / "passages.jsonl"),
+                                 VideoTimelineStore(tmp_path / "video_timeline.jsonl"))
+    dialog.resize(1800, 1150)
+    dialog.show()
+    qapp.processEvents()
+    panel = dialog.video_filmstrip.full_race
+    assert panel.image_height() >= 250
+    assert dialog.video_filmstrip.maximumHeight() > dialog.video_filmstrip.minimumHeight()
+    sizes = dialog.review_content_splitter.sizes()
+    height = panel.image_height()
+    panel.enlarge_button.click()
+    qapp.processEvents()
+    assert panel.image_height() > height
+    assert dialog.workspace_splitter.height() >= 180
+    panel.enlarge_button.click()
+    qapp.processEvents()
+    assert dialog.review_content_splitter.sizes() == sizes
+    dialog.review_content_splitter.setSizes([sizes[0] - 60, sizes[1] + 60])
+    dialog._review_divider_moved()
+    sizes = dialog.review_content_splitter.sizes()
+    dialog._initialize_review_splitters()
+    assert dialog.review_content_splitter.sizes() == sizes
+    dialog.close()
+
+
+def test_whole_race_click_crosses_archives_then_judgment_stays_in_camera_one(qapp, tmp_path, fake_playback):
+    from realtime.race_filmstrip import RaceFilmstripFrame
+
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="first", bib="149", passage_time_ms=15000))
+    passages.append(_event(event_id="second", bib="67", passage_time_ms=35000, sequence=2))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for name, start in (("first", 10000), ("second", 30000)):
+        _add_segment(timeline, tmp_path / f"camera_01_archive_{name}.mkv", source_id="camera_01",
+                     camera_index=1, started_at_ms=start, ended_at_ms=start + 10000)
+    dialog = PassageReviewDialog(passages, timeline)
+    dialog.show()
+    qapp.processEvents()
+    panel = dialog.video_filmstrip.full_race
+    pane = dialog._camera_one_pane()
+    second = next(source for source in panel.index.sources if source.start_ms == 30000)
+    frame_image = QImage(800, 600, QImage.Format_RGB32)
+    frame_image.fill(0)
+    frame = RaceFilmstripFrame(second, 35200, 5200, 260, frame_image)
+    panel.cache[frame.key] = frame
+    panel.browse_to(35200)
+    left = panel.visible_times()[0]
+    selected = dialog._selected_event_id
+    dialog._open_race_filmstrip_frame(frame)
+    qapp.processEvents()
+    assert dialog._selected_event_id == selected  # Clicking never guesses identity.
+    assert pane.location.video_path == second.location.video_path
+    assert pane._worker.seek_calls[-1] == 5200
+    assert dialog.association_store.associations() == ()
+    pane._worker.frame_ready.emit(frame_image, 5200, 260)
+    dialog._select_event("second", preserve_current_frame=pane)
+    assert panel.visible_times()[0] == left
+    for position, frame_index in ((5200, 260), (5220, 261)):
+        pane._worker.frame_ready.emit(frame_image, position, frame_index)
+        pane.video_view.set_marker_mode(True)
+        QTest.mouseClick(pane.video_view.viewport(), Qt.LeftButton, pos=pane.video_view.viewport().rect().center())
+        assert dialog._confirm_pending_marker(pane)
+        saved = dialog.association_store.get("second", REGULAR_SOURCE)
+        assert saved.frame_index == frame_index
+        assert saved.position_ms == position
+        assert saved.segment_id == second.location.segment.segment_id
+        assert panel.visible_times()[0] == left
+        assert (30000 + position, "67") in panel.markers
+    assert dialog.association_store.get("first", REGULAR_SOURCE) is None
+    assert panel.checked_ranges() == ()  # A judgment does not inspect a time window.
+    assert not (tmp_path / "filmstrip_checks.jsonl").exists()
+    dialog.close()
+
+
+@pytest.mark.parametrize("exit_method", ["escape", "f", "button", "close"])
+def test_filmstrip_popup_judges_exact_frame_and_restores_browsing(
+    qapp, tmp_path, fake_playback, monkeypatch, exit_method,
+):
+    from realtime.race_filmstrip import RaceFilmstripFrame, RaceFilmstripPanel
+
+    monkeypatch.setattr(RaceFilmstripPanel, "_load_visible", lambda self: None)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="first", bib="149", passage_time_ms=15000))
+    passages.append(_event(event_id="second", bib="67", passage_time_ms=35000, sequence=2))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for index, start in enumerate((10000, 30000)):
+        _add_segment(timeline, tmp_path / f"camera_01_archive_{index}.mkv",
+                     source_id="camera_01", camera_index=1,
+                     started_at_ms=start, ended_at_ms=start + 20000)
+    dialog = PassageReviewDialog(passages, timeline)
+    dialog.resize(1800, 1100)
+    dialog.show()
+    dialog.activateWindow()
+    qapp.processEvents()
+    panel = dialog.video_filmstrip.full_race
+    pane = dialog.regular_pane
+    assert dialog.evidence_splitter.isHidden()
+    assert not pane.isVisible()
+    assert dialog.results_panel.width() == dialog.workspace_splitter.width()
+    image = QImage(1280, 960, QImage.Format_RGB888)
+    image.fill(0)
+    source = next(source for source in panel.index.sources if source.start_ms == 30000)
+    frame = RaceFilmstripFrame(source, 35200, 5200, 260, image)
+    panel.cache[frame.key] = frame
+    panel.browse_to(35200)
+    bar = panel.canvas.horizontalScrollBar()
+    bar.setValue(bar.value() + 17)
+    left = panel.index.start_ms + bar.value() / panel.tile_pitch * panel.interval_ms
+    sizes = dialog.review_content_splitter.sizes()
+    tile = (35200 - panel.index.start_ms) // panel.interval_ms
+    click_x = tile * panel.tile_pitch - bar.value() + panel.tile_width // 2
+    QTest.mouseClick(panel.canvas.viewport(), Qt.LeftButton, pos=QPoint(click_x, 100))
+    worker = pane._worker
+    assert worker.video_path == source.location.video_path
+    assert worker.seek_calls[-1] == 5200
+    assert dialog._maximized_window is None
+    QTest.keyClick(panel.canvas, Qt.Key_F)
+    qapp.processEvents()
+    popup = dialog._maximized_window
+    assert popup is not None and popup.isVisible()
+    assert pane.isVisible() and pane.window() is popup
+    assert dialog.table.window() is popup
+    assert pane._worker is worker
+    assert worker.seek_calls[-1] == 5200
+    worker.frame_ready.emit(image, 5200, 260)
+    seeks = list(worker.seek_calls)
+    # Selecting another number must keep the clicked camera frame.
+    row = next(i for i, event in enumerate(dialog._visible_events) if event.event_id == "second")
+    QTest.mouseClick(dialog.table.viewport(), Qt.LeftButton,
+                     pos=dialog.table.visualItemRect(dialog.table.item(row, 1)).center())
+    assert dialog._selected_event_id == "second"
+    assert pane._current_frame_index == 260
+    assert worker.seek_calls == seeks
+    pane.video_view.set_marker_mode(True)
+    QTest.mouseClick(pane.video_view.viewport(), Qt.LeftButton,
+                     pos=pane.video_view.viewport().rect().center())
+    assert dialog._confirm_pending_marker(pane)
+    saved = dialog.association_store.get("second", REGULAR_SOURCE)
+    assert (saved.bib, saved.frame_index, saved.position_ms) == ("67", 260, 5200)
+    assert saved.segment_id == source.location.segment.segment_id
+    assert dialog.association_store.get("first", REGULAR_SOURCE) is None
+    # Recording can extend while the operator is judging an earlier picture.
+    _add_segment(timeline, tmp_path / "camera_01_archive_2.mkv",
+                 source_id="camera_01", camera_index=1,
+                 started_at_ms=50000, ended_at_ms=70000)
+    dialog.refresh()
+    assert dialog._maximized_window is popup
+    assert panel.index.end_ms == 70000
+    if exit_method == "button":
+        next(button for button in popup.findChildren(QPushButton)
+             if button.text().startswith("返回胶卷")).click()
+    elif exit_method == "close":
+        popup.close()
+    else:
+        pane.video_view.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(pane.video_view, Qt.Key_Escape if exit_method == "escape" else Qt.Key_F)
+    qapp.processEvents()
+    assert dialog._maximized_window is None
+    assert dialog.table.window() is dialog
+    assert dialog.results_panel.isVisible()
+    assert dialog.evidence_splitter.isHidden() and not pane.isVisible()
+    assert pane._worker is worker
+    assert dialog.review_content_splitter.sizes() == sizes
+    restored_left = panel.index.start_ms + bar.value() / panel.tile_pitch * panel.interval_ms
+    assert abs(restored_left - left) < 1
+    assert (35200, "67") in panel.markers
+    assert not panel.checked_ranges()
+    dialog.close()
+
+
+def test_whole_race_filters_do_not_remove_recordings_or_change_clicked_identity(qapp, tmp_path, fake_playback):
+    from realtime.race_filmstrip import RaceFilmstripFrame
+
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="first", bib="149", passage_time_ms=15000))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01_archive.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10000, ended_at_ms=60000)
+    dialog = PassageReviewDialog(passages, timeline)
+    panel = dialog.video_filmstrip.full_race
+    original = tuple(source.key for source in panel.index.sources)
+    dialog.identity_search.setText("does-not-exist")
+    dialog.refresh()
+    assert not dialog._visible_events
+    assert tuple(source.key for source in panel.index.sources) == original
+    image = QImage(80, 60, QImage.Format_RGB32)
+    image.fill(0)
+    frame = RaceFilmstripFrame(panel.index.sources[0], 32000, 22000, 1100, image)
+    dialog._open_race_filmstrip_frame(frame)
+    assert dialog._selected_event_id == ""
+    assert dialog._camera_one_pane()._identity == "待补录"
+    assert dialog._camera_one_pane()._worker.seek_calls[-1] == 22000
+    assert not dialog.association_store.associations()
+    assert len(passages.events()) == 1
     dialog.close()
 
 
@@ -4241,7 +4712,7 @@ def test_fullscreen_toggle_refits_the_entire_review_window(
         started_at_ms=10_000,
         ended_at_ms=20_000,
     )
-    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog = PassageReviewDialog(passage_store, timeline_store, regular_camera_indexes=(1, 2))
     dialog.show()
     qapp.processEvents()
     worker = fake_playback.instances[0]
