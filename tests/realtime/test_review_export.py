@@ -1,5 +1,6 @@
 import csv
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from realtime import review_export
@@ -75,6 +76,16 @@ def test_regular_confirmation_marks_overall_review_confirmed(tmp_path):
     assert row.regular_status == "已确认"
     assert row.high_speed_status == "未确认"
     assert row.review_status == "已确认"
+
+
+def test_export_does_not_reuse_confirmation_after_group_reset(tmp_path):
+    store = PassageEvidenceAssociationStore(tmp_path / "associations.jsonl")
+    _confirm(store, "passage-1", REGULAR_SOURCE, _timestamp_ms(1))
+    event = replace(_event(), revision=3, received_at_ms=_timestamp_ms(2))
+    row = review_export.build_review_summary_rows((event,), store)[0]
+    assert row.regular_status == "未确认"
+    assert row.review_status == "未确认"
+    assert row.last_confirmation_time == ""
 
 
 def test_high_speed_confirmation_marks_overall_review_confirmed(tmp_path):

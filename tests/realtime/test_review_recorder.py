@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -214,6 +215,44 @@ def test_archive_path_cache_rechecks_zero_byte_file_growth(tmp_path, monkeypatch
     assert publisher._archive_paths() == (first, active)
 
 
+def test_archive_recovery_skips_empty_failed_sessions_without_per_session_scans(
+    tmp_path, monkeypatch,
+):
+    archive_dir = tmp_path / "videos"
+    archive_dir.mkdir()
+    manifests = []
+    for index in range(250):
+        name = f"camera_01_test_{index}"
+        manifest = archive_dir / f"{name}_archive_session.json"
+        manifest.write_text(json.dumps({
+            "schema_version": review_recorder.ARCHIVE_SESSION_SCHEMA_VERSION,
+            "camera_index": 1, "session_id": name,
+            "session_started_at_ms": index * 1000,
+            "archive_pattern": f"{name}_archive_%04d.mkv",
+        }), encoding="utf-8")
+        manifests.append(manifest)
+    # A failed session may have left a zero-byte video as well.
+    (archive_dir / "camera_01_test_0_archive_0000.mkv").touch()
+    scans = []
+    real_scandir = review_recorder.os.scandir
+
+    def scandir(path):
+        scans.append(path)
+        return real_scandir(path)
+
+    monkeypatch.setattr(review_recorder.os, "scandir", scandir)
+    assert load_archive_recording_sessions(tmp_path) == ()
+    assert len(scans) == 1
+
+    # Recovery must still find real media even if its first segment is gone.
+    (archive_dir / "camera_01_test_249_archive_0003.mkv").write_bytes(b"video")
+    scans.clear()
+    sessions = load_archive_recording_sessions(tmp_path)
+    assert [session.session_id for session in sessions] == ["camera_01_test_249"]
+    assert len(scans) == 1
+    assert all(path.is_file() for path in manifests)
+
+
 def test_sealed_archive_remains_locatable_after_review_segments_expire(
     tmp_path,
 ):
@@ -230,15 +269,16 @@ def test_sealed_archive_remains_locatable_after_review_segments_expire(
     )
     playlist = recorder.start()
     assert recorder.archive_pattern is not None
+    assert load_archive_recording_sessions(tmp_path / "race") == ()
+    first_archive = Path(str(recorder.archive_pattern).replace("%04d", "0000"))
+    active_archive = Path(str(recorder.archive_pattern).replace("%04d", "0001"))
+    first_archive.write_bytes(b"sealed archive")
+    active_archive.write_bytes(b"active archive")
     sessions = load_archive_recording_sessions(tmp_path / "race")
     assert len(sessions) == 1
     assert sessions[0].camera_index == 1
     assert sessions[0].session_started_at_ms == 1_787_313_600_000
     assert sessions[0].archive_pattern == recorder.archive_pattern.resolve()
-    first_archive = Path(str(recorder.archive_pattern).replace("%04d", "0000"))
-    active_archive = Path(str(recorder.archive_pattern).replace("%04d", "0001"))
-    first_archive.write_bytes(b"sealed archive")
-    active_archive.write_bytes(b"active archive")
     duration_probe = (
         lambda path: 300_000 if Path(path) == first_archive else 120_000
     )

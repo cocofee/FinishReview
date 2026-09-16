@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from .passage_receiver import PassageEvent
+
 
 SCHEMA_VERSION = 1
 CONFIRMED = "confirmed"
@@ -491,6 +493,7 @@ class PassageEvidenceAssociation:
     confirmation_status: str = CONFIRMED
     revision: int = 1
     schema_version: int = SCHEMA_VERSION
+    passage_revision: int = 0
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -517,6 +520,8 @@ class PassageEvidenceAssociation:
             raise ValueError("confirmation_status must be confirmed or deleted")
         if self.revision <= 0:
             raise ValueError("revision must be positive")
+        if self.passage_revision < 0:
+            raise ValueError("passage_revision must be non-negative")
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PassageEvidenceAssociation":
@@ -535,7 +540,25 @@ class PassageEvidenceAssociation:
             confirmed_at_ms=int(payload.get("confirmed_at_ms", -1)),
             confirmation_status=str(payload.get("confirmation_status", "")),
             revision=int(payload.get("revision", 0)),
+            passage_revision=int(payload.get("passage_revision", 0)),
         )
+
+    def matches_event(self, event: Optional[PassageEvent]) -> bool:
+        """确认只适用于当时的选手和过线版本，不能沿用被清空的记录编号。"""
+        if (
+            event is None
+            or not event.is_active
+            or self.confirmation_status != CONFIRMED
+            or self.passage_event_id != event.event_id
+            or self.bib.strip() != (event.bib.strip() or "未知")
+        ):
+            return False
+        if self.passage_revision:
+            return self.passage_revision == event.revision
+        # 兼容旧判罚：新版本收到后，之前的确认不能套到新记录上。
+        if event.received_at_ms > 0:
+            return self.confirmed_at_ms >= event.received_at_ms
+        return event.revision == 1
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -673,6 +696,7 @@ class PassageEvidenceAssociationStore:
         marker_x_normalized: float,
         marker_y_normalized: float,
         confirmed_at_ms: int,
+        passage_revision: int = 0,
     ) -> PassageEvidenceAssociation:
         with self._lock:
             current = self._latest.get((str(passage_event_id), str(confirmed_source)))
@@ -687,6 +711,7 @@ class PassageEvidenceAssociationStore:
                 marker_y_normalized=float(marker_y_normalized),
                 confirmed_at_ms=int(confirmed_at_ms),
                 revision=1 if current is None else current.revision + 1,
+                passage_revision=int(passage_revision),
             )
             self._append(association)
             return association
@@ -735,6 +760,14 @@ class PassageEvidenceAssociationStore:
                     association := self.get(str(passage_event_id), source)
                 ) is not None
             )
+
+    def get_for_event(
+        self, event: Optional[PassageEvent], confirmed_source: str,
+    ) -> Optional[PassageEvidenceAssociation]:
+        if event is None:
+            return None
+        association = self.get(event.event_id, confirmed_source)
+        return association if association is not None and association.matches_event(event) else None
 
     def associations(self) -> tuple[PassageEvidenceAssociation, ...]:
         """Return the current active associations in stable event/source order."""

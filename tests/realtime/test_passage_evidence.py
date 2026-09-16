@@ -1,4 +1,9 @@
 import json
+from dataclasses import replace
+
+import pytest
+
+from realtime.passage_receiver import PassageEvent
 
 from realtime.passage_evidence import (
     ContinuousMarkerStore,
@@ -102,3 +107,42 @@ def test_association_store_recovers_an_incomplete_tail(tmp_path):
     assert journal_path.read_bytes().endswith(b"\n")
     moved = _confirm(reopened, x=0.8, confirmed_at_ms=2_000)
     assert moved.revision == 2
+
+
+def _passage(**changes):
+    event = PassageEvent(
+        event_id="passage-15", race_id="race", stage_id="stage", group_id="group",
+        sequence=15, chip_id="chip-15", bib="15", passage_time_ms=500,
+        lap=1, emitted_at_ms=500, received_at_ms=500,
+    )
+    return replace(event, **changes)
+
+
+def test_legacy_confirmation_does_not_follow_reused_passage_id(tmp_path):
+    store = PassageEvidenceAssociationStore(tmp_path / "associations.jsonl")
+    original = _confirm(store, confirmed_at_ms=1_000)
+    event = _passage()
+    assert store.get_for_event(event, REGULAR_SOURCE) == original
+    assert store.get_for_event(replace(event, is_active=False, revision=2), REGULAR_SOURCE) is None
+    assert store.get_for_event(replace(event, bib="16", revision=3), REGULAR_SOURCE) is None
+    # 同一人再次出发也必须重新确认。
+    assert store.get_for_event(replace(event, revision=3, received_at_ms=2_000), REGULAR_SOURCE) is None
+    assert store.get(event.event_id, REGULAR_SOURCE) == original
+
+
+@pytest.mark.parametrize("source", [REGULAR_SOURCE, HIGH_SPEED_SOURCE])
+def test_confirmation_is_bound_to_passage_revision_across_restart(tmp_path, source):
+    path = tmp_path / "associations.jsonl"
+    store = PassageEvidenceAssociationStore(path)
+    event = _passage(revision=3)
+    association = store.confirm(
+        passage_event_id=event.event_id, bib=event.bib, confirmed_source=source,
+        segment_id="segment", frame_index=25, position_ms=1_000,
+        marker_x_normalized=.5, marker_y_normalized=.5,
+        confirmed_at_ms=2_000, passage_revision=event.revision,
+    )
+    reopened = PassageEvidenceAssociationStore(path)
+    assert reopened.get_for_event(event, source) == association
+    assert reopened.get_for_event(replace(event, revision=4, passage_time_ms=600), source) is None
+    assert reopened.get_for_event(replace(event, bib="16"), source) is None
+    assert reopened.get_for_event(replace(event, is_active=False), source) is None

@@ -41,6 +41,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QInputDialog,
     QPushButton,
@@ -2180,11 +2181,12 @@ class PassageEvidencePane(QFrame):
         delta_ms = int(position_ms) - self._target_position_ms
         current_timestamp_ms = event.timeline_timestamp_ms + delta_ms
         self.time_label.setText(
-            f"{format_passage_time(current_timestamp_ms)}  Δ{delta_ms:+d} ms"
+            format_passage_time(current_timestamp_ms)
         )
         self.time_label.setToolTip(
             f"文件位置 {position_ms / 1000.0:.3f} s；"
-            f"Passage 目标 {format_passage_time(event.timeline_timestamp_ms)}"
+            f"预计过线 {format_passage_time(event.timeline_timestamp_ms)}；"
+            f"距预计过线 {delta_ms:+d} ms"
         )
 
     def _update_frame_indicator(self, position_ms: int) -> None:
@@ -3192,7 +3194,7 @@ class PassageReviewSurface(QDialog):
         self.next_batch_btn.clicked.connect(
             lambda: self._move_filmstrip_batch(1)
         )
-        self.previous_passage_btn = QPushButton("▲")
+        self.previous_passage_btn = QPushButton("上一条")
         self.previous_passage_btn.setToolTip("上一条")
         self.previous_frame_btn = QPushButton("|◀")
         self.previous_frame_btn.setToolTip("上一帧")
@@ -3200,7 +3202,7 @@ class PassageReviewSurface(QDialog):
         self.play_both_btn.setToolTip("同时播放或暂停全部画面")
         self.next_frame_btn = QPushButton("▶|")
         self.next_frame_btn.setToolTip("下一帧")
-        self.next_passage_btn = QPushButton("▼")
+        self.next_passage_btn = QPushButton("下一条")
         self.next_passage_btn.setToolTip("下一条")
         self.fullscreen_btn = QPushButton("全屏")
         self.fullscreen_btn.setToolTip("全屏显示整个复核窗口（F11）")
@@ -3214,6 +3216,8 @@ class PassageReviewSurface(QDialog):
         ):
             button.setFixedWidth(36)
         self.play_both_btn.setFixedWidth(68)
+        self.previous_passage_btn.setFixedWidth(58)
+        self.next_passage_btn.setFixedWidth(58)
         self.auto_advance_checkbox = QCheckBox("确认后下一条")
         self.auto_advance_checkbox.setChecked(False)
         self.auto_advance_checkbox.setToolTip(
@@ -3228,24 +3232,40 @@ class PassageReviewSurface(QDialog):
         self.next_passage_btn.clicked.connect(lambda: self._move_selection(1))
         self.target_position_btn.clicked.connect(self._seek_to_target_position)
         self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        self.review_more_btn = QPushButton("更多", self)
+        self.review_more_menu = QMenu(self.review_more_btn)
+        self.review_more_btn.setMenu(self.review_more_menu)
+        self._review_more_actions = []
+        for control, title in (
+            (self.target_position_btn, "定位到预计过线"),
+            (self.previous_frame_btn, "上一帧（←）"),
+            (self.next_frame_btn, "下一帧（→）"),
+            (self.play_both_btn, ""),
+            (self.fullscreen_btn, ""),
+            (self.auto_advance_checkbox, ""),
+            (self.preview_mark_btn, ""),
+            (self.preview_confirm_btn, ""),
+        ):
+            control.setParent(transport)
+            control.hide()
+            action = self.review_more_menu.addAction(title or control.text())
+            action.setCheckable(control.isCheckable())
+            action.triggered.connect(
+                lambda _checked=False, button=control: button.click()
+            )
+            self._review_more_actions.append((action, control, title))
+        self.review_more_menu.aboutToShow.connect(self._update_review_more_actions)
         self.transport_layout.addWidget(self.current_passage_label)
         self.transport_layout.addWidget(self.current_context_label)
         self.transport_layout.addWidget(self.batch_context_label)
         self.transport_layout.addWidget(self.batch_review_btn)
         self.transport_layout.addStretch(1)
         self.transport_layout.addWidget(self.current_time_label)
-        self.transport_layout.addWidget(self.target_position_btn)
-        self.transport_layout.addWidget(self.preview_mark_btn)
-        self.transport_layout.addWidget(self.preview_confirm_btn)
-        self.transport_layout.addWidget(self.previous_frame_btn)
-        self.transport_layout.addWidget(self.play_both_btn)
-        self.transport_layout.addWidget(self.next_frame_btn)
-        self.transport_layout.addWidget(self.auto_advance_checkbox)
         self.previous_batch_btn.hide()
         self.next_batch_btn.hide()
         self.transport_layout.addWidget(self.previous_passage_btn)
         self.transport_layout.addWidget(self.next_passage_btn)
-        self.transport_layout.addWidget(self.fullscreen_btn)
+        self.transport_layout.addWidget(self.review_more_btn)
 
         self.evidence_splitter = QSplitter(Qt.Horizontal)
         self.evidence_splitter.setChildrenCollapsible(False)
@@ -3370,8 +3390,7 @@ class PassageReviewSurface(QDialog):
         # keep this preview slider for compatibility but do not render a
         # duplicate control beneath the filmstrip.
         self.preview_video_view.setVisible(self._top_preview_video_visible)
-        self.preview_mark_btn.setVisible(self._top_preview_video_visible)
-        self.preview_confirm_btn.setVisible(self._top_preview_video_visible)
+        self._update_review_more_actions()
         if not self._top_preview_video_visible:
             # A hidden expanding graphics view can still leave excess space in
             # nested Qt layouts. Collapse it explicitly so the filmstrip sits
@@ -4365,6 +4384,19 @@ class PassageReviewSurface(QDialog):
         )
         return query in event.bib.strip().casefold() or query in athlete_name.casefold()
 
+    def _association_for_event(
+        self, event_id: str, source_kind: str,
+    ) -> Optional[PassageEvidenceAssociation]:
+        return self.association_store.get_for_event(
+            self.passage_store.get(event_id), source_kind,
+        )
+
+    def _current_associations(self) -> tuple[PassageEvidenceAssociation, ...]:
+        return tuple(
+            association for association in self.association_store.associations()
+            if association.matches_event(self.passage_store.get(association.passage_event_id))
+        )
+
     def _review_status_for_event(
         self,
         event_id: str,
@@ -4384,8 +4416,8 @@ class PassageReviewSurface(QDialog):
         # segment rather than the segment selected from the official passage
         # timestamp. The saved association is authoritative for list status;
         # location matching is only needed when rendering a marker in a pane.
-        regular_association = self.association_store.get(event_id, REGULAR_SOURCE)
-        high_speed_association = self.association_store.get(event_id, HIGH_SPEED_SOURCE)
+        regular_association = self._association_for_event(event_id, REGULAR_SOURCE)
+        high_speed_association = self._association_for_event(event_id, HIGH_SPEED_SOURCE)
         fallback = review_status_text(lookup, regular, high_speed)
         return self._confirmation_status(
             regular_association,
@@ -4479,7 +4511,7 @@ class PassageReviewSurface(QDialog):
                 self._continuous_clock_offsets[key] = int(calibration.offset_ms)
                 changed = True
         associations = sorted(
-            self.association_store.associations(),
+            self._current_associations(),
             key=lambda item: (
                 events_by_id.get(item.passage_event_id).timeline_timestamp_ms
                 if item.passage_event_id in events_by_id
@@ -4742,7 +4774,7 @@ class PassageReviewSurface(QDialog):
         source_kind: str,
         location: Optional[PassageVideoLocation],
     ) -> Optional[PassageEvidenceAssociation]:
-        association = self.association_store.get(event_id, source_kind)
+        association = self._association_for_event(event_id, source_kind)
         if not _association_matches_location(association, location):
             return None
         return association
@@ -4755,7 +4787,7 @@ class PassageReviewSurface(QDialog):
         high_speed: bool,
     ) -> Optional[PassageVideoLocation]:
         source_kind = HIGH_SPEED_SOURCE if high_speed else REGULAR_SOURCE
-        association = self.association_store.get(event_id, source_kind)
+        association = self._association_for_event(event_id, source_kind)
         if association is not None:
             associated = next(
                 (
@@ -5113,10 +5145,22 @@ class PassageReviewSurface(QDialog):
             None,
         )
 
+    def _update_review_more_actions(self) -> None:
+        for action, control, title in self._review_more_actions:
+            action.setText(title or control.text())
+            action.setEnabled(control.isEnabled())
+            action.setChecked(control.isChecked())
+            action.setToolTip(control.toolTip())
+            action.setVisible(
+                control not in (self.preview_mark_btn, self.preview_confirm_btn)
+                or self._top_preview_video_visible
+            )
+
     def _update_batch_controls(self, event_id: str = "") -> None:
         batch = self._review_batch_by_event_id.get(str(event_id))
         if not self._visible_events:
             self.batch_context_label.clear()
+            self.batch_context_label.setToolTip("")
             self.batch_review_btn.setVisible(False)
             self.video_discovered_btn.setEnabled(False)
             self.video_discovered_table.setVisible(False)
@@ -5124,17 +5168,7 @@ class PassageReviewSurface(QDialog):
                 pane.video_view.clear_batch_roster()
             return
         self.batch_review_btn.setVisible(True)
-        if self._batch_mode:
-            row = max(0, self.table.currentRow())
-            context = f"判读 {row + 1:,}/{len(self._visible_events):,}"
-            calibration = self._continuous_calibration_summary()
-            self.batch_context_label.setText(
-                " · ".join(value for value in (context, calibration) if value)
-            )
-        elif batch is not None and batch.size >= 2:
-            self.batch_context_label.setText(f"附近 {batch.size} 人")
-        else:
-            self.batch_context_label.clear()
+        self.batch_context_label.setText(self._continuous_calibration_summary())
         self.batch_review_btn.setText(
             "退出判读" if self._batch_mode else "判读"
         )
@@ -5145,17 +5179,27 @@ class PassageReviewSurface(QDialog):
         self._refresh_video_discovered_table()
 
     def _continuous_calibration_summary(self) -> str:
-        offsets: dict[int, int] = {}
-        for (camera_index, _session_key), offset_ms in sorted(
-            self._continuous_clock_offsets.items()
-        ):
-            offsets[int(camera_index)] = int(offset_ms)
-        if not offsets:
+        pane = self._active_playback_pane()
+        location = pane.location
+        if pane.source_kind != REGULAR_SOURCE or location is None:
+            self.batch_context_label.setToolTip("")
             return ""
-        return "补偿 " + " / ".join(
-            f"机位{camera_index} {offset_ms:+d} ms"
-            for camera_index, offset_ms in sorted(offsets.items())
+        camera_index = int(location.segment.camera_index)
+        key = (camera_index, self._recording_session_key(location))
+        offset_ms = self._continuous_clock_offsets.get(key)
+        calibration = self.calibration_store.get(*key)
+        if offset_ms is None and calibration is not None:
+            offset_ms = int(calibration.offset_ms)
+        if offset_ms is None:
+            self.batch_context_label.setToolTip(
+                "找到首位运动员的实际过线画面并确认，后续选手沿用该机位时间偏移。"
+            )
+            return f"机位{camera_index} 待首人校时"
+        self.batch_context_label.setToolTip(
+            f"机位 {camera_index} 已按首人校准，时间偏移 {offset_ms:+d} ms；"
+            "后续运动员沿用此偏移定位。"
         )
+        return f"机位{camera_index} 已校准"
 
     def _update_batch_roster_overlays(
         self,
@@ -5490,7 +5534,7 @@ class PassageReviewSurface(QDialog):
             (
                 event.event_id
                 for event in ordered_events
-                if self.association_store.get(event.event_id, REGULAR_SOURCE) is None
+                if self._association_for_event(event.event_id, REGULAR_SOURCE) is None
             ),
             events[anchor_index].event_id,
         )
@@ -5808,6 +5852,12 @@ class PassageReviewSurface(QDialog):
             self.refresh()
             return
         events = self._events_for_current_metadata(self.passage_store.events())
+        active_event_ids = {event.event_id for event in events}
+        if changed_event_ids - active_event_ids:
+            # Withdrawals also invalidate the selected frame, batch and judgment
+            # overlays. Reconcile them together, including non-selected groups.
+            self.refresh()
+            return
         if self._update_group_combo(events):
             self.refresh()
             return
@@ -6006,7 +6056,7 @@ class PassageReviewSurface(QDialog):
         lookup: PassageVideoLookup,
     ) -> Optional[PassageVideoLocation]:
         locations = self._regular_locations(lookup)
-        association = self.association_store.get(event_id, REGULAR_SOURCE)
+        association = self._association_for_event(event_id, REGULAR_SOURCE)
         if association is not None:
             associated = next(
                 (
@@ -6931,7 +6981,7 @@ class PassageReviewSurface(QDialog):
         records = []
         saved = [
             (f"event:{item.passage_event_id}", item, False)
-            for item in self.association_store.associations()
+            for item in self._current_associations()
             if item.confirmed_source == REGULAR_SOURCE
             and item.passage_event_id in events
         ]
@@ -6995,7 +7045,7 @@ class PassageReviewSurface(QDialog):
             event = SimpleNamespace(event_id="", bib="待补录", timeline_timestamp_ms=(origin or 0) + position_ms - offset)
         target = int(event.timeline_timestamp_ms) + offset - origin if origin is not None else position_ms
         location = replace(location, passage_position_ms=target, playback_position_ms=position_ms, clock_offset_ms=offset)
-        association = self.association_store.get(event.event_id, REGULAR_SOURCE) if event.event_id else None
+        association = self._association_for_event(event.event_id, REGULAR_SOURCE) if event.event_id else None
         self._set_sync_playing(False, seek_final=False)
         self._deferred_start_timer.stop()
         self._deferred_selection_panes.clear()
@@ -7044,7 +7094,7 @@ class PassageReviewSurface(QDialog):
             next((item for item in self.continuous_marker_store.markers()
                   if f"marker:{item.marker_id}" == key), None)
             if record.unknown else
-            self.association_store.get(record.event_id, REGULAR_SOURCE)
+            self._association_for_event(record.event_id, REGULAR_SOURCE)
         )
         location = self._saved_regular_location(saved) if saved is not None else None
         if (location is None or location.status not in _OPENABLE_STATUSES
@@ -7134,7 +7184,7 @@ class PassageReviewSurface(QDialog):
         )
         tolerance_ms = max(200, int(pane.frame_duration_ms()) * 3)
         overlays: list[tuple[float, float, str, bool, bool]] = []
-        for association in self.association_store.associations():
+        for association in self._current_associations():
             if (
                 association.confirmed_source != REGULAR_SOURCE
                 or (
@@ -7614,7 +7664,13 @@ class PassageReviewSurface(QDialog):
         self.next_passage_btn.setEnabled(0 <= row < self.table.rowCount() - 1)
 
     def _clear_selection_details(self) -> None:
-        self._set_sync_playing(False)
+        self._set_sync_playing(False, seek_final=False)
+        self._deferred_start_timer.stop()
+        self._deferred_selection_panes.clear()
+        self._selection_pending_panes.clear()
+        self._filmstrip_preview_timer.stop()
+        self._pending_filmstrip_preview_position = None
+        self._pending_filmstrip_position = None
         self._shared_delta_ms = 0
         self._selected_event_id = ""
         metadata = self._current_metadata()
@@ -7645,12 +7701,16 @@ class PassageReviewSurface(QDialog):
         self.current_passage_label.setText("未选择通过记录")
         self.current_context_label.clear()
         self.current_time_label.setText("--:--:--.---")
+        self.current_time_label.setToolTip("")
         self.batch_context_label.clear()
+        self.batch_context_label.setToolTip("")
         self.batch_review_btn.setVisible(False)
         self.video_discovered_btn.setEnabled(False)
         self.video_discovered_table.setVisible(False)
         for pane in self.evidence_panes:
             pane.clear_passage()
+        self.preview_video_view.clear_frame("选择一条通过记录后在这里预览判读")
+        self.preview_confirm_btn.setEnabled(False)
         self._update_navigation_controls()
 
     def focus_athlete(
@@ -7795,7 +7855,7 @@ class PassageReviewSurface(QDialog):
 
     def _update_reference_states(self, event_id: str) -> None:
         confirmed = any(
-            self.association_store.get(event_id, source_kind) is not None
+            self._association_for_event(event_id, source_kind) is not None
             for source_kind in (REGULAR_SOURCE, HIGH_SPEED_SOURCE)
         )
         for pane in self.evidence_panes:
@@ -7823,8 +7883,7 @@ class PassageReviewSurface(QDialog):
     ) -> bool:
         location = pane.location
         if (
-            not self._batch_mode
-            or pane.source_kind != REGULAR_SOURCE
+            pane.source_kind != REGULAR_SOURCE
             or location is None
             or location.segment.media_started_at_ms is None
         ):
@@ -7833,7 +7892,7 @@ class PassageReviewSurface(QDialog):
             location.segment.camera_index,
             self._recording_session_key(location),
         )
-        if key in self._continuous_clock_offsets:
+        if key in self._continuous_clock_offsets or self.calibration_store.get(*key) is not None:
             return False
         offset_ms = (
             int(location.segment.media_started_at_ms)
@@ -7899,7 +7958,8 @@ class PassageReviewSurface(QDialog):
         if event is None:
             return False
         pane_event = getattr(pane, "_event", None)
-        if pane_event is None or pane_event.event_id != event.event_id:
+        if (pane_event is None or pane_event.event_id != event.event_id
+                or pane_event.revision != event.revision or not event.is_active):
             logger.error(
                 "Refused mismatched confirmation selected=%s pane=%s",
                 event.event_id,
@@ -7908,7 +7968,7 @@ class PassageReviewSurface(QDialog):
             return False
         identity = event.bib.strip() or "未知"
         is_rejudgment = (
-            self.association_store.get(event.event_id, pane.source_kind) is not None
+            self._association_for_event(event.event_id, pane.source_kind) is not None
         )
         try:
             association = self.association_store.confirm(
@@ -7921,6 +7981,7 @@ class PassageReviewSurface(QDialog):
                 marker_x_normalized=float(pending["marker_x_normalized"]),
                 marker_y_normalized=float(pending["marker_y_normalized"]),
                 confirmed_at_ms=int(time.time() * 1000.0),
+                passage_revision=event.revision,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "保存失败", f"无法保存证据标记：{error}")
@@ -7970,8 +8031,8 @@ class PassageReviewSurface(QDialog):
             lookup,
             high_speed=True,
         )
-        regular_association = self.association_store.get(event_id, REGULAR_SOURCE)
-        high_speed_association = self.association_store.get(event_id, HIGH_SPEED_SOURCE)
+        regular_association = self._association_for_event(event_id, REGULAR_SOURCE)
+        high_speed_association = self._association_for_event(event_id, HIGH_SPEED_SOURCE)
         readiness_status = review_status_text(lookup, regular, high_speed)
         status = self._confirmation_status(
             regular_association,
@@ -8079,6 +8140,10 @@ class PassageReviewSurface(QDialog):
             )
         self.summary_label.setText(summary)
         self._available_evidence_count = len(self._located_event_ids)
+        self.summary_label.setText(
+            f"{summary} · 可回看 {self._available_evidence_count:,}"
+        )
+        self.summary_label.setToolTip("可回看表示录像已可用；是否完成判读以已确认为准。")
 
     def _all_available_sources_confirmed(self, event_id: str) -> bool:
         lookup = self._lookups.get(event_id)
@@ -8195,9 +8260,9 @@ class PassageReviewSurface(QDialog):
             while 0 <= row < self.table.rowCount():
                 candidate = self._visible_events[row]
                 has_evidence = (
-                    self.association_store.get(candidate.event_id, REGULAR_SOURCE)
+                    self._association_for_event(candidate.event_id, REGULAR_SOURCE)
                     is not None
-                    or self.association_store.get(
+                    or self._association_for_event(
                         candidate.event_id,
                         HIGH_SPEED_SOURCE,
                     )
@@ -8251,7 +8316,7 @@ class PassageReviewSurface(QDialog):
         )
 
     def _seek_saved_confirmation(self, event_id: str) -> bool:
-        association = self.association_store.get(event_id, REGULAR_SOURCE)
+        association = self._association_for_event(event_id, REGULAR_SOURCE)
         if association is None:
             return False
         segment = self.timeline_store.get_segment(association.segment_id)
@@ -8871,8 +8936,11 @@ class PassageReviewSurface(QDialog):
         if event is None:
             return
         self.current_time_label.setText(
-            f"{format_passage_time(event.timeline_timestamp_ms + self._shared_delta_ms)} "
-            f"(Δ{self._shared_delta_ms:+d} ms)"
+            format_passage_time(event.timeline_timestamp_ms + self._shared_delta_ms)
+        )
+        self.current_time_label.setToolTip(
+            f"预计过线 {format_passage_time(event.timeline_timestamp_ms)}；"
+            f"距预计过线 {self._shared_delta_ms:+d} ms"
         )
 
     def _fit_visible_evidence_views(self) -> None:
@@ -9240,17 +9308,22 @@ class PassageReviewSurface(QDialog):
         # continuous camera recording.  It must not open the old short
         # evidence clip; that remains an explicit pane-button action.
         self._select_event(event.event_id, locate_target=True)
-        if self._uses_popup_judging() and self._maximized_window is None:
-            self._toggle_maximized_pane(self._camera_one_pane())
         # A race configured with no ordinary camera has no continuous target
         # to locate.  Preserve the established high-speed-only affordance by
         # maximising that pane, without invoking the generic short-clip
         # callback used by the ordinary-camera workflow.
-        if not any(
+        regular_available = any(
             pane.location is not None
             and pane.location.status in _OPENABLE_STATUSES
             for pane in self.regular_panes
+        )
+        if (
+            regular_available
+            and self._uses_popup_judging()
+            and self._maximized_window is None
         ):
+            self._toggle_maximized_pane(self._camera_one_pane())
+        if not regular_available:
             lookup = self._lookups.get(event.event_id)
             high_speed = (
                 source_location(lookup, high_speed=True)
@@ -9259,6 +9332,10 @@ class PassageReviewSurface(QDialog):
             )
             if high_speed is not None and high_speed.status in _OPENABLE_STATUSES:
                 self._toggle_maximized_pane(self.high_speed_pane)
+            elif self._uses_popup_judging():
+                self.video_filmstrip.full_race.status_label.setText(
+                    "该通过时刻暂无录像，请先检查摄像头连接；芯片记录已保留。"
+                )
 
     def _open_location_if_available(
         self,

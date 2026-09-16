@@ -150,6 +150,33 @@ from .visual_crossing import (
 logger = logging.getLogger("FinishReview")
 
 
+def _is_rtsp_auth_error(detail: object) -> bool:
+    text = str(detail or "").casefold()
+    return bool(re.search(r"\b401\b", text)) and any(
+        marker in text for marker in ("unauthorized", "authorization failed", "认证失败")
+    )
+
+
+def _format_rtsp_probe_error(detail: object) -> str:
+    """Turn noisy FFmpeg probe output into an operator-facing diagnosis."""
+
+    text = sanitize_recording_message(detail)
+    normalized = text.casefold()
+    if _is_rtsp_auth_error(text):
+        return (
+            "摄像头认证失败（401）：请核对用户名、密码和预览权限；"
+            "如账号已锁定，请等待解锁后再试。"
+        )
+    if "connection refused" in normalized:
+        return "RTSP端口拒绝连接：请确认摄像头已启用RTSP服务，且地址中的端口正确。"
+    if "timed out" in normalized or "timeout" in normalized:
+        return "RTSP连接超时：请检查摄像头IP、网络连通性和防火墙。"
+    if not text:
+        return "RTSP测试失败，请检查摄像头地址和网络。"
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), text)
+    return first_line[:240]
+
+
 @dataclass(frozen=True, slots=True)
 class _VideoCandidateDelivery:
     generation: int
@@ -456,7 +483,9 @@ class _RtspProbeWorker(QThread):
         detail = (stderr or b"").decode("utf-8", errors="replace").strip()
         self.probe_finished.emit(
             False,
-            sanitize_recording_message(detail or f"FFmpeg退出代码 {process.returncode}"),
+            _format_rtsp_probe_error(
+                detail or f"FFmpeg退出代码 {process.returncode}"
+            ),
         )
 
     @staticmethod
@@ -1083,6 +1112,9 @@ class FinishReviewLaunchDialog(QDialog):
         form.addRow("CycleRace", cycle_status)
         self.camera_status_label = QLabel(self)
         self.camera_status_label.setObjectName("recordingDeviceStatus")
+        self.camera_status_label.setWordWrap(True)
+        self.camera_status_label.setTextFormat(Qt.PlainText)
+        self.camera_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         form.addRow("设备检查", self.camera_status_label)
         device_layout.addLayout(form)
         device_layout.addStretch(1)
@@ -1825,15 +1857,17 @@ class FinishReviewLaunchDialog(QDialog):
 
     def _on_rtsp_probe_finished(self, ok: bool, message: str) -> None:
         current_source = self._current_rtsp_source()
-        self._rtsp_probe_ok = bool(ok and current_source == self._rtsp_probe_source)
+        if current_source != self._rtsp_probe_source:
+            return
+        self._rtsp_probe_ok = bool(ok)
         self._rtsp_probe_message = message
         self._refresh_camera_status()
 
     def _on_secondary_rtsp_probe_finished(self, ok: bool, message: str) -> None:
         current_source = self._current_secondary_rtsp_source()
-        self._secondary_rtsp_probe_ok = bool(
-            ok and current_source == self._secondary_rtsp_probe_source
-        )
+        if current_source != self._secondary_rtsp_probe_source:
+            return
+        self._secondary_rtsp_probe_ok = bool(ok)
         self._secondary_rtsp_probe_message = message
         self._refresh_camera_status()
 
@@ -1935,7 +1969,7 @@ class FinishReviewLaunchDialog(QDialog):
                 color = "#247a52"
             else:
                 text = self._rtsp_probe_message or "机位1已配置，尚未测试实际画面"
-                color = "#a56300"
+                color = "#b54747" if self._rtsp_probe_message else "#a56300"
         else:
             selected = str(self.device_combo.currentData() or "")
             if not selected:
@@ -1973,7 +2007,9 @@ class FinishReviewLaunchDialog(QDialog):
                         self._secondary_rtsp_probe_message
                         or "机位2尚未测试实际画面"
                     )
-                    secondary_color = "#a56300"
+                    secondary_color = (
+                        "#b54747" if self._secondary_rtsp_probe_message else "#a56300"
+                    )
             else:
                 secondary_selected = str(
                     self.secondary_device_combo.currentData() or ""
@@ -2376,6 +2412,8 @@ class _CompactStatusIndicator(QFrame):
 
     def _display_state(self) -> str:
         if self._state == "error":
+            if "认证失败" in self._raw_text:
+                return "认证失败"
             return "异常"
         if self._state == "busy":
             return "处理中"
@@ -2540,6 +2578,16 @@ class FinishReviewWindow(PassageReviewSurface):
                 else "cyclerace_passage_events.jsonl"
             )
         )
+        # CycleRace delivers events to the workspace-root inbox while this
+        # window may be opened on another event workspace.  Reconcile the
+        # latest revisions, including inactive tombstones, before building the
+        # review surface so an idle/withdrawn passage cannot reappear after a
+        # restart.
+        if self.timing_provider == "cyclerace" and inbox_metadata is not None:
+            self._merge_cyclerace_events(
+                passage_store,
+                inbox_metadata.race_id,
+            )
         metadata_store = (
             None
             if self.timing_provider == "racetiger"
@@ -2656,6 +2704,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._camera_reconnect_attempts: dict[int, int] = {}
         self._camera_reconnect_not_before: dict[int, float] = {}
         self._camera_reconnect_errors: dict[int, str] = {}
+        self._camera_auth_failed_sources: dict[int, str] = {}
         self._camera_segment_progress: dict[
             int,
             tuple[int | None, float],
@@ -4345,6 +4394,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._camera_reconnect_attempts.clear()
         self._camera_reconnect_not_before.clear()
         self._camera_reconnect_errors.clear()
+        self._camera_auth_failed_sources.clear()
         self._stop_requested = False
         try:
             free_bytes = shutil.disk_usage(self.output_dir).free
@@ -4738,6 +4788,18 @@ class FinishReviewWindow(PassageReviewSurface):
         source = dict(self._configured_recording_sources()).get(camera_index)
         if not source:
             return False
+        if _is_rtsp_auth_error(recorder_error):
+            self._camera_auth_failed_sources[camera_index] = source
+            self._camera_reconnect_not_before[camera_index] = float("inf")
+            detail = (
+                _format_rtsp_probe_error(recorder_error)
+                + " 自动重试已暂停；修改凭据后，点击开始录像重试。"
+            )
+            self._camera_reconnect_errors[camera_index] = detail
+            self._runtime_error = f"机位{camera_index}：{detail}"
+            self._auto_recording_error = self._runtime_error
+            logger.warning("Camera %s authentication failed; automatic retries paused", camera_index)
+            return False
         attempt = self._camera_reconnect_attempts.get(camera_index, 0) + 1
         reconnect_started = time.perf_counter()
         try:
@@ -5042,6 +5104,8 @@ class FinishReviewWindow(PassageReviewSurface):
             and current_metadata.race_id == metadata.race_id
         ):
             self.metadata_store.store(metadata)
+            self._merge_cyclerace_events(self.passage_store, metadata.race_id)
+            self.refresh()
             return False
 
         self._export_review_summary()
@@ -5054,16 +5118,7 @@ class FinishReviewWindow(PassageReviewSurface):
         target_passage_store = PassageEventStore(
             target_dir / "cyclerace_passage_events.jsonl"
         )
-        events_by_id: dict[str, PassageEvent] = {}
-        for store in (self.passage_store, self._receiver_passage_store):
-            for event in store.events():
-                if event.race_id != metadata.race_id:
-                    continue
-                current = events_by_id.get(event.event_id)
-                if current is None or event.revision > current.revision:
-                    events_by_id[event.event_id] = event
-        for event in events_by_id.values():
-            target_passage_store.append(event)
+        self._merge_cyclerace_events(target_passage_store, metadata.race_id)
 
         recording_was_active = self._recording_any_active()
         applied = self._apply_settings(
@@ -5080,6 +5135,41 @@ class FinishReviewWindow(PassageReviewSurface):
         if applied and recording_was_active:
             self._workspace_notice = "已切换新赛事，录像待重新开始"
         return applied
+
+    def _merge_cyclerace_events(
+        self,
+        target_store: PassageEventStore,
+        race_id: str,
+    ) -> int:
+        """Merge the newest live/inbox revisions into an event workspace.
+
+        ``PassageEventStore.events()`` hides inactive events by default.  The
+        inactive records are revisioned tombstones, however, and must travel
+        with the workspace or an older active passage can be resurrected when
+        switching back from an archive or restarting the application.
+        """
+        events_by_id: dict[str, PassageEvent] = {}
+        stores = [target_store, self._receiver_passage_store]
+        # During ``__init__`` the Qt base class has not been initialised yet,
+        # so attribute lookup through QObject can raise RuntimeError.
+        existing_store = self.__dict__.get("passage_store")
+        if existing_store is not None and existing_store is not target_store:
+            stores.append(existing_store)
+        for store in stores:
+            for event in store.events(include_inactive=True):
+                if event.race_id != race_id:
+                    continue
+                current = events_by_id.get(event.event_id)
+                if current is None or event.revision > current.revision:
+                    events_by_id[event.event_id] = event
+        merged = 0
+        for event in events_by_id.values():
+            current = target_store.get(event.event_id)
+            if current is not None and current.revision >= event.revision:
+                continue
+            target_store.append(event)
+            merged += 1
+        return merged
 
     def _is_test_passage(self, event: PassageEvent) -> bool:
         event_key = (event.race_id, event.stage_id, event.event_id)
@@ -5108,10 +5198,18 @@ class FinishReviewWindow(PassageReviewSurface):
             <= LIVE_EVIDENCE_DATE_TOLERANCE_MS
         )
 
+    def _camera_auth_retry_blocked(self) -> bool:
+        self._poll_recording_health()
+        return any(
+            self._camera_auth_failed_sources.get(camera_index) == source
+            for camera_index, source in self._configured_recording_sources()
+        )
+
     def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
         if (
             self._workspace_mode != "live"
             or not event.is_active
+            or self._camera_auth_retry_blocked()
             or self._recording_any_active()
             or self._is_test_passage(event)
             or not self._is_live_passage(event)
@@ -5137,6 +5235,7 @@ class FinishReviewWindow(PassageReviewSurface):
     def _auto_start_recording_for_metadata(self, metadata: RaceMetadata) -> bool:
         if (
             self._workspace_mode != "live"
+            or self._camera_auth_retry_blocked()
             or self._recording_any_active()
             or not any(
                 not _is_test_group_name(group.name)
@@ -5825,7 +5924,12 @@ class FinishReviewWindow(PassageReviewSurface):
         segments_by_camera = snapshot.segments_by_camera
         reconnecting = snapshot.reconnecting_cameras
         if reconnecting:
-            camera_text, camera_color = "录像设备: 自动重连中", "#b54747"
+            auth_failed = any(
+                _is_rtsp_auth_error(snapshot.reconnect_errors[index])
+                for index in reconnecting
+            )
+            camera_text = "录像设备: 认证失败" if auth_failed else "录像设备: 自动重连中"
+            camera_color = "#b54747"
             camera_state = "error"
             camera_tooltip = "\n".join(
                 f"机位{camera_index}: {snapshot.reconnect_errors[camera_index]}"

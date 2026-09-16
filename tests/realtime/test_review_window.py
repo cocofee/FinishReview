@@ -571,6 +571,31 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     restored.close()
 
 
+def test_cyclerace_workspace_merge_carries_inactive_tombstone(qapp, tmp_path):
+    window = _window(tmp_path / "events")
+    active = _event(
+        race_id="race-idle",
+        event_id="passage-1",
+        revision=10,
+        bib="001",
+    )
+    withdrawn = replace(active, revision=11, is_active=False)
+    other = _event(
+        race_id="race-idle",
+        event_id="passage-2",
+        revision=3,
+        bib="002",
+    )
+    window.passage_store.append(active)
+    window._receiver_passage_store.append(withdrawn)
+    window._receiver_passage_store.append(other)
+
+    assert window._merge_cyclerace_events(window.passage_store, "race-idle") == 2
+    assert window.passage_store.get("passage-1") == withdrawn
+    assert window.passage_store.events() == (other,)
+    window.close()
+
+
 def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
     root = tmp_path / "events"
     occupied = root / "城市赛"
@@ -2333,6 +2358,81 @@ def test_failed_camera_reconnect_uses_backoff_and_keeps_other_camera_running(
     assert window.camera_status_label.text() == "录像设备: 自动重连中"
     assert "2秒后重试" in window.camera_status_label.toolTip()
     window.close()
+
+
+def test_auth_failure_pauses_retries_without_stopping_passage_intake(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+    window.start_recording()
+    failed = _FakeRecorder.instances[-1]
+    failed.is_running = False
+    failed.check_error = lambda: "Server returned 401 Unauthorized (authorization failed)"
+    event = _event(passage_timestamp_ms=int(time.time() * 1000), received_at_ms=int(time.time() * 1000))
+    try:
+        # A fresh passage may arrive before the health timer notices the failure.
+        window.receiver.deliver(event)
+        for offset in (1, 120, 3600):
+            window._poll_recording_health(now=time.monotonic() + offset)
+        window._update_runtime_status()
+
+        assert len(_FakeRecorder.instances) == 1
+        assert window.passage_store.get(event.event_id) is not None
+        assert window.receiver.is_running
+        assert window.camera_status_label._detail_label.text() == "认证失败"
+        assert "自动重试已暂停" in window.camera_status_label.toolTip()
+
+        metadata = RaceMetadata(
+            race_id="race-1", stage_id="stage-1", revision=1, emitted_at_ms=1,
+            groups=(RaceGroupMetadata(group_id="men-open", name="男子公开组"),),
+        )
+        assert not window._auto_start_recording_for_metadata(metadata)
+        assert len(_FakeRecorder.instances) == 1
+
+        # An explicit retry after correcting the device is still possible.
+        window.start_recording()
+        assert len(_FakeRecorder.instances) == 2
+        assert window._recorders[1].is_running
+        assert not window._camera_auth_failed_sources
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("secondary", [False, True])
+def test_rtsp_probe_ignores_result_after_credentials_change(qapp, tmp_path, secondary):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://user:old@camera-one/live", output_dir=tmp_path,
+            secondary_source="rtsp://user:old@camera-two/live",
+            passage_host="127.0.0.1", passage_port=18765, camera_index=1,
+        ),
+        device_provider=lambda: (),
+    )
+    prefix = "secondary_rtsp" if secondary else "rtsp"
+    try:
+        current = getattr(dialog, f"_current_{prefix}_source")()
+        setattr(dialog, f"_{prefix}_probe_source", current)
+        getattr(dialog, f"{prefix}_password_edit").setText("corrected")
+        getattr(dialog, f"_on_{prefix}_probe_finished")(False, "401 Unauthorized")
+        assert "401" not in dialog.camera_status_label.text()
+        assert not getattr(dialog, f"_{prefix}_probe_message")
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        ("method DESCRIBE failed: 401 (Unauthorized)", "认证失败（401）"),
+        ("Connection refused", "端口拒绝连接"),
+        ("Connection timed out", "连接超时"),
+    ],
+)
+def test_rtsp_probe_error_is_concise_and_hides_credentials(detail, expected):
+    raw = detail + "\nError opening rtsp://admin:private-password@camera/live"
+    result = review_window_module._format_rtsp_probe_error(raw)
+    assert expected in result
+    assert "private-password" not in result
+    assert "\n" not in result
 
 
 def test_two_regular_sources_show_two_panes_without_high_speed(qapp, tmp_path):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import math
 import os
@@ -345,8 +346,28 @@ def load_archive_recording_sessions(
     output_dir: str | Path,
 ) -> tuple[ArchiveRecordingSession, ...]:
     archive_dir = (Path(output_dir).expanduser().resolve() / "videos").resolve()
+    # Failed connections create session manifests without any video. Enumerate
+    # the directory once so recovery does not create thousands of publishers
+    # that each glob the same directory on every refresh.
+    manifests: list[Path] = []
+    media_names: list[str] = []
+    try:
+        with os.scandir(archive_dir) as entries:
+            for entry in entries:
+                if entry.name.endswith("_archive_session.json"):
+                    manifests.append(Path(entry.path))
+                    continue
+                try:
+                    if entry.is_file() and entry.stat().st_size > 0:
+                        media_names.append(entry.name)
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        return ()
+    if not media_names:
+        return ()
     sessions = []
-    for manifest_path in archive_dir.glob("*_archive_session.json"):
+    for manifest_path in manifests:
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             if payload.get("schema_version") != ARCHIVE_SESSION_SCHEMA_VERSION:
@@ -361,6 +382,11 @@ def load_archive_recording_sessions(
                 or session_started_at_ms < 0
                 or Path(pattern_name).name != pattern_name
                 or "%04d" not in pattern_name
+            ):
+                continue
+            if not any(
+                fnmatch.fnmatchcase(name, pattern_name.replace("%04d", "*"))
+                for name in media_names
             ):
                 continue
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):

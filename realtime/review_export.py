@@ -151,8 +151,8 @@ def build_review_summary_rows(
             athletes_by_id,
             athletes_by_identity,
         )
-        regular = association_store.get(event.event_id, REGULAR_SOURCE)
-        high_speed = association_store.get(event.event_id, HIGH_SPEED_SOURCE)
+        regular = association_store.get_for_event(event, REGULAR_SOURCE)
+        high_speed = association_store.get_for_event(event, HIGH_SPEED_SOURCE)
         confirmations = tuple(
             association
             for association in (regular, high_speed)

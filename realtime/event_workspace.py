@@ -178,8 +178,8 @@ def summarize_event_workspace(
             return EventWorkspaceSummary(len(events), 0)
         association_store = PassageEvidenceAssociationStore(association_path)
         confirmed_count = sum(
-            association_store.get(event.event_id, REGULAR_SOURCE) is not None
-            or association_store.get(event.event_id, HIGH_SPEED_SOURCE) is not None
+            association_store.get_for_event(event, REGULAR_SOURCE) is not None
+            or association_store.get_for_event(event, HIGH_SPEED_SOURCE) is not None
             for event in events
         )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
