@@ -3390,8 +3390,10 @@ class PassageReviewSurface(QDialog):
 
         self.review_content_splitter = QSplitter(Qt.Vertical, self)
         self.review_content_splitter.setChildrenCollapsible(False)
-        self.review_content_splitter.setHandleWidth(10)
-        self.review_content_splitter.setStyleSheet("QSplitter::handle:vertical { background: #cbd5e1; }")
+        self.review_content_splitter.setHandleWidth(6)
+        self.review_content_splitter.setStyleSheet(
+            "QSplitter::handle:vertical { background: #edf1f4; border-top: 1px solid #cbd5e1; }"
+            "QSplitter::handle:vertical:hover { background: #cbd5e1; }")
         self.review_content_splitter.setMinimumSize(0, 0)
         self.review_content_splitter.addWidget(preview_panel)
         self.review_content_splitter.addWidget(self.workspace_splitter)

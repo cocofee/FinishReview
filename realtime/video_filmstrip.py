@@ -736,6 +736,7 @@ class VideoFilmstripWidget(QFrame):
         self.status_label.hide()
         self.title_label.hide()
         self.full_race.show()
+        self.judgment_track.embed_header(self.full_race.toolbar)
         self.judgment_track.set_expanded(False)
 
     def closeEvent(self, event) -> None:

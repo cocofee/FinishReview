@@ -30,11 +30,13 @@ class CameraJudgmentTrack(QWidget):
         self.setObjectName("cameraJudgmentTrack")
         self.setFixedHeight(112)
         self._records: tuple[CameraJudgment, ...] = ()
+        self._embedded_header = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         self.summary = QLabel("判读记录 · 尚无标记", self)
         header = QHBoxLayout()
+        self.header_layout = header
         header.addWidget(self.summary, 1)
         self.expand_button = QPushButton("收起记录", self)
         self.expand_button.setCheckable(True)
@@ -60,11 +62,23 @@ class CameraJudgmentTrack(QWidget):
         self.list.itemActivated.connect(self._request_item)
         layout.addWidget(self.list)
 
+    def embed_header(self, toolbar: QHBoxLayout) -> None:
+        if self._embedded_header:
+            return
+        self._embedded_header = True
+        self.header_layout.removeWidget(self.summary)
+        self.header_layout.removeWidget(self.expand_button)
+        self.summary.hide()
+        toolbar.insertWidget(toolbar.count() - 1, self.expand_button)
+        self.expand_button.setStyleSheet("")
+        self.expand_button.show()
+        self.set_expanded(self.expand_button.isChecked())
+
     def set_expanded(self, expanded: bool) -> None:
         self.expand_button.setChecked(expanded)
-        self.expand_button.setText("收起记录" if expanded else "全部记录")
+        self.expand_button.setText("收起记录" if expanded else "判读记录" if self._embedded_header else "全部记录")
         self.list.setVisible(expanded)
-        self.setFixedHeight(112 if expanded else 26)
+        self.setFixedHeight((86 if expanded else 0) if self._embedded_header else (112 if expanded else 26))
 
     def _request_item(self, item: QListWidgetItem) -> None:
         self.judgment_requested.emit(str(item.data(Qt.UserRole)))
@@ -105,7 +119,6 @@ class CameraJudgmentTrack(QWidget):
         scrollbar.setValue(scroll)
         confirmed = sum(not record.unknown for record in records)
         unknown = len(records) - confirmed
-        self.summary.setText(
-            f"判读记录 · 已确认 {confirmed} · 待补录 {unknown} · 点击回看"
-            if records else "判读记录 · 尚无标记"
-        )
+        self.summary.setText(f"已判 {confirmed}" + (f" · 待补录 {unknown}" if unknown else ""))
+        self.summary.setToolTip(f"判读记录 · 已确认 {confirmed} · 待补录 {unknown}\n点击时间线号码或展开全部记录回看原帧。")
+        self.expand_button.setToolTip(self.summary.toolTip())

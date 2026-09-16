@@ -734,6 +734,7 @@ def test_filmstrip_popup_judges_exact_frame_and_restores_browsing(
     qapp.processEvents()
     panel = dialog.video_filmstrip.full_race
     pane = dialog.regular_pane
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     assert dialog.evidence_splitter.isHidden()
     assert not pane.isVisible()
     assert dialog.results_panel.width() == dialog.workspace_splitter.width()

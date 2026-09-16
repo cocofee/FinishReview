@@ -6,8 +6,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 import pytest
-from PyQt5.QtCore import QObject, QPoint, Qt, pyqtSignal
-from PyQt5.QtGui import QImage
+from PyQt5.QtCore import QObject, QPoint, QPointF, Qt, pyqtSignal
+from PyQt5.QtGui import QImage, QWheelEvent
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
@@ -220,9 +220,142 @@ def result(recording, timestamp):
     return RaceFilmstripFrame(recording, timestamp, position, position // 50, image)
 
 
+def wheel(panel, *, angle=0, pixels=0):
+    viewport = panel.canvas.viewport()
+    point = viewport.rect().center()
+    event = QWheelEvent(QPointF(point), QPointF(viewport.mapToGlobal(point)),
+                        QPoint(0, pixels), QPoint(0, angle), Qt.NoButton, Qt.NoModifier,
+                        Qt.NoScrollPhase, False)
+    QApplication.sendEvent(viewport, event)
+
+
+def test_default_half_second_wheel_accumulates_without_seeking_camera(qapp, tmp_path, manual_worker):
+    panel = RaceFilmstripPanel()
+    try:
+        panel.resize(1200, 450)
+        panel.show()
+        recording = source(tmp_path / "first", duration=60000)
+        panel.set_sources((recording,))
+        qapp.processEvents()
+        assert panel.density_combo.currentData() == 500
+        assert panel.time_at(1) - panel.time_at(0) == 500
+        panel.browse_to(30000)
+        panel.set_current_frame(recording.location, 2000)
+        bar = panel.canvas.horizontalScrollBar()
+        before = bar.value()
+        selected = QSignalSpy(panel.frame_requested)
+        wheel(panel, angle=-120)
+        wheel(panel, angle=-120)
+        QTest.qWait(160)
+        assert bar.value() == before + 2 * panel.tile_pitch
+        assert not selected and panel.current_time == 12000
+        wheel(panel, angle=120)
+        QTest.qWait(160)
+        assert bar.value() == before + panel.tile_pitch
+        wheel(panel, pixels=-37)
+        assert bar.value() == before + panel.tile_pitch + 37
+        panel.follow_button.click()
+        wheel(panel, angle=120)
+        assert not panel.follow_button.isChecked()
+    finally:
+        panel.close()
+
+
+def test_wheel_reversal_and_click_stop_old_scroll_target(qapp, tmp_path, manual_worker):
+    panel = RaceFilmstripPanel()
+    try:
+        panel.resize(1200, 450)
+        panel.show()
+        recording = source(tmp_path / "first", duration=60000)
+        panel.set_sources((recording,))
+        qapp.processEvents()
+        panel.browse_to(30000)
+        bar = panel.canvas.horizontalScrollBar()
+        wheel(panel, angle=-360)
+        QTest.qWait(40)
+        turning_point = bar.value()
+        wheel(panel, angle=120)
+        QTest.qWait(160)
+        assert bar.value() == turning_point - panel.tile_pitch
+        wheel(panel, angle=-120)
+        QTest.qWait(30)
+        clicked_at = bar.value()
+        tile = (clicked_at + 100) // panel.tile_pitch
+        frame = result(recording, panel.time_at(tile))
+        panel.cache[frame.key] = frame
+        selected = QSignalSpy(panel.frame_requested)
+        QTest.mouseClick(panel.canvas.viewport(), Qt.LeftButton, pos=QPoint(100, 80))
+        QTest.qWait(160)
+        assert bar.value() == clicked_at
+        assert len(selected) == 1 and selected[0][0] is frame
+    finally:
+        panel.close()
+
+
+def test_wheel_boundaries_and_density_changes_leave_no_stale_scroll(qapp, tmp_path, manual_worker):
+    panel = RaceFilmstripPanel()
+    try:
+        panel.resize(1200, 450)
+        panel.show()
+        panel.set_sources((source(tmp_path / "first", duration=60000),))
+        qapp.processEvents()
+        bar = panel.canvas.horizontalScrollBar()
+        wheel(panel, angle=120)
+        QTest.qWait(160)
+        assert bar.value() == 0
+        bar.setValue(bar.maximum())
+        wheel(panel, angle=-120)
+        QTest.qWait(160)
+        assert bar.value() == bar.maximum()
+        panel.browse_to(30000)
+        wheel(panel, angle=-360)
+        QTest.qWait(30)
+        panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
+        changed_at = bar.value()
+        QTest.qWait(160)
+        assert bar.value() == changed_at
+        wheel(panel, angle=-120)
+        panel.clear()
+        QTest.qWait(160)
+        assert bar.value() == 0 and panel.tile_count() == 0
+    finally:
+        panel.close()
+
+
+def test_continuous_wheel_keeps_visible_decoding_and_loads_before_stopping(qapp, tmp_path, manual_worker):
+    panel = RaceFilmstripPanel()
+    try:
+        panel.resize(1200, 450)
+        panel.show()
+        panel.set_sources((source(tmp_path / "first", duration=60000),))
+        qapp.processEvents()
+        panel._load_visible()
+        worker = panel._worker
+        assert worker is not None
+        wheel(panel, angle=-120)
+        QTest.qWait(40)
+        assert not worker.stopped
+        worker.finished.emit()
+        for _ in range(6):
+            wheel(panel, angle=-30)
+            QTest.qWait(25)
+        assert len(manual_worker.instances) == 2
+        assert panel._worker is not None and not panel._worker.stopped
+        # Scrolling well beyond a running batch still retires that batch;
+        # no second decoder may start until the old one acknowledges stop.
+        stale_worker = panel._worker
+        wheel(panel, angle=-2400)
+        QTest.qWait(160)
+        assert stale_worker.stopped
+        assert len(manual_worker.instances) == 2
+    finally:
+        panel.close()
+
+
 def test_whole_day_rail_loads_only_visible_jobs_and_bounds_cache(qapp, tmp_path, manual_worker):
     recording = source(tmp_path / "whole_day", duration=12 * 3600 * 1000)
     panel = RaceFilmstripPanel()
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     panel.resize(1200, 300)
     panel.show()
     panel.set_sources((recording,))
@@ -264,6 +397,7 @@ def test_click_uses_its_original_recording_and_never_opens_gap(qapp, tmp_path, m
     first = source(tmp_path / "first", 10000, 1000)
     second = source(tmp_path / "second", 12000, 1000)
     panel = RaceFilmstripPanel()
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     panel.set_sources((first, second))
     selected = QSignalSpy(panel.frame_requested)
     frame = result(second, 12200)
@@ -279,6 +413,7 @@ def test_click_uses_its_original_recording_and_never_opens_gap(qapp, tmp_path, m
 def test_pending_click_is_cancelled_when_operator_browses_elsewhere(qapp, tmp_path, manual_worker):
     recording = source(tmp_path / "first", duration=60000)
     panel = RaceFilmstripPanel()
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     panel.resize(1000, 300)
     panel.show()
     panel.set_sources((recording,))
@@ -303,6 +438,7 @@ def test_race_switch_and_close_reject_old_queued_frames(qapp, tmp_path, manual_w
     first = source(tmp_path / "first", duration=60000)
     second = source(tmp_path / "second", duration=60000, race="race-2")
     panel = RaceFilmstripPanel()
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     panel.resize(1000, 300)
     panel.show()
     panel.set_sources((first,))
@@ -378,10 +514,14 @@ def test_inspection_skips_gaps_failed_unloaded_and_partial_tiles(qapp, tmp_path,
     second = source(tmp_path / "second", 10500, 500)
     missing = source(tmp_path / "missing", 11000, 500, available=False)
     panel = RaceFilmstripPanel()
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     panel.resize(1900, 350)
     panel.show()
     panel.set_check_context(tmp_path / "checks.jsonl", "race-1")
     panel.set_sources((first, second, missing))
+    qapp.processEvents()
+    # Keep the loaded second segment fully visible as toolbar height changes.
+    panel.resize(7 * panel.tile_pitch, panel.height())
     qapp.processEvents()
     panel.canvas.horizontalScrollBar().setValue(80)
     for recording, timestamp in ((first, 10000), (first, 10100), (second, 10500)):
@@ -419,6 +559,8 @@ def test_coarse_browsing_and_inspection_survive_archive_boundaries(qapp, tmp_pat
     panel.set_sources((first, second, later))
     qapp.processEvents()
     panel.density_combo.setCurrentIndex(panel.density_combo.findData(5000))
+    panel.resize(4 * panel.tile_pitch, panel.height())
+    qapp.processEvents()
     panel.browse_to(10000)
     for timestamp in (10000, 15000, 22000, 25000):
         recording = panel.index.span_at(timestamp).source
@@ -494,6 +636,7 @@ def test_larger_thumbnails_obey_memory_budget(qapp, tmp_path, manual_worker):
 def test_f_shortcut_opens_selected_original_frame(qapp, tmp_path, manual_worker):
     recording = source(tmp_path / "first", duration=60000)
     panel = RaceFilmstripPanel()
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     panel.resize(1400, 450)
     panel.show()
     panel.activateWindow()
@@ -518,6 +661,7 @@ def test_f_shortcut_opens_selected_original_frame(qapp, tmp_path, manual_worker)
 def test_f_waits_for_original_frame_and_cancels_stale_requests(qapp, tmp_path, manual_worker, cancel):
     recording = source(tmp_path / "first", duration=60000)
     panel = RaceFilmstripPanel()
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(100))
     panel.resize(1400, 450)
     panel.show()
     panel.activateWindow()

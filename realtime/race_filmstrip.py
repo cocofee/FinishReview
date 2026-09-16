@@ -11,11 +11,11 @@ import math
 from pathlib import Path
 
 import cv2
-from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAbstractScrollArea, QComboBox, QHBoxLayout, QLabel, QMenu, QPushButton,
-    QShortcut, QVBoxLayout, QWidget,
+    QShortcut, QSizePolicy, QVBoxLayout, QWidget,
 )
 from PyQt5.QtGui import QKeySequence
 
@@ -25,7 +25,7 @@ from .filmstrip_checks import FilmstripCheckStore, merge_ranges, subtract_ranges
 
 TILE_GAP = 8
 IMAGE_TOP = 4
-IMAGE_FOOTER = 60
+IMAGE_FOOTER = 48
 MAX_CACHE = 160
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 MAX_BATCH = 16
@@ -249,54 +249,6 @@ class RaceThumbnailWorker(QThread):
                 capture.release()
 
 
-class RaceOverview(QWidget):
-    position_requested = pyqtSignal(object)
-
-    def __init__(self, owner):
-        super().__init__(owner)
-        self.owner = owner
-        self.setFixedHeight(36)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("点击或拖动定位整场时间；蓝灰为录像，浅灰为缺口，橙色为不可用；下方绿色为手动检查范围，上方绿点为已判记录，红线为机位 1")
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#e2e8f0"))
-        index = self.owner.index
-        duration = index.end_ms - index.start_ms
-        if duration <= 0:
-            return
-        def x(timestamp):
-            return (timestamp - index.start_ms) * self.width() / duration
-        for span in index.spans:
-            if span.source is not None:
-                painter.fillRect(QRectF(x(span.start_ms), 7, max(1, x(span.end_ms) - x(span.start_ms)), 18),
-                                 QColor("#94a3b8" if span.source.available else "#f59e0b"))
-        for timestamp, _ in self.owner.markers:
-            painter.fillRect(QRectF(x(timestamp), 1, 2, 5), QColor("#16a34a"))
-        for start, end in self.owner.checked_ranges():
-            painter.fillRect(QRectF(x(start), 28, max(1, x(end) - x(start)), 6), QColor("#16a34a"))
-        left, right = self.owner.visible_times()
-        painter.setPen(QPen(QColor("#0284c7"), 2))
-        painter.drawRect(QRectF(x(left), 5, max(3, x(right) - x(left)), 22))
-        current = self.owner.current_time
-        if current is not None and index.start_ms <= current <= index.end_ms:
-            painter.setPen(QPen(QColor("#ef4444"), 2))
-            painter.drawLine(QPointF(x(current), 0), QPointF(x(current), 32))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._request_position(event.x())
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton:
-            self._request_position(event.x())
-
-    def _request_position(self, pixel):
-        index = self.owner.index
-        self.position_requested.emit(index.start_ms + int(max(0, min(self.width(), pixel)) / max(1, self.width()) * (index.end_ms - index.start_ms)))
-
-
 class RaceFilmstripCanvas(QAbstractScrollArea):
     def __init__(self, owner):
         super().__init__(owner)
@@ -309,6 +261,18 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
         self._press = None
         self._moved = False
         self._judgment_menu = None
+        self._wheel_target = None
+        self._wheel_animation = QPropertyAnimation(self.horizontalScrollBar(), b"value", self)
+        self._wheel_animation.setDuration(100)
+        self._wheel_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._wheel_animation.finished.connect(self._wheel_finished)
+        self.horizontalScrollBar().setToolTip("左右拖动浏览整场录像；鼠标在胶卷上向下滚看后面，向上滚看前面。")
+        self.horizontalScrollBar().setStyleSheet(
+            "QScrollBar:horizontal { height: 10px; background: #edf1f4; margin: 0; }"
+            "QScrollBar::handle:horizontal { background: #aab6c3; min-width: 32px; border-radius: 3px; }"
+            "QScrollBar::handle:horizontal:hover { background: #718096; }"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
+            "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }")
         self.horizontalScrollBar().valueChanged.connect(owner._viewport_changed)
         self.horizontalScrollBar().sliderPressed.connect(owner._begin_browsing)
         self.horizontalScrollBar().actionTriggered.connect(owner._begin_browsing)
@@ -406,8 +370,8 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
                 clusters[-1][1].append(record)
             else:
                 clusters.append((label_x, [record]))
-        y = self.viewport().height() - IMAGE_FOOTER + 28
-        return tuple((QRectF(x, y, 72, 24), tuple(records))
+        y = self.viewport().height() - IMAGE_FOOTER + 24
+        return tuple((QRectF(x, y, 72, 22), tuple(records))
                      for x, records in clusters)
 
     def _open_judgments(self, records, position):
@@ -442,7 +406,8 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
                 source, sample = self.owner.index.sample_at(self.owner.time_at(tile), self.owner.interval_ms)
                 frame = self.owner.cache.get((source.key, sample)) if source else None
                 if frame is not None:
-                    tooltip = f"原帧判读时间：{self.owner.display_time(frame.recorder_time_ms, source)} · 帧 {frame.frame_index + 1}"
+                    tooltip = (f"原帧判读时间：{self.owner.display_time(frame.recorder_time_ms, source)} · 帧 {frame.frame_index + 1}"
+                               "\n滚轮向下看后面，向上看前面；点击图片后按 F 判读。")
             self.viewport().setToolTip(tooltip)
         if self._press is not None:
             delta = event.x() - self._press.x()
@@ -469,10 +434,50 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
             self._press = None
 
     def wheelEvent(self, event):
-        self.owner._begin_browsing()
-        delta = event.angleDelta().y() or event.angleDelta().x()
-        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(delta / 120 * self.owner.tile_pitch))
+        self.owner._begin_browsing(keep_wheel=True)
+        bar = self.horizontalScrollBar()
+        pixels = event.pixelDelta().y() or event.pixelDelta().x()
+        if pixels:
+            # Touchpads already provide a smooth pixel stream; do not add lag.
+            self.stop_scroll()
+            bar.setValue(bar.value() - pixels)
+        else:
+            delta = event.angleDelta().y() or event.angleDelta().x()
+            if delta:
+                distance = -delta / 120 * self.owner.tile_pitch
+                target = self._wheel_target
+                if target is None or (target - bar.value()) * distance < 0:
+                    target = bar.value()
+                self._wheel_animation.stop()
+                self._wheel_target = max(bar.minimum(), min(bar.maximum(), target + distance))
+                self._wheel_animation.setStartValue(bar.value())
+                self._wheel_animation.setEndValue(round(self._wheel_target))
+                self._wheel_animation.start()
         event.accept()
+
+    def stop_scroll(self):
+        self._wheel_animation.stop()
+        self._wheel_target = None
+
+    def _wheel_finished(self):
+        self._wheel_target = None
+        if not self.owner._closed:
+            QTimer.singleShot(0, self.owner._load_visible)
+
+
+class _FilmstripNotice(QLabel):
+    """单行反馈不挤压胶卷；较长的异常信息可悬停查看。"""
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+        self.setVisible(bool(text))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        painter.drawText(self.contentsRect(), Qt.AlignLeft | Qt.AlignVCenter,
+                         self.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.contentsRect().width()))
 
 
 class RaceFilmstripPanel(QWidget):
@@ -485,7 +490,7 @@ class RaceFilmstripPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.index = RaceRecordingIndex()
-        self.interval_ms = 100
+        self.interval_ms = 500
         self.tile_width = 400
         self.tile_pitch = self.tile_width + TILE_GAP
         self._image_aspect = 4 / 3
@@ -514,70 +519,83 @@ class RaceFilmstripPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(3)
         summary = QHBoxLayout()
+        self.toolbar = summary
         self.range_label = QLabel("时间胶卷 · 机位 1")
         summary.addWidget(self.range_label)
-        summary.addStretch()
-        self.new_recording_label = QLabel()
-        summary.addWidget(self.new_recording_label)
-        self.follow_button = QPushButton("跟随最新")
+        self.new_recording_label = QLabel(self)
+        self.new_recording_label.setStyleSheet("color: #64748b; font-size: 9pt;")
+        self.follow_button = QPushButton("跟随最新", self)
         self.follow_button.setCheckable(True)
         self.follow_button.setToolTip("跟随最新可回看的录像；拖动、翻页或点击原帧时退出跟随")
         self.follow_button.toggled.connect(self._follow_changed)
-        summary.addWidget(self.follow_button)
+        self.follow_button.hide()
         self.density_combo = QComboBox()
         for milliseconds in (50, 100, 200, 500, 1000, 2000, 5000, 10000):
             spacing = f"{milliseconds} ms" if milliseconds < 1000 else f"{milliseconds // 1000} 秒"
             self.density_combo.addItem(f"每 {spacing} 一张", milliseconds)
-        self.density_combo.setCurrentIndex(1)
+        self.density_combo.setCurrentIndex(self.density_combo.findData(self.interval_ms))
         self.density_combo.setToolTip("间隔大便于查找时段；缩小间隔看密集到达和遮挡。缩略图只用于浏览，判定请到机位 1 逐帧查看。")
         self.density_combo.currentIndexChanged.connect(self._density_changed)
         summary.insertWidget(1, self.density_combo)
-        for index, (label, action) in enumerate((("前一屏", lambda: self.page(-1)),
-                                                ("后一屏", lambda: self.page(1)),
-                                                ("当前帧", self.browse_camera))):
-            button = QPushButton(label, self)
-            button.clicked.connect(action)
-            summary.insertWidget(2 + index, button)
+        current_button = QPushButton("当前帧", self)
+        current_button.setToolTip("回到当前判读原帧所在的时间")
+        current_button.clicked.connect(self.browse_camera)
+        summary.addWidget(current_button)
+        self.inspection_label = QLabel(self)
+        self.inspection_label.setStyleSheet("color: #b45309; font-size: 9pt;")
+        self.inspection_label.hide()
+        summary.addWidget(self.inspection_label)
+        self.status_label = _FilmstripNotice(self)
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status_label.setMaximumWidth(360)
+        self.status_label.setStyleSheet("color: #475569; font-size: 9pt;")
+        self.status_label.hide()
+        summary.addWidget(self.status_label, 1)
+        summary.addStretch(1)
+        summary.addWidget(self.new_recording_label)
+        summary.addWidget(self.follow_button)
         self.enlarge_button = QPushButton("放大胶卷", self)
         self.enlarge_button.setToolTip("增加胶卷高度；也可拖动胶卷下方分隔线调节")
         self.enlarge_button.clicked.connect(self.enlarge_requested.emit)
         self.enlarge_button.hide()
         self.more_button = QPushButton("更多", self)
         menu = QMenu(self.more_button)
+        menu.addAction("前一屏", lambda: self.page(-1))
+        menu.addAction("后一屏", lambda: self.page(1))
         menu.addAction("回到起点", lambda: self.browse_to(self.index.start_ms))
         menu.addAction("回到末尾", lambda: self.browse_to(self.index.end_ms))
+        follow_action = menu.addAction("跟随最新")
+        follow_action.setCheckable(True)
+        follow_action.toggled.connect(self.follow_button.setChecked)
+        self.follow_button.toggled.connect(follow_action.setChecked)
+        menu.addSeparator()
         menu.addAction("刷新录像", self.reload)
         enlarge_action = menu.addAction("放大胶卷", self.enlarge_button.click)
         menu.aboutToShow.connect(lambda: enlarge_action.setText(self.enlarge_button.text()))
         self.more_button.setMenu(menu)
         summary.addWidget(self.more_button)
         layout.addLayout(summary)
-        self.overview = RaceOverview(self)
-        self.overview.position_requested.connect(self.browse_to)
-        layout.addWidget(self.overview)
-        inspection = QHBoxLayout()
-        self.inspection_label = QLabel()
-        inspection.addWidget(self.inspection_label, 1)
-        self.check_button = QPushButton("本屏已检查")
+        self.check_button = QPushButton("本屏已检查", self)
         self.check_button.clicked.connect(lambda: self.mark_visible_checked(True))
         self.check_button.setToolTip("手动确认本屏完整显示的图片所代表的时间范围已检查；空档、未加载及失败图片不计入")
-        inspection.addWidget(self.check_button)
+        self.check_button.hide()
         self.uncheck_button = QPushButton("取消本屏检查", self)
         self.uncheck_button.clicked.connect(lambda: self.mark_visible_checked(False))
         self.uncheck_button.hide()
         menu.addSeparator()
+        self.inspection_action = menu.addAction("等待录像")
+        self.inspection_action.setEnabled(False)
+        check_action = menu.addAction("本屏已检查", self.check_button.click)
+        menu.aboutToShow.connect(lambda: check_action.setEnabled(self.check_button.isEnabled()))
         uncheck_action = menu.addAction("取消本屏检查", self.uncheck_button.click)
         menu.aboutToShow.connect(lambda: uncheck_action.setEnabled(self.uncheck_button.isEnabled()))
-        self.next_unchecked_button = QPushButton("下一处未检查")
+        self.next_unchecked_button = QPushButton("下一处未检查", self)
         self.next_unchecked_button.clicked.connect(self.browse_unchecked)
-        inspection.addWidget(self.next_unchecked_button)
-        layout.addLayout(inspection)
+        self.next_unchecked_button.hide()
+        next_unchecked_action = menu.addAction("下一处未检查", self.next_unchecked_button.click)
+        menu.aboutToShow.connect(lambda: next_unchecked_action.setEnabled(self.next_unchecked_button.isEnabled()))
         self.canvas = RaceFilmstripCanvas(self)
         layout.addWidget(self.canvas, 1)
-        self.status_label = QLabel("点击运动员所在图片，按 F 打开原帧判读；Esc 返回胶卷。")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #475569; font-size: 9pt;")
-        layout.addWidget(self.status_label)
         self._load_timer = QTimer(self)
         self._load_timer.setSingleShot(True)
         self._load_timer.setInterval(90)
@@ -642,6 +660,7 @@ class RaceFilmstripPanel(QWidget):
     def _set_scroll_range(self):
         if not hasattr(self, "canvas"):
             return
+        self.canvas.stop_scroll()
         bar = self.canvas.horizontalScrollBar()
         bar.setPageStep(self.canvas.viewport().width())
         bar.setSingleStep(self.tile_pitch)
@@ -696,7 +715,11 @@ class RaceFilmstripPanel(QWidget):
                 f"判读时间：{self.display_time(self.index.start_ms)} — {self.display_time(self.index.end_ms)}\n"
                 f"录像原始时钟：{format_time(self.index.start_ms, date=True)} — {format_time(self.index.end_ms, date=True)}")
             gaps = sum(span.source is None or not span.source.available for span in self.index.spans)
-            self.status_label.setText(f"{len(sources)} 段录像 · {gaps} 处缺口/不可用 · 点击图片，按 F 判读；Esc 返回。" + (f"另有 {pending} 段等待归档。" if pending else ""))
+            self.range_label.setToolTip(self.range_label.toolTip() +
+                f"\n{len(sources)} 段录像 · {gaps} 处缺口/不可用" +
+                (f" · {pending} 段等待归档" if pending else "") +
+                "\n点击图片，按 F 打开原帧判读；Esc 返回胶卷。")
+            self.status_label.setText("")
         else:
             self.range_label.setText("时间胶卷 · 相机 1 · 等待录像")
             self.status_label.setText("尚无可验证的录像时间范围，请等待录像归档或刷新。")
@@ -714,7 +737,7 @@ class RaceFilmstripPanel(QWidget):
         except (OSError, ValueError, RuntimeError) as error:
             self._check_error = f"检查进度读取失败：{error}"
         self._update_inspection_controls()
-        self.overview.update()
+        self.canvas.viewport().update()
 
     def available_ranges(self):
         return merge_ranges((span.start_ms, span.end_ms) for span in self.index.spans
@@ -762,7 +785,6 @@ class RaceFilmstripPanel(QWidget):
             self.status_label.setText(f"检查进度保存失败，未更改标记：{error}")
             return
         self._update_inspection_controls()
-        self.overview.update()
         self.canvas.viewport().update()
         self.status_label.setText("已保存本屏检查范围；判定仍在机位 1 确认。" if checked else "已取消本屏检查标记。")
 
@@ -784,17 +806,24 @@ class RaceFilmstripPanel(QWidget):
         left, right = self.visible_times()
         inspected = sum(end - start for start, end in self.checked_ranges())
         total = sum(end - start for start, end in self.available_ranges())
-        self.inspection_label.setText(f"本屏 {format_duration(right - left)} · 已检查 {format_duration(inspected)} / {format_duration(total)}" if total else "等待录像")
-        self.inspection_label.setToolTip(self._check_error or f"本屏判读时间：{self.display_time(left)} — {self.display_time(right)}\n手动已检查 {format_duration(inspected)} / 可用录像 {format_duration(total)}；下方绿条为检查进度，上方绿点为判读记录。")
+        percent = inspected * 100 / total if total else 0
+        progress = "<0.1" if 0 < percent < 0.1 else f"{percent:.1f}"
+        self.inspection_label.setText(f"本屏 {format_duration(right - left)} · 已检查 {progress}%" if total else "等待录像")
+        self.inspection_label.setToolTip(self._check_error or f"本屏判读时间：{self.display_time(left)} — {self.display_time(right)}\n手动已检查 {format_duration(inspected)} / 可用录像 {format_duration(total)}；图片上沿绿条为已检查范围，下沿号码为判读记录。")
         self.check_button.setEnabled(self._check_store is not None and bool(self._screen_ranges(loaded_only=True)))
         self.uncheck_button.setEnabled(self._check_store is not None and bool(self.checked_ranges()))
         self.next_unchecked_button.setEnabled(self._check_store is not None and bool(self.unchecked_ranges()))
         if self._check_error:
             self.inspection_label.setText("检查进度读取失败")
+        self.inspection_label.setVisible(bool(self._check_error))
+        self.inspection_action.setText(self.inspection_label.text())
+        self.more_button.setToolTip(self.inspection_label.toolTip())
 
     def _follow_changed(self, enabled):
         self.follow_button.setText("正在跟随" if enabled else "跟随最新")
+        self.follow_button.setVisible(enabled)
         if enabled:
+            self.canvas.stop_scroll()
             self._user_navigated = True
             self._pending = None
             self._scroll_to_latest()
@@ -809,12 +838,10 @@ class RaceFilmstripPanel(QWidget):
                            for start, end in self.available_ranges())
         if new_duration > 0:
             text = f"新增可回看 {format_duration(new_duration)}"
-        elif self.follow_button.isChecked():
-            text = "跟随最新可回看录像"
         else:
             text = ""
         if self._pending_sources:
-            text += f" · {self._pending_sources} 段等待归档"
+            text += (" · " if text else "") + f"{self._pending_sources} 段等待归档"
         self.new_recording_label.setText(text)
 
     def set_current_frame(self, location, position_ms):
@@ -826,7 +853,6 @@ class RaceFilmstripPanel(QWidget):
             self._position_scroll(self.current_time)
             self._initial_positioned = True
         self.canvas.viewport().update()
-        self.overview.update()
 
     def set_judgments(self, records, selected_event_id=""):
         self._judgments = tuple(sorted((record for record in records if record.recorder_time_ms is not None),
@@ -835,7 +861,6 @@ class RaceFilmstripPanel(QWidget):
         self.selected_event_id = selected_event_id
         self.markers = tuple(sorted((record.recorder_time_ms, record.label) for record in records if record.recorder_time_ms is not None))
         self.canvas.viewport().update()
-        self.overview.update()
 
     def _position_scroll(self, timestamp, *, center=True):
         pixel = round((timestamp - self.index.start_ms) / self.interval_ms * self.tile_pitch)
@@ -847,7 +872,9 @@ class RaceFilmstripPanel(QWidget):
         self._begin_browsing()
         self._position_scroll(timestamp)
 
-    def _begin_browsing(self, *_):
+    def _begin_browsing(self, *_, keep_wheel=False):
+        if not keep_wheel:
+            self.canvas.stop_scroll()
         self._user_navigated = True
         self._pending = None
         self._pending_judgment = None
@@ -879,14 +906,19 @@ class RaceFilmstripPanel(QWidget):
             return
         self._pending = None
         self._pending_judgment = None
-        self._cancel_decode()
+        wheeling = self.canvas._wheel_target is not None
+        left, right = self.visible_times()
+        # Keep useful decoding alive through animation ticks. Once its whole
+        # batch leaves the screen, retire it before starting the next batch.
+        if not wheeling or (self._worker is not None and
+                            not any(left <= timestamp < right for _, timestamp in self._worker.jobs)):
+            self._cancel_decode()
         self.canvas.viewport().update()
-        self.overview.update()
         if self.canvas.horizontalScrollBar().value() == self.canvas.horizontalScrollBar().maximum():
             self._seen_end_ms = self.index.end_ms
         self._update_new_recording_label()
         self._update_inspection_controls()
-        if not self._closed:
+        if not self._closed and (not wheeling or not self._load_timer.isActive()):
             self._load_timer.start()
 
     def open_tile(self, tile):
@@ -911,6 +943,7 @@ class RaceFilmstripPanel(QWidget):
         frame = self.cache.get(key)
         if frame is not None:
             self._active_frame = frame
+            self.status_label.setText("")
             self.frame_requested.emit(frame)
         elif key in self.errors:
             self.status_label.setText(self.errors[key] + "；可点“刷新录像”重试。")
@@ -964,6 +997,7 @@ class RaceFilmstripPanel(QWidget):
             self._pending = None
             self._pending_judgment = None
             self._active_frame = frame
+            self.status_label.setText("")
             self.frame_requested.emit(frame)
             if open_judgment:
                 self.judgment_requested.emit(frame)
@@ -1031,7 +1065,6 @@ class RaceFilmstripPanel(QWidget):
         self._pending_sources = 0
         self._set_scroll_range()
         self.canvas.viewport().update()
-        self.overview.update()
         self._update_new_recording_label()
         self._update_inspection_controls()
 
@@ -1043,6 +1076,7 @@ class RaceFilmstripPanel(QWidget):
 
     def stop(self):
         self._closed = True
+        self.canvas.stop_scroll()
         self._load_timer.stop()
         self._refresh_timer.stop()
         self._pending = None
