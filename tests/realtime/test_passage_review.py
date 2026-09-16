@@ -4294,10 +4294,12 @@ def test_zoom_requests_full_resolution_without_replacing_the_worker(
     dialog.close()
 
 
+@pytest.mark.parametrize("actual_size", [False, True])
 def test_full_resolution_request_waits_for_the_latest_paused_frame(
     qapp,
     tmp_path,
     fake_playback,
+    actual_size,
 ):
     passage_store = PassageEventStore(tmp_path / "passages.jsonl")
     passage_store.append(_event(passage_time_ms=15_000))
@@ -4319,7 +4321,11 @@ def test_full_resolution_request_waits_for_the_latest_paused_frame(
 
     worker.frame_ready.emit(preview, 5_000, 250)
     qapp.processEvents()
-    pane.video_view.set_actual_size()
+    if actual_size:
+        pane.video_view.set_actual_size()
+    else:
+        pane.video_view.fit_to_window()
+        assert pane.video_view.zoom_percent < 100
     QTest.qWait(50)
     worker.frame_ready.emit(preview, 5_080, 254)
     assert _wait_until(
@@ -4327,6 +4333,57 @@ def test_full_resolution_request_waits_for_the_latest_paused_frame(
         timeout_ms=pane.FULL_RESOLUTION_IDLE_MS + 500,
     )
     dialog.close()
+
+
+@pytest.mark.parametrize("pause_method", ["set_playing", "set_linked_playing", "finished"])
+def test_paused_fitted_video_restores_original_and_rejects_stale_detail(
+    qapp, tmp_path, fake_playback, pause_method,
+):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(passage_time_ms=15000))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10000, ended_at_ms=20000)
+    dialog = PassageReviewDialog(passages, timeline)
+    try:
+        qapp.processEvents()
+        pane = dialog.regular_pane
+        worker = fake_playback.instances[0]
+        preview = QImage(1280, 720, QImage.Format_RGB888)
+        preview.fill(Qt.red)
+        original = QImage(2560, 1440, QImage.Format_RGB888)
+        original.fill(Qt.green)
+        pane.set_playing(True)
+        worker.frame_ready.emit(preview, 5000, 250)
+        pane.video_view.fit_to_window()
+        assert pane.video_view.zoom_percent < 100
+        QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 50)
+        assert not worker.full_resolution_calls
+        if pause_method == "finished":
+            worker.playback_finished.emit()
+        else:
+            getattr(pane, pause_method)(False)
+        assert _wait_until(lambda: worker.full_resolution_calls == [250],
+                           timeout_ms=pane.FULL_RESOLUTION_IDLE_MS + 500)
+        worker.full_resolution_ready.emit(original, 5000, 250)
+        assert pane.video_view._pixmap_item.pixmap().size() == original.size()
+        worker.frame_ready.emit(preview, 5040, 252)
+        worker.full_resolution_ready.emit(original, 5000, 250)
+        assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+        assert (pane._current_frame_index, pane._current_position_ms) == (252, 5040)
+        assert _wait_until(lambda: worker.full_resolution_calls == [250, 252],
+                           timeout_ms=pane.FULL_RESOLUTION_IDLE_MS + 500)
+        worker.full_resolution_ready.emit(original, 5040, 252)
+        assert pane.video_view._pixmap_item.pixmap().size() == original.size()
+        # Revisiting the same cached frame must refine it again, too.
+        worker.frame_ready.emit(preview, 5040, 252)
+        assert _wait_until(lambda: worker.full_resolution_calls == [250, 252, 252],
+                           timeout_ms=pane.FULL_RESOLUTION_IDLE_MS + 500)
+        pane.set_playing(True)
+        worker.full_resolution_ready.emit(original, 5040, 252)
+        assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+    finally:
+        dialog.close()
 
 
 def test_timeline_drag_moves_forward_and_coalesces_preview_requests(

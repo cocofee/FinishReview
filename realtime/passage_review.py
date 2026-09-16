@@ -443,6 +443,8 @@ class EvidenceImageView(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self._pixmap_item = QGraphicsPixmapItem()
         self._detail_pixmap_item = QGraphicsPixmapItem()
+        self._pixmap_item.setTransformationMode(Qt.SmoothTransformation)
+        self._detail_pixmap_item.setTransformationMode(Qt.SmoothTransformation)
         self._detail_pixmap_item.setZValue(1)
         self._detail_pixmap_item.hide()
         self._message_item = self._scene.addText("")
@@ -2113,6 +2115,9 @@ class PassageEvidencePane(QFrame):
         previous_frame_index = self._current_frame_index
         self._current_frame_index = int(frame_index)
         self._current_position_ms = int(position_ms)
+        # A cached preview can replace a previously refined copy of this frame.
+        # Let the next idle request restore the original pixels in that case too.
+        self._last_full_resolution_request = -1
         if (
             self._pending_marker is not None
             and previous_frame_index >= 0
@@ -2136,12 +2141,7 @@ class PassageEvidencePane(QFrame):
             self._current_position_ms - self._target_position_ms
         )
         self.preview_frame_ready.emit(image, self._current_position_ms, self._current_frame_index)
-        if (
-            not self._playing
-            and not self._video_scrubbing
-            and self.video_view.zoom_percent >= 100
-        ):
-            self._schedule_full_resolution_request()
+        self._schedule_paused_frame_detail()
         if previous_frame_index < 0 and self._event is not None:
             self.initial_frame_ready.emit(self._event.event_id)
 
@@ -2153,7 +2153,8 @@ class PassageEvidencePane(QFrame):
     ) -> None:
         if self.sender() is not self._worker:
             return
-        if int(frame_index) != self._current_frame_index:
+        if (int(frame_index) != self._current_frame_index or self._playing
+                or self._video_scrubbing or self._timeline_dragging):
             return
         self.video_view.set_frame(
             image,
@@ -2207,7 +2208,8 @@ class PassageEvidencePane(QFrame):
     def _request_full_resolution(self) -> None:
         worker = self._worker
         frame_index = self._current_frame_index
-        if worker is None or frame_index < 0 or self._video_scrubbing:
+        if (worker is None or frame_index < 0 or self._playing
+                or self._video_scrubbing or self._timeline_dragging):
             return
         if frame_index == self._last_full_resolution_request:
             return
@@ -2220,9 +2222,16 @@ class PassageEvidencePane(QFrame):
             or self._current_frame_index < 0
             or self._playing
             or self._video_scrubbing
+            or self._timeline_dragging
         ):
             return
         self._full_resolution_timer.start()
+
+    def _schedule_paused_frame_detail(self) -> None:
+        # Ordinary video pauses should use the original even when fitted below
+        # 100%. Very wide line-scan images retain their on-demand detail tiles.
+        if self.source_kind == REGULAR_SOURCE or self.video_view.zoom_percent >= 100:
+            self._schedule_full_resolution_request()
 
     def _flush_full_resolution_request(self) -> None:
         self._request_full_resolution()
@@ -2306,6 +2315,7 @@ class PassageEvidencePane(QFrame):
             return
         self._playing = False
         self.play_btn.setText("▶")
+        self._schedule_paused_frame_detail()
 
     def _on_step_boundary_reached(self, direction: int) -> None:
         if self.sender() is not self._worker:
@@ -2341,6 +2351,8 @@ class PassageEvidencePane(QFrame):
         else:
             worker.pause()
             self.play_btn.setText("▶")
+            self._last_full_resolution_request = -1
+            self._schedule_paused_frame_detail()
 
     def toggle_playing(self) -> None:
         self.set_playing(not self._playing)
@@ -2411,6 +2423,7 @@ class PassageEvidencePane(QFrame):
         self.play_btn.setText("Ⅱ" if self._playing else "▶")
 
     def set_linked_playing(self, playing: bool) -> None:
+        self._full_resolution_timer.stop()
         self._playing = bool(playing)
         worker = self._worker
         if worker is not None:
@@ -2418,6 +2431,8 @@ class PassageEvidencePane(QFrame):
                 worker.set_shuttle_speed(1.0)
             else:
                 worker.pause()
+                self._last_full_resolution_request = -1
+                self._schedule_paused_frame_detail()
         self.play_btn.setText("Ⅱ" if self._playing else "▶")
 
     def linked_drift_ms(self, delta_ms: int) -> Optional[int]:
