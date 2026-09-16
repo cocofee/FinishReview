@@ -17,6 +17,7 @@ from realtime.race_filmstrip import (
     RaceThumbnailWorker, MAX_CACHE, recording_sources,
 )
 from realtime.video_timeline import PassageVideoLocation, RecordingSegment, VideoTimelineStore
+from realtime.camera_judgments import CameraJudgment
 
 
 @pytest.fixture(scope="module")
@@ -67,6 +68,83 @@ def test_catalog_uses_all_camera_one_recordings_in_race_without_roster(tmp_path)
     sources, pending = recording_sources(store, 1, "race-1")
     assert {item.location.video_path.stem for item in sources} == {"first", "unread_riders"}
     assert pending == 0
+
+
+def test_calibration_changes_labels_without_moving_or_redecoding_original(qapp, tmp_path, manual_worker):
+    recording = source(tmp_path / "first", duration=60000)
+    panel = RaceFilmstripPanel()
+    panel.resize(1200, 450)
+    panel.show()
+    panel.set_sources((recording,))
+    qapp.processEvents()
+    frame = result(recording, 12200)
+    panel.cache[frame.key] = frame
+    panel.browse_to(12200)
+    panel.set_current_frame(recording.location, 2200)
+    scroll = panel.canvas.horizontalScrollBar().value()
+    calibrated = replace(recording, location=replace(recording.location, clock_offset_ms=2000))
+    panel.set_sources((calibrated,))
+    assert panel.display_time(12200, frame.source) == "08:00:10.200"
+    assert panel.cache[frame.key] is frame
+    assert panel.current_time == 12200
+    assert panel.canvas.horizontalScrollBar().value() == scroll
+    panel.close()
+
+
+def test_judgment_ruler_keeps_exact_times_and_dense_records_clickable(qapp, tmp_path, manual_worker):
+    recording = source(tmp_path / "first", duration=60000)
+    panel = RaceFilmstripPanel()
+    panel.resize(1200, 450)
+    panel.show()
+    panel.set_sources((recording,))
+    qapp.processEvents()
+    records = tuple(CameraJudgment(str(i), str(i), "segment", time - 10000, time,
+                                   str(101 + i), filmstrip.format_time(time))
+                    for i, time in enumerate((12000, 12000, 12001, 12400)))
+    panel.set_judgments(records)
+    panel.browse_to(12000)
+    panel.set_current_frame(recording.location, 2000)
+    assert panel.time_for_x(panel.x_for_time(12001)) == 12001
+    assert panel.x_for_time(12001) > panel.x_for_time(12000)
+    regions = panel.canvas.judgment_regions()
+    assert [record.key for record in regions[0][1]] == ["0", "1", "2"]
+    clicked = QSignalSpy(panel.saved_judgment_requested)
+    QTest.mouseClick(panel.canvas.viewport(), Qt.LeftButton, pos=regions[0][0].center().toPoint())
+    menu = panel.canvas._judgment_menu
+    assert len(menu.actions()) == 3
+    menu.actions()[1].trigger()
+    assert clicked[0][0] == "1"
+    menu.close()
+    assert not panel._pending
+    # A changed density keeps the same canonical times, including same-frame riders.
+    panel.density_combo.setCurrentIndex(panel.density_combo.findData(200))
+    panel.browse_to(12000)
+    assert panel.time_for_x(panel.x_for_time(12001)) == 12001
+    assert len(panel._judgments) == 4
+    panel.close()
+
+
+def test_ruler_click_requests_exact_time_and_does_not_seek_across_gap(qapp, tmp_path, manual_worker):
+    first = source(tmp_path / "first", duration=1000)
+    second = source(tmp_path / "second", start=13000, duration=1000)
+    panel = RaceFilmstripPanel()
+    panel.resize(1200, 450)
+    panel.show()
+    panel.set_sources((first, second))
+    qapp.processEvents()
+    panel.browse_to(10340)
+    x = round(panel.x_for_time(10340))
+    y = panel.canvas.viewport().height() - filmstrip.IMAGE_FOOTER + 10
+    QTest.mouseClick(panel.canvas.viewport(), Qt.LeftButton, pos=QPoint(x, y))
+    panel._load_visible()
+    assert panel._worker.jobs[0] == (first, 10340)
+    selected = QSignalSpy(panel.frame_requested)
+    panel._worker.frame_ready.emit(result(first, 10340))
+    assert selected[0][0].recorder_time_ms == 10340
+    panel.open_time(12000)
+    assert panel._pending is None
+    assert len(selected) == 1
+    panel.close()
 
 
 def test_worker_thumbnail_is_whole_original_frame_with_exact_index(qapp, tmp_path):

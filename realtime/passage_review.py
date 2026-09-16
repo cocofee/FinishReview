@@ -322,6 +322,35 @@ def _expanded_column_widths(
     return tuple(width + addition for width, addition in zip(widths, additions))
 
 
+class _ReviewFilterBar(QWidget):
+    """窄名单区自动分两行，避免筛选和搜索相互挤压。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._wrapped = None
+        self.width_controls = ()
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(5)
+        self.status = QHBoxLayout()
+        self.tools = QHBoxLayout()
+        self.status.setSpacing(5)
+        self.tools.setSpacing(5)
+        self.grid.addLayout(self.status, 0, 0)
+        self.grid.addLayout(self.tools, 0, 1)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        wrapped = self.width() < 1100
+        if wrapped != self._wrapped:
+            self._wrapped = wrapped
+            for widget, wide, narrow in self.width_controls:
+                widget.setMinimumWidth(narrow if wrapped else wide)
+            self.grid.removeItem(self.tools)
+            self.grid.addLayout(self.tools, 1 if wrapped else 0, 0 if wrapped else 1)
+
+
 class _AutoFitTableWidget(QTableWidget):
     """Fit columns to their content, then use the remaining viewport width."""
 
@@ -1287,7 +1316,8 @@ class PassageEvidencePane(QFrame):
             " padding: 2px 7px; font-size: 10pt; font-weight: 700;"
             "}"
         )
-        self.frame_indicator_label.setFixedSize(250, 30)
+        self.frame_indicator_label.setMinimumHeight(30)
+        self.frame_indicator_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.camera_combo = QComboBox(self)
         self.camera_combo.setMinimumWidth(88)
         self.camera_combo.setToolTip("切换普通录像机位")
@@ -1338,13 +1368,10 @@ class PassageEvidencePane(QFrame):
         layout.addWidget(self.video_view, 1)
 
         self.timeline = TargetTimelineSlider(Qt.Horizontal, self)
-        self.timeline.setInvertedAppearance(True)
-        self.timeline.setInvertedControls(True)
         self.timeline.setRange(0, 0)
         self.timeline.setEnabled(False)
         self.timeline.setFocusPolicy(Qt.NoFocus)
-        self.timeline.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.timeline.setToolTip("使用左右方向键逐帧查看")
+        self.timeline.setToolTip("左早右晚；拖动定位，左右方向键逐帧查看")
         self.timeline.sliderPressed.connect(self._on_timeline_pressed)
         self.timeline.sliderMoved.connect(self._on_timeline_moved)
         self.timeline.sliderReleased.connect(self._on_timeline_released)
@@ -2204,20 +2231,23 @@ class PassageEvidencePane(QFrame):
         self.actual_size_btn.setText(f"{int(percent)}%")
 
     def _on_timeline_pressed(self) -> None:
+        self._reset_video_scrub()
         self._timeline_dragging = True
+        self.set_playing(False)
         self.scrub_started.emit()
 
     def _on_timeline_moved(self, position_ms: int) -> None:
         if not self._timeline_dragging:
             return
         position_ms = int(position_ms)
-        self._update_time_label(position_ms)
-        self.passage_delta_requested.emit(
-            position_ms - self._target_position_ms
-        )
+        self._pending_scrub_delta_ms = position_ms - self._target_position_ms
+        if not self._scrub_preview_timer.isActive():
+            self._scrub_preview_timer.start()
 
     def _on_timeline_released(self) -> None:
         self._timeline_dragging = False
+        self._scrub_preview_timer.stop()
+        self._pending_scrub_delta_ms = None
         self.passage_delta_requested.emit(
             int(self.timeline.value()) - self._target_position_ms
         )
@@ -2253,7 +2283,7 @@ class PassageEvidencePane(QFrame):
     def _flush_scrub_preview(self) -> None:
         delta_ms = self._pending_scrub_delta_ms
         self._pending_scrub_delta_ms = None
-        if delta_ms is not None and self._video_scrubbing:
+        if delta_ms is not None and (self._video_scrubbing or self._timeline_dragging):
             self.scrub_preview_requested.emit(delta_ms)
 
     def _on_video_scrub_finished(self, horizontal_pixels: int) -> None:
@@ -2261,6 +2291,7 @@ class PassageEvidencePane(QFrame):
         self._scrub_preview_timer.stop()
         self._pending_scrub_delta_ms = None
         self._video_scrubbing = False
+        self._timeline_dragging = False
         self.passage_delta_requested.emit(final_delta_ms)
 
     def _reset_video_scrub(self) -> None:
@@ -2268,6 +2299,7 @@ class PassageEvidencePane(QFrame):
         self._full_resolution_timer.stop()
         self._pending_scrub_delta_ms = None
         self._video_scrubbing = False
+        self._timeline_dragging = False
 
     def _on_playback_finished(self) -> None:
         if self.sender() is not self._worker:
@@ -2914,8 +2946,8 @@ class PassageReviewSurface(QDialog):
         results_layout = QVBoxLayout(results_panel)
         results_layout.setContentsMargins(8, 6, 8, 8)
         results_layout.setSpacing(6)
-        filters = QHBoxLayout()
-        filters.setSpacing(7)
+        self.filter_bar = _ReviewFilterBar(results_panel)
+        filters = self.filter_bar.status
         results_title = QLabel("通过记录")
         results_title.setObjectName("panelTitle")
         filters.addWidget(results_title)
@@ -2946,6 +2978,7 @@ class PassageReviewSurface(QDialog):
         self._sync_review_filter_buttons()
 
         filters.addStretch(1)
+        filters = self.filter_bar.tools
         self.group_combo = QComboBox(self)
         self.group_combo.setMinimumWidth(180)
         self.group_combo.setMaximumWidth(220)
@@ -2959,8 +2992,12 @@ class PassageReviewSurface(QDialog):
         self.identity_search.textChanged.connect(self._on_search_changed)
         self.identity_search.returnPressed.connect(self._find_identity)
         filters.addWidget(self.identity_search)
+        self.filter_bar.width_controls = (
+            (self.group_combo, 180, 110), (self.identity_search, 180, 120),
+        )
 
         self.summary_label = QLabel()
+        self.summary_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.summary_label.setStyleSheet("color: #667085; font-size: 9pt;")
         self.summary_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         filters.addWidget(self.summary_label)
@@ -3028,7 +3065,7 @@ class PassageReviewSurface(QDialog):
         self.offset_spin.setToolTip("复核系统时间 = CycleRace passage 时间 + 此偏移")
         self.offset_spin.valueChanged.connect(self._on_offset_changed)
         filters.addWidget(self.offset_spin)
-        results_layout.addLayout(filters)
+        results_layout.addWidget(self.filter_bar)
 
         self.table = _AutoFitTableWidget(0, 9, self)
         table_palette = self.table.palette()
@@ -3189,8 +3226,8 @@ class PassageReviewSurface(QDialog):
         self.transport_layout.addWidget(self.play_both_btn)
         self.transport_layout.addWidget(self.next_frame_btn)
         self.transport_layout.addWidget(self.auto_advance_checkbox)
-        self.transport_layout.addWidget(self.previous_batch_btn)
-        self.transport_layout.addWidget(self.next_batch_btn)
+        self.previous_batch_btn.hide()
+        self.next_batch_btn.hide()
         self.transport_layout.addWidget(self.previous_passage_btn)
         self.transport_layout.addWidget(self.next_passage_btn)
         self.transport_layout.addWidget(self.fullscreen_btn)
@@ -3234,6 +3271,7 @@ class PassageReviewSurface(QDialog):
         self.video_filmstrip.enable_full_race()
         self.video_filmstrip.full_race.frame_requested.connect(self._open_race_filmstrip_frame)
         self.video_filmstrip.full_race.judgment_requested.connect(self._maximize_filmstrip_camera)
+        self.video_filmstrip.full_race.saved_judgment_requested.connect(self._open_camera_judgment)
         self.video_filmstrip.full_race.refresh_requested.connect(self._update_filmstrip)
         self.video_filmstrip.full_race.enlarge_requested.connect(self._toggle_filmstrip_size)
         self.video_filmstrip.judgment_track.show()
@@ -3299,8 +3337,6 @@ class PassageReviewSurface(QDialog):
         self.video_filmstrip.ready_changed.connect(self._on_filmstrip_ready)
         preview_layout.addWidget(self.video_filmstrip, 1)
         self.preview_timeline = TargetTimelineSlider(Qt.Horizontal, self)
-        self.preview_timeline.setInvertedAppearance(True)
-        self.preview_timeline.setInvertedControls(True)
         self.preview_timeline.setRange(0, 0)
         self.preview_timeline.setEnabled(False)
         self.preview_timeline.setFixedHeight(22)
@@ -4246,10 +4282,14 @@ class PassageReviewSurface(QDialog):
             return self._clock_offset_for_camera(1)
         camera_index = max(1, int(location.segment.camera_index))
         session_key = self._recording_session_key(location)
+        return self._calibrated_clock_offset(camera_index, session_key)
+
+    def _calibrated_clock_offset(self, camera_index: int, session_key: str) -> int:
+        calibration = self.calibration_store.get(camera_index, session_key)
         return int(
             self._continuous_clock_offsets.get(
                 (camera_index, session_key),
-                int(location.clock_offset_ms),
+                calibration.offset_ms if calibration is not None else self._clock_offset_for_camera(camera_index),
             )
         )
 
@@ -4498,10 +4538,8 @@ class PassageReviewSurface(QDialog):
         location = self._regular_location_for_camera(lookup, camera_index)
         if location is None:
             return lookup
-        calibrated_offset = self._continuous_clock_offsets.get(
-            (camera_index, self._recording_session_key(location))
-        )
-        if calibrated_offset is None or calibrated_offset == base_offset:
+        calibrated_offset = self._continuous_offset_for_location(location)
+        if calibrated_offset == base_offset:
             return lookup
         return self.timeline_store.locate_passage(
             event.timeline_timestamp_ms,
@@ -5548,7 +5586,7 @@ class PassageReviewSurface(QDialog):
         if splitter is None or splitter.height() <= 0:
             return
         total = splitter.height()
-        preview_height = max(420, int(total * (0.76 if self._uses_popup_judging() else 0.65)))
+        preview_height = max(420, int(total * (0.64 if self._uses_popup_judging() else 0.65)))
         target = [preview_height, max(1, total - preview_height)]
         current = splitter.sizes()
         if len(current) == 2 and abs(current[0] - target[0]) <= 2:
@@ -6044,26 +6082,17 @@ class PassageReviewSurface(QDialog):
         location = pane.location
         if location is None or location.segment.media_started_at_ms is None:
             return None
-        camera_index = max(1, int(pane.camera_index))
-        session_key = self._recording_session_key(location)
-        offset_ms = self._continuous_clock_offsets.get(
-            (camera_index, session_key),
-            self._clock_offset_for_camera(camera_index),
-        )
+        offset_ms = self._continuous_offset_for_location(location)
         target_time_ms = int(event.timeline_timestamp_ms) + int(offset_ms)
-        position_ms = max(
-            0,
-            target_time_ms - int(location.segment.media_started_at_ms),
-        )
+        # 换号码只换身份；预计过线点可以在当前文件之外，不能截断后改变原帧时间。
+        position_ms = target_time_ms - int(location.segment.media_started_at_ms)
+        playback_ms = max(0, position_ms - self.CONTINUOUS_SKIP_LEAD_MS)
         if location.segment.media_duration_ms is not None:
-            position_ms = min(position_ms, location.segment.media_duration_ms)
+            playback_ms = min(playback_ms, location.segment.media_duration_ms)
         return replace(
             location,
             passage_position_ms=position_ms,
-            playback_position_ms=max(
-                0,
-                position_ms - self.CONTINUOUS_SKIP_LEAD_MS,
-            ),
+            playback_position_ms=playback_ms,
             clock_offset_ms=offset_ms,
         )
 
@@ -6182,20 +6211,7 @@ class PassageReviewSurface(QDialog):
             f"{identity} {athlete_name if athlete_name != '--' else ''}".strip()
         )
         self.current_passage_label.setText(athlete_summary)
-        row = self.table.currentRow()
-        position_text = (
-            f"{row + 1:,} / {len(self._visible_events):,}"
-            if 0 <= row < len(self._visible_events)
-            else f"0 / {len(self._visible_events):,}"
-        )
-        group_label = self.group_value.text().strip()
-        self.current_context_label.setText(
-            " · ".join(
-                value
-                for value in (group_label, position_text, display_status)
-                if value and value != "--"
-            )
-        )
+        self._update_current_context(display_status)
         if not preserve_media:
             self.current_time_label.setText(
                 format_passage_time(event.timeline_timestamp_ms + self._shared_delta_ms)
@@ -6744,14 +6760,17 @@ class PassageReviewSurface(QDialog):
         if workspace_key != getattr(self, "_race_filmstrip_workspace_key", None):
             self.video_filmstrip.full_race.clear()
             self._race_filmstrip_workspace_key = workspace_key
-        sources, pending = recording_sources(self.timeline_store, pane.camera_index, race_id)
+        sources, pending = recording_sources(
+            self.timeline_store, pane.camera_index, race_id,
+            offset_for_location=self._continuous_offset_for_location,
+        )
         panel = self.video_filmstrip.full_race
         panel.set_check_context(self.timeline_store.journal_path.parent / "filmstrip_checks.jsonl",
                                 race_id, pane.camera_index)
         panel.set_sources(sources, pending)
         if pane.location is not None and pane._current_frame_index >= 0:
             panel.set_current_frame(pane.location, pane._current_position_ms)
-        panel.set_judgments(self._camera_judgment_records(pane))
+        panel.set_judgments(self._camera_judgment_records(pane), self._selected_event_id)
 
     def _open_race_filmstrip_frame(self, frame: RaceFilmstripFrame) -> None:
         panel = self.video_filmstrip.full_race
@@ -6892,11 +6911,6 @@ class PassageReviewSurface(QDialog):
             for event in self._events_for_current_metadata(self.passage_store.events())
         }
         metadata = self._current_metadata()
-        offsets = {
-            (item.camera_index, item.session_key): int(item.offset_ms)
-            for item in self.calibration_store.calibrations()
-        }
-        offsets.update(self._continuous_clock_offsets)
         records = []
         saved = [
             (f"event:{item.passage_event_id}", item, False)
@@ -6925,11 +6939,10 @@ class PassageReviewSurface(QDialog):
                 int(segment.media_started_at_ms) + item.position_ms
                 if segment.media_started_at_ms is not None else None
             )
-            offset = offsets.get(
-                (pane.camera_index, self._recording_session_key_from_path(
+            offset = self._calibrated_clock_offset(
+                pane.camera_index, self._recording_session_key_from_path(
                     segment.source_id, self.timeline_store.resolve_video_path(segment),
-                )),
-                self._clock_offset_for_camera(pane.camera_index),
+                ),
             )
             label = item.label if unknown else (
                 events[item.passage_event_id].bib.strip() or item.bib.strip() or "未知"
@@ -6986,7 +6999,7 @@ class PassageReviewSurface(QDialog):
     def _refresh_camera_judgments(self) -> None:
         pane = self._camera_one_pane()
         records = self._camera_judgment_records(pane)
-        self.video_filmstrip.full_race.set_judgments(records)
+        self.video_filmstrip.full_race.set_judgments(records, self._selected_event_id)
         self.video_filmstrip.judgment_track.set_records(
             records, self._selected_event_id,
         )
@@ -7068,6 +7081,16 @@ class PassageReviewSurface(QDialog):
         self._filmstrip_requested_window_start_ms = None
         self._update_filmstrip()
         self._refresh_camera_judgments()
+
+        # 回看是明确的定位操作：原帧、胶卷和可见判读窗口一起定位。
+        pane.seek_media_frame(record.position_ms, saved.frame_index)
+        panel = self.video_filmstrip.full_race
+        panel.set_current_frame(location, record.position_ms)
+        if record.recorder_time_ms is not None:
+            panel.browse_to(record.recorder_time_ms)
+        if self._uses_popup_judging() and self._maximized_window is None:
+            self._toggle_maximized_pane(pane)
+        pane.video_view.setFocus(Qt.ShortcutFocusReason)
 
     def _continuous_marker_overlays(
         self,
@@ -7906,6 +7929,15 @@ class PassageReviewSurface(QDialog):
             )
         return True
 
+    def _update_current_context(self, display_status: str) -> None:
+        row = self.table.currentRow()
+        position = row + 1 if 0 <= row < len(self._visible_events) else 0
+        self.current_context_label.setText(" · ".join(
+            value for value in (self.group_value.text().strip(),
+                                f"{position:,} / {len(self._visible_events):,}", display_status)
+            if value and value != "--"
+        ))
+
     def _update_event_confirmation_status(self, event_id: str) -> None:
         self._refresh_camera_judgments()
         lookup = self._lookups.get(event_id)
@@ -7954,6 +7986,7 @@ class PassageReviewSurface(QDialog):
             break
         if event_id == self._selected_event_id:
             self.source_value.setText(self._display_confirmation_status(status))
+            self._update_current_context(self._display_confirmation_status(status))
         batch = self._active_review_batch()
         if self._batch_mode and batch is not None:
             self._update_batch_roster_overlays(batch)

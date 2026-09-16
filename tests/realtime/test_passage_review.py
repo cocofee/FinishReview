@@ -490,6 +490,73 @@ def test_camera_judgment_restores_calibrated_time_and_keeps_missing_evidence_rec
     dialog.close()
 
 
+@pytest.mark.parametrize("offset, calibrated", [(2000, None), (-1300, None), (2000, 1000)])
+def test_filmstrip_and_saved_judgment_share_calibrated_frame_time(
+    qapp, tmp_path, fake_playback, monkeypatch, offset, calibrated,
+):
+    from realtime.race_filmstrip import RaceFilmstripFrame, RaceFilmstripPanel
+
+    monkeypatch.setattr(RaceFilmstripPanel, "_load_visible", lambda self: None)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    passages.append(_event(event_id="later", sequence=2, bib="24", passage_time_ms=85000))
+    passages.append(_event(event_id="earlier", sequence=3, bib="25", passage_time_ms=5000))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    path = tmp_path / "camera_01_archive.mkv"
+    _add_segment(timeline, path, source_id="camera_01", camera_index=1,
+                 started_at_ms=10_000, ended_at_ms=70_000)
+    if calibrated is not None:
+        calibration = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl")
+        calibration.record(
+            camera_index=1,
+            session_key=PassageReviewDialog._recording_session_key_from_path("camera_01", path),
+            offset_ms=calibrated, anchor_event_id="passage-1", anchor_bib="23",
+            calibrated_at_ms=99_000,
+        )
+    effective = offset if calibrated is None else calibrated
+    dialog = PassageReviewDialog(passages, timeline, clock_offset_ms=offset)
+    dialog.resize(1280, 800)
+    dialog.show()
+    qapp.processEvents()
+    panel, pane = dialog.video_filmstrip.full_race, dialog.regular_pane
+    image = QImage(800, 600, QImage.Format_RGB32)
+    image.fill(0)
+    position = 5000 + effective
+    frame = RaceFilmstripFrame(panel.index.sources[0], 10000 + position, position, position // 20, image)
+    panel.browse_to(frame.recorder_time_ms)
+    dialog._maximize_filmstrip_camera(frame)
+    pane._worker.frame_ready.emit(image, position, frame.frame_index)
+    assert pane.location.clock_offset_ms == effective
+    assert panel.display_time(frame.recorder_time_ms) == "08:00:15.000"
+    assert "08:00:15.000" in pane.frame_indicator_label.text()
+    seeks = list(pane._worker.seek_calls)
+    for identity in ("later", "earlier", "passage-1"):
+        dialog._select_event(identity, preserve_current_frame=pane)
+        assert pane._worker.seek_calls == seeks
+        assert pane._current_frame_index == frame.frame_index
+        assert "08:00:15.000" in pane.frame_indicator_label.text()
+        assert "08:00:15.000" in dialog.current_time_label.text()
+    pane._on_marker_position_selected(0.5, 0.5)
+    assert dialog._confirm_pending_marker(pane)
+    record = dialog.video_filmstrip.judgment_track._records[0]
+    assert "已确认" in dialog.current_context_label.text()
+    assert record.time_label == panel.display_time(frame.recorder_time_ms)
+    saved = dialog.association_store.associations()
+    dialog._restore_maximized_pane()
+    panel.browse_to(50000)
+    dialog._open_camera_judgment(record.key)
+    qapp.processEvents()
+    assert dialog._maximized_window is not None
+    assert pane.isVisible()
+    assert panel.visible_times()[0] <= frame.recorder_time_ms < panel.visible_times()[1]
+    pane._worker.frame_ready.emit(image, position, frame.frame_index)
+    assert pane.location.clock_offset_ms == effective
+    assert "08:00:15.000" in pane.frame_indicator_label.text()
+    assert pane._current_frame_index == frame.frame_index
+    assert dialog.association_store.associations() == saved
+    dialog.close()
+
+
 def test_evidence_view_maps_full_resolution_tile_to_source_coordinates(qapp):
     view = passage_review.EvidenceImageView()
     preview = QImage(50, 20, QImage.Format_RGB888)
@@ -4261,7 +4328,7 @@ def test_full_resolution_request_waits_for_the_latest_paused_frame(
     dialog.close()
 
 
-def test_timeline_ignores_mouse_drag_for_frame_navigation(
+def test_timeline_drag_moves_forward_and_coalesces_preview_requests(
     qapp,
     tmp_path,
     fake_playback,
@@ -4282,13 +4349,31 @@ def test_timeline_ignores_mouse_drag_for_frame_navigation(
     dialog.show()
     qapp.processEvents()
     pane = dialog.regular_pane
+    dialog._toggle_maximized_pane(pane)
+    qapp.processEvents()
     worker = fake_playback.instances[0]
     worker.seek_calls.clear()
 
     assert not pane._timeline_dragging
     assert worker.seek_calls == []
-    assert pane.timeline.testAttribute(Qt.WA_TransparentForMouseEvents)
+    assert not pane.timeline.testAttribute(Qt.WA_TransparentForMouseEvents)
+    assert not pane.timeline.invertedAppearance()
     assert pane.timeline.focusPolicy() == Qt.NoFocus
+    slider = pane.timeline
+    QTest.mousePress(slider, Qt.LeftButton, pos=QPoint(10, slider.height() // 2))
+    targets = []
+    for x in (30, 60, 90):
+        slider._move_to_position(x)
+        targets.append(slider.value())
+    assert targets == sorted(targets)
+    assert not worker.seek_calls
+    assert not worker.preview_seek_calls
+    pane._flush_scrub_preview()
+    assert worker.preview_seek_calls == [targets[-1]]
+    QTest.mouseRelease(slider, Qt.LeftButton, pos=QPoint(90, slider.height() // 2))
+    assert worker.seek_calls == [targets[-1]]
+    assert not pane._timeline_dragging
+    assert not pane._scrub_preview_timer.isActive()
     dialog.close()
 
 

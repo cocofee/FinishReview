@@ -306,7 +306,7 @@ class TargetTimelineSlider(QSlider):
         self.target_position_ms = (
             None
             if position_ms is None
-            else MediaPositionMs(max(0, int(position_ms)))
+            else MediaPositionMs(int(position_ms))
         )
         self.update()
 

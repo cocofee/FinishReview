@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QLabel, QListView, QListWidget, QListWidgetItem,
+    QAbstractItemView, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QPushButton,
     QVBoxLayout, QWidget,
 )
 
@@ -28,13 +28,21 @@ class CameraJudgmentTrack(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("cameraJudgmentTrack")
-        self.setFixedHeight(88)
+        self.setFixedHeight(112)
         self._records: tuple[CameraJudgment, ...] = ()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         self.summary = QLabel("判读记录 · 尚无标记", self)
-        layout.addWidget(self.summary)
+        header = QHBoxLayout()
+        header.addWidget(self.summary, 1)
+        self.expand_button = QPushButton("收起记录", self)
+        self.expand_button.setCheckable(True)
+        self.expand_button.setChecked(True)
+        self.expand_button.setStyleSheet("min-height: 20px; font-size: 9pt; padding: 0 6px;")
+        self.expand_button.toggled.connect(self.set_expanded)
+        header.addWidget(self.expand_button)
+        layout.addLayout(header)
         self.list = QListWidget(self)
         self.list.setObjectName("cameraJudgmentList")
         self.list.setFlow(QListView.LeftToRight)
@@ -51,6 +59,12 @@ class CameraJudgmentTrack(QWidget):
         self.list.itemClicked.connect(self._request_item)
         self.list.itemActivated.connect(self._request_item)
         layout.addWidget(self.list)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.expand_button.setChecked(expanded)
+        self.expand_button.setText("收起记录" if expanded else "全部记录")
+        self.list.setVisible(expanded)
+        self.setFixedHeight(112 if expanded else 26)
 
     def _request_item(self, item: QListWidgetItem) -> None:
         self.judgment_requested.emit(str(item.data(Qt.UserRole)))
