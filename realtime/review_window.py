@@ -4697,8 +4697,14 @@ class FinishReviewWindow(PassageReviewSurface):
         media_started_at_ms = int(first.started_at_ms)
         media_ended_at_ms = int(last.ended_at_ms)
         anchor_time_ms = int(anchor_time_ms)
+        # The HLS playlist trails the wall clock by one or two completed
+        # segments. Keep its newest frame as the live-tail anchor while the
+        # five-minute archive file is still being sealed.
         if not media_started_at_ms <= anchor_time_ms <= media_ended_at_ms:
-            return None
+            if anchor_time_ms >= media_ended_at_ms:
+                anchor_time_ms = max(media_started_at_ms, media_ended_at_ms - 1)
+            else:
+                return None
         duration_ms = media_ended_at_ms - media_started_at_ms
         if duration_ms <= 0:
             return None
@@ -4707,7 +4713,7 @@ class FinishReviewWindow(PassageReviewSurface):
         segment = RecordingSegment(
             segment_id=(
                 f"live-filmstrip-{ring_buffer.camera_index}-"
-                f"{ring_buffer.segment_revision}"
+                f"{Path(playlist_path).stem}"
             ),
             source_id=ring_buffer.source_id,
             camera_index=ring_buffer.camera_index,
@@ -4718,7 +4724,7 @@ class FinishReviewWindow(PassageReviewSurface):
             media_started_at_ms=media_started_at_ms,
             clock_source=DEFAULT_CLOCK_SOURCE,
             timing_error_ms=DEFAULT_TIMING_ERROR_MS,
-            end_reason="live_filmstrip_batch",
+            end_reason="live_filmstrip_tail",
             race_id=race_id,
         )
         position_ms = anchor_time_ms - media_started_at_ms
@@ -5662,7 +5668,15 @@ class FinishReviewWindow(PassageReviewSurface):
                 self._capture_error = sanitize_recording_message(exc)
                 logger.exception("Failed to apply background capture refresh")
         if result.error:
-            self._capture_error = sanitize_recording_message(result.error)
+                self._capture_error = sanitize_recording_message(result.error)
+        # A newly published HLS segment extends the time-film tail before the
+        # five-minute archive is sealed. Refresh only the lightweight source
+        # index here; visible thumbnails are still decoded lazily by the panel.
+        if result.apply_state and result.discovered_segment_count:
+            try:
+                self._update_filmstrip()
+            except Exception:  # noqa: BLE001 - a preview refresh must not stop capture.
+                logger.exception("Failed to refresh live filmstrip tail")
         if result.cleanup_after_apply and not apply_failed:
             self._capture_refresh_worker.submit(
                 CaptureRefreshRequest(

@@ -70,6 +70,59 @@ def test_catalog_uses_all_camera_one_recordings_in_race_without_roster(tmp_path)
     assert pending == 0
 
 
+def test_catalog_includes_live_hls_tail_while_archive_is_pending(tmp_path):
+    store = VideoTimelineStore(tmp_path / "timeline.jsonl")
+    archive_path = tmp_path / "archive.mkv"
+    archive_path.write_bytes(b"archive")
+    archive = store.start_segment(
+        source_id="camera_01",
+        camera_index=1,
+        video_path=archive_path,
+        started_at_ms=10_000,
+        race_id="race-1",
+    )
+    store.finish_segment(
+        archive.segment_id,
+        ended_at_ms=20_000,
+        media_started_at_ms=10_000,
+        media_duration_ms=10_000,
+    )
+    live_path = tmp_path / "live.mkv"
+    live_path.write_bytes(b"live")
+    live_segment = RecordingSegment(
+        "live-filmstrip-1-1",
+        "camera_01_review",
+        1,
+        str(live_path),
+        20_000,
+        25_000,
+        5_000,
+        20_000,
+        race_id="race-1",
+        end_reason="live_filmstrip_tail",
+    )
+    live_location = PassageVideoLocation(
+        live_segment,
+        live_path,
+        4_000,
+        1_000,
+        0,
+        2_000,
+        "unverified",
+    )
+    sources, pending = recording_sources(
+        store,
+        1,
+        "race-1",
+        live_location=live_location,
+    )
+    assert pending == 0
+    assert any(source.location.segment.end_reason == "live_filmstrip_tail" for source in sources)
+    index = RaceRecordingIndex(sources)
+    assert index.span_at(22_000).source is not None
+    assert index.span_at(22_000).source.location.segment.end_reason == "live_filmstrip_tail"
+
+
 def test_calibration_changes_labels_without_moving_or_redecoding_original(qapp, tmp_path, manual_worker):
     recording = source(tmp_path / "first", duration=60000)
     panel = RaceFilmstripPanel()

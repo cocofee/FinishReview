@@ -60,8 +60,11 @@ class FilmstripSource:
 
     @property
     def key(self):
+        # Source identity must survive a live HLS playlist growing at its
+        # right edge. Coverage end is tracked separately by ``set_sources``;
+        # keeping it out of this key preserves already decoded thumbnails.
         return (str(self.location.video_path.absolute()), self.start_ms,
-                self.location.segment.segment_id, self.end_ms)
+                self.location.segment.segment_id)
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,14 @@ class RaceRecordingIndex:
         return None, timestamp
 
 
-def recording_sources(store, camera_index: int, race_id: str = "", *, offset_for_location=None):
+def recording_sources(
+    store,
+    camera_index: int,
+    race_id: str = "",
+    *,
+    offset_for_location=None,
+    live_location: PassageVideoLocation | None = None,
+):
     """Use recording coverage, never the roster or its filters, for the rail."""
     sources = []
     pending = 0
@@ -150,6 +160,39 @@ def recording_sources(store, camera_index: int, race_id: str = "", *, offset_for
         if offset_for_location is not None:
             location = replace(location, clock_offset_ms=offset_for_location(location))
         sources.append(FilmstripSource(location, start, end, available, priority))
+    # The archive writer deliberately leaves the current five-minute file out
+    # until it is sealed and duration-probed.  Keep the already published HLS
+    # tail in the same chronological index so the operator can review the
+    # newest arrivals without waiting for that seal.  Archive sources have a
+    # higher priority and therefore replace this overlap automatically once
+    # the long-form file is published.
+    if live_location is not None:
+        segment = live_location.segment
+        if (
+            segment.camera_index == camera_index
+            and segment.media_started_at_ms is not None
+            and segment.media_duration_ms is not None
+            and (not race_id or not segment.race_id or segment.race_id == race_id)
+        ):
+            path = Path(live_location.video_path)
+            available = path.is_file()
+            if available and path.suffix.lower() == ".m3u8":
+                available = store.video_path_is_playable(path)
+            location = live_location
+            if offset_for_location is not None:
+                location = replace(location, clock_offset_ms=offset_for_location(location))
+            sources.append(
+                FilmstripSource(
+                    location,
+                    int(segment.media_started_at_ms),
+                    int(segment.media_started_at_ms + segment.media_duration_ms),
+                    available,
+                    2,
+                )
+            )
+            # This is an active tail, not a missing interval.  The caller
+            # renders a separate processing notice; keep ``pending`` reserved
+            # for archive segments that have no temporary playback source.
     return tuple(sources), pending
 
 
@@ -684,7 +727,19 @@ class RaceFilmstripPanel(QWidget):
             self._position_scroll(left, center=False)
 
     def set_sources(self, sources, pending=0):
-        signature = (tuple((source.key, source.available, source.priority, source.location.clock_offset_ms) for source in sources), pending)
+        signature = (
+            tuple(
+                (
+                    source.key,
+                    source.end_ms,
+                    source.available,
+                    source.priority,
+                    source.location.clock_offset_ms,
+                )
+                for source in sources
+            ),
+            pending,
+        )
         if signature == self._signature:
             return
         self._signature = signature
@@ -719,10 +774,31 @@ class RaceFilmstripPanel(QWidget):
                 f"\n{len(sources)} 段录像 · {gaps} 处缺口/不可用" +
                 (f" · {pending} 段等待归档" if pending else "") +
                 "\n点击图片，按 F 打开原帧判读；Esc 返回胶卷。")
-            self.status_label.setText("")
+            live_sources = tuple(
+                source
+                for source in sources
+                if source.location.segment.end_reason == "live_filmstrip_tail"
+            )
+            live_count = len(live_sources)
+            if live_count:
+                self.status_label.setText(
+                    "录像处理中 · 当前尾部已可回看；归档完成后自动切换完整录像"
+                    if any(source.available for source in live_sources)
+                    else "录像处理中 · 实时缓存正在准备，暂不可回看"
+                )
+            elif pending:
+                self.status_label.setText(
+                    f"录像处理中 · {pending} 段等待封口；已归档部分仍可判读"
+                )
+            else:
+                self.status_label.setText("")
         else:
             self.range_label.setText("时间胶卷 · 相机 1 · 等待录像")
-            self.status_label.setText("尚无可验证的录像时间范围，请等待录像归档或刷新。")
+            self.status_label.setText(
+                "录像处理中 · 下一段 5 分钟录像正在封口，请稍候；已归档部分仍可判读。"
+                if pending
+                else "尚无可验证的录像时间范围，请等待录像归档或刷新。"
+            )
         self._viewport_changed()
 
     def set_check_context(self, path, race_id, camera_index=1):

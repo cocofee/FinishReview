@@ -6827,10 +6827,32 @@ class PassageReviewSurface(QDialog):
         if workspace_key != getattr(self, "_race_filmstrip_workspace_key", None):
             self.video_filmstrip.full_race.clear()
             self._race_filmstrip_workspace_key = workspace_key
+        live_location = None
+        live_location_reader = getattr(self, "_live_location_for_filmstrip", None)
+        if callable(live_location_reader):
+            # The rolling HLS playlist is the only reliable source while the
+            # current five-minute archive file is still open. It is read and
+            # indexed here; no second recorder or decoder is started.
+            live_location = live_location_reader(
+                pane,
+                int(time.time() * 1000.0),
+            )
+        # There can be a short interval between starting the recorder and the
+        # first playable HLS segment. Keep that interval visible as processing
+        # instead of presenting it as a permanent recording gap.
+        recorder_active_reader = getattr(self, "_recording_any_active", None)
+        recording_processing = bool(
+            callable(recorder_active_reader)
+            and hasattr(self, "_recorders")
+            and recorder_active_reader()
+        )
         sources, pending = recording_sources(
             self.timeline_store, pane.camera_index, race_id,
             offset_for_location=self._continuous_offset_for_location,
+            live_location=live_location,
         )
+        if recording_processing and live_location is None:
+            pending = max(1, pending)
         panel = self.video_filmstrip.full_race
         panel.set_check_context(self.timeline_store.journal_path.parent / "filmstrip_checks.jsonl",
                                 race_id, pane.camera_index)
