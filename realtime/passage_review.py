@@ -4488,7 +4488,16 @@ class PassageReviewSurface(QDialog):
     def _recording_session_key_from_path(source_id: str, video_path: Path) -> str:
         path = Path(video_path).absolute()
         stem = _ARCHIVE_SEGMENT_SUFFIX_RE.sub("", path.stem)
-        return f"{source_id}|{path.parent}|{stem}"
+        match = re.fullmatch(
+            r"(camera_\d+)_\d{8}_\d{6}_\d{6}(?:_review_\d+)?", stem,
+        )
+        parent = path.parent
+        if match is not None:
+            stem = re.sub(r"_review_\d+$", "", stem)
+            if parent.parent.name == "review_buffer":
+                parent = parent.parent.parent / "videos"
+            source_id = match.group(1) + "_review"
+        return f"{source_id}|{parent}|{stem}"
 
     @classmethod
     def _recording_session_key(cls, location: PassageVideoLocation) -> str:
@@ -4506,7 +4515,12 @@ class PassageReviewSurface(QDialog):
         }
         changed = False
         for calibration in self.calibration_store.calibrations():
-            key = (calibration.camera_index, calibration.session_key)
+            parts = calibration.session_key.split("|", 2)
+            session_key = (
+                self._recording_session_key_from_path(parts[0], Path(parts[1]) / parts[2])
+                if len(parts) == 3 else calibration.session_key
+            )
+            key = (calibration.camera_index, session_key)
             if key not in self._continuous_clock_offsets:
                 self._continuous_clock_offsets[key] = int(calibration.offset_ms)
                 changed = True
@@ -6483,6 +6497,16 @@ class PassageReviewSurface(QDialog):
 
         return None
 
+    def _live_locations_for_filmstrip(self, pane) -> tuple[PassageVideoLocation, ...]:
+        return ()
+
+    def _persist_filmstrip_location(
+        self, location: PassageVideoLocation,
+    ) -> PassageVideoLocation:
+        """Give a window implementation a chance to make live media durable."""
+
+        return location
+
     def _archive_location_for_filmstrip(
         self,
         pane: PassageEvidencePane,
@@ -6827,16 +6851,7 @@ class PassageReviewSurface(QDialog):
         if workspace_key != getattr(self, "_race_filmstrip_workspace_key", None):
             self.video_filmstrip.full_race.clear()
             self._race_filmstrip_workspace_key = workspace_key
-        live_location = None
-        live_location_reader = getattr(self, "_live_location_for_filmstrip", None)
-        if callable(live_location_reader):
-            # The rolling HLS playlist is the only reliable source while the
-            # current five-minute archive file is still open. It is read and
-            # indexed here; no second recorder or decoder is started.
-            live_location = live_location_reader(
-                pane,
-                int(time.time() * 1000.0),
-            )
+        live_locations = self._live_locations_for_filmstrip(pane)
         # There can be a short interval between starting the recorder and the
         # first playable HLS segment. Keep that interval visible as processing
         # instead of presenting it as a permanent recording gap.
@@ -6849,9 +6864,9 @@ class PassageReviewSurface(QDialog):
         sources, pending = recording_sources(
             self.timeline_store, pane.camera_index, race_id,
             offset_for_location=self._continuous_offset_for_location,
-            live_location=live_location,
+            live_locations=live_locations,
         )
-        if recording_processing and live_location is None:
+        if recording_processing and not live_locations:
             pending = max(1, pending)
         panel = self.video_filmstrip.full_race
         panel.set_check_context(self.timeline_store.journal_path.parent / "filmstrip_checks.jsonl",
@@ -6861,16 +6876,18 @@ class PassageReviewSurface(QDialog):
             panel.set_current_frame(pane.location, pane._current_position_ms)
         panel.set_judgments(self._camera_judgment_records(pane), self._selected_event_id)
 
-    def _open_race_filmstrip_frame(self, frame: RaceFilmstripFrame) -> None:
+    def _open_race_filmstrip_frame(self, frame: RaceFilmstripFrame) -> bool:
         panel = self.video_filmstrip.full_race
         if frame.source.key not in {source.key for source in panel.index.sources}:
-            return
+            return False
         if not frame.source.location.video_path.is_file():
             panel.status_label.setText("录像文件不可用，未移动机位 1。")
-            return
-        self._seek_retained_camera_frame(frame.source.location, frame.position_ms, frame.frame_index)
+            return False
+        if self._seek_retained_camera_frame(frame.source.location, frame.position_ms, frame.frame_index) is False:
+            return False
         panel.set_current_frame(frame.source.location, frame.position_ms)
         self._refresh_camera_judgments()
+        return True
 
     def _maximize_filmstrip_camera(self, frame: RaceFilmstripFrame) -> None:
         """F from the filmstrip keeps its exact frame and enlarges camera 1."""
@@ -6880,7 +6897,8 @@ class PassageReviewSurface(QDialog):
         if not frame.source.location.video_path.is_file():
             panel.status_label.setText("录像文件不可用，无法打开判读。")
             return
-        self._open_race_filmstrip_frame(frame)
+        if not self._open_race_filmstrip_frame(frame):
+            return
         pane = self._camera_one_pane()
         if self._maximized_pane is not pane:
             self._toggle_maximized_pane(pane)
@@ -7057,8 +7075,15 @@ class PassageReviewSurface(QDialog):
             item.key,
         )))
 
-    def _seek_retained_camera_frame(self, location: PassageVideoLocation, position_ms: int, frame_index: int) -> None:
+    def _seek_retained_camera_frame(self, location: PassageVideoLocation, position_ms: int, frame_index: int) -> bool:
         """Open a pinned image's source independently of the overview window."""
+        try:
+            location = self._persist_filmstrip_location(location)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.video_filmstrip.full_race.status_label.setText(
+                f"原帧保留失败，未进入判读：{error}"
+            )
+            return False
         pane = self._camera_one_pane()
         offset = self._continuous_offset_for_location(location)
         origin = location.segment.media_started_at_ms
@@ -7084,6 +7109,7 @@ class PassageReviewSurface(QDialog):
         pane.seek_media_frame(position_ms, frame_index)
         self._shared_delta_ms = position_ms - target
         self._update_shared_time_label()
+        return True
 
     def _refresh_camera_judgments(self) -> None:
         pane = self._camera_one_pane()
@@ -7956,6 +7982,9 @@ class PassageReviewSurface(QDialog):
             if location is None:
                 return False
             try:
+                location = self._persist_filmstrip_location(location)
+                pane._location = location
+                pending["segment_id"] = location.segment.segment_id
                 self.continuous_marker_store.create(
                     camera_index=max(1, int(location.segment.camera_index)),
                     segment_id=str(pending["segment_id"]),
@@ -7993,6 +8022,11 @@ class PassageReviewSurface(QDialog):
             self._association_for_event(event.event_id, pane.source_kind) is not None
         )
         try:
+            location = self._persist_filmstrip_location(pane.location)
+            if location is None:
+                return False
+            pane._location = location
+            pending["segment_id"] = location.segment.segment_id
             association = self.association_store.confirm(
                 passage_event_id=event.event_id,
                 bib=identity,
@@ -8534,7 +8568,7 @@ class PassageReviewSurface(QDialog):
         direction = 1 if int(frame_delta) > 0 else -1
         frame_index = int(getattr(pane, "_current_frame_index", -1))
         frame_count = int(getattr(pane, "_frame_count", 0))
-        at_first_frame = frame_index == 0 or position_ms <= frame_ms
+        at_first_frame = frame_index == 0 if frame_index >= 0 else position_ms == 0
         at_last_frame = (
             frame_count > 0 and frame_index >= frame_count - 1
         ) or (
@@ -8546,6 +8580,27 @@ class PassageReviewSurface(QDialog):
             return False
 
         current = location.segment
+        if pane is self._camera_one_pane():
+            origin = int(current.media_started_at_ms or current.started_at_ms)
+            edge = origin + int(current.media_duration_ms or duration_ms)
+            index = self.video_filmstrip.full_race.index
+            span = index.span_at(edge if direction > 0 else origin - 1)
+            live_boundary = location.video_path.suffix.lower() == ".ts" or (
+                span is not None and span.source is not None
+                and span.source.location.video_path.suffix.lower() == ".ts"
+            )
+            if live_boundary:
+                # Cross closed live files and the archive/live seam without
+                # requiring the next TS to have been opened and saved already.
+                if span is None or span.source is None or not span.source.available:
+                    return False
+                if direction < 0 and span.end_ms < origin:
+                    return False
+                timestamp = edge if direction > 0 else origin - frame_ms
+                target = span.source.location
+                position = max(0, timestamp - span.source.start_ms)
+                fps = float(getattr(pane, "_fps", 0) or 1000 / frame_ms)
+                return self._seek_retained_camera_frame(target, position, round(position * fps / 1000))
         event = self.passage_store.get(self._selected_event_id)
         if event is None:
             return False

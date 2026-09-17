@@ -577,7 +577,7 @@ class FfmpegReviewRecorder:
                 f"hls_time={self.review_segment_seconds}:"
                 f"hls_list_size={list_size}:"
                 "hls_flags=temp_file+program_date_time+independent_segments:"
-                "hls_segment_type=mpegts:hls_start_number_source=epoch_us:"
+                "hls_segment_type=mpegts:hls_start_number_source=generic:start_number=0:"
                 f"hls_segment_filename={review_relative.as_posix()}]"
                 f"{playlist_relative.as_posix()}"
             )
@@ -648,7 +648,9 @@ class FfmpegReviewRecorder:
             "-hls_segment_type",
             "mpegts",
             "-hls_start_number_source",
-            "epoch_us",
+            "generic",
+            "-start_number",
+            "0",
             "-hls_segment_filename",
             str(review_pattern),
             str(playlist_path),
@@ -863,6 +865,23 @@ class ArchiveTimelinePublisher:
             return ()
 
         cursor_ms = int(session_started_at_ms)
+        # HLS PDT starts at the first video packet, not at process launch.
+        # The scanner saves that origin before the playlist rolls. Use it for
+        # both archive publication and recovery so calibrated labels do not
+        # jump when a live TS is replaced by the corresponding MKV.
+        pattern = getattr(self.recorder, "archive_pattern", None)
+        if pattern is not None:
+            pattern = Path(pattern)
+            stem = pattern.stem.removesuffix("_archive_%04d")
+            clock_path = (pattern.parent.parent / "review_buffer"
+                          / f"camera_{self.recorder.camera_index:02d}"
+                          / f"{stem}.clock.json")
+            try:
+                origin = json.loads(clock_path.read_text(encoding="utf-8"))
+                if origin["playlist_stem"] == stem:
+                    cursor_ms = int(origin["media_started_at_ms"])
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         published = []
         for archive_path in archive_paths:
             existing = self.timeline_store.find_segment_by_video_path(archive_path)
@@ -918,6 +937,7 @@ class ReviewRingBuffer:
         )
         self._lock = threading.RLock()
         self._segments: dict[str, ReviewSegment] = {}
+        self._playlist_segment_ids: set[str] = set()
         self._segment_revision = 0
         self._pins_by_event: dict[str, set[str]] = {}
         self._pins_by_segment: dict[str, set[str]] = {}
@@ -1142,12 +1162,21 @@ class ReviewRingBuffer:
         except FileNotFoundError:
             return ()
         discovered = []
+        playlist_segment_ids: set[str] = set()
+        first_media_entry = True
         current_start_ms: int | None = None
         running_start_ms: int | None = None
         duration_ms: int | None = None
+        media_sequence: int | None = None
         for raw_line in lines:
             line = raw_line.strip()
             if not line:
+                continue
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                try:
+                    media_sequence = int(line.split(":", 1)[1])
+                except ValueError:
+                    media_sequence = None
                 continue
             if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
                 value = line.split(":", 1)[1]
@@ -1166,6 +1195,8 @@ class ReviewRingBuffer:
             if line.startswith("#") or duration_ms is None:
                 continue
 
+            is_first_media_entry = first_media_entry
+            first_media_entry = False
             segment_path = (self.buffer_dir / line).resolve()
             try:
                 segment_path.relative_to(self.buffer_dir)
@@ -1178,6 +1209,8 @@ class ReviewRingBuffer:
                 if current_start_ms is not None
                 else running_start_ms
             )
+            if is_first_media_entry and media_sequence == 0 and started_at_ms is not None:
+                self._save_media_origin(started_at_ms)
             if (
                 started_at_ms is None
                 or segment_path.suffix.lower() == ".tmp"
@@ -1197,6 +1230,7 @@ class ReviewRingBuffer:
                 duration_ms=int(duration_ms),
             )
             if segment.segment_id not in self._cleanup_pending_segments:
+                playlist_segment_ids.add(segment.segment_id)
                 if segment.segment_id not in self._segments:
                     discovered.append(segment)
                     self._segment_revision += 1
@@ -1204,7 +1238,59 @@ class ReviewRingBuffer:
             running_start_ms = segment.ended_at_ms
             duration_ms = None
             current_start_ms = None
+        self._playlist_segment_ids = playlist_segment_ids
         return tuple(discovered)
+
+    def filmstrip_segments(self) -> tuple[ReviewSegment, ...]:
+        """Only the current session's published media, excluding old pins."""
+        with self._lock:
+            return tuple(sorted(
+                (self._segments[key] for key in self._playlist_segment_ids
+                 if key in self._segments),
+                key=lambda item: (item.started_at_ms, item.segment_id),
+            ))
+
+    def _save_media_origin(self, started_at_ms: int) -> None:
+        path = self.playlist_path.with_suffix(".clock.json")
+        if path.exists():
+            return
+        temporary = path.with_suffix(".json.tmp")
+        payload = {"playlist_stem": self.playlist_path.stem,
+                   "media_started_at_ms": int(started_at_ms)}
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(payload, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+
+    def retain_filmstrip_segment(self, segment: RecordingSegment,
+                                 store: VideoTimelineStore) -> RecordingSegment:
+        """Pin and register precisely the immutable TS the operator opened."""
+        path = Path(segment.video_path).resolve()
+        start = int(segment.media_started_at_ms)
+        duration = int(segment.media_duration_ms)
+        owner = "published:filmstrip:" + hashlib.sha256(
+            str(path).encode("utf-8")
+        ).hexdigest()
+        pinned = self.pin_window(
+            owner, started_at_ms=start + min(1, duration - 1), ended_at_ms=start + duration - 1,
+            scan=False, owner_kind="published_clip", race_id=segment.race_id,
+        )
+        matching = next((item for item in pinned
+                         if self.resolve_path(item) == path
+                         and item.started_at_ms == start
+                         and item.duration_ms == duration), None)
+        if matching is None or not path.is_file() or path.stat().st_size <= 0:
+            raise ValueError("这段实时录像已不可用，请刷新胶卷后重试")
+        existing = store.find_segment_by_video_path(path)
+        if existing is not None:
+            return existing
+        return store.add_completed_segment(
+            source_id=segment.source_id, camera_index=segment.camera_index,
+            video_path=path, media_started_at_ms=start, media_duration_ms=duration,
+            clock_source=segment.clock_source, timing_error_ms=segment.timing_error_ms,
+            end_reason="retained_filmstrip_segment", race_id=segment.race_id,
+        )
 
     def create_video_passage_scan_worker(
         self,

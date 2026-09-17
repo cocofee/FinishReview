@@ -4680,62 +4680,98 @@ class FinishReviewWindow(PassageReviewSurface):
         pane,
         anchor_time_ms: int,
     ) -> PassageVideoLocation | None:
-        """Expose the current rolling HLS window before archive sealing."""
+        """Return the immutable live TS containing ``anchor_time_ms``."""
 
         ring_buffers = getattr(self, "_ring_buffers", {})
         ring_buffer = ring_buffers.get(int(getattr(pane, "camera_index", 0)))
         if ring_buffer is None:
             return None
-        playlist_path = Path(ring_buffer.playlist_path)
-        if not playlist_path.is_file():
+        locations = self._live_locations_for_filmstrip(pane)
+        if not locations:
             return None
-        segments = tuple(ring_buffer.segments())
-        if not segments:
-            return None
-        first = segments[0]
-        last = segments[-1]
-        media_started_at_ms = int(first.started_at_ms)
-        media_ended_at_ms = int(last.ended_at_ms)
         anchor_time_ms = int(anchor_time_ms)
-        # The HLS playlist trails the wall clock by one or two completed
-        # segments. Keep its newest frame as the live-tail anchor while the
-        # five-minute archive file is still being sealed.
-        if not media_started_at_ms <= anchor_time_ms <= media_ended_at_ms:
-            if anchor_time_ms >= media_ended_at_ms:
-                anchor_time_ms = max(media_started_at_ms, media_ended_at_ms - 1)
-            else:
-                return None
-        duration_ms = media_ended_at_ms - media_started_at_ms
-        if duration_ms <= 0:
+        selected = next((location for location in locations
+                         if location.segment.started_at_ms <= anchor_time_ms
+                         < location.segment.ended_at_ms), None)
+        # Never bridge a real gap or substitute the newest frame for an
+        # unavailable requested time. The full-race rail indexes every TS.
+        if selected is None:
             return None
-        event = self.passage_store.get(self._selected_event_id)
-        race_id = event.race_id if event is not None else ""
-        segment = RecordingSegment(
-            segment_id=(
-                f"live-filmstrip-{ring_buffer.camera_index}-"
-                f"{Path(playlist_path).stem}"
-            ),
-            source_id=ring_buffer.source_id,
-            camera_index=ring_buffer.camera_index,
-            video_path=str(playlist_path),
-            started_at_ms=media_started_at_ms,
-            ended_at_ms=media_ended_at_ms,
-            media_duration_ms=duration_ms,
-            media_started_at_ms=media_started_at_ms,
-            clock_source=DEFAULT_CLOCK_SOURCE,
-            timing_error_ms=DEFAULT_TIMING_ERROR_MS,
-            end_reason="live_filmstrip_tail",
-            race_id=race_id,
+        origin = int(selected.segment.media_started_at_ms or selected.segment.started_at_ms)
+        position = max(0, min(
+            int(selected.segment.media_duration_ms or 1) - 1,
+            anchor_time_ms - origin,
+        ))
+        return replace(
+            selected,
+            passage_position_ms=position,
+            playback_position_ms=max(0, position - self.pre_roll_ms),
         )
-        position_ms = anchor_time_ms - media_started_at_ms
-        return PassageVideoLocation(
+
+    def _live_locations_for_filmstrip(self, pane) -> tuple[PassageVideoLocation, ...]:
+        """Build stable sources from the closed TS files in the rolling buffer."""
+
+        ring_buffer = getattr(self, "_ring_buffers", {}).get(
+            int(getattr(pane, "camera_index", 0))
+        )
+        if ring_buffer is None:
+            return ()
+        event = self.passage_store.get(self._selected_event_id)
+        metadata = self._current_metadata()
+        race_id = metadata.race_id if metadata is not None else event.race_id if event is not None else ""
+        locations = []
+        for item in ring_buffer.filmstrip_segments():
+            path = ring_buffer.resolve_path(item)
+            try:
+                available = path.is_file() and path.stat().st_size > 0
+            except OSError:
+                available = False
+            if not available:
+                continue
+            duration_ms = int(item.duration_ms)
+            segment = RecordingSegment(
+                segment_id=f"live-filmstrip-{ring_buffer.camera_index}-{item.segment_id}",
+                source_id=ring_buffer.source_id,
+                camera_index=ring_buffer.camera_index,
+                video_path=str(path),
+                started_at_ms=int(item.started_at_ms),
+                ended_at_ms=int(item.ended_at_ms),
+                media_duration_ms=duration_ms,
+                media_started_at_ms=int(item.started_at_ms),
+                clock_source=DEFAULT_CLOCK_SOURCE,
+                timing_error_ms=DEFAULT_TIMING_ERROR_MS,
+                end_reason="live_filmstrip_tail",
+                race_id=race_id,
+            )
+            locations.append(PassageVideoLocation(
+                segment=segment,
+                video_path=path,
+                passage_position_ms=0,
+                playback_position_ms=0,
+                clock_offset_ms=0,
+                timing_error_ms=DEFAULT_TIMING_ERROR_MS,
+                status="unverified",
+            ))
+        return tuple(locations)
+
+    def _persist_filmstrip_location(
+        self, location: PassageVideoLocation,
+    ) -> PassageVideoLocation:
+        if location is None or location.segment.end_reason != "live_filmstrip_tail":
+            return location
+        ring_buffer = getattr(self, "_ring_buffers", {}).get(
+            int(location.segment.camera_index)
+        )
+        if ring_buffer is None:
+            raise ValueError("实时缓存已结束，请刷新胶卷后打开归档录像")
+        segment = ring_buffer.retain_filmstrip_segment(
+            location.segment, self.timeline_store
+        )
+        return replace(
+            location,
             segment=segment,
-            video_path=playlist_path,
-            passage_position_ms=position_ms,
-            playback_position_ms=max(0, position_ms - self.pre_roll_ms),
-            clock_offset_ms=0,
-            timing_error_ms=DEFAULT_TIMING_ERROR_MS,
-            status="unverified",
+            video_path=self.timeline_store.resolve_video_path(segment),
+            status="located",
         )
 
     def _recording_stall_error(
@@ -5668,11 +5704,11 @@ class FinishReviewWindow(PassageReviewSurface):
                 self._capture_error = sanitize_recording_message(exc)
                 logger.exception("Failed to apply background capture refresh")
         if result.error:
-                self._capture_error = sanitize_recording_message(result.error)
+            self._capture_error = sanitize_recording_message(result.error)
         # A newly published HLS segment extends the time-film tail before the
         # five-minute archive is sealed. Refresh only the lightweight source
         # index here; visible thumbnails are still decoded lazily by the panel.
-        if result.apply_state and result.discovered_segment_count:
+        if (result.apply_state and result.discovered_segment_count) or result.deleted_paths:
             try:
                 self._update_filmstrip()
             except Exception:  # noqa: BLE001 - a preview refresh must not stop capture.

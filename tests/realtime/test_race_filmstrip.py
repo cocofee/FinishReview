@@ -123,6 +123,76 @@ def test_catalog_includes_live_hls_tail_while_archive_is_pending(tmp_path):
     assert index.span_at(22_000).source.location.segment.end_reason == "live_filmstrip_tail"
 
 
+def test_new_live_segments_preserve_inflight_click_and_thumbnail_worker(qapp, tmp_path, manual_worker):
+    first = source(tmp_path / "first.ts", duration=2000)
+    second = source(tmp_path / "second.ts", start=12000, duration=2000)
+    panel = RaceFilmstripPanel()
+    panel.resize(1000, 450)
+    panel.show()
+    panel.set_sources((first,))
+    panel.open_time(10500)
+    panel._load_visible()
+    worker = panel._worker
+    selected = QSignalSpy(panel.frame_requested)
+    panel._pending_judgment = (first.key, 10500)
+    try:
+        panel.set_sources((first, second))
+        assert panel._worker is worker
+        assert not worker.stopped
+        assert panel._pending == panel._pending_judgment == (first.key, 10500)
+        frame = result(first, 10500)
+        worker.frame_ready.emit(frame)
+        assert len(selected) == 1 and selected[0][0] == frame
+    finally:
+        panel.close()
+
+
+def test_expired_live_source_cancels_pending_click(qapp, tmp_path, manual_worker):
+    first = source(tmp_path / "first.ts", duration=2000)
+    second = source(tmp_path / "second.ts", start=12000, duration=2000)
+    panel = RaceFilmstripPanel()
+    panel.show()
+    panel.set_sources((first,))
+    panel.open_time(10500)
+    panel._load_visible()
+    worker = panel._worker
+    selected = QSignalSpy(panel.frame_requested)
+    try:
+        panel.set_sources((second,))
+        assert worker.stopped
+        assert panel._pending is None
+        worker.frame_ready.emit(result(first, 10500))
+        assert not selected
+    finally:
+        panel.close()
+
+
+@pytest.mark.parametrize("available", (False, True))
+def test_unavailable_source_with_same_identity_cancels_pending_click(qapp, tmp_path, manual_worker, available):
+    recording_path = tmp_path / "rolling.ts"
+    first = source(recording_path, duration=2000)
+    unavailable = source(recording_path, duration=1000, available=available)
+    panel = RaceFilmstripPanel()
+    panel.show()
+    panel.set_sources((first,))
+    panel.open_time(11500)
+    panel._load_visible()
+    worker = panel._worker
+    selected = QSignalSpy(panel.frame_requested)
+    try:
+        panel._pending_judgment = panel._pending
+        panel.set_sources((unavailable,))
+        assert worker.stopped
+        assert panel._pending is None
+        assert panel._pending_judgment is None
+        stale = result(first, 11500)
+        worker.frame_ready.emit(stale)
+        assert not selected
+        assert stale.key not in panel.cache
+    finally:
+        panel.close()
+
+
 def test_calibration_changes_labels_without_moving_or_redecoding_original(qapp, tmp_path, manual_worker):
     recording = source(tmp_path / "first", duration=60000)
     panel = RaceFilmstripPanel()

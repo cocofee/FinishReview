@@ -298,6 +298,78 @@ def test_concrete_review_windows_are_sibling_types():
     )
 
 
+def test_live_filmstrip_confirmation_reopens_after_cleanup_and_archive(qapp, tmp_path, monkeypatch):
+    from PyQt5.QtGui import QImage
+    from realtime.review_recorder import ReviewRingBuffer
+    from realtime.race_filmstrip import RaceFilmstripFrame
+
+    window = _window(tmp_path)
+    root = tmp_path / "review_buffer" / "camera_01"
+    root.mkdir(parents=True, exist_ok=True)
+    stem = "camera_01_20260917_091639_094654"
+    start = 1_789_600_000_000
+    video = root / f"{stem}_review_0000000000000000.ts"
+    video.write_bytes(b"video")
+    playlist = root / f"{stem}.m3u8"
+    playlist.write_text(
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.000,\n"
+        f"#EXT-X-PROGRAM-DATE-TIME:{datetime.fromtimestamp(start / 1000, timezone.utc).isoformat()}\n"
+        f"{video.name}\n", encoding="utf-8",
+    )
+    ring = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=1)
+    ring.scan()
+    event = _event(passage_timestamp_ms=start + 1000)
+    window.passage_store.append(event)
+    window._ring_buffers = {1: ring}
+    window.refresh()
+    window.auto_advance_checkbox.setChecked(False)
+    panel = window.video_filmstrip.full_race
+    source = next(s for s in panel.index.sources if s.location.video_path == video)
+    image = QImage(640, 360, QImage.Format_RGB888)
+    image.fill(0)
+    frame = RaceFilmstripFrame(source, start + 520, 520, 13, image)
+    try:
+        assert window._open_race_filmstrip_frame(frame)
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(image, 520, 13)
+        pane._on_marker_position_selected(.5, .5)
+        assert window._confirm_pending_marker(pane)
+        records = window._camera_judgment_records(pane)
+        assert len(records) == 1
+        assert records[0].recorder_time_ms == start + 520
+        assert records[0].clock_offset_ms == -480
+        segment_id = records[0].segment_id
+        ring.cleanup(current_time_ms=start + 100000)
+        assert video.is_file()
+        archive = tmp_path / "videos" / f"{stem}_archive_0000.mkv"
+        archive.parent.mkdir(exist_ok=True)
+        archive.write_bytes(b"archive")
+        window.timeline_store.add_completed_segment(
+            source_id="camera_01_review", camera_index=1, video_path=archive,
+            media_started_at_ms=start, media_duration_ms=10000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=2000,
+            end_reason="continuous_archive_fallback", race_id=event.race_id,
+        )
+        window._update_filmstrip()
+        assert panel.index.span_at(start + 520).source.location.video_path == archive
+        assert window._continuous_offset_for_location(panel.index.span_at(start + 520).source.location) == -480
+    finally:
+        window._ring_buffers = {}
+        window.close()
+    reopened = _window(tmp_path)
+    try:
+        reopened.refresh()
+        records = reopened._camera_judgment_records(reopened.regular_pane)
+        assert len(records) == 1 and records[0].segment_id == segment_id
+        assert records[0].clock_offset_ms == -480
+        monkeypatch.setattr(reopened, "_uses_popup_judging", lambda: False)
+        reopened._open_camera_judgment(records[0].key)
+        assert reopened.regular_pane.location.video_path == video
+        assert reopened.regular_pane.location.playback_position_ms == 520
+    finally:
+        reopened.close()
+
+
 def test_select_event_forwards_selection_options(qapp, tmp_path, monkeypatch):
     window = _window(tmp_path)
     captured = {}

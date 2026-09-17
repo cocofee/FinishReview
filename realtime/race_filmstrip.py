@@ -137,6 +137,7 @@ def recording_sources(
     *,
     offset_for_location=None,
     live_location: PassageVideoLocation | None = None,
+    live_locations=(),
 ):
     """Use recording coverage, never the roster or its filters, for the rail."""
     sources = []
@@ -166,7 +167,10 @@ def recording_sources(
     # newest arrivals without waiting for that seal.  Archive sources have a
     # higher priority and therefore replace this overlap automatically once
     # the long-form file is published.
+    live_values = tuple(live_locations)
     if live_location is not None:
+        live_values = (*live_values, live_location)
+    for live_location in live_values:
         segment = live_location.segment
         if (
             segment.camera_index == camera_index
@@ -175,9 +179,15 @@ def recording_sources(
             and (not race_id or not segment.race_id or segment.race_id == race_id)
         ):
             path = Path(live_location.video_path)
-            available = path.is_file()
-            if available and path.suffix.lower() == ".m3u8":
-                available = store.video_path_is_playable(path)
+            # Each live source is one closed TS segment.  Validate only that
+            # immutable file; validating a rolling playlist makes an otherwise
+            # healthy tail fail when its old head has already been cleaned up.
+            try:
+                available = path.is_file() and path.stat().st_size > 0
+            except OSError:
+                available = False
+            if path.suffix.lower() == ".m3u8":
+                available = available and store.video_path_is_playable(path)
             location = live_location
             if offset_for_location is not None:
                 location = replace(location, clock_offset_ms=offset_for_location(location))
@@ -253,7 +263,7 @@ class RaceThumbnailWorker(QThread):
                     if count > 0 and target >= int(count):
                         raise ValueError("超出实际录像范围")
                     if last_index != target:
-                        if source.location.video_path.suffix.lower() != ".m3u8" and (
+                        if source.location.video_path.suffix.lower() not in {".m3u8", ".ts"} and (
                             last_index < 0 or target - next_frame > 100 or target < next_frame
                         ):
                             if capture.set(cv2.CAP_PROP_POS_FRAMES, target):
@@ -748,11 +758,22 @@ class RaceFilmstripPanel(QWidget):
         had_spans = bool(self.index.spans)
         self.index = RaceRecordingIndex(sources)
         self._sources_by_key = {source.key: source for source in sources}
-        keys = {source.key for source in sources}
-        self.cache = OrderedDict((key, value) for key, value in self.cache.items() if key[0] in keys)
-        self.errors = OrderedDict((key, value) for key, value in self.errors.items() if key[0] in keys)
-        self._pending = None
-        self._cancel_decode()
+        def request_available(key):
+            source = self._sources_by_key.get(key[0])
+            return (source is not None and source.available
+                    and source.start_ms <= key[1] < source.end_ms)
+
+        self.cache = OrderedDict((key, value) for key, value in self.cache.items() if request_available(key))
+        self.errors = OrderedDict((key, value) for key, value in self.errors.items() if request_available(key))
+        if self._pending is not None:
+            # The same source may have lost its file or part of its coverage.
+            if not request_available(self._pending):
+                self._pending = None
+                self._pending_judgment = None
+        # Background appends do not represent operator navigation. Preserve
+        # an in-flight click and useful decoding while changing scroll bounds.
+        bar = self.canvas.horizontalScrollBar()
+        previously_blocked = bar.blockSignals(True)
         self._set_scroll_range()
         self._pending_sources = pending
         if not had_spans:
@@ -764,6 +785,7 @@ class RaceFilmstripPanel(QWidget):
         elif self.current_time is not None and not self._user_navigated:
             self._position_scroll(self.current_time)
             self._initial_positioned = True
+        bar.blockSignals(previously_blocked)
         if self.index.spans:
             self.range_label.setText("时间胶卷 · 机位 1")
             self.range_label.setToolTip(
@@ -799,7 +821,7 @@ class RaceFilmstripPanel(QWidget):
                 if pending
                 else "尚无可验证的录像时间范围，请等待录像归档或刷新。"
             )
-        self._viewport_changed()
+        self._viewport_changed(preserve_requests=True)
 
     def set_check_context(self, path, race_id, camera_index=1):
         context = (str(Path(path).absolute()), race_id, camera_index)
@@ -977,16 +999,26 @@ class RaceFilmstripPanel(QWidget):
             self._position_scroll((left + right) // 2)
         self._viewport_changed()
 
-    def _viewport_changed(self, *_):
+    def _viewport_changed(self, *_, preserve_requests=False):
         if not hasattr(self, "_load_timer"):
             return
-        self._pending = None
-        self._pending_judgment = None
+        if not preserve_requests:
+            self._pending = None
+            self._pending_judgment = None
         wheeling = self.canvas._wheel_target is not None
         left, right = self.visible_times()
         # Keep useful decoding alive through animation ticks. Once its whole
         # batch leaves the screen, retire it before starting the next batch.
-        if not wheeling or (self._worker is not None and
+        worker_valid = self._worker is not None and all(
+            source.key in self._sources_by_key
+            and self._sources_by_key[source.key].available
+            and self._sources_by_key[source.key].end_ms == source.end_ms
+            for source, _ in self._worker.jobs
+        )
+        if preserve_requests:
+            if not worker_valid:
+                self._cancel_decode()
+        elif not wheeling or (self._worker is not None and
                             not any(left <= timestamp < right for _, timestamp in self._worker.jobs)):
             self._cancel_decode()
         self.canvas.viewport().update()
@@ -1060,7 +1092,9 @@ class RaceFilmstripPanel(QWidget):
     def _frame_ready(self, frame):
         if self.sender() is not self._worker or self._closed:
             return
-        if frame.source.key not in {source.key for source in self.index.sources}:
+        source = self._sources_by_key.get(frame.source.key)
+        if (source is None or not source.available
+                or not source.start_ms <= frame.key[1] < source.end_ms):
             return
         self.cache[frame.key] = frame
         self.cache.move_to_end(frame.key)

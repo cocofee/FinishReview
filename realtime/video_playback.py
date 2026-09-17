@@ -436,7 +436,7 @@ class VideoPlaybackWorker(QThread):
         self._duration_ms = 0
         self._frame_count = 0
         self._fps = 25.0
-        self._sequential_capture = self.video_path.suffix.lower() == ".m3u8"
+        self._sequential_capture = self.video_path.suffix.lower() in {".m3u8", ".ts"}
         self._frame_cache: OrderedDict[int, QImage] = OrderedDict()
         self._frame_cache_bytes = 0
         self._cache_generation = 0
@@ -827,7 +827,7 @@ class VideoPlaybackWorker(QThread):
             return True
 
     def _playlist_duration_ms(self) -> Optional[int]:
-        if not self._sequential_capture:
+        if self.video_path.suffix.lower() != ".m3u8":
             return None
         try:
             lines = self.video_path.read_text(encoding="utf-8").splitlines()
@@ -852,7 +852,7 @@ class VideoPlaybackWorker(QThread):
         return max(1, int(round(duration_seconds * 1000.0)))
 
     def _probe_sequential_fps(self, fallback_fps: float) -> float:
-        if not self._sequential_capture:
+        if self.video_path.suffix.lower() != ".m3u8":
             return fallback_fps
         capture = _open_video_capture(self.video_path, self._capture_factory)
         try:
