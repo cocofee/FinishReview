@@ -537,6 +537,33 @@ def test_pin_journal_restores_protected_segments_after_restart(tmp_path):
     assert (tmp_path / "finish.ts").is_file()
 
 
+def test_history_registration_does_not_recheck_unchanged_pinned_files(tmp_path, monkeypatch):
+    playlist = _write_playlist(
+        tmp_path,
+        [("finish.ts", "2026-08-21T12:00:00.000+00:00", 2.0)],
+    )
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    buffer.pin_window("saved", started_at_ms=1_787_313_600_000,
+                      ended_at_ms=1_787_313_602_000)
+    checked = []
+    resolve = buffer.resolve_path
+
+    def counted(segment):
+        checked.append(segment.segment_id)
+        return resolve(segment)
+
+    monkeypatch.setattr(buffer, "resolve_path", counted)
+    coordinator = PassageReviewCoordinator(buffer)
+    for i in range(300):
+        coordinator.register(f"historical-{i}", passage_timestamp_ms=1000 + i, scan=False)
+    # Scanner progress and unrelated cleanup records also leave old pins alone.
+    buffer.commit_scan_cursor("scanner", 120000)
+    buffer._append_pin_record({"record_type": "cleanup_committed", "segment_id": "unrelated",
+                               "started_at_ms": 1, "ended_at_ms": 2})
+    assert not checked
+    assert buffer.pinned_event_ids("finish.ts") == frozenset({"saved"})
+
+
 def test_stale_ring_instance_reloads_pin_state_before_release(tmp_path):
     playlist = _write_playlist(
         tmp_path,

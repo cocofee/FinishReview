@@ -948,6 +948,8 @@ class ReviewRingBuffer:
         self._cleanup_deleted_intervals: list[tuple[int, int]] = []
         self._scan_watermark_ms: int | None = None
         self._journal_projection = ReviewBufferJournalProjection()
+        self._applied_journal_revision = -1
+        self._applied_owner_payloads: dict[str, tuple[dict, ...]] = {}
         self._load_pin_journal()
         self._recover_cleanup_transactions()
         self._recover_cleanup_files()
@@ -1069,12 +1071,22 @@ class ReviewRingBuffer:
 
     def _sync_pin_journal_locked(self) -> None:
         self._journal_projection.sync(self.pin_journal_path)
-        self._reconcile_journal_projection()
+        if self._applied_journal_revision != self._journal_projection.revision:
+            self._reconcile_journal_projection()
+            self._applied_journal_revision = self._journal_projection.revision
 
     def _reconcile_journal_projection(self) -> None:
-        pins_by_owner: dict[str, set[str]] = {}
-        pins_by_segment: dict[str, set[str]] = {}
+        owners = self._journal_projection.owner_segments
+        for owner_id in self._applied_owner_payloads.keys() - owners.keys():
+            self._release_in_memory(owner_id)
+            self._applied_owner_payloads.pop(owner_id, None)
+        # Owner tuples are replaced only by records affecting that owner.
+        # Do not stat every historical TS for every registration or cursor
+        # append. Shared segments also need just one check per reconciliation.
+        checked_segments: dict[ReviewSegment, bool] = {}
         for owner_id, payloads in self._journal_projection.owner_segments.items():
+            if self._applied_owner_payloads.get(owner_id) is payloads:
+                continue
             segment_ids = set()
             for payload in payloads:
                 try:
@@ -1083,16 +1095,14 @@ class ReviewRingBuffer:
                     continue
                 if segment.segment_id in self._journal_projection.deleted_segment_ids:
                     continue
-                path = self.resolve_path(segment)
-                if not path.is_file():
+                if segment not in checked_segments:
+                    checked_segments[segment] = self.resolve_path(segment).is_file()
+                if not checked_segments[segment]:
                     continue
                 self._segments.setdefault(segment.segment_id, segment)
                 segment_ids.add(segment.segment_id)
-                pins_by_segment.setdefault(segment.segment_id, set()).add(owner_id)
-            if segment_ids:
-                pins_by_owner[owner_id] = segment_ids
-        self._pins_by_event = pins_by_owner
-        self._pins_by_segment = pins_by_segment
+            self._set_event_pins(owner_id, segment_ids)
+            self._applied_owner_payloads[owner_id] = payloads
         for segment_id in self._journal_projection.deleted_segment_ids:
             self._segments.pop(segment_id, None)
         self._cleanup_deleted_intervals = list(

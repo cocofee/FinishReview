@@ -1301,6 +1301,64 @@ def test_received_passage_uses_incremental_table_refresh(
     window.close()
 
 
+def test_evidence_failure_does_not_hide_received_passage(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path, passage_batch_interval_ms=1000)
+    window.start()
+    receiver = _FakeReceiver.instances[0]
+    event = _event()
+
+    def fail_publish(_camera_index):
+        raise RuntimeError("evidence unavailable")
+
+    monkeypatch.setattr(window, "_publish_ready_windows", fail_publish)
+    try:
+        receiver.deliver(event)
+        qapp.processEvents()
+        window._passage_batch_timer.stop()
+        window._flush_passage_batch()
+        assert window.table.rowCount() == 1
+        assert window.table.item(0, 1).text() == event.bib
+        assert window._capture_error == "evidence unavailable"
+        withdrawn = replace(event, revision=2, is_active=False)
+        receiver.deliver(withdrawn)
+        qapp.processEvents()
+        window._passage_batch_timer.stop()
+        window._flush_passage_batch()
+        assert window.table.rowCount() == 0
+    finally:
+        window.close()
+
+
+def test_restarted_recording_reuses_persisted_binding_without_regrouping(qapp, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    window = _window(tmp_path)
+    event = _event(passage_timestamp_ms=15000)
+    window.passage_store.append(event)
+    clip = window.review_binding_store.get_or_add_clip(
+        race_id=event.race_id, camera_index=1, source_id="camera_01_review",
+        started_at_ms=10000, ended_at_ms=20000,
+        playlist_path=tmp_path / "saved.m3u8", segment_signature="saved-group",
+        timeline_segment_id="saved-timeline",
+    )
+    window.review_binding_store.bind(
+        event_id=event.event_id, revision=event.revision, camera_index=1,
+        clip_id=clip.clip_id, passage_timestamp_ms=15000, passage_offset_ms=5000,
+    )
+    # Restart forgets only the in-memory publication set, never the durable binding.
+    window._published_keys.clear()
+    coordinator = SimpleNamespace(register=lambda *a, **k: pytest.fail("must reuse saved binding"))
+    window._coordinators = {1: coordinator}
+    try:
+        window._register_passage(event, scan=False)
+        assert (1, event.event_id, event.revision, 15000) in window._published_keys
+        assert not window._has_published_passage(1, replace(event, revision=2), 15000)
+        assert not window._has_published_passage(1, event, 16000)
+    finally:
+        window._coordinators = {}
+        window.close()
+
+
 def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
     qapp,
     tmp_path,

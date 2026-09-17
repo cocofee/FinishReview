@@ -1,4 +1,5 @@
 import json
+import os
 
 from realtime.durable_jsonl import append_jsonl_records
 from realtime.review_buffer_journal import ReviewBufferJournalProjection
@@ -51,6 +52,46 @@ def test_incremental_reducer_does_not_replay_released_owner(tmp_path):
     projection.sync(path)
     assert "legacy" not in projection.owner_segments
     assert tuple(projection.owner_segments) == ("owner:new",)
+
+
+def test_append_reduces_only_new_records_and_preserves_unaffected_owners(tmp_path, monkeypatch):
+    path = tmp_path / "pins.jsonl"
+    projection = ReviewBufferJournalProjection()
+    _append(path, {"op": "pin", "event_id": "rider", "segments": [_segment()]})
+    projection.sync(path)
+    original = projection.owner_segments["rider"]
+    applied = []
+    reduce_record = projection.apply
+
+    def counted(record):
+        applied.append(record)
+        reduce_record(record)
+
+    monkeypatch.setattr(projection, "apply", counted)
+    for i in range(10):
+        _append(path, {"record_type": "cleanup_committed", "segment_id": f"unused-{i}",
+                       "started_at_ms": i * 100, "ended_at_ms": i * 100 + 100})
+        projection.sync(path)
+        projection.sync(path)
+        assert projection.owner_segments["rider"] is original
+    assert len(applied) == 10
+
+
+def test_projection_reloads_replacement_and_same_size_rewrite(tmp_path):
+    path = tmp_path / "pins.jsonl"
+    projection = ReviewBufferJournalProjection()
+    _append(path, {"op": "pin", "event_id": "old", "segments": [_segment()]})
+    projection.sync(path)
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_bytes(path.read_bytes().replace(b'"old"', b'"new"'))
+    os.replace(replacement, path)
+    projection.sync(path)
+    assert set(projection.owner_segments) == {"new"}
+    previous_mtime = path.stat().st_mtime_ns
+    path.write_bytes(path.read_bytes().replace(b'"new"', b'"end"'))
+    os.utime(path, ns=(previous_mtime, previous_mtime + 1_000_000_000))
+    projection.sync(path)
+    assert set(projection.owner_segments) == {"end"}
 
 
 def test_cleanup_commit_reduces_tombstone_interval_and_cursor(tmp_path):

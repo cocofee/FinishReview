@@ -20,7 +20,9 @@ class ReviewBufferJournalProjection:
 
     def __init__(self) -> None:
         self.offset = 0
-        self.file_id: tuple[int, int, int] | None = None
+        self.file_id: tuple[int, int] | None = None
+        self._mtime_ns: int | None = None
+        self.revision = 0
         self.owner_segments: dict[str, tuple[dict[str, Any], ...]] = {}
         self.owner_metadata: dict[str, dict[str, Any]] = {}
         self.cleanup_intents: dict[str, dict[str, Any]] = {}
@@ -29,6 +31,7 @@ class ReviewBufferJournalProjection:
         self.scan_cursors: dict[str, int] = {}
 
     def reset(self) -> None:
+        self.revision += 1
         self.offset = 0
         self.owner_segments.clear()
         self.owner_metadata.clear()
@@ -38,11 +41,10 @@ class ReviewBufferJournalProjection:
         self.scan_cursors.clear()
 
     @staticmethod
-    def _file_identity(stat_result) -> tuple[int, int, int]:
+    def _file_identity(stat_result) -> tuple[int, int]:
         return (
             int(getattr(stat_result, "st_dev", 0)),
             int(getattr(stat_result, "st_ino", 0)),
-            int(getattr(stat_result, "st_mtime_ns", 0)),
         )
 
     def sync(self, path: str | Path) -> None:
@@ -51,6 +53,7 @@ class ReviewBufferJournalProjection:
             if self.offset:
                 self.reset()
             self.file_id = None
+            self._mtime_ns = None
             return
         try:
             stat_result = journal_path.stat()
@@ -59,14 +62,22 @@ class ReviewBufferJournalProjection:
                 f"failed to inspect review buffer journal: {journal_path}"
             ) from error
         identity = self._file_identity(stat_result)
+        mtime_ns = int(stat_result.st_mtime_ns)
         if (
             self.file_id is not None
             and identity != self.file_id
             and any(identity)
             and any(self.file_id)
-        ) or stat_result.st_size < self.offset:
+        ) or stat_result.st_size < self.offset or (
+            stat_result.st_size == self.offset
+            and self._mtime_ns is not None
+            and mtime_ns != self._mtime_ns
+        ):
             self.reset()
         self.file_id = identity
+        # Modification time changes on every append; it is not file identity.
+        # Only same-size rewrites need it to invalidate the existing projection.
+        self._mtime_ns = mtime_ns
         if stat_result.st_size == self.offset:
             return
         try:
@@ -116,6 +127,7 @@ class ReviewBufferJournalProjection:
             ) from error
 
     def apply(self, record: Mapping[str, Any]) -> None:
+        self.revision += 1
         record_type = str(record.get("record_type") or "")
         operation = str(record.get("op") or "")
         if operation == "pin" or record_type == "pin_set":
@@ -158,6 +170,9 @@ class ReviewBufferJournalProjection:
             if segment_id:
                 self.deleted_segment_ids.add(segment_id)
                 for owner_id, segments in tuple(self.owner_segments.items()):
+                    if not any(str(payload.get("segment_id") or "") == segment_id
+                               for payload in segments):
+                        continue
                     retained = tuple(
                         payload
                         for payload in segments

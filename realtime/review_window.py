@@ -4940,6 +4940,8 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         self._unsupported_event_ids.discard(event.event_id)
         for camera_index, coordinator in self._coordinators.items():
+            if self._has_published_passage(camera_index, event, timestamp_ms):
+                continue
             window = coordinator.register(
                 event.event_id,
                 passage_timestamp_ms=timestamp_ms,
@@ -4965,6 +4967,20 @@ class FinishReviewWindow(PassageReviewSurface):
         if revision is not None:
             self.review_binding_store.deactivate(event_id, revision)
 
+    def _has_published_passage(
+        self, camera_index: int, event: PassageEvent, timestamp_ms: int,
+    ) -> bool:
+        """Reuse the durable binding after restart instead of regrouping it."""
+        key = (int(camera_index), event.event_id, event.revision, int(timestamp_ms))
+        if key in self._published_keys:
+            return True
+        for binding in self.review_binding_store.active_bindings(event.event_id, event.revision):
+            if (binding.camera_index == int(camera_index)
+                    and binding.passage_timestamp_ms == int(timestamp_ms)):
+                self._published_keys.add(key)
+                return True
+        return False
+
     def _publish_window(
         self,
         camera_index: int,
@@ -4981,7 +4997,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if (
             publisher is None
             or window.state is not PassageReviewState.READY
-            or key in self._published_keys
+            or self._has_published_passage(camera_index, event, window.passage_timestamp_ms)
         ):
             return False
         publisher.publish(
@@ -5009,7 +5025,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 event.revision,
                 window.passage_timestamp_ms,
             )
-            if key in self._published_keys:
+            if self._has_published_passage(camera_index, event, window.passage_timestamp_ms):
                 continue
             pending.append((window, event, key))
         pending.sort(
@@ -5400,6 +5416,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 and event.stage_id == metadata.stage_id
             )
 
+        changed_event_ids = {event.event_id for event in pending_events}
         try:
             active_events = tuple(
                 event
@@ -5412,7 +5429,6 @@ class FinishReviewWindow(PassageReviewSurface):
             archive_segments = (
                 self._publish_archive_segments() if active_events else ()
             )
-            changed_event_ids = {event.event_id for event in pending_events}
             for event in pending_events:
                 if event.is_active and belongs_to_current_context(event):
                     self._register_passage(event, scan=False)
@@ -5429,12 +5445,14 @@ class FinishReviewWindow(PassageReviewSurface):
                 changed_event_ids.update(
                     self._event_ids_for_archive_segments(archive_segments)
                 )
-            self.refresh_events(changed_event_ids)
-            self._apply_pending_focus()
             self._capture_error = ""
         except Exception as exc:
             self._capture_error = sanitize_recording_message(exc)
             logger.exception("Failed to prepare passage review evidence")
+        # Passage delivery is already durable. An evidence failure must never
+        # hide a new time, correction or withdrawal from the operator.
+        self.refresh_events(changed_event_ids)
+        self._apply_pending_focus()
         self._update_runtime_status()
 
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
