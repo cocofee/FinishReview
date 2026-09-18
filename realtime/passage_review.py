@@ -359,6 +359,9 @@ class _AutoFitTableWidget(QTableWidget):
         super().__init__(*args, **kwargs)
         self._column_fit_scheduled = False
         self._compact_mode = False
+        # Bound content measurement as the live roster grows. Full text is
+        # still available in the cells/tooltips and the selected rider pane.
+        self.horizontalHeader().setResizeContentsPrecision(100)
 
     def set_compact_mode(self, enabled: bool) -> None:
         self._compact_mode = bool(enabled)
@@ -374,7 +377,6 @@ class _AutoFitTableWidget(QTableWidget):
         self._column_fit_scheduled = False
         if self.columnCount() != len(_TABLE_COLUMN_MIN_WIDTHS):
             return
-        self.resizeColumnsToContents()
         header = self.horizontalHeader()
         visible_columns = tuple(
             column
@@ -386,6 +388,7 @@ class _AutoFitTableWidget(QTableWidget):
             for column in visible_columns:
                 header.resizeSection(column, compact_widths.get(column, 84))
             return
+        self.resizeColumnsToContents()
         content_widths = tuple(
             header.sectionSize(column) for column in visible_columns
         )
@@ -1227,6 +1230,7 @@ class PassageEvidencePane(QFrame):
     scrub_preview_requested = pyqtSignal(int)
     initial_frame_ready = pyqtSignal(str)
     preview_frame_ready = pyqtSignal(object, int, int)
+    detail_requested = pyqtSignal(object)
 
     MAX_SCRUB_SPAN_MS = 6_000
     SCRUB_PREVIEW_INTERVAL_MS = 80
@@ -1283,6 +1287,7 @@ class PassageEvidencePane(QFrame):
         self._current_position_ms = 0
         self._timeline_dragging = False
         self._last_full_resolution_request = -1
+        self._full_resolution_enabled = True
         self._scrub_origin_delta_ms = 0
         self._video_scrubbing = False
         self._pending_scrub_delta_ms: Optional[int] = None
@@ -1329,11 +1334,14 @@ class PassageEvidencePane(QFrame):
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.status_label.setObjectName("evidencePaneStatus")
         self._set_status_label("未选择")
+        self.quality_label = QLabel("")
+        self.quality_label.setVisible(self.source_kind == REGULAR_SOURCE and self.camera_index == 1)
         header.addWidget(self.title_label)
         header.addWidget(self.active_badge)
         header.addWidget(self.frame_indicator_label)
         header.addWidget(self.camera_combo)
         header.addStretch()
+        header.addWidget(self.quality_label)
         header.addWidget(self.status_label)
         layout.addLayout(header)
 
@@ -1342,7 +1350,7 @@ class PassageEvidencePane(QFrame):
         self.video_view.clear_frame("选择一条通过记录后自动定位")
         self.video_view.zoom_changed.connect(self._on_zoom_changed)
         self.video_view.full_resolution_requested.connect(
-            self._schedule_full_resolution_request
+            self._on_detail_requested
         )
         self.video_view.maximize_requested.connect(
             lambda: self.maximize_requested.emit(self)
@@ -1399,6 +1407,9 @@ class PassageEvidencePane(QFrame):
         self.fit_btn.setToolTip("适应当前窗格")
         self.zoom_in_btn = QPushButton("+")
         self.zoom_in_btn.setToolTip("放大")
+        self.hd_btn = QPushButton("高清")
+        self.hd_btn.setToolTip("暂停并读取当前帧原图；滚轮放大，中键拖动查看号码")
+        self.hd_btn.setVisible(self.source_kind == REGULAR_SOURCE and self.camera_index == 1)
         self.maximize_btn = QPushButton("放大")
         self.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
         self.mark_btn = QPushButton("标线")
@@ -1419,6 +1430,7 @@ class PassageEvidencePane(QFrame):
         controls.addWidget(self.actual_size_btn)
         controls.addWidget(self.fit_btn)
         controls.addWidget(self.zoom_in_btn)
+        controls.addWidget(self.hd_btn)
         controls.addWidget(self.maximize_btn)
         controls.addWidget(self.mark_btn)
         controls.addWidget(self.confirm_btn)
@@ -1432,6 +1444,7 @@ class PassageEvidencePane(QFrame):
         self.actual_size_btn.clicked.connect(self.video_view.set_actual_size)
         self.fit_btn.clicked.connect(self.video_view.fit_to_window)
         self.zoom_in_btn.clicked.connect(lambda: self.video_view.zoom_by(1.2))
+        self.hd_btn.clicked.connect(self._on_detail_requested)
         self.maximize_btn.clicked.connect(lambda: self.maximize_requested.emit(self))
         self._maximize_shortcut = QShortcut(QKeySequence(Qt.Key_F), self)
         self._maximize_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
@@ -1832,6 +1845,7 @@ class PassageEvidencePane(QFrame):
         self._current_frame_index = -1
         self._current_position_ms = 0
         self._last_full_resolution_request = -1
+        self.quality_label.clear()
         self.timeline.setProperty("initial_frame_index", None)
         self._full_resolution_timer.stop()
         self._reset_video_scrub()
@@ -1924,7 +1938,9 @@ class PassageEvidencePane(QFrame):
                 worker = VideoPlaybackWorker(
                     location.video_path,
                     self,
-                    reverse_prefetch=not self._low_resource_mode,
+                    # Continuous reverse playback uses one bounded lookahead;
+                    # paused single-frame review still avoids idle decoding.
+                    reverse_prefetch=True,
                     idle_prefetch=not self._low_resource_mode,
                 )
             except TypeError:
@@ -1932,11 +1948,12 @@ class PassageEvidencePane(QFrame):
                 # compatible with the historical two-argument constructor.
                 worker = VideoPlaybackWorker(location.video_path, self)
                 if self._low_resource_mode:
-                    if hasattr(worker, "_reverse_prefetch_enabled"):
-                        worker._reverse_prefetch_enabled = False
                     if hasattr(worker, "_idle_prefetch_enabled"):
                         worker._idle_prefetch_enabled = False
         worker.media_locator = str(location.media_locator)
+        set_presentation_ack = getattr(worker, "set_presentation_ack_enabled", None)
+        if callable(set_presentation_ack):
+            set_presentation_ack(True)
         set_idle_prefetch = getattr(worker, "set_idle_prefetch_enabled", None)
         if callable(set_idle_prefetch):
             set_idle_prefetch(self._idle_prefetch_enabled)
@@ -2033,6 +2050,7 @@ class PassageEvidencePane(QFrame):
 
     def clear_passage(self, message: str = "没有通过记录") -> None:
         self._stop_worker()
+        self.quality_label.clear()
         self._event = None
         self._location = None
         self._lookup_status = ""
@@ -2113,6 +2131,7 @@ class PassageEvidencePane(QFrame):
     def _on_frame_ready(self, image, position_ms: int, frame_index: int) -> None:
         if self.sender() is not self._worker:
             return
+        worker = self._worker
         previous_frame_index = self._current_frame_index
         self._current_frame_index = int(frame_index)
         self._current_position_ms = int(position_ms)
@@ -2130,6 +2149,7 @@ class PassageEvidencePane(QFrame):
             source_width=self._source_width,
             source_height=self._source_height,
         )
+        self._update_frame_quality(image)
         self._update_status_label()
         self._set_transport_enabled(True)
         self.video_view.set_marker_mode(self._marking_enabled)
@@ -2145,6 +2165,10 @@ class PassageEvidencePane(QFrame):
         self._schedule_paused_frame_detail()
         if previous_frame_index < 0 and self._event is not None:
             self.initial_frame_ready.emit(self._event.event_id)
+        needs_presentation = getattr(worker, "frame_needs_presentation", None)
+        if callable(needs_presentation) and needs_presentation(frame_index):
+            self.video_view.viewport().repaint()
+            worker.acknowledge_presented_frame(frame_index)
 
     def _on_full_resolution_ready(
         self,
@@ -2154,7 +2178,8 @@ class PassageEvidencePane(QFrame):
     ) -> None:
         if self.sender() is not self._worker:
             return
-        if (int(frame_index) != self._current_frame_index or self._playing
+        if (not self._full_resolution_enabled
+                or int(frame_index) != self._current_frame_index or self._playing
                 or self._video_scrubbing or self._timeline_dragging):
             return
         self.video_view.set_frame(
@@ -2163,16 +2188,60 @@ class PassageEvidencePane(QFrame):
             source_height=self._source_height,
         )
         self._current_position_ms = int(position_ms)
+        self._update_frame_quality(image)
         self._render_marker()
         self._update_time_label(position_ms)
         self._update_frame_indicator(position_ms)
-        self.preview_frame_ready.emit(image, int(position_ms), int(frame_index))
+        # Camera 1 originals belong to the judging view. The overview and
+        # timeline keep their lightweight previews for spotting passages.
+        if self.source_kind != REGULAR_SOURCE or self.camera_index != 1:
+            self.preview_frame_ready.emit(image, int(position_ms), int(frame_index))
 
-    def _on_full_resolution_error(self, message: str) -> None:
+    def _on_full_resolution_error(self, message: str, frame_index=None) -> None:
         if self.sender() is not self._worker:
             return
+        if (not self._full_resolution_enabled or self._playing
+                or self._video_scrubbing or self._timeline_dragging
+                or (frame_index is not None and int(frame_index) != self._current_frame_index)):
+            return
         self._last_full_resolution_request = -1
+        self.quality_label.setText("原图读取失败，可点高清重试")
         self._set_status_label(self._availability_status(), str(message))
+
+    def _update_frame_quality(self, image) -> None:
+        original = (self._source_width > 0 and self._source_height > 0
+                    and image.width() >= self._source_width
+                    and image.height() >= self._source_height)
+        kind = "原图" if original else "预览"
+        self.quality_label.setText(f"{kind} {image.width()}×{image.height()}")
+
+    def set_full_resolution_enabled(self, enabled: bool) -> None:
+        """Only the judging popup needs original pixels in single-camera mode."""
+        if self._full_resolution_enabled == bool(enabled):
+            return
+        self._full_resolution_enabled = bool(enabled)
+        self._full_resolution_timer.stop()
+        self._last_full_resolution_request = -1
+        if enabled:
+            self._schedule_paused_frame_detail()
+        elif self.video_view.has_frame:
+            image = self.video_view._pixmap_item.pixmap().toImage()
+            if image.width() > 1280 or image.height() > 720:
+                image = image.scaled(1280, 720, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.video_view.set_frame(image, source_width=self._source_width,
+                                     source_height=self._source_height)
+            self._update_frame_quality(image)
+
+    def _on_detail_requested(self) -> None:
+        if not self._full_resolution_enabled or self._current_frame_index < 0:
+            return
+        if self.source_kind == REGULAR_SOURCE and self.camera_index == 1:
+            was_playing = self._playing
+            position_ms, frame_index = self._current_position_ms, self._current_frame_index
+            self.detail_requested.emit(self)
+            if was_playing:
+                self.seek_media_frame(position_ms, frame_index)
+        self._schedule_full_resolution_request()
 
     def _update_time_label(self, position_ms: int) -> None:
         event = self._event
@@ -2210,17 +2279,19 @@ class PassageEvidencePane(QFrame):
     def _request_full_resolution(self) -> None:
         worker = self._worker
         frame_index = self._current_frame_index
-        if (worker is None or frame_index < 0 or self._playing
+        if (not self._full_resolution_enabled or worker is None or frame_index < 0 or self._playing
                 or self._video_scrubbing or self._timeline_dragging):
             return
         if frame_index == self._last_full_resolution_request:
             return
         self._last_full_resolution_request = frame_index
+        self.quality_label.setText("原图读取中…")
         worker.request_full_resolution(frame_index)
 
     def _schedule_full_resolution_request(self) -> None:
         if (
-            self._worker is None
+            not self._full_resolution_enabled
+            or self._worker is None
             or self._current_frame_index < 0
             or self._playing
             or self._video_scrubbing
@@ -2510,6 +2581,7 @@ class PassageEvidencePane(QFrame):
         )
 
     def _set_transport_enabled(self, enabled: bool) -> None:
+        self.hd_btn.setEnabled(enabled and self.video_view.has_frame)
         self.previous_frame_btn.setEnabled(enabled)
         self.play_btn.setEnabled(enabled)
         self.next_frame_btn.setEnabled(enabled)
@@ -3479,6 +3551,7 @@ class PassageReviewSurface(QDialog):
             )
         )
         pane.play_requested.connect(lambda current=pane: self._toggle_pane(current))
+        pane.detail_requested.connect(self._on_pane_detail_requested)
         pane.passage_delta_requested.connect(
             lambda delta, current=pane: self._seek_pane_delta(
                 current, delta, preview=False
@@ -4771,9 +4844,9 @@ class PassageReviewSurface(QDialog):
             self._include_recorded_evidence,
             self._batch_mode,
             self._continuous_calibration_revision,
-            self.review_binding_store.revision
+            self.review_binding_store.active_bindings(event.event_id, event.revision)
             if self.review_binding_store is not None
-            else 0,
+            else (),
         )
         cached = self._lookup_cache.get(event.event_id)
         if cached is not None and cached[0] == key:
@@ -5097,7 +5170,10 @@ class PassageReviewSurface(QDialog):
         self,
         events: tuple[PassageEvent, ...],
         previous_event_id: str,
+        changed_event_ids: set[str] | None = None,
     ) -> None:
+        previous_ids = [event.event_id for event in self._visible_events]
+        scroll = self.table.verticalScrollBar().value()
         if self._batch_mode:
             self._visible_events = list(events)
         else:
@@ -5114,21 +5190,49 @@ class PassageReviewSurface(QDialog):
             ]
 
         self.table.blockSignals(True)
-        self.table.setRowCount(len(self._visible_events))
+        self.table.setUpdatesEnabled(False)
+        desired_ids = [event.event_id for event in self._visible_events]
+        order_changed = previous_ids != desired_ids
         selected_row = -1
-        for row, event in enumerate(self._visible_events):
-            lookup = self._lookups[event.event_id]
-            self._write_event_row(row, event, lookup)
-            if event.event_id == previous_event_id:
-                selected_row = row
+        try:
+            if changed_event_ids is None:
+                self.table.setRowCount(len(self._visible_events))
+                for row, event in enumerate(self._visible_events):
+                    self._write_event_row(row, event, self._lookups[event.event_id])
+            else:
+                desired = set(desired_ids)
+                for row in range(len(previous_ids) - 1, -1, -1):
+                    if previous_ids[row] not in desired:
+                        self.table.removeRow(row)
+                        previous_ids.pop(row)
+                for row, event in enumerate(self._visible_events):
+                    inserted = row >= len(previous_ids) or previous_ids[row] != event.event_id
+                    if inserted:
+                        if event.event_id in previous_ids:
+                            old_row = previous_ids.index(event.event_id)
+                            self.table.removeRow(old_row)
+                            previous_ids.pop(old_row)
+                        self.table.insertRow(row)
+                        previous_ids.insert(row, event.event_id)
+                    if inserted or event.event_id in changed_event_ids:
+                        self._write_event_row(row, event, self._lookups[event.event_id])
+                if order_changed:
+                    self._renumber_visible_rows()
+            if changed_event_ids is None or order_changed:
+                self._event_row_by_id = {event_id: row for row, event_id in enumerate(desired_ids)}
+            selected_row = self._event_row_by_id.get(previous_event_id, -1)
+        finally:
+            self.table.setUpdatesEnabled(True)
 
         if selected_row < 0 and self._visible_events:
             selected_row = 0
-        if selected_row >= 0:
+        if selected_row >= 0 and (changed_event_ids is None or order_changed
+                                  or self.table.currentRow() != selected_row):
             self.table.setCurrentCell(selected_row, 1)
             self.table.selectRow(selected_row)
         self.table.blockSignals(False)
         self.table.schedule_auto_fit()
+        self.table.verticalScrollBar().setValue(scroll)
 
         self._render_summary()
         if selected_row >= 0:
@@ -5140,10 +5244,11 @@ class PassageReviewSurface(QDialog):
                 and getattr(active_pane, "_current_frame_index", -1) >= 0
                 else None
             )
-            self._select_event(
-                selected_event_id,
-                preserve_current_frame=preserve_current_frame,
-            )
+            if (changed_event_ids is None or selected_event_id != self._selected_event_id
+                    or selected_event_id in changed_event_ids):
+                self._select_event(
+                    selected_event_id, preserve_current_frame=preserve_current_frame,
+                )
         else:
             self._clear_selection_details()
 
@@ -5583,6 +5688,8 @@ class PassageReviewSurface(QDialog):
             return
         if self._uses_popup_judging():
             self._set_continuous_results_table(False)
+            pane = self._camera_one_pane()
+            pane.set_full_resolution_enabled(pane is self._maximized_pane)
             self.evidence_splitter.hide()
             self.workspace_splitter.setMinimumHeight(180)
             self.workspace_splitter.setHandleWidth(0)
@@ -5766,7 +5873,7 @@ class PassageReviewSurface(QDialog):
             self.refresh()
             return
         self._total_event_count = len(events)
-        self._render_filtered_queue(events, self._selected_event_id)
+        self._render_filtered_queue(events, self._selected_event_id, set())
 
     def refresh(self) -> None:
         previous_event_id = self._selected_event_id
@@ -5818,171 +5925,102 @@ class PassageReviewSurface(QDialog):
         self._confirmed_event_ids.clear()
         self._event_review_statuses.clear()
         for event in events:
-            lookup = self._lookups[event.event_id]
-            regular = self._source_location_with_saved_association(
-                event.event_id,
-                lookup,
-                high_speed=False,
-            )
-            high_speed = self._source_location_with_saved_association(
-                event.event_id,
-                lookup,
-                high_speed=True,
-            )
-            regular_association = self._source_association(
-                event.event_id,
-                REGULAR_SOURCE,
-                regular,
-            )
-            high_speed_association = self._source_association(
-                event.event_id,
-                HIGH_SPEED_SOURCE,
-                high_speed,
-            )
-            readiness_status = review_status_text(lookup, regular, high_speed)
-            self._event_review_statuses[event.event_id] = self._confirmation_status(
-                regular_association,
-                high_speed_association,
-                readiness_status,
-            )
-            self._record_summary_state(
-                event.event_id,
-                regular,
-                high_speed,
-                readiness_status,
-                regular_association,
-                high_speed_association,
-            )
+            self._project_event_status(event)
 
         self._render_filtered_queue(events, previous_event_id)
         self._update_filmstrip()
         self._refresh_camera_judgments()
 
+    def _project_event_status(self, event: PassageEvent) -> None:
+        lookup = self._lookups[event.event_id]
+        regular = self._source_location_with_saved_association(
+            event.event_id,
+            lookup,
+            high_speed=False,
+        )
+        high_speed = self._source_location_with_saved_association(
+            event.event_id,
+            lookup,
+            high_speed=True,
+        )
+        regular_association = self._source_association(
+            event.event_id,
+            REGULAR_SOURCE,
+            regular,
+        )
+        high_speed_association = self._source_association(
+            event.event_id,
+            HIGH_SPEED_SOURCE,
+            high_speed,
+        )
+        readiness_status = review_status_text(lookup, regular, high_speed)
+        self._event_review_statuses[event.event_id] = self._confirmation_status(
+            regular_association,
+            high_speed_association,
+            readiness_status,
+        )
+        self._record_summary_state(
+            event.event_id,
+            regular,
+            high_speed,
+            readiness_status,
+            regular_association,
+            high_speed_association,
+        )
+
     def refresh_events(self, event_ids: Iterable[str]) -> None:
-        changed_event_ids = {str(event_id) for event_id in event_ids if event_id}
-        if not changed_event_ids:
+        changed = {str(event_id) for event_id in event_ids if event_id}
+        if not changed:
             return
-        if len(changed_event_ids) > 64:
+        metadata = self._current_metadata()
+        context = (metadata.race_id, metadata.stage_id) if metadata is not None else ("", "")
+        if context != self._metadata_context_key:
             self.refresh()
             return
         events = self._events_for_current_metadata(self.passage_store.events())
-        active_event_ids = {event.event_id for event in events}
-        if changed_event_ids - active_event_ids:
-            # Withdrawals also invalidate the selected frame, batch and judgment
-            # overlays. Reconcile them together, including non-selected groups.
-            self.refresh()
-            return
-        if self._update_group_combo(events):
-            self.refresh()
-            return
-        selected_group = str(self.group_combo.currentData() or "")
-        query = self.identity_search.text().strip()
-        if selected_group or query or self._active_review_filter != "all":
-            self.refresh()
-            return
+        by_id = {event.event_id: event for event in events}
         self._total_event_count = len(events)
+        self._update_group_combo(events)
         signature = self._timeline_cache_signature()
         if signature != self._timeline_signature:
             self._timeline_signature = signature
             self._lookup_cache = {
-                event_id: cached
-                for event_id, cached in self._lookup_cache.items()
+                event_id: cached for event_id, cached in self._lookup_cache.items()
                 if self._cache_survives_timeline_update(cached[1])
             }
-        for event_id in changed_event_ids:
+        for event_id in changed:
             self._lookup_cache.pop(event_id, None)
-
-        event_by_id = {event.event_id: event for event in events}
-        ordered_changed_events = [
-            event for event in events if event.event_id in changed_event_ids
-        ]
-        selected_event_changed = self._selected_event_id in changed_event_ids
-        selected_event_id = self._selected_event_id
-
-        self.table.blockSignals(True)
-        for event_id in changed_event_ids:
-            event = event_by_id.get(event_id)
-            row = next(
-                (
-                    index
-                    for index, visible_event in enumerate(self._visible_events)
-                    if visible_event.event_id == event_id
-                ),
-                -1,
-            )
-            should_show = event is not None and (
-                not selected_group or event.group_id == selected_group
-            )
-            if row >= 0 and not should_show:
-                self.table.removeRow(row)
-                self._visible_events.pop(row)
+            event = by_id.get(event_id)
+            if event is None:
                 self._lookups.pop(event_id, None)
+                self._event_review_statuses.pop(event_id, None)
                 self._discard_summary_state(event_id)
-
-        for event in ordered_changed_events:
-            if selected_group and event.group_id != selected_group:
-                continue
-            row = next(
-                (
-                    index
-                    for index, visible_event in enumerate(self._visible_events)
-                    if visible_event.event_id == event.event_id
-                ),
-                -1,
-            )
-            lookup = self._cached_lookup(event)
-            self._lookups[event.event_id] = lookup
-            if row < 0:
-                visible_order = [
-                    candidate.event_id
-                    for candidate in events
-                    if not selected_group or candidate.group_id == selected_group
-                ]
-                desired_row = visible_order.index(event.event_id)
-                row = min(desired_row, len(self._visible_events))
-                self._visible_events.insert(row, event)
-                self.table.insertRow(row)
             else:
-                self._visible_events[row] = event
-            self._write_event_row(row, event, lookup)
-
-        self._renumber_visible_rows()
-
-        selected_row = next(
-            (
-                index
-                for index, event in enumerate(self._visible_events)
-                if event.event_id == selected_event_id
-            ),
-            -1,
+                self._lookups[event_id] = self._cached_lookup(event)
+                self._project_event_status(event)
+        # Handle a first snapshot that also contains events whose UI notification
+        # was coalesced with this batch, without rebuilding existing table items.
+        for event in events:
+            if event.event_id not in self._lookups:
+                self._lookups[event.event_id] = self._cached_lookup(event)
+                self._project_event_status(event)
+                changed.add(event.event_id)
+        self._review_batches = build_review_batches(
+            events, review_gap_ms=self.REVIEW_BATCH_GAP_MS,
+            subwave_gap_ms=self.REVIEW_SUBWAVE_GAP_MS,
         )
-        if selected_row >= 0:
-            self.table.setCurrentCell(selected_row, 1)
-            self.table.selectRow(selected_row)
-        elif self._visible_events:
-            selected_row = 0
-            selected_event_id = self._visible_events[0].event_id
-            self.table.setCurrentCell(selected_row, 1)
-            self.table.selectRow(selected_row)
-            selected_event_changed = True
-        self.table.blockSignals(False)
-        self.table.schedule_auto_fit()
-
+        self._review_batch_by_event_id = {
+            event_id: batch for batch in self._review_batches for event_id in batch.event_ids
+        }
+        self._reconcile_video_discoveries(events)
+        if self._active_review_batch_id and not any(
+            batch.batch_id == self._active_review_batch_id for batch in self._review_batches
+        ):
+            self._batch_mode = False
+            self._active_review_batch_id = ""
+        self._render_filtered_queue(events, self._selected_event_id, changed)
         self._update_navigation_controls()
-        self._render_summary()
-        if selected_event_changed and selected_event_id:
-            active_pane = self._camera_one_pane()
-            preserve_current_frame = (
-                active_pane
-                if getattr(active_pane, "_current_frame_index", -1) >= 0
-                else None
-            )
-            self._select_event(
-                selected_event_id,
-                preserve_current_frame=preserve_current_frame,
-            )
-        elif not self._visible_events:
-            self._clear_selection_details()
+        self._refresh_camera_judgments()
 
     @staticmethod
     def _status_color(value: str) -> QColor:
@@ -6851,23 +6889,27 @@ class PassageReviewSurface(QDialog):
         if workspace_key != getattr(self, "_race_filmstrip_workspace_key", None):
             self.video_filmstrip.full_race.clear()
             self._race_filmstrip_workspace_key = workspace_key
-        live_locations = self._live_locations_for_filmstrip(pane)
-        # There can be a short interval between starting the recorder and the
-        # first playable HLS segment. Keep that interval visible as processing
-        # instead of presenting it as a permanent recording gap.
-        recorder_active_reader = getattr(self, "_recording_any_active", None)
-        recording_processing = bool(
-            callable(recorder_active_reader)
-            and hasattr(self, "_recorders")
-            and recorder_active_reader()
-        )
-        sources, pending = recording_sources(
-            self.timeline_store, pane.camera_index, race_id,
-            offset_for_location=self._continuous_offset_for_location,
-            live_locations=live_locations,
-        )
-        if recording_processing and not live_locations:
-            pending = max(1, pending)
+        provider = getattr(self, "_recording_sources_for_filmstrip", None)
+        if provider is not None:
+            sources, pending = provider(pane, race_id)
+        else:
+            live_locations = self._live_locations_for_filmstrip(pane)
+            # There can be a short interval between starting the recorder and the
+            # first playable HLS segment. Keep that interval visible as processing
+            # instead of presenting it as a permanent recording gap.
+            recorder_active_reader = getattr(self, "_recording_any_active", None)
+            recording_processing = bool(
+                callable(recorder_active_reader)
+                and hasattr(self, "_recorders")
+                and recorder_active_reader()
+            )
+            sources, pending = recording_sources(
+                self.timeline_store, pane.camera_index, race_id,
+                offset_for_location=self._continuous_offset_for_location,
+                live_locations=live_locations,
+            )
+            if recording_processing and not live_locations:
+                pending = max(1, pending)
         panel = self.video_filmstrip.full_race
         panel.set_check_context(self.timeline_store.journal_path.parent / "filmstrip_checks.jsonl",
                                 race_id, pane.camera_index)
@@ -8125,7 +8167,7 @@ class PassageReviewSurface(QDialog):
         if self._batch_mode and batch is not None:
             self._update_batch_roster_overlays(batch)
         if self._active_review_filter != "all":
-            self.refresh()
+            self._refresh_filtered_view()
             return
         self._render_summary()
 
@@ -8487,7 +8529,12 @@ class PassageReviewSurface(QDialog):
     def _toggle_active_pane(self) -> None:
         self._toggle_pane(self._active_playback_pane())
 
+    def _on_pane_detail_requested(self, pane: PassageEvidencePane) -> None:
+        self._mark_filmstrip_operator_busy()
+        self._activate_pane(pane, align=False)
+
     def _toggle_pane(self, pane: PassageEvidencePane) -> None:
+        self._mark_filmstrip_operator_busy()
         was_sync_playing = self._sync_playing
         if was_sync_playing:
             self._set_sync_playing(False, seek_final=False)
@@ -8508,6 +8555,7 @@ class PassageReviewSurface(QDialog):
         pane: PassageEvidencePane,
         frame_delta: int,
     ) -> None:
+        self._mark_filmstrip_operator_busy()
         if abs(int(frame_delta)) == CTRL_FRAME_STEP:
             direction = 1 if int(frame_delta) > 0 else -1
             if self._navigate_video_candidate(direction, pane):
@@ -8827,6 +8875,7 @@ class PassageReviewSurface(QDialog):
         *,
         preview: bool,
     ) -> None:
+        self._mark_filmstrip_operator_busy()
         self._activate_pane(pane, align=False)
         # Preview clips from camera 1/2 are one temporary evidence window. A
         # scrub or seek on either preview pane must move both cameras together;
@@ -9092,6 +9141,9 @@ class PassageReviewSurface(QDialog):
         pane_index = self.evidence_splitter.indexOf(pane)
         if pane_index < 0:
             return
+        if self._uses_popup_judging():
+            pane.set_playing(False)
+            pane.set_full_resolution_enabled(True)
         window = QDialog(
             self,
             Qt.Window
@@ -9365,6 +9417,7 @@ class PassageReviewSurface(QDialog):
         QTimer.singleShot(0, self._distribute_evidence_panes)
         if self._uses_popup_judging():
             self.evidence_splitter.hide()
+            pane.set_full_resolution_enabled(False)
             pane.set_playing(False)
             if return_state is not None:
                 self.review_content_splitter.setSizes(return_state[0])

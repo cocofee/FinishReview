@@ -32,6 +32,52 @@ def source(path, start=10000, duration=10000, *, priority=0, available=True, cam
     return FilmstripSource(location, start, start + duration, available, priority)
 
 
+def test_new_recording_scope_hides_history_but_allows_explicit_browsing(qapp, tmp_path, manual_worker):
+    old = source(tmp_path / "yesterday.mkv", 10000, 1000, available=False)
+    live = source(tmp_path / "current.ts", 100000, 2000)
+    panel = RaceFilmstripPanel()
+    try:
+        panel.set_sources((old,), pending=1)
+        panel.open_time(10000)
+        panel.set_recording_start(99000)
+        assert not panel.index.sources
+        assert panel._pending is None
+        assert "本次录像尚无可用画面" in panel.status_label.text()
+        assert "已归档部分仍可判读" not in panel.status_label.text()
+        panel.set_sources((old, live))
+        assert panel.index.sources == (live,)
+        assert panel.index.start_ms == live.start_ms
+        panel.scope_combo.setCurrentIndex(panel.scope_combo.findData("all"))
+        assert panel.index.sources == (old, live)
+        panel.scope_combo.setCurrentIndex(panel.scope_combo.findData("current"))
+        assert panel.index.sources == (live,)
+        # A later recording and a workspace change both reset the view scope.
+        panel.set_recording_start(103000)
+        assert not panel.index.sources
+        panel.set_recording_start(None)
+        assert panel.scope_combo.isHidden()
+        assert panel.index.sources == (old, live)
+    finally:
+        panel.close()
+
+
+def test_recording_scope_survives_archive_handover_and_clear(qapp, tmp_path, manual_worker):
+    live = source(tmp_path / "live.ts", 100000, 2000, priority=2)
+    archive = source(tmp_path / "archive.mkv", 100000, 5000)
+    panel = RaceFilmstripPanel()
+    try:
+        panel.set_recording_start(99000)
+        panel.set_sources((live,))
+        panel.browse_to(100500)
+        panel.set_sources((live, archive))
+        assert panel.index.span_at(100500).source == archive
+        panel.clear()
+        panel.set_sources((source(tmp_path / "old", 10000, 1000), archive))
+        assert panel.index.sources == (archive,)
+    finally:
+        panel.close()
+
+
 def test_recording_index_prefers_archive_and_preserves_missing_time(tmp_path):
     archive = source(tmp_path / "archive.mkv", 10000, 10000)
     overlap = source(tmp_path / "clip.m3u8", 14000, 14000, priority=2)
@@ -193,7 +239,7 @@ def test_unavailable_source_with_same_identity_cancels_pending_click(qapp, tmp_p
         panel.close()
 
 
-def test_calibration_changes_labels_without_moving_or_redecoding_original(qapp, tmp_path, manual_worker):
+def test_calibration_keeps_recording_labels_and_original_frame(qapp, tmp_path, manual_worker):
     recording = source(tmp_path / "first", duration=60000)
     panel = RaceFilmstripPanel()
     panel.resize(1200, 450)
@@ -207,11 +253,32 @@ def test_calibration_changes_labels_without_moving_or_redecoding_original(qapp, 
     scroll = panel.canvas.horizontalScrollBar().value()
     calibrated = replace(recording, location=replace(recording.location, clock_offset_ms=2000))
     panel.set_sources((calibrated,))
-    assert panel.display_time(12200, frame.source) == "08:00:10.200"
+    assert panel.display_time(12200, frame.source) == "08:00:12.200"
+    assert panel.judgment_time(12200, frame.source) == "08:00:10.200"
     assert panel.cache[frame.key] is frame
     assert panel.current_time == 12200
     assert panel.canvas.horizontalScrollBar().value() == scroll
     panel.close()
+
+
+def test_old_chip_calibration_does_not_backdate_current_recording(qapp, tmp_path, manual_worker):
+    from datetime import datetime
+
+    start = int(datetime(2026, 9, 18, 17, 38, 6, tzinfo=filmstrip.BEIJING).timestamp() * 1000)
+    timestamp = int(datetime(2026, 9, 18, 17, 44, 28, 387000, tzinfo=filmstrip.BEIJING).timestamp() * 1000)
+    recording = source(tmp_path / "current.ts", start=start, duration=7 * 60000)
+    calibrated = replace(recording, location=replace(recording.location, clock_offset_ms=432996329))
+    panel = RaceFilmstripPanel()
+    try:
+        panel.set_recording_start(start)
+        panel.set_sources((calibrated,))
+        assert panel.index.sources == (calibrated,)
+        assert panel.display_time(timestamp) == "17:44:28.387"
+        assert panel.judgment_time(timestamp) == "17:27:52.058"
+        assert "录像时间（北京时间）" in panel.range_label.toolTip()
+        assert "校时后判读时间" in panel.range_label.toolTip()
+    finally:
+        panel.close()
 
 
 def test_judgment_ruler_keeps_exact_times_and_dense_records_clickable(qapp, tmp_path, manual_worker):
@@ -325,7 +392,8 @@ def manual_worker(monkeypatch):
             self.stopped = False
             self.instances.append(self)
 
-        def start(self):
+        def start(self, priority=None):
+            self.priority = priority
             pass
 
         def request_stop(self):
@@ -341,6 +409,21 @@ def result(recording, timestamp):
     image.fill(0)
     position = timestamp - recording.start_ms
     return RaceFilmstripFrame(recording, timestamp, position, position // 50, image)
+
+
+def test_operator_busy_defers_thumbnails_but_allows_explicit_click(qapp, tmp_path, manual_worker):
+    recording = source(tmp_path / "video", duration=60000)
+    panel = RaceFilmstripPanel()
+    panel.show()
+    panel.set_operator_busy(True)
+    panel.set_sources((recording,))
+    panel._load_visible()
+    assert panel._worker is None
+    panel.open_time(10500)
+    panel._load_visible()
+    assert panel._worker is not None
+    assert panel._worker.jobs == ((recording, 10500),)
+    panel.close()
 
 
 def wheel(panel, *, angle=0, pixels=0):

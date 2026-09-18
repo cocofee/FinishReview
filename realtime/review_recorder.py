@@ -937,6 +937,7 @@ class ReviewRingBuffer:
         )
         self._lock = threading.RLock()
         self._segments: dict[str, ReviewSegment] = {}
+        self._status_segments: tuple[ReviewSegment, ...] = ()
         self._playlist_segment_ids: set[str] = set()
         self._segment_revision = 0
         self._pins_by_event: dict[str, set[str]] = {}
@@ -1165,10 +1166,25 @@ class ReviewRingBuffer:
         with self._lock:
             return self._scan_unlocked()
 
+    def _read_playlist(self) -> list[str]:
+        # FFmpeg atomically replaces the live playlist. Windows can briefly
+        # deny an open during that handover; retry only this read, before any
+        # index/pin state changes. Persistent access errors must still reach
+        # the caller so evidence cleanup is not mistaken for a healthy scan.
+        delays = (0.01, 0.02)
+        for attempt in range(len(delays) + 1):
+            try:
+                return self.playlist_path.read_text(encoding="utf-8").splitlines()
+            except PermissionError:
+                if attempt == len(delays):
+                    raise
+                time.sleep(delays[attempt])
+        raise AssertionError("unreachable playlist retry")
+
     def _scan_unlocked(self) -> tuple[ReviewSegment, ...]:
         """Load completed segments currently published by the HLS playlist."""
         try:
-            lines = self.playlist_path.read_text(encoding="utf-8").splitlines()
+            lines = self._read_playlist()
         except FileNotFoundError:
             return ()
         discovered = []
@@ -1249,6 +1265,7 @@ class ReviewRingBuffer:
             duration_ms = None
             current_start_ms = None
         self._playlist_segment_ids = playlist_segment_ids
+        self._status_segments = self.segments()
         return tuple(discovered)
 
     def filmstrip_segments(self) -> tuple[ReviewSegment, ...]:
@@ -1410,6 +1427,16 @@ class ReviewRingBuffer:
                     key=lambda item: (item.started_at_ms, item.segment_id),
                 )
             )
+
+    def status_segments(self) -> tuple[ReviewSegment, ...]:
+        """UI diagnostics must not wait behind a filesystem operation."""
+        if not self._lock.acquire(blocking=False):
+            return self._status_segments
+        try:
+            self._status_segments = self.segments()
+            return self._status_segments
+        finally:
+            self._lock.release()
 
     def acquire_scan_leases(self, segments: Iterable[ReviewSegment]) -> bool:
         """Reserve current segments against cleanup for one scanner operation."""

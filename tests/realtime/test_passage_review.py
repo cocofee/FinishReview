@@ -64,6 +64,7 @@ class _FakePlaybackWorker(QObject):
     metadata_ready = pyqtSignal(int, float, int, int, int)
     frame_ready = pyqtSignal(object, int, int)
     full_resolution_ready = pyqtSignal(object, int, int)
+    full_resolution_error = pyqtSignal(str, int)
     playback_finished = pyqtSignal()
     step_boundary_reached = pyqtSignal(int)
     playback_error = pyqtSignal(str)
@@ -491,10 +492,10 @@ def test_camera_judgment_restores_calibrated_time_and_keeps_missing_evidence_rec
 
 
 @pytest.mark.parametrize("offset, calibrated", [(2000, None), (-1300, None), (2000, 1000)])
-def test_filmstrip_and_saved_judgment_share_calibrated_frame_time(
+def test_filmstrip_recording_time_and_saved_judgment_keep_distinct_clocks(
     qapp, tmp_path, fake_playback, monkeypatch, offset, calibrated,
 ):
-    from realtime.race_filmstrip import RaceFilmstripFrame, RaceFilmstripPanel
+    from realtime.race_filmstrip import RaceFilmstripFrame, RaceFilmstripPanel, format_time
 
     monkeypatch.setattr(RaceFilmstripPanel, "_load_visible", lambda self: None)
     passages = PassageEventStore(tmp_path / "passages.jsonl")
@@ -527,7 +528,8 @@ def test_filmstrip_and_saved_judgment_share_calibrated_frame_time(
     dialog._maximize_filmstrip_camera(frame)
     pane._worker.frame_ready.emit(image, position, frame.frame_index)
     assert pane.location.clock_offset_ms == effective
-    assert panel.display_time(frame.recorder_time_ms) == "08:00:15.000"
+    assert panel.display_time(frame.recorder_time_ms) == format_time(15000 + effective)
+    assert panel.judgment_time(frame.recorder_time_ms) == "08:00:15.000"
     assert "08:00:15.000" in pane.frame_indicator_label.text()
     seeks = list(pane._worker.seek_calls)
     for identity in ("later", "earlier", "passage-1"):
@@ -540,7 +542,7 @@ def test_filmstrip_and_saved_judgment_share_calibrated_frame_time(
     assert dialog._confirm_pending_marker(pane)
     record = dialog.video_filmstrip.judgment_track._records[0]
     assert "已确认" in dialog.current_context_label.text()
-    assert record.time_label == panel.display_time(frame.recorder_time_ms)
+    assert record.time_label == panel.judgment_time(frame.recorder_time_ms)
     saved = dialog.association_store.associations()
     dialog._restore_maximized_pane()
     panel.browse_to(50000)
@@ -4015,6 +4017,61 @@ def test_review_rejects_external_clip_from_another_race(qapp, tmp_path):
     dialog.close()
 
 
+@pytest.mark.parametrize("action", ["play", "step", "seek"])
+def test_single_video_controls_suspend_filmstrip_until_idle(qapp, tmp_path, fake_playback, action):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "videos" / "camera.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10_000, ended_at_ms=30_000)
+    dialog = PassageReviewDialog(passages, timeline, low_resource_mode=True,
+                                 regular_camera_indexes=(1,), show_high_speed_pane=False)
+    dialog.show()
+    qapp.processEvents()
+    try:
+        pane = dialog.regular_pane
+        filmstrip = dialog.video_filmstrip.full_race
+        dialog.video_filmstrip.set_operator_busy(False)
+        if action == "play":
+            pane.play_requested.emit()
+        elif action == "step":
+            pane.step_requested.emit(-1)
+        else:
+            pane.passage_delta_requested.emit(500)
+        assert filmstrip._operator_busy
+        if action == "play":
+            assert pane.is_playing
+            dialog._on_filmstrip_operator_idle()
+            assert filmstrip._operator_busy
+            pane.play_requested.emit()
+        dialog._on_filmstrip_operator_idle()
+        assert not filmstrip._operator_busy
+    finally:
+        dialog.close()
+
+
+def test_single_video_enables_reverse_lookahead_without_idle_prefetch(qapp, tmp_path, monkeypatch):
+    class ConfiguredWorker(_FakePlaybackWorker):
+        def __init__(self, path, parent=None, *, reverse_prefetch=True, idle_prefetch=True):
+            super().__init__(path, parent, idle_prefetch=idle_prefetch)
+            self.reverse_prefetch = reverse_prefetch
+
+    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", ConfiguredWorker)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "videos" / "camera.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10_000, ended_at_ms=30_000)
+    dialog = PassageReviewDialog(passages, timeline, low_resource_mode=True,
+                                 regular_camera_indexes=(1,), show_high_speed_pane=False)
+    try:
+        worker = dialog.regular_pane._worker
+        assert worker.reverse_prefetch
+        assert not any(worker.idle_prefetch_calls)
+    finally:
+        dialog.close()
+
+
 def test_frame_step_controls_only_focused_pane_at_its_native_frame_rate(
     qapp,
     tmp_path,
@@ -4341,6 +4398,7 @@ def test_zoom_requests_full_resolution_without_replacing_the_worker(
     )
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
+    dialog._toggle_maximized_pane(dialog.regular_pane)
     worker = fake_playback.instances[0]
     preview = QImage(1280, 720, QImage.Format_RGB888)
     preview.fill(0)
@@ -4381,6 +4439,7 @@ def test_full_resolution_request_waits_for_the_latest_paused_frame(
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
     pane = dialog.regular_pane
+    dialog._toggle_maximized_pane(pane)
     worker = fake_playback.instances[0]
     preview = QImage(1280, 720, QImage.Format_RGB888)
     preview.fill(0)
@@ -4414,6 +4473,7 @@ def test_paused_fitted_video_restores_original_and_rejects_stale_detail(
     try:
         qapp.processEvents()
         pane = dialog.regular_pane
+        dialog._toggle_maximized_pane(pane)
         worker = fake_playback.instances[0]
         preview = QImage(1280, 720, QImage.Format_RGB888)
         preview.fill(Qt.red)
@@ -4448,6 +4508,75 @@ def test_paused_fitted_video_restores_original_and_rejects_stale_detail(
         pane.set_playing(True)
         worker.full_resolution_ready.emit(original, 5040, 252)
         assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("action", ["button", "zoom", "actual_size"])
+def test_camera_one_originals_only_load_in_judging_and_can_retry(
+    qapp, tmp_path, fake_playback, monkeypatch, action,
+):
+    from realtime.race_filmstrip import RaceFilmstripPanel
+
+    monkeypatch.setattr(RaceFilmstripPanel, "_load_visible", lambda self: None)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(passage_time_ms=15000))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10000, ended_at_ms=20000)
+    dialog = PassageReviewDialog(passages, timeline)
+    try:
+        qapp.processEvents()
+        pane = dialog.regular_pane
+        worker = pane._worker
+        preview = QImage(1280, 720, QImage.Format_RGB888)
+        preview.fill(Qt.red)
+        original = QImage(2560, 1440, QImage.Format_RGB888)
+        original.fill(Qt.green)
+        worker.frame_ready.emit(preview, 5000, 250)
+        QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 50)
+        assert worker.full_resolution_calls == []
+        dialog._toggle_maximized_pane(pane)
+        assert _wait_until(lambda: worker.full_resolution_calls == [250])
+        worker.full_resolution_ready.emit(original, 5000, 250)
+        assert pane.video_view._pixmap_item.pixmap().size() == original.size()
+        assert pane.quality_label.text() == "原图 2560×1440"
+        assert dialog.preview_video_view._pixmap_item.pixmap().size() == preview.size()
+
+        pane.set_playing(True)
+        worker.frame_ready.emit(preview, 5040, 252)
+        before = worker.pause_calls
+        if action == "button":
+            pane.hd_btn.click()
+        elif action == "zoom":
+            pane.video_view.zoom_by(1.2)
+        else:
+            pane.video_view.set_actual_size()
+        assert not pane.is_playing
+        assert worker.pause_calls > before
+        assert worker.seek_calls[-1] == 5040
+        worker.frame_ready.emit(preview, 5040, 252)
+        pane._on_marker_position_selected(0.4, 0.6)
+        transform = pane.video_view.transform()
+        marker = pane.video_view._marker
+        assert _wait_until(lambda: worker.full_resolution_calls == [250, 252])
+        worker.full_resolution_error.emit("cannot read original", 252)
+        assert "读取失败" in pane.quality_label.text()
+        assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+        pane.hd_btn.click()
+        assert _wait_until(lambda: worker.full_resolution_calls == [250, 252, 252])
+        worker.full_resolution_ready.emit(original, 5040, 252)
+        assert pane.video_view.transform() == transform
+        assert pane.video_view._marker == marker
+        assert (pane._current_frame_index, pane._current_position_ms) == (252, 5040)
+        assert dialog.preview_video_view._pixmap_item.pixmap().size() == preview.size()
+
+        dialog._restore_maximized_pane()
+        worker.full_resolution_ready.emit(original, 5040, 252)
+        assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+        worker.frame_ready.emit(preview, 5080, 254)
+        QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 50)
+        assert worker.full_resolution_calls == [250, 252, 252]
     finally:
         dialog.close()
 
@@ -5012,6 +5141,7 @@ def test_video_scrub_defers_full_resolution_until_exact_frame(
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
     pane = dialog.regular_pane
+    dialog._toggle_maximized_pane(pane)
     worker = fake_playback.instances[0]
     frame = QImage(1280, 720, QImage.Format_RGB888)
     frame.fill(0)
@@ -5794,25 +5924,43 @@ def test_more_menu_preserves_frame_step_and_disabled_actions(qapp, tmp_path, fak
         dialog.close()
 
 
-def test_large_incremental_batch_falls_back_to_one_full_refresh(
-    qapp,
-    tmp_path,
-    monkeypatch,
-):
-    dialog = PassageReviewDialog(
-        PassageEventStore(tmp_path / "passages.jsonl"),
-        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
-    )
-    refresh_calls = 0
+def test_large_incremental_batch_preserves_unchanged_rows(qapp, tmp_path, monkeypatch):
+    store = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(event_id="first", passage_time_ms=10000)
+    store.append(first)
+    dialog = PassageReviewDialog(store, VideoTimelineStore(tmp_path / "timeline.jsonl"))
+    item = dialog.table.item(0, 1)
+    monkeypatch.setattr(dialog, "refresh", lambda: pytest.fail("unexpected full refresh"))
+    for index in range(65):
+        store.append(_event(event_id=f"new-{index}", passage_time_ms=20000 + index))
+    dialog.refresh_events(f"new-{index}" for index in range(65))
+    assert dialog.table.rowCount() == 66
+    assert dialog.table.item(0, 1) is item
+    assert dialog._selected_event_id == first.event_id
+    dialog.close()
 
-    def counted_refresh():
-        nonlocal refresh_calls
-        refresh_calls += 1
 
-    monkeypatch.setattr(dialog, "refresh", counted_refresh)
-    dialog.refresh_events(f"passage-{index}" for index in range(65))
-
-    assert refresh_calls == 1
+@pytest.mark.parametrize("filter_kind", ["group", "search"])
+def test_filtered_incremental_changes_preserve_unrelated_items(qapp, tmp_path, monkeypatch, filter_kind):
+    store = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(event_id="first", bib="151", passage_time_ms=10000)
+    second = _event(event_id="second", bib="152", passage_time_ms=11000)
+    store.append(first)
+    store.append(second)
+    dialog = PassageReviewDialog(store, VideoTimelineStore(tmp_path / "timeline.jsonl"))
+    if filter_kind == "group":
+        dialog.group_combo.setCurrentIndex(dialog.group_combo.findData(first.group_id))
+    else:
+        dialog.identity_search.setText("15")
+        dialog._search_refresh_timer.stop()
+        dialog._refresh_filtered_view()
+    item = dialog.table.item(0, 1)
+    monkeypatch.setattr(dialog, "refresh", lambda: pytest.fail("unexpected full refresh"))
+    store.append(replace(second, revision=2, is_active=False))
+    dialog.refresh_events((second.event_id,))
+    assert dialog.table.rowCount() == 1
+    assert dialog.table.item(0, 1) is item
+    assert dialog._selected_event_id == first.event_id
     dialog.close()
 
 

@@ -473,6 +473,101 @@ def test_ring_buffer_indexes_only_completed_playlist_segments(tmp_path):
     assert buffer.scan() == ()
 
 
+@pytest.mark.parametrize("failures", [1, 2, 3])
+def test_playlist_access_retry_preserves_index_and_pins(tmp_path, monkeypatch, failures):
+    first = ("first.ts", "2026-08-21T12:00:00.000+00:00", 2.0)
+    second = ("second.ts", "2026-08-21T12:00:02.000+00:00", 2.0)
+    playlist = _write_playlist(tmp_path, [first])
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    initial = buffer.scan()
+    buffer.pin_window("rider", started_at_ms=initial[0].started_at_ms,
+                      ended_at_ms=initial[0].ended_at_ms, scan=False)
+    pins_before = buffer.pin_journal_path.read_bytes()
+    _write_playlist(tmp_path, [first, second])
+    read_text = Path.read_text
+    attempts = []
+    waits = []
+
+    def locked_read(path, *args, **kwargs):
+        if path == playlist:
+            attempts.append(path)
+            if len(attempts) <= failures:
+                raise PermissionError(13, "playlist temporarily locked", str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", locked_read)
+    monkeypatch.setattr(review_recorder.time, "sleep", waits.append)
+    if failures == 3:
+        with pytest.raises(PermissionError):
+            buffer.scan()
+        assert buffer.filmstrip_segments() == initial
+        assert buffer.segments() == initial
+        assert len(attempts) == 3
+        monkeypatch.setattr(Path, "read_text", read_text)
+        discovered = buffer.scan()
+    else:
+        discovered = buffer.scan()
+        assert len(attempts) == failures + 1
+    assert len(waits) == min(failures, 2)
+    assert sum(waits) <= 0.03
+    assert [segment.segment_id for segment in discovered] == ["second.ts"]
+    assert [segment.segment_id for segment in buffer.filmstrip_segments()] == ["first.ts", "second.ts"]
+    assert buffer.pinned_event_ids("first.ts") == frozenset({"rider"})
+    assert buffer.pin_journal_path.read_bytes() == pins_before
+    assert buffer.scan() == ()
+
+
+def test_playlist_read_does_not_retry_unrelated_io_failure(tmp_path, monkeypatch):
+    playlist = _write_playlist(tmp_path, [])
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    waits = []
+
+    def fail(*args, **kwargs):
+        raise OSError(5, "disk failure")
+
+    monkeypatch.setattr(Path, "read_text", fail)
+    monkeypatch.setattr(review_recorder.time, "sleep", waits.append)
+    with pytest.raises(OSError, match="disk failure"):
+        buffer.scan()
+    assert waits == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing semantics")
+def test_playlist_recovers_after_real_windows_file_lock(tmp_path, monkeypatch):
+    import ctypes
+    from ctypes import wintypes
+
+    playlist = _write_playlist(tmp_path, [
+        ("first.ts", "2026-08-21T12:00:00.000+00:00", 2.0),
+    ])
+    buffer = ReviewRingBuffer(playlist, camera_index=1)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(str(playlist), 0x80000000, 0, None, 3, 0x80, None)
+    assert handle != ctypes.c_void_p(-1).value, ctypes.WinError(ctypes.get_last_error())
+    waits = []
+
+    def unlock(delay):
+        nonlocal handle
+        waits.append(delay)
+        assert kernel.CloseHandle(handle)
+        handle = None
+
+    monkeypatch.setattr(review_recorder.time, "sleep", unlock)
+    try:
+        discovered = buffer.scan()
+        assert len(waits) == 1
+        assert [segment.segment_id for segment in discovered] == ["first.ts"]
+    finally:
+        if handle is not None:
+            kernel.CloseHandle(handle)
+
+
 def test_passages_share_segments_and_cleanup_preserves_pins(tmp_path):
     playlist = _write_playlist(
         tmp_path,

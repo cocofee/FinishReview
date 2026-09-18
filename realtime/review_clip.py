@@ -95,6 +95,9 @@ class PassageReviewBindingStore:
         self.journal_path = Path(journal_path).expanduser().absolute()
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # Serialize durable writes without holding the UI's read lock during
+        # fsync. Readers see the last committed state until the merge completes.
+        self._write_lock = threading.RLock()
         self._clips: dict[str, ReviewClip] = {}
         self._clip_ids_by_signature: dict[tuple[str, int, str, str], str] = {}
         self._bindings: dict[tuple[str, int, int], PassageReviewBinding] = {}
@@ -313,7 +316,7 @@ class PassageReviewBindingStore:
         timeline_segment_id: str,
     ) -> ReviewClip:
         key = self._clip_key(race_id, camera_index, source_id, segment_signature)
-        with self._lock:
+        with self._write_lock:
             existing_id = self._clip_ids_by_signature.get(key)
             if existing_id is not None:
                 return self._clips[existing_id]
@@ -343,7 +346,8 @@ class PassageReviewBindingStore:
                 "state": clip.state,
             }
             self._append_record(payload)
-            self._merge_record(payload)
+            with self._lock:
+                self._merge_record(payload)
             return clip
 
     def bind(
@@ -379,7 +383,7 @@ class PassageReviewBindingStore:
         }
         if len(requested_by_key) != len(bindings):
             raise ReviewClipError("duplicate binding in one batch")
-        with self._lock:
+        with self._write_lock:
             payloads = []
             for key, requested in requested_by_key.items():
                 existing = self._bindings.get(key)
@@ -404,8 +408,9 @@ class PassageReviewBindingStore:
                     }
                 )
             self._append_records(tuple(payloads))
-            for payload in payloads:
-                self._merge_record(payload)
+            with self._lock:
+                for payload in payloads:
+                    self._merge_record(payload)
             return tuple(
                 self._bindings[key]
                 for key in requested_by_key
@@ -465,7 +470,7 @@ class PassageReviewBindingStore:
         revision = int(revision)
         if not event_id or revision <= 0:
             return
-        with self._lock:
+        with self._write_lock:
             camera_indexes = self._active_camera_indexes_by_event.get(event_id, ())
             if not any(
                 self._active_bindings[(event_id, camera_index)].revision <= revision
@@ -479,7 +484,8 @@ class PassageReviewBindingStore:
                 "revision": revision,
             }
             self._append_record(payload)
-            self._merge_record(payload)
+            with self._lock:
+                self._merge_record(payload)
 
 
 __all__ = [

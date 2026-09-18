@@ -6,6 +6,8 @@ from typing import ClassVar
 import pytest
 
 from realtime.recording_controller import (
+    PendingRecordingPassage,
+    RecordingRecoveryState,
     RecordingSessionController,
     start_recording_pipeline,
 )
@@ -128,6 +130,95 @@ def _start_session(controller, tmp_path, **overrides):
     }
     values.update(overrides)
     return controller.start(**values)
+
+
+def _restart(controller, tmp_path, **overrides):
+    values = dict(camera_index=1, source="rtsp://replacement/live", output_dir=tmp_path,
+                  ffmpeg_path=None, review_retention_seconds=360,
+                  timeline_store=object(), timing_error_ms=125)
+    values.update(overrides)
+    return controller.restart_camera(**values)
+
+
+def test_restart_restores_pending_passage_revision(tmp_path):
+    registered = []
+
+    class Coordinator(_FakeCoordinator):
+        def register(self, event_id, **kwargs):
+            registered.append((event_id, kwargs))
+            return "restored-window"
+
+    controller = _controller(coordinator_factory=Coordinator)
+    first, = _start_session(controller, tmp_path)
+    replacement, windows = _restart(controller, tmp_path, pending_passages=(
+        PendingRecordingPassage("event-1", 1234, 3, "race-1"),
+    ))
+    assert first.recorder.stop_calls == 1 and not first.recorder.is_running
+    assert controller.recorders[1] is replacement.recorder
+    assert windows == {"event-1": "restored-window"}
+    assert registered == [("event-1", dict(passage_timestamp_ms=1234, scan=False,
+                                          revision=3, race_id="race-1"))]
+    controller.stop()
+
+
+def test_restart_refuses_replacement_until_old_process_is_stopped(tmp_path):
+    class Recorder(_FakeRecorder):
+        def stop(self):
+            if self.stop_calls == 0:
+                self.stop_calls += 1
+                raise OSError("still running")
+            super().stop()
+
+    controller = _controller(recorder_factory=Recorder)
+    original, = _start_session(controller, tmp_path)
+    with pytest.raises(OSError, match="still running"):
+        _restart(controller, tmp_path)
+    assert len(Recorder.instances) == 1
+    assert controller.recorders[1] is original.recorder
+    controller.stop()
+
+
+@pytest.mark.parametrize("fail_registration", [False, True])
+def test_restart_retains_replacement_when_rollback_cannot_stop_it(tmp_path, fail_registration):
+    class Recorder(_FakeRecorder):
+        def start(self):
+            result = super().start()
+            if self.source == "rtsp://replacement/live" and not fail_registration:
+                raise RuntimeError("replacement failed")
+            return result
+
+        def stop(self):
+            if self.source == "rtsp://replacement/live" and self.stop_calls == 0:
+                self.stop_calls += 1
+                raise OSError("cannot stop replacement")
+            super().stop()
+
+    class Coordinator(_FakeCoordinator):
+        def register(self, *_args, **_kwargs):
+            raise RuntimeError("replacement failed")
+
+    controller = _controller(recorder_factory=Recorder, coordinator_factory=Coordinator)
+    original, = _start_session(controller, tmp_path)
+    with pytest.raises(RuntimeError, match="replacement failed"):
+        _restart(controller, tmp_path, pending_passages=(PendingRecordingPassage("e", 1, 2, "r"),))
+    assert controller.recorders[1] is Recorder.instances[-1]
+    assert controller.recorders[1].is_running
+    assert controller.pipelines[1] is original
+    assert not original.recorder.is_running
+    assert controller.stop() == ()
+    assert not controller.recorders
+
+
+def test_recovery_backoff_caps_and_success_resets_only_one_camera():
+    state = RecordingRecoveryState()
+    assert [state.failed(1, now=100)[1] for _ in range(7)] == [2, 4, 8, 16, 30, 30, 30]
+    assert not state.can_retry(1, now=129)
+    assert state.can_retry(1, now=130)
+    state.pause_auth(2, "two", "401")
+    state.succeeded(1)
+    assert state.can_retry(1, now=100)
+    assert not state.can_retry(2, now=1e10)
+    assert state.errors == {2: "401"}
 
 
 def test_start_recording_pipeline_builds_connected_components(tmp_path):

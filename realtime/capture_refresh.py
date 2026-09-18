@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections import deque
+from concurrent.futures import Future
 import logging
+import shutil
 from pathlib import Path
 import threading
 import time
 from typing import Callable
 
 from .runtime_metrics import RuntimeMetrics
+from .evidence_pipeline import EvidenceRefreshJob, EvidenceSnapshot
+from .recording_catalog import RecordingCatalogJob, RecordingCatalogSnapshot
 
 
 logger = logging.getLogger("FinishReview.CaptureRefresh")
@@ -32,6 +37,9 @@ class CaptureRefreshRequest:
     scan: bool = True
     apply_state: bool = True
     cleanup_after_apply: bool = False
+    evidence_job: EvidenceRefreshJob | None = None
+    catalog_job: RecordingCatalogJob | None = None
+    storage_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +51,10 @@ class CaptureRefreshResult:
     error: str = ""
     apply_state: bool = True
     cleanup_after_apply: bool = False
+    evidence: EvidenceSnapshot | None = None
+    catalog: RecordingCatalogSnapshot | None = None
+    archive_affected_events: frozenset[str] = frozenset()
+    storage: tuple[Path, float | None, str] | None = None
 
 
 class CaptureRefreshWorker:
@@ -62,6 +74,23 @@ class CaptureRefreshWorker:
         self._stop_requested = False
         self._minimum_generation = 0
         self._active_generation: int | None = None
+        self._tasks = deque()
+
+    def submit_task(self, operation) -> Future:
+        """Queue explicit preparation/finalization behind the active disk owner.
+
+        Unlike coalesced scans, these tasks must each run exactly once. Callers
+        retain their context until completion; stop drains accepted tasks.
+        """
+        future = Future()
+        with self._condition:
+            if self._stop_requested or len(self._tasks) >= 16:
+                future.set_exception(RuntimeError("后台任务队列暂时不可用，请稍后重试"))
+                return future
+            self._tasks.append((operation, future))
+            self.start()
+            self._condition.notify_all()
+        return future
 
     @property
     def is_running(self) -> bool:
@@ -91,7 +120,7 @@ class CaptureRefreshWorker:
             ):
                 return
             pending = self._pending
-            if pending is not None:
+            if pending is not None and pending.generation == request.generation:
                 cleanup_needed = bool(
                     request.cleanup
                     or request.cleanup_after_apply
@@ -106,6 +135,14 @@ class CaptureRefreshWorker:
                         int(request.current_time_ms),
                         int(pending.current_time_ms),
                     ),
+                    # A cleanup-only request must not replace pending evidence
+                    # work. Full event snapshots supersede older snapshots.
+                    evidence_job=request.evidence_job or pending.evidence_job,
+                    catalog_job=request.catalog_job or pending.catalog_job,
+                    storage_path=request.storage_path or pending.storage_path,
+                    scan=request.scan or pending.scan,
+                    archive_jobs=request.archive_jobs or pending.archive_jobs,
+                    apply_state=request.apply_state or pending.apply_state,
                 )
             self._pending = request
             self._condition.notify_all()
@@ -188,15 +225,29 @@ class CaptureRefreshWorker:
     def _run(self) -> None:
         while True:
             with self._condition:
-                while self._pending is None and not self._stop_requested:
+                while self._pending is None and not self._tasks and not self._stop_requested:
                     self._condition.wait()
-                if self._stop_requested:
+                if self._stop_requested and not self._tasks:
                     return
-                request = self._pending
-                self._pending = None
+                task = self._tasks.popleft() if self._tasks else None
+                request = None if task else self._pending
+                if task is None:
+                    self._pending = None
                 self._active_generation = (
-                    None if request is None else request.generation
+                    self._minimum_generation if task else None if request is None else request.generation
                 )
+            if task is not None:
+                operation, future = task
+                try:
+                    if future.set_running_or_notify_cancel():
+                        future.set_result(operation())
+                except Exception as error:
+                    future.set_exception(error)
+                finally:
+                    with self._condition:
+                        self._active_generation = None
+                        self._condition.notify_all()
+                continue
             if request is None:
                 with self._condition:
                     self._active_generation = None
@@ -225,6 +276,10 @@ class CaptureRefreshWorker:
         archive_segments: list[object] = []
         deleted_paths: list[Path] = []
         errors: list[str] = []
+        evidence = None
+        catalog = None
+        archive_affected_events = frozenset()
+        storage = None
         for ring_buffer in request.ring_buffers if request.scan else ():
             if self._is_cancelled(request):
                 break
@@ -264,7 +319,24 @@ class CaptureRefreshWorker:
                 started,
                 item_count=len(published),
             )
-        if request.cleanup:
+        if request.evidence_job is not None and not self._is_cancelled(request):
+            started = time.perf_counter()
+            try:
+                job = request.evidence_job
+                evidence = job.pipeline.refresh(job.passages, lambda: self._is_cancelled(request))
+                if archive_segments and request.catalog_job is not None:
+                    archive_affected_events = job.pipeline.archive_affected_events(
+                        job.passages, archive_segments, request.catalog_job.store,
+                    )
+                self._observe("background_evidence_publish", started, item_count=len(job.passages))
+            except Exception as error:  # noqa: BLE001 - retry from durable events.
+                errors.append(f"evidence: {error}")
+                self._observe("background_evidence_publish", started, failed=True)
+                logger.exception("Background evidence preparation failed")
+        with self._condition:
+            pending_evidence = self._pending is not None and self._pending.evidence_job is not None
+        # Failed or queued registrations must retain media until they can pin it.
+        if request.cleanup and not (request.evidence_job is not None and errors) and not pending_evidence:
             for ring_buffer in request.ring_buffers:
                 if self._is_cancelled(request):
                     break
@@ -286,12 +358,27 @@ class CaptureRefreshWorker:
                     started,
                     item_count=len(deleted),
                 )
+        if request.catalog_job is not None and not self._is_cancelled(request):
+            started = time.perf_counter()
+            try:
+                job = request.catalog_job
+                catalog = job.catalog.refresh(job, deleted_paths=deleted_paths)
+                self._observe("background_recording_catalog", started, item_count=len(catalog.sources))
+            except Exception as error:  # noqa: BLE001 - keep evidence progress.
+                errors.append(f"catalog: {error}")
+                self._observe("background_recording_catalog", started, failed=True)
+                logger.exception("Background recording catalog refresh failed")
         self._observe(
             "capture_refresh_background",
             refresh_started,
             item_count=discovered_count + len(archive_segments),
             failed=bool(errors),
         )
+        if request.storage_path is not None and not self._is_cancelled(request):
+            try:
+                storage = (request.storage_path, shutil.disk_usage(request.storage_path).free / (1024**3), "")
+            except OSError as error:
+                storage = (request.storage_path, None, str(error))
         return CaptureRefreshResult(
             generation=request.generation,
             archive_segments=tuple(archive_segments),
@@ -300,6 +387,10 @@ class CaptureRefreshWorker:
             error="; ".join(errors),
             apply_state=request.apply_state,
             cleanup_after_apply=request.cleanup_after_apply,
+            evidence=evidence,
+            catalog=catalog,
+            archive_affected_events=archive_affected_events,
+            storage=storage,
         )
 
 

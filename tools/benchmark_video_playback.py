@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import os
 import platform
 import random
 import statistics
+import subprocess
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -15,6 +19,7 @@ import cv2
 from PyQt5.QtCore import QCoreApplication, QEventLoop, QTimer
 
 from realtime.video_playback import VideoPlaybackWorker
+from realtime.decode_resources import DECODE_RESOURCES
 
 
 CaptureFactory = Callable[[str], cv2.VideoCapture]
@@ -219,6 +224,7 @@ def _measure_reverse_prefetch_playback(
     timestamps = []
     errors = []
     finished = False
+    timed_out = False
 
     def finish() -> None:
         nonlocal finished
@@ -229,6 +235,8 @@ def _measure_reverse_prefetch_playback(
         loop.quit()
 
     def on_frame(_image, _position_ms: int, frame_index: int) -> None:
+        if finished:
+            return
         timestamps.append(time.perf_counter())
         frame_indexes.append(int(frame_index))
         if len(frame_indexes) >= requested_frames:
@@ -238,7 +246,12 @@ def _measure_reverse_prefetch_playback(
     worker.playback_error.connect(lambda message: (errors.append(message), finish()))
     timeout = QTimer()
     timeout.setSingleShot(True)
-    timeout.timeout.connect(finish)
+    def on_timeout():
+        nonlocal timed_out
+        timed_out = True
+        finish()
+
+    timeout.timeout.connect(on_timeout)
     timeout_ms = max(
         3_000,
         int(requested_frames * 1000.0 / max(worker._fps, 0.1) * 2.5 + 2_000),
@@ -249,7 +262,10 @@ def _measure_reverse_prefetch_playback(
     loop.exec_()
     timeout.stop()
     worker.stop()
-    worker.wait(3_000)
+    stopped = worker.wait(3_000)
+    if not stopped:
+        # Keep the QThread alive until it owns no decoders; report the timeout.
+        worker.wait()
     app.processEvents()
 
     gaps_ms = [
@@ -263,6 +279,11 @@ def _measure_reverse_prefetch_playback(
     )
     return {
         "requested_frames": requested_frames,
+        "timed_out": timed_out,
+        "stopped_within_timeout": stopped,
+        "frame_indexes": frame_indexes,
+        "frame_gaps_ms": [round(value, 3) for value in gaps_ms],
+        "resources": asdict(DECODE_RESOURCES.snapshot()),
         "displayed_frames": len(frame_indexes),
         **_reverse_sequence_summary(frame_indexes, requested_frames),
         "display_fps": round((len(frame_indexes) - 1) / elapsed, 3)
@@ -366,10 +387,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    root = Path(__file__).resolve().parents[1]
+    try:
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True))
+    except (OSError, subprocess.CalledProcessError):
+        revision, dirty = "unknown", None
+    source_digest = hashlib.sha256()
+    for name in ("realtime/video_playback.py", "realtime/decode_resources.py", "tools/benchmark_video_playback.py"):
+        source_digest.update((root / name).read_bytes())
     result = {
         "environment": {
             "platform": platform.platform(),
             "python_opencv": cv2.__version__,
+            "python": platform.python_version(),
+            "processor": platform.processor(),
+            "logical_cpus": os.cpu_count(),
+            "base_revision": revision,
+            "working_tree_dirty": dirty,
+            "source_sha256": source_digest.hexdigest(),
+            "cache": "fresh decoder per measurement; operating-system file cache is not flushed",
         },
         "videos": [
             benchmark_video(

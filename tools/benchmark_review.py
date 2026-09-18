@@ -7,9 +7,11 @@ import json
 import os
 import platform
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from typing import Callable
@@ -32,7 +34,7 @@ def _percentile(samples: list[float], percentile: float) -> float:
     return ordered[index]
 
 
-def _measure(callback: Callable[[], None], iterations: int) -> dict[str, float]:
+def _measure(callback: Callable[[], None], iterations: int) -> dict[str, object]:
     samples = []
     for _ in range(max(1, int(iterations))):
         started = time.perf_counter()
@@ -43,6 +45,7 @@ def _measure(callback: Callable[[], None], iterations: int) -> dict[str, float]:
         "p95_ms": round(_percentile(samples, 0.95), 3),
         "min_ms": round(min(samples), 3),
         "max_ms": round(max(samples), 3),
+        "samples_ms": [round(sample, 3) for sample in samples],
     }
 
 
@@ -65,20 +68,32 @@ def _events(count: int, started_at_ms: int) -> list[PassageEvent]:
 
 
 def _populate_passage_store(store: PassageEventStore, events: list[PassageEvent]) -> None:
-    store._events = {event.event_id: event for event in events}
-    store._event_order = [event.event_id for event in events]
-    store._race_ids = {event.race_id for event in events}
+    store.journal_path.write_text(
+        "".join(json.dumps(event.to_payload()) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    # Fixture setup is outside the measurement. Exercise the production loader
+    # so newly added indexes cannot silently disappear from the benchmark.
+    store.__init__(store.journal_path)
 
 
 def _populate_timeline_store(
     store: VideoTimelineStore,
     segments: list[RecordingSegment],
 ) -> None:
-    store._segments = {segment.segment_id: segment for segment in segments}
-    store._segment_order = [segment.segment_id for segment in segments]
+    records = []
+    for segment in segments:
+        payload = asdict(segment)
+        records.append({**payload, "schema_version": 1, "record_type": "segment_started"})
+        if segment.ended_at_ms is not None:
+            records.append({**payload, "schema_version": 1, "record_type": "segment_ended"})
+    store.journal_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8",
+    )
+    store.__init__(store.journal_path)
 
 
-def _write_benchmark_video(video_path: Path) -> None:
+def _write_benchmark_video(video_path: Path, *, frame_count: int = 3) -> None:
     writer = cv2.VideoWriter(
         str(video_path),
         cv2.VideoWriter_fourcc(*"MJPG"),
@@ -89,7 +104,7 @@ def _write_benchmark_video(video_path: Path) -> None:
         raise RuntimeError("could not create benchmark video")
     try:
         frame = np.zeros((32, 32, 3), dtype=np.uint8)
-        for _ in range(3):
+        for _ in range(frame_count):
             writer.write(frame)
     finally:
         writer.release()
@@ -107,7 +122,7 @@ def _review_workspace_benchmark(
         events = _events(event_count, started_at_ms)
         _populate_passage_store(passage_store, events)
         video_path = root / "camera-1.avi"
-        _write_benchmark_video(video_path)
+        _write_benchmark_video(video_path, frame_count=event_count + 20)
         _populate_timeline_store(
             timeline_store,
             [
@@ -125,6 +140,9 @@ def _review_workspace_benchmark(
             ],
         )
 
+        located = timeline_store.locate_passage(events[-1].timeline_timestamp_ms,
+                                                race_id="benchmark-race")
+        assert located.status == "located" and len(located.locations) == 1
         created_at = time.perf_counter()
         dialog = PassageReviewDialog(passage_store, timeline_store)
         QApplication.processEvents()
@@ -142,6 +160,17 @@ def _review_workspace_benchmark(
             ),
             max(3, ui_iterations),
         )
+        dialog.identity_search.setText("Athlete")
+        dialog._search_refresh_timer.stop()
+        dialog._refresh_filtered_view()
+        filtered_refresh = _measure(
+            lambda: (dialog.refresh_events((changed.event_id,)), QApplication.processEvents()),
+            max(3, ui_iterations),
+        )
+        batch_refresh = _measure(
+            lambda: (dialog.refresh_events(event.event_id for event in events[:100]),
+                     QApplication.processEvents()), max(3, ui_iterations),
+        )
         dialog.close()
         QApplication.processEvents()
         return {
@@ -149,6 +178,8 @@ def _review_workspace_benchmark(
             "initial_render_ms": round(initial_render_ms, 3),
             "full_refresh": full_refresh,
             "single_event_refresh": incremental_refresh,
+            "filtered_single_event_refresh": filtered_refresh,
+            "filtered_100_event_refresh": batch_refresh,
         }
 
 
@@ -171,9 +202,12 @@ def _timeline_lookup_benchmark(segment_count: int, iterations: int) -> dict[str,
         ]
         _populate_timeline_store(store, segments)
         target_ms = (segment_count - 1) * 1_000 + 450
-        store.locate_passage(target_ms, race_id="benchmark-race")
+        lookup = store.locate_passage(target_ms, race_id="benchmark-race")
+        # Deliberately missing files isolate index lookup from media decoding.
+        assert lookup.status == "missing_file" and lookup.locations
         return {
             "segments": segment_count,
+            "expected_status": "missing_file",
             "lookup": _measure(
                 lambda: store.locate_passage(target_ms, race_id="benchmark-race"),
                 iterations,
@@ -223,11 +257,23 @@ def main(argv: list[str] | None = None) -> int:
     if not sizes:
         raise SystemExit("at least one positive size is required")
     app = QApplication.instance() or QApplication([])
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        revision = "unknown"
     results = {
         "environment": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "qt_platform": os.environ.get("QT_QPA_PLATFORM", ""),
+            "base_revision": revision,
+            "processor": platform.processor(),
+            "logical_cpus": os.cpu_count(),
+            "media": "synthetic MJPG 32x32 at 10 fps; full duration covers all events",
+            "cache": "initial_render is cold; subsequent operations reuse the same dialog",
         },
         "review_workspace": [
             _review_workspace_benchmark(size, args.ui_iterations) for size in sizes

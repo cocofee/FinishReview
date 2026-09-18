@@ -1,4 +1,5 @@
 import threading
+import pytest
 
 from realtime.capture_refresh import (
     ArchiveRefreshJob,
@@ -6,6 +7,39 @@ from realtime.capture_refresh import (
     CaptureRefreshWorker,
 )
 from realtime.runtime_metrics import RuntimeMetrics
+
+
+def test_explicit_tasks_share_scan_owner_and_stop_drains_accepted_tasks():
+    ring = _RingBuffer(block_scan=True)
+    worker = CaptureRefreshWorker(lambda _result: None)
+    worker.start()
+    worker.submit(_request(1, ring))
+    assert ring.scan_started.wait(2)
+    threads = []
+    first = worker.submit_task(lambda: threads.append(threading.get_ident()))
+    second = worker.submit_task(lambda: threads.append(threading.get_ident()))
+    assert not worker.stop(timeout=0.01)
+    ring.release_scan.set()
+    assert first.result(timeout=2) is None
+    assert second.result(timeout=2) is None
+    assert worker.stop()
+    assert threads == ring.scan_threads * 2
+
+
+def test_explicit_task_failure_does_not_drop_next_task():
+    worker = CaptureRefreshWorker(lambda _result: None)
+
+    def fail():
+        raise OSError("disk failure")
+
+    try:
+        failed = worker.submit_task(fail)
+        next_task = worker.submit_task(lambda: "recovered")
+        with pytest.raises(OSError, match="disk failure"):
+            failed.result(timeout=2)
+        assert next_task.result(timeout=2) == "recovered"
+    finally:
+        assert worker.stop()
 
 
 class _RingBuffer:
@@ -95,7 +129,7 @@ def test_capture_refresh_coalesces_pending_requests_and_keeps_cleanup():
 
     def receive(result):
         results.append(result)
-        if result.generation == 3:
+        if len(results) == 2:
             completed.set()
 
     worker = CaptureRefreshWorker(receive)
@@ -103,13 +137,13 @@ def test_capture_refresh_coalesces_pending_requests_and_keeps_cleanup():
     worker.submit(_request(1, ring_buffer))
     assert ring_buffer.scan_started.wait(2)
 
-    worker.submit(_request(2, ring_buffer, cleanup=True, current_time_ms=2_000))
-    worker.submit(_request(3, ring_buffer, cleanup=False, current_time_ms=3_000))
+    worker.submit(_request(1, ring_buffer, cleanup=True, current_time_ms=2_000))
+    worker.submit(_request(1, ring_buffer, cleanup=False, current_time_ms=3_000))
     ring_buffer.release_scan.set()
 
     assert completed.wait(2)
     assert worker.stop()
-    assert [result.generation for result in results] == [1, 3]
+    assert [result.generation for result in results] == [1, 1]
     assert ring_buffer.cleanup_times == []
     assert results[-1].cleanup_after_apply
 

@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from bisect import bisect_right
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -215,20 +216,24 @@ def _optional_integer(payload: Mapping[str, Any], name: str) -> Optional[int]:
     return None if value is None else _integer(value, name)
 
 
-def probe_video_duration_ms(video_path: str | Path) -> Optional[int]:
+def probe_video_duration_ms(video_path: str | Path, *, cancelled=lambda: False) -> Optional[int]:
     """Return the decoded media duration when OpenCV can verify it."""
     path = Path(video_path)
     try:
         if not path.is_file() or path.stat().st_size <= 0:
             return None
         import cv2
+        from .decode_resources import DECODE_RESOURCES, THUMBNAIL
     except (ImportError, OSError):
         return None
 
     capture = None
     try:
-        capture = cv2.VideoCapture(str(path))
-        if not capture.isOpened():
+        capture = DECODE_RESOURCES.open_capture(
+            path, cv2.VideoCapture, priority=THUMBNAIL, cancelled=cancelled,
+            timeout=0.5, wait=threading.current_thread() is not threading.main_thread(),
+        )
+        if capture is None or not capture.isOpened():
             return None
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
@@ -283,6 +288,8 @@ class VideoTimelineStore:
         self.journal_path = Path(journal_path).expanduser().absolute()
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # Disk durability is serialized separately from the short index lock.
+        self._write_lock = threading.RLock()
         self._segments: dict[str, RecordingSegment] = {}
         self._segment_order: list[str] = []
         self._segment_order_index: dict[str, int] = {}
@@ -299,6 +306,8 @@ class VideoTimelineStore:
         self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
         self._rebuild_indexes()
+        self._segment_changes = deque(maxlen=2048)
+        self._change_floor = self._revision
 
     @property
     def recovered_incomplete_tail(self) -> bool:
@@ -309,6 +318,24 @@ class VideoTimelineStore:
     def revision(self) -> int:
         with self._lock:
             return self._revision
+
+    def segment_changes_since(self, revision: int):
+        """Return one atomic delta, or a complete snapshot after history expiry."""
+        with self._lock:
+            if revision == self._revision:
+                return self._revision, False, ()
+            if revision < self._change_floor or revision > self._revision:
+                return self._revision, True, self.segments()
+            identifiers = dict.fromkeys(
+                segment_id for changed_at, segment_id in self._segment_changes
+                if changed_at > revision
+            )
+            return self._revision, False, tuple(self._segments[key] for key in identifiers)
+
+    def _record_segment_change(self, segment):
+        if len(self._segment_changes) == self._segment_changes.maxlen:
+            self._change_floor = self._segment_changes[0][0]
+        self._segment_changes.append((self._revision, segment.segment_id))
 
     def _load_existing(self) -> None:
         if not self.journal_path.exists():
@@ -701,12 +728,14 @@ class VideoTimelineStore:
             "timing_error_ms": segment.timing_error_ms,
             "race_id": segment.race_id,
         }
-        with self._lock:
+        with self._write_lock:
             self._append_record(payload)
-            self._segments[segment.segment_id] = segment
-            self._segment_order.append(segment.segment_id)
-            self._index_segment(segment, len(self._segment_order) - 1)
-            self._revision += 1
+            with self._lock:
+                self._segments[segment.segment_id] = segment
+                self._segment_order.append(segment.segment_id)
+                self._index_segment(segment, len(self._segment_order) - 1)
+                self._revision += 1
+                self._record_segment_change(segment)
         return segment
 
     def finish_segment(
@@ -718,7 +747,7 @@ class VideoTimelineStore:
         media_duration_ms: Optional[int] = None,
         media_started_at_ms: Optional[int] = None,
     ) -> RecordingSegment:
-        with self._lock:
+        with self._write_lock:
             current = self._segments.get(str(segment_id))
             if current is None:
                 raise VideoTimelineError(f"unknown segment_id: {segment_id}")
@@ -751,24 +780,26 @@ class VideoTimelineStore:
                 payload["media_duration_ms"] = media_duration_ms
                 payload["media_started_at_ms"] = int(media_started_at_ms)
             self._append_record(payload)
-            self._segments[current.segment_id] = updated
-            self._open_segment_ids_by_race.get(current.race_id, set()).discard(
-                current.segment_id
-            )
-            interval = self._segment_interval(updated)
-            if interval is not None:
-                index = self._closed_indexes_by_race.setdefault(
-                    updated.race_id,
-                    _SegmentIntervalIndex(),
+            with self._lock:
+                self._segments[current.segment_id] = updated
+                self._open_segment_ids_by_race.get(current.race_id, set()).discard(
+                    current.segment_id
                 )
-                index.add(
-                    started_at_ms=interval[0],
-                    ended_at_ms=interval[1],
-                    order=self._segment_order_index[updated.segment_id],
-                    segment_id=updated.segment_id,
-                )
-                self._index_closed_bounds(updated)
-            self._revision += 1
+                interval = self._segment_interval(updated)
+                if interval is not None:
+                    index = self._closed_indexes_by_race.setdefault(
+                        updated.race_id,
+                        _SegmentIntervalIndex(),
+                    )
+                    index.add(
+                        started_at_ms=interval[0],
+                        ended_at_ms=interval[1],
+                        order=self._segment_order_index[updated.segment_id],
+                        segment_id=updated.segment_id,
+                    )
+                    self._index_closed_bounds(updated)
+                self._revision += 1
+                self._record_segment_change(updated)
             return updated
 
     def add_completed_segment(
@@ -823,12 +854,14 @@ class VideoTimelineStore:
             "media_duration_ms": media_duration_ms,
             "media_started_at_ms": media_started_at_ms,
         }
-        with self._lock:
+        with self._write_lock:
             self._append_records((started_payload, ended_payload))
-            self._segments[segment.segment_id] = segment
-            self._segment_order.append(segment.segment_id)
-            self._index_segment(segment, len(self._segment_order) - 1)
-            self._revision += 2
+            with self._lock:
+                self._segments[segment.segment_id] = segment
+                self._segment_order.append(segment.segment_id)
+                self._index_segment(segment, len(self._segment_order) - 1)
+                self._revision += 2
+                self._record_segment_change(segment)
         return segment
 
     def segments(self) -> tuple[RecordingSegment, ...]:
