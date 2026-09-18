@@ -1,5 +1,7 @@
 # FinishReview 回放性能长期优化方案
 
+> 2026-09-18 更新：1 倍及以下反向播放改为连续原帧，窗口建立后立即预取下一窗口并复用在途解码；播放和胶卷引入共享 capture/图像预算。合成 H.264/H.265 的反向帧序列正确性已通过，但 H.265 仍低于源帧率，现场目标尚未验收。完整状态见 [Issue #3 实施记录](ISSUE_3_ARCHITECTURE_OPTIMIZATION_PLAN.md#9-实施与验证记录)，以下为历史记录。
+
 > 日期：2026-08-28
 > 仓库：`C:\Users\Administrator\Documents\trae_projects\video analysis\FinishReview`
 > 分支：`main`

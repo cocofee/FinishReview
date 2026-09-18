@@ -1,5 +1,7 @@
 # FinishReview 架构路线图独立复核报告
 
+> 2026-09-18 更新：Issue #3 已落实后台证据队列、增量名单/录像目录、播放资源预算及设置/预检界面拆分。当前代码与未完成验收以 [Issue #3 实施记录](ISSUE_3_ARCHITECTURE_OPTIMIZATION_PLAN.md#9-实施与验证记录) 为准；以下保留历史复核，旧行号与“未修改”描述不代表当前状态。
+
 > 复核日期：2026-08-24
 > 仓库：`C:\Users\Administrator\Documents\trae_projects\video analysis\FinishReview`
 > 分支：`main`
