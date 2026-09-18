@@ -256,3 +256,11 @@ PyInstaller 构建、发行目录边界检查及 EXE `--smoke-test`（退出码 
 本轮全量回归：809 passed、1 skipped，151.30 s；日志 `artifacts/issue3/pytest-hd-final.txt`。Ruff 与 compileall 通过。
 
 本轮 PyInstaller 构建完成，发行目录边界检查通过，EXE `--smoke-test` 退出码 0。构建日志：`artifacts/issue3/build-hd-final.txt`；本地发行入口：`artifacts/dist/FinishReviewConsole/FinishReviewConsole.exe`。
+
+### 源码运行反馈：录像范围与时间显示
+
+开始新录像后，时间胶卷默认显示本次范围，旧录像通过“全部录像（含历史）”主动查看。自动重连沿用当前范围，停止后仍可回看；切换数据源时清除范围。该边界来自开始录像，不根据旧过线记录猜测开枪或清空赛事数据。
+
+修正首人校时改变胶卷刻度的问题：胶卷显示录像北京时间，悬停另列校时后判读时间。用户现场截图中的 17:27 实际为本次 17:44 录像减去了约 16 分 36 秒的校时偏移（校准锚点另有 5 天日期差）。本轮不改动校时存储、原帧坐标或判读关联，测试验证范围过滤、实时缓存交接、自动重连、跨天校时和原帧回看。
+
+最终全量测试 813 passed、1 skipped（152.64 s），Ruff、compileall 通过，日志 `artifacts/issue3/pytest-recording-time-verified.txt`。本轮为源码运行反馈修复，没有重新打包。

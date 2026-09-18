@@ -492,10 +492,10 @@ def test_camera_judgment_restores_calibrated_time_and_keeps_missing_evidence_rec
 
 
 @pytest.mark.parametrize("offset, calibrated", [(2000, None), (-1300, None), (2000, 1000)])
-def test_filmstrip_and_saved_judgment_share_calibrated_frame_time(
+def test_filmstrip_recording_time_and_saved_judgment_keep_distinct_clocks(
     qapp, tmp_path, fake_playback, monkeypatch, offset, calibrated,
 ):
-    from realtime.race_filmstrip import RaceFilmstripFrame, RaceFilmstripPanel
+    from realtime.race_filmstrip import RaceFilmstripFrame, RaceFilmstripPanel, format_time
 
     monkeypatch.setattr(RaceFilmstripPanel, "_load_visible", lambda self: None)
     passages = PassageEventStore(tmp_path / "passages.jsonl")
@@ -528,7 +528,8 @@ def test_filmstrip_and_saved_judgment_share_calibrated_frame_time(
     dialog._maximize_filmstrip_camera(frame)
     pane._worker.frame_ready.emit(image, position, frame.frame_index)
     assert pane.location.clock_offset_ms == effective
-    assert panel.display_time(frame.recorder_time_ms) == "08:00:15.000"
+    assert panel.display_time(frame.recorder_time_ms) == format_time(15000 + effective)
+    assert panel.judgment_time(frame.recorder_time_ms) == "08:00:15.000"
     assert "08:00:15.000" in pane.frame_indicator_label.text()
     seeks = list(pane._worker.seek_calls)
     for identity in ("later", "earlier", "passage-1"):
@@ -541,7 +542,7 @@ def test_filmstrip_and_saved_judgment_share_calibrated_frame_time(
     assert dialog._confirm_pending_marker(pane)
     record = dialog.video_filmstrip.judgment_track._records[0]
     assert "已确认" in dialog.current_context_label.text()
-    assert record.time_label == panel.display_time(frame.recorder_time_ms)
+    assert record.time_label == panel.judgment_time(frame.recorder_time_ms)
     saved = dialog.association_store.associations()
     dialog._restore_maximized_pane()
     panel.browse_to(50000)

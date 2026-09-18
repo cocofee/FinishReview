@@ -345,6 +345,43 @@ def test_concrete_review_windows_are_sibling_types():
     )
 
 
+def test_new_recording_excludes_previous_day_and_reconnect_keeps_scope(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    monkeypatch.setattr(window, "_video_assist_enabled", lambda: False)
+    old_start = int(time.time() * 1000) - 86400000
+    old = tmp_path / "yesterday.mkv"
+    old.write_bytes(b"old video")
+    window.timeline_store.add_completed_segment(
+        source_id="camera_01_review", camera_index=1, video_path=old,
+        media_started_at_ms=old_start, media_duration_ms=10000,
+        clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=2000,
+        end_reason="continuous_archive_fallback", race_id="race-1",
+    )
+    try:
+        window.passage_store.append(_event())
+        window.start_recording()
+        panel = window.video_filmstrip.full_race
+        start = panel._recording_start_ms
+        _wait_until(qapp, lambda: bool(panel.index.sources))
+        assert all(item.end_ms > start for item in panel.index.sources)
+        assert old not in {item.location.video_path for item in panel.index.sources}
+        window._restart_recording_camera(1, window.source)
+        assert panel._recording_start_ms == start
+        window.stop_recording()
+        assert panel._recording_start_ms == start
+        panel.scope_combo.setCurrentIndex(panel.scope_combo.findData("all"))
+        assert old in {item.location.video_path for item in panel.index.sources}
+        window.start_recording()
+        assert panel.scope_combo.currentData() == "current"
+        assert panel._recording_start_ms >= start
+    finally:
+        window.close()
+    # Only a view filter changed; old evidence remains recoverable from disk.
+    assert old.is_file()
+    assert any(item.media_started_at_ms == old_start
+               for item in VideoTimelineStore(tmp_path / "video_timeline.jsonl").segments())
+
+
 def test_live_filmstrip_confirmation_reopens_after_cleanup_and_archive(qapp, tmp_path, monkeypatch):
     from PyQt5.QtGui import QImage
     from realtime.review_recorder import ReviewRingBuffer

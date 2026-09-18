@@ -310,7 +310,8 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
                 source, sample = self.owner.index.sample_at(self.owner.time_at(tile), self.owner.interval_ms)
                 frame = self.owner.cache.get((source.key, sample)) if source else None
                 if frame is not None:
-                    tooltip = (f"原帧判读时间：{self.owner.display_time(frame.recorder_time_ms, source)} · 帧 {frame.frame_index + 1}"
+                    tooltip = (f"录像时间（北京时间）：{self.owner.display_time(frame.recorder_time_ms, source)} · 帧 {frame.frame_index + 1}"
+                               f"\n校时后判读时间：{self.owner.judgment_time(frame.recorder_time_ms, source)}"
                                "\n滚轮向下看后面，向上看前面；点击图片后按 F 判读。")
             self.viewport().setToolTip(tooltip)
         if self._press is not None:
@@ -419,6 +420,9 @@ class RaceFilmstripPanel(QWidget):
         self._check_error = ""
         self._seen_end_ms = 0
         self._pending_sources = 0
+        self._recording_start_ms = None
+        self._all_sources = ()
+        self._all_pending_sources = 0
         self._active_frame = None
         self._pending_judgment = None
         layout = QVBoxLayout(self)
@@ -426,8 +430,15 @@ class RaceFilmstripPanel(QWidget):
         layout.setSpacing(3)
         summary = QHBoxLayout()
         self.toolbar = summary
-        self.range_label = QLabel("时间胶卷 · 机位 1")
+        self.range_label = QLabel("时间胶卷 · 机位 1 · 录像时间")
         summary.addWidget(self.range_label)
+        self.scope_combo = QComboBox(self)
+        self.scope_combo.addItem("本次录像", "current")
+        self.scope_combo.addItem("全部录像（含历史）", "all")
+        self.scope_combo.setToolTip("本次录像从点击开始录像时起；自动重连仍属于本次，历史录像保留在全部录像中")
+        self.scope_combo.hide()
+        self.scope_combo.currentIndexChanged.connect(self._scope_changed)
+        summary.addWidget(self.scope_combo)
         self.new_recording_label = QLabel(self)
         self.new_recording_label.setStyleSheet("color: #64748b; font-size: 9pt;")
         self.follow_button = QPushButton("跟随最新", self)
@@ -538,6 +549,11 @@ class RaceFilmstripPanel(QWidget):
                      / self.tile_pitch * self.interval_ms)
 
     def display_time(self, timestamp, source=None):
+        # The browsing ruler uses the recorder's Beijing time. Calibrating an
+        # athlete's chip/video association must not relabel live recording time.
+        return format_time(timestamp)
+
+    def judgment_time(self, timestamp, source=None):
         if source is None:
             span = self.index.span_at(min(timestamp, self.index.end_ms - 1))
             source = span.source if span else None
@@ -590,6 +606,14 @@ class RaceFilmstripPanel(QWidget):
             self._position_scroll(left, center=False)
 
     def set_sources(self, sources, pending=0):
+        self._all_sources = tuple(sources)
+        sources = self._all_sources
+        self._all_pending_sources = int(pending)
+        if self._recording_start_ms is not None and self.scope_combo.currentData() == "current":
+            # Keep each file's original origin: thumbnail frame offsets depend
+            # on start_ms, so a display filter must never rewrite it.
+            sources = tuple(source for source in sources
+                            if source.end_ms > self._recording_start_ms)
         signature = (
             tuple(
                 (
@@ -642,10 +666,11 @@ class RaceFilmstripPanel(QWidget):
             self._initial_positioned = True
         bar.blockSignals(previously_blocked)
         if self.index.spans:
-            self.range_label.setText("时间胶卷 · 机位 1")
+            self.range_label.setText("时间胶卷 · 机位 1 · 录像时间")
             self.range_label.setToolTip(
-                f"判读时间：{self.display_time(self.index.start_ms)} — {self.display_time(self.index.end_ms)}\n"
-                f"录像原始时钟：{format_time(self.index.start_ms, date=True)} — {format_time(self.index.end_ms, date=True)}")
+                f"录像时间（北京时间）：{format_time(self.index.start_ms, date=True)} — {format_time(self.index.end_ms, date=True)}\n"
+                f"校时后判读时间：{self.judgment_time(self.index.start_ms)} — {self.judgment_time(self.index.end_ms)}\n"
+                "胶卷刻度显示录像时间，不随号码确认或校时改变。")
             gaps = sum(span.source is None or not span.source.available for span in self.index.spans)
             self.range_label.setToolTip(self.range_label.toolTip() +
                 f"\n{len(sources)} 段录像 · {gaps} 处缺口/不可用" +
@@ -672,11 +697,36 @@ class RaceFilmstripPanel(QWidget):
         else:
             self.range_label.setText("时间胶卷 · 相机 1 · 等待录像")
             self.status_label.setText(
-                "录像处理中 · 下一段 5 分钟录像正在封口，请稍候；已归档部分仍可判读。"
+                "本次录像尚无可用画面，请检查录像状态；历史录像可切换至“全部录像”查看。"
+                if self._recording_start_ms is not None and self.scope_combo.currentData() == "current"
+                else "录像处理中 · 尚未产生可回看片段，请检查录像状态或稍后刷新。"
                 if pending
                 else "尚无可验证的录像时间范围，请等待录像归档或刷新。"
             )
         self._viewport_changed(preserve_requests=True)
+
+    def set_recording_start(self, timestamp_ms):
+        """Start a new browsing scope without modifying the durable journals."""
+        self._recording_start_ms = None if timestamp_ms is None else int(timestamp_ms)
+        self.scope_combo.blockSignals(True)
+        self.scope_combo.setCurrentIndex(0)
+        self.scope_combo.setVisible(timestamp_ms is not None)
+        self.scope_combo.blockSignals(False)
+        if timestamp_ms is not None:
+            self.scope_combo.setItemText(0, f"本次录像 · {format_time(int(timestamp_ms), date=True)[:14]}")
+        self._scope_changed()
+
+    def _scope_changed(self):
+        self._cancel_decode()
+        self._pending = None
+        self._pending_judgment = None
+        self._active_frame = None
+        self._initial_positioned = False
+        self._user_navigated = False
+        self._signature = None
+        # Only the displayed range resets. Keep judgments and check journals.
+        self.index = RaceRecordingIndex()
+        self.set_sources(self._all_sources, self._all_pending_sources)
 
     def set_check_context(self, path, race_id, camera_index=1):
         context = (str(Path(path).absolute()), race_id, camera_index)
@@ -762,7 +812,7 @@ class RaceFilmstripPanel(QWidget):
         percent = inspected * 100 / total if total else 0
         progress = "<0.1" if 0 < percent < 0.1 else f"{percent:.1f}"
         self.inspection_label.setText(f"本屏 {format_duration(right - left)} · 已检查 {progress}%" if total else "等待录像")
-        self.inspection_label.setToolTip(self._check_error or f"本屏判读时间：{self.display_time(left)} — {self.display_time(right)}\n手动已检查 {format_duration(inspected)} / 可用录像 {format_duration(total)}；图片上沿绿条为已检查范围，下沿号码为判读记录。")
+        self.inspection_label.setToolTip(self._check_error or f"本屏录像时间（北京时间）：{self.display_time(left)} — {self.display_time(right)}\n手动已检查 {format_duration(inspected)} / 可用录像 {format_duration(total)}；图片上沿绿条为已检查范围，下沿号码为判读记录。")
         self.check_button.setEnabled(self._check_store is not None and bool(self._screen_ranges(loaded_only=True)))
         self.uncheck_button.setEnabled(self._check_store is not None and bool(self.checked_ranges()))
         self.next_unchecked_button.setEnabled(self._check_store is not None and bool(self.unchecked_ranges()))
@@ -1016,6 +1066,8 @@ class RaceFilmstripPanel(QWidget):
     def clear(self):
         self._cancel_decode()
         self._signature = None
+        self._all_sources = ()
+        self._all_pending_sources = 0
         self.index = RaceRecordingIndex()
         self._sources_by_key.clear()
         self.cache.clear()

@@ -1757,6 +1757,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._sync_evidence_pane_layout(include_recorded=False)
         if data_source_changed:
             assert prepared_data_source is not None
+            self.video_filmstrip.full_race.set_recording_start(None)
             (
                 passage_store,
                 metadata_store,
@@ -2467,6 +2468,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if free_bytes < 1024**3:
             raise RecordingError("赛事存储空间不足 1 GB，无法开始录像")
         archive_publishers = []
+        recording_started_ms = int(time.time() * 1000)
         try:
             pipelines = self._run_capture_task(lambda: self._recording_controller.start(
                 sources=configured_sources,
@@ -2557,6 +2559,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._auto_recording_error = ""
             self._capture_error = ""
             self._workspace_notice = ""
+            self.video_filmstrip.full_race.set_recording_start(recording_started_ms)
             self._refresh_timer.start()
             self._request_capture_refresh()
             self._lookup_cache.clear()
