@@ -16,6 +16,7 @@ from .thread_lifecycle import retire_qthread, track_qthread
 from .camera_judgments import CameraJudgmentTrack
 from .race_filmstrip import RaceFilmstripPanel
 from .time_domain import DurationMs, MediaPositionMs, WallClockMs
+from .decode_resources import DECODE_RESOURCES, THUMBNAIL, PREFETCH, ImageCache
 
 DEFAULT_FILMSTRIP_INTERVAL_MS = 2_000
 # Continuous camera review uses a denser rail because several riders can cross
@@ -179,11 +180,16 @@ class VideoFilmstripWorker(QThread):
             self.failed.emit("当前窗口存在未解码的录像位置")
 
     def run(self) -> None:
-        capture = cv2.VideoCapture(str(self.video_path))
-        if not capture.isOpened():
-            self.failed.emit(f"Unable to open video: {self.video_path}")
+        capture = DECODE_RESOURCES.open_capture(
+            self.video_path, cv2.VideoCapture, priority=getattr(self, "decode_priority", THUMBNAIL),
+            cancelled=lambda: self._stop_requested,
+        )
+        if capture is None:
             return
         try:
+            if not capture.isOpened():
+                self.failed.emit(f"Unable to open video: {self.video_path}")
+                return
             fps = max(0.1, float(capture.get(cv2.CAP_PROP_FPS) or 0.0))
             if self.sequential_window:
                 self._run_sequential_window(capture, fps)
@@ -633,8 +639,7 @@ class VideoFilmstripWidget(QFrame):
         self._prefetch_path: Path | None = None
         self._prefetch_error = ""
         self._operator_busy = False
-        self._frames: list[FilmstripFrame] = []
-        self._frames_by_path: dict[Path, dict[int, FilmstripFrame]] = {}
+        self._frames_by_path: dict[Path, ImageCache] = {}
         self._prefetch_positions_by_path: dict[Path, set[int]] = {}
         # Bounded ring for previous/current/next two-minute windows.
         self._retained_windows: list[tuple[Path, int, int]] = []
@@ -922,10 +927,9 @@ class VideoFilmstripWidget(QFrame):
             if not ranges:
                 self._frames_by_path.pop(path, None)
                 continue
-            self._frames_by_path[path] = {
-                position: frame for position, frame in frames.items()
-                if any(start <= int(position) <= end for start, end in ranges)
-            }
+            for position in tuple(frames):
+                if not any(start <= int(position) <= end for start, end in ranges):
+                    frames.pop(position, None)
         for path, positions in tuple(self._prefetch_positions_by_path.items()):
             ranges = ranges_by_path.get(path)
             if not ranges:
@@ -958,7 +962,6 @@ class VideoFilmstripWidget(QFrame):
         self.stop()
         self.stop_prefetch()
         self._prefetch_error = ""
-        self._frames.clear()
         self._frames_by_path.clear()
         self._prefetch_positions_by_path.clear()
         self._retained_windows.clear()
@@ -1045,7 +1048,7 @@ class VideoFilmstripWidget(QFrame):
         )
         self._remember_window(path, int(start_ms), int(end_ms))
         self._prefetch_positions_by_path[path] = set(positions)
-        cache = self._frames_by_path.setdefault(path, {})
+        cache = self._path_cache(path)
         missing = tuple(sorted(position for position in positions if position not in cache))
         self.stop_prefetch()
         self._prefetch_error = ""
@@ -1075,6 +1078,7 @@ class VideoFilmstripWidget(QFrame):
             lambda target=worker: self._on_prefetch_worker_finished(target)
         )
         self._prefetch_worker = worker
+        worker.decode_priority = PREFETCH
         track_qthread(worker)
         worker.start(QThread.LowPriority)
 
@@ -1085,7 +1089,7 @@ class VideoFilmstripWidget(QFrame):
         position_ms: int,
         frame_index: int,
     ) -> None:
-        cache = self._frames_by_path.setdefault(Path(path), {})
+        cache = self._path_cache(Path(path))
         cache.setdefault(
             int(position_ms),
             FilmstripFrame(MediaPositionMs(int(position_ms)), int(frame_index), image),
@@ -1134,7 +1138,6 @@ class VideoFilmstripWidget(QFrame):
         self._set_ready(False, "正在准备当前两分钟胶卷...")
         self._decode_error = ""
         if self._video_path != path:
-            self._frames.clear()
             self._video_path = path
             self._display_origin_ms = (
                 None if origin_ms is None else int(origin_ms)
@@ -1144,8 +1147,6 @@ class VideoFilmstripWidget(QFrame):
         self._display_start_ms = max(0, int(start_ms))
         self._display_end_ms = max(self._display_start_ms, int(end_ms))
         self._remember_window(path, self._display_start_ms, self._display_end_ms)
-        cached = self._frames_by_path.get(path, {})
-        self._frames = sorted(cached.values(), key=lambda value: value.position_ms)
         if self._current_position_ms < 0:
             self._display_reference_ms = self._display_start_ms
         self.content.refresh_geometry()
@@ -1290,11 +1291,10 @@ class VideoFilmstripWidget(QFrame):
             int(frame_index),
             image,
         )
-        frame_cache = self._frames_by_path.setdefault(self._video_path, {})
+        frame_cache = self._path_cache(self._video_path)
         if frame.position_ms in frame_cache:
             return
         frame_cache[frame.position_ms] = frame
-        self._frames = sorted(frame_cache.values(), key=lambda value: value.position_ms)
         if not self._expected_positions:
             self._ready = True
         else:
@@ -1307,6 +1307,19 @@ class VideoFilmstripWidget(QFrame):
         if not self._first_frame_received:
             self._first_frame_received = True
         self._schedule_render_pending()
+
+    def _path_cache(self, path):
+        if path not in self._frames_by_path:
+            self._frames_by_path[path] = ImageCache(
+                priority=THUMBNAIL, image_of=lambda frame: frame.image,
+            )
+        return self._frames_by_path[path]
+
+    @property
+    def _frames(self):
+        # Do not retain a second list of images after global cache eviction.
+        cache = self._frames_by_path.get(self._video_path, {})
+        return sorted(cache.values(), key=lambda value: value.position_ms)
 
     def _schedule_render_pending(self) -> None:
         if self._render_timer_pending:

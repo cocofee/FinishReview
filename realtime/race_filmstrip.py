@@ -22,6 +22,7 @@ from .recording_catalog import FilmstripSource, RecordingSpan, RaceRecordingInde
 from .thread_lifecycle import retire_qthread, track_qthread
 from .video_timeline import DEFAULT_CLOCK_SOURCE, PassageVideoLocation
 from .filmstrip_checks import FilmstripCheckStore, merge_ranges, subtract_ranges
+from .decode_resources import DECODE_RESOURCES, FOREGROUND, THUMBNAIL, ImageCache
 
 TILE_GAP = 8
 IMAGE_TOP = 4
@@ -75,6 +76,7 @@ class RaceThumbnailWorker(QThread):
         super().__init__(parent)
         self.jobs = tuple(jobs)
         self._stop_requested = False
+        self.decode_priority = THUMBNAIL
 
     def request_stop(self):
         self._stop_requested = True
@@ -88,7 +90,12 @@ class RaceThumbnailWorker(QThread):
             if self._stop_requested:
                 return
             source = jobs[0][0]
-            capture = cv2.VideoCapture(str(source.location.video_path))
+            capture = DECODE_RESOURCES.open_capture(
+                source.location.video_path, cv2.VideoCapture,
+                priority=self.decode_priority, cancelled=lambda: self._stop_requested,
+            )
+            if capture is None:
+                return
             completed = set()
             try:
                 if not capture.isOpened():
@@ -396,7 +403,8 @@ class RaceFilmstripPanel(QWidget):
         self._judgments = ()
         self._judgment_times = ()
         self.selected_event_id = ""
-        self.cache = OrderedDict()
+        self.cache = ImageCache(priority=THUMBNAIL, image_of=lambda frame: frame.image,
+                                max_items=MAX_CACHE, max_bytes=MAX_CACHE_BYTES)
         self.errors = OrderedDict()
         self._worker = None
         self._closed = False
@@ -608,7 +616,9 @@ class RaceFilmstripPanel(QWidget):
             return (source is not None and source.available
                     and source.start_ms <= key[1] < source.end_ms)
 
-        self.cache = OrderedDict((key, value) for key, value in self.cache.items() if request_available(key))
+        for key in tuple(self.cache):
+            if not request_available(key):
+                self.cache.pop(key, None)
         self.errors = OrderedDict((key, value) for key, value in self.errors.items() if request_available(key))
         if self._pending is not None:
             # The same source may have lost its file or part of its coverage.
@@ -938,6 +948,7 @@ class RaceFilmstripPanel(QWidget):
         if not jobs:
             return
         worker = RaceThumbnailWorker(jobs[:MAX_BATCH], self)
+        worker.decode_priority = FOREGROUND if self._pending is not None else THUMBNAIL
         self._worker = worker
         worker.frame_ready.connect(self._frame_ready)
         worker.failed.connect(self._failed)
@@ -954,10 +965,6 @@ class RaceFilmstripPanel(QWidget):
             return
         self.cache[frame.key] = frame
         self.cache.move_to_end(frame.key)
-        cache_bytes = sum(item.image.sizeInBytes() for item in self.cache.values())
-        while len(self.cache) > MAX_CACHE or (cache_bytes > MAX_CACHE_BYTES and len(self.cache) > 1):
-            _, removed = self.cache.popitem(last=False)
-            cache_bytes -= removed.image.sizeInBytes()
         if self._pending == frame.key:
             open_judgment = self._pending_judgment == frame.key
             self._pending = None

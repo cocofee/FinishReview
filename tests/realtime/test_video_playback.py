@@ -1063,8 +1063,14 @@ def test_reverse_window_rejects_imprecise_seek_result():
     assert list(worker._frame_cache) == []
 
 
-def test_playing_worker_uses_reverse_window_for_continuous_reverse(qapp):
-    capture = _FakeCapture(frame_count=100)
+@pytest.mark.parametrize("read_delay", [0.0, 0.025])
+def test_playing_worker_uses_reverse_window_for_continuous_reverse(qapp, read_delay):
+    class SlowCapture(_FakeCapture):
+        def read(self):
+            time.sleep(read_delay)
+            return super().read()
+
+    capture = SlowCapture(frame_count=100)
     worker = VideoPlaybackWorker(
         Path("recording.mkv"),
         capture_factory=lambda _path: capture,
@@ -1090,9 +1096,7 @@ def test_playing_worker_uses_reverse_window_for_continuous_reverse(qapp):
     loop.exec_()
 
     assert worker.wait(2_000)
-    assert frame_indexes[0] == 75
-    assert frame_indexes[1:] == sorted(frame_indexes[1:], reverse=True)
-    assert len(set(frame_indexes)) == len(frame_indexes)
+    assert frame_indexes == list(range(75, 67, -1))
     assert len(capture.set_positions) <= 2
     assert capture.released is True
 
@@ -1134,3 +1138,39 @@ def test_reverse_playback_prefetches_next_window_with_secondary_capture(qapp):
     assert captures[1].read_positions == list(range(55, 65))
     assert frame_indexes == sorted(frame_indexes, reverse=True)
     assert all(capture.released for capture in captures)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_reverse_boundary_reuses_inflight_window_and_wait_is_cancellable(qapp, cancel):
+    capture = _FakeCapture(frame_count=100)
+    worker = VideoPlaybackWorker(Path("recording.mkv"), reverse_prefetch=False)
+    worker._fps = 20
+    worker._frame_count = 100
+    generation = worker._request_generation
+    worker._reverse_prefetch_active = (50, 59, generation, 1)
+    result = []
+    images = []
+    worker.frame_ready.connect(lambda _image, _ms, index: images.append(index))
+    thread = threading.Thread(target=lambda: result.append(worker._decode_target(
+        capture, 59, 70, generation=generation, reverse_window=True,
+    )))
+    thread.start()
+    try:
+        if cancel:
+            worker.pause()
+        else:
+            image = QImage(32, 24, QImage.Format_RGB888)
+            with worker._condition:
+                worker._cache_image(59, image)
+                worker._reverse_prefetched_window = (50, 59, generation)
+                worker._reverse_prefetch_active = None
+                worker._condition.notify_all()
+        thread.join(1)
+        assert not thread.is_alive()
+        qapp.processEvents()
+        assert capture.set_positions == capture.read_positions == []
+        assert result == [(True, 70)]
+        assert images == ([] if cancel else [59])
+    finally:
+        worker.stop()
+        thread.join(2)
