@@ -216,20 +216,24 @@ def _optional_integer(payload: Mapping[str, Any], name: str) -> Optional[int]:
     return None if value is None else _integer(value, name)
 
 
-def probe_video_duration_ms(video_path: str | Path) -> Optional[int]:
+def probe_video_duration_ms(video_path: str | Path, *, cancelled=lambda: False) -> Optional[int]:
     """Return the decoded media duration when OpenCV can verify it."""
     path = Path(video_path)
     try:
         if not path.is_file() or path.stat().st_size <= 0:
             return None
         import cv2
+        from .decode_resources import DECODE_RESOURCES, THUMBNAIL
     except (ImportError, OSError):
         return None
 
     capture = None
     try:
-        capture = cv2.VideoCapture(str(path))
-        if not capture.isOpened():
+        capture = DECODE_RESOURCES.open_capture(
+            path, cv2.VideoCapture, priority=THUMBNAIL, cancelled=cancelled,
+            timeout=0.5, wait=threading.current_thread() is not threading.main_thread(),
+        )
+        if capture is None or not capture.isOpened():
             return None
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)

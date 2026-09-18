@@ -5,7 +5,7 @@ import gc
 import pytest
 from PyQt5.QtGui import QImage
 
-from realtime.decode_resources import DecodeResources, FOREGROUND, THUMBNAIL, PREFETCH, ImageCache
+from realtime.decode_resources import DecodeResources, FOREGROUND, THUMBNAIL, PREFETCH, ANALYSIS, ImageCache
 
 
 class Capture:
@@ -14,6 +14,47 @@ class Capture:
 
     def release(self):
         self.released = True
+
+
+def test_cancel_during_open_releases_capture_without_delivering_it():
+    resources = DecodeResources()
+    cancelled = threading.Event()
+    capture = Capture("x")
+
+    def factory(_path):
+        cancelled.set()
+        return capture
+
+    assert resources.open_capture("x", factory, cancelled=cancelled.is_set) is None
+    assert capture.released
+    assert resources.snapshot().captures == 0
+
+
+def test_analysis_yields_to_waiting_thumbnail_and_timeout_removes_ticket():
+    resources = DecodeResources(max_captures=2, max_background=1)
+    analysis = resources.open_capture("x", Capture, priority=ANALYSIS)
+    acquired = threading.Event()
+
+    def thumbnail():
+        capture = resources.open_capture("x", Capture, priority=THUMBNAIL, timeout=1)
+        if capture is not None:
+            acquired.set()
+            capture.release()
+
+    thread = threading.Thread(target=thumbnail)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 1
+        while not analysis.should_yield() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert analysis.should_yield()
+        assert resources.open_capture("x", Capture, priority=ANALYSIS, timeout=0.01) is None
+        assert resources.snapshot().waiting == 1
+    finally:
+        analysis.release()
+        thread.join(2)
+    assert acquired.is_set()
+    assert resources.snapshot().captures == resources.snapshot().waiting == 0
 
 
 def test_background_capacity_reserves_foreground_and_releases_on_failure():

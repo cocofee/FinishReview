@@ -161,6 +161,9 @@ class PlaybackCoordinator(QObject):
         worker.points_ready.connect(self._on_activity_points)
         worker.progress_ready.connect(self._on_activity_progress)
         worker.completed.connect(self._on_activity_completed)
+        failed = getattr(worker, "failed", None)
+        if failed is not None:
+            failed.connect(self._on_activity_failed)
         worker.finished.connect(self._on_activity_worker_finished)
         self._activity_worker = worker
         track_qthread(worker)
@@ -175,6 +178,10 @@ class PlaybackCoordinator(QObject):
         self.activity_timeline.set_analysis_state(
             f"正在分析 {self._activity_progress}%"
         )
+
+    def _on_activity_failed(self, message: str) -> None:
+        if self.sender() is self._activity_worker:
+            self.activity_timeline.set_analysis_state(f"分析未完成：{message}")
 
     def _on_activity_points(self, points) -> None:
         if self.sender() is not self._activity_worker:

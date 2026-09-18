@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 import threading
+import logging
+import math
 
 import cv2
 import numpy as np
 from PyQt5.QtCore import QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPen
 from PyQt5.QtWidgets import QWidget
+from .decode_resources import DECODE_RESOURCES, ANALYSIS
 
 
 class VideoActivityWorker(QThread):
@@ -18,6 +21,7 @@ class VideoActivityWorker(QThread):
     points_ready = pyqtSignal(object)
     progress_ready = pyqtSignal(int)
     completed = pyqtSignal()
+    failed = pyqtSignal(str)
 
     def __init__(self, video_path: Path, start_ms: int, end_ms: int, parent=None):
         super().__init__(parent)
@@ -42,10 +46,18 @@ class VideoActivityWorker(QThread):
             self._paused.clear()
 
     def run(self) -> None:
-        capture = cv2.VideoCapture(str(self.video_path))
-        if not capture.isOpened():
-            return
+        capture = None
         try:
+            while self._paused.is_set() and not self._stop.wait(0.03):
+                pass
+            capture = DECODE_RESOURCES.open_capture(
+                self.video_path, cv2.VideoCapture, priority=ANALYSIS, cancelled=self._stop.is_set,
+            )
+            if capture is None:
+                return
+            if not capture.isOpened():
+                self.failed.emit("活动分析无法打开录像")
+                return
             fps = max(1.0, float(capture.get(cv2.CAP_PROP_FPS) or 25.0))
             sample_step = max(1, int(round(fps / 4.0)))
             start_frame = max(0, int(round(self.start_ms * fps / 1000.0)))
@@ -58,13 +70,33 @@ class VideoActivityWorker(QThread):
             last_progress = -1
             self.progress_ready.emit(0)
             while frame_index <= end_frame and not self._stop.is_set():
+                resumed = False
+                if self._paused.is_set() or capture.should_yield():
+                    capture.release()
+                    capture = None
                 while self._paused.is_set() and not self._stop.is_set():
                     self.msleep(30)
                 if self._stop.is_set():
                     break
+                if capture is None:
+                    capture = DECODE_RESOURCES.open_capture(
+                        self.video_path, cv2.VideoCapture, priority=ANALYSIS,
+                        cancelled=self._stop.is_set,
+                    )
+                    if capture is None:
+                        return
+                    if not capture.isOpened() or not capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index):
+                        raise RuntimeError("活动分析无法恢复录像位置")
+                    resumed = True
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     break
+                if self._stop.is_set():
+                    return
+                if resumed:
+                    reported = float(capture.get(cv2.CAP_PROP_POS_FRAMES))
+                    if not math.isfinite(reported) or abs(reported - frame_index - 1) > 0.01:
+                        raise RuntimeError("活动分析恢复位置未验证")
                 if (frame_index - start_frame) % sample_step == 0:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     gray = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
@@ -93,8 +125,13 @@ class VideoActivityWorker(QThread):
             if not self._stop.is_set():
                 self.progress_ready.emit(100)
                 self.completed.emit()
+        except Exception as error:
+            logging.getLogger("FinishReview.Activity").exception("Activity analysis failed")
+            if not self._stop.is_set():
+                self.failed.emit(str(error))
         finally:
-            capture.release()
+            if capture is not None:
+                capture.release()
 
 
 class ActivityTimelineWidget(QWidget):

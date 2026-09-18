@@ -17,6 +17,7 @@ from .runtime_metrics import RuntimeMetrics
 FOREGROUND = 0
 THUMBNAIL = 1
 PREFETCH = 2
+ANALYSIS = 3
 
 
 @dataclass(frozen=True)
@@ -44,8 +45,10 @@ class DecodeResources:
         self._peak_cache_bytes = self._hits = self._misses = 0
         self.metrics = RuntimeMetrics()
 
-    def open_capture(self, path, factory, *, priority=FOREGROUND, cancelled=lambda: False, wait=True):
+    def open_capture(self, path, factory, *, priority=FOREGROUND, cancelled=lambda: False,
+                     wait=True, timeout=None):
         started = time.perf_counter()
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
         ticket = (priority, object())
         with self._condition:
             self._waiting.append(ticket)
@@ -58,7 +61,7 @@ class DecodeResources:
                         self._background += int(priority != FOREGROUND)
                         self._peak_captures = max(self._peak_captures, self._captures)
                         break
-                    if not wait:
+                    if not wait or (deadline is not None and time.monotonic() >= deadline):
                         return None
                     self._condition.wait(0.05)
                 else:
@@ -72,10 +75,22 @@ class DecodeResources:
             if capture is None:
                 self._release_capture(priority)
                 return None
-            return _CaptureLease(capture, self, priority)
         except BaseException:
             self._release_capture(priority)
             raise
+        lease = _CaptureLease(capture, self, priority)
+        if cancelled():
+            lease.release()
+            return None
+        return lease
+
+    def _should_yield(self, priority, opened_at):
+        with self._condition:
+            return priority != FOREGROUND and any(
+                waiting_priority < priority or (
+                    waiting_priority == priority and time.monotonic() - opened_at >= 0.5
+                ) for waiting_priority, _ticket in self._waiting
+            )
 
     def _release_capture(self, priority):
         with self._condition:
@@ -98,17 +113,23 @@ class _CaptureLease:
         self._capture = capture
         self._resources = resources
         self._priority = priority
+        self._opened_at = time.monotonic()
+        self._release_lock = threading.Lock()
+
+    def should_yield(self):
+        return self._resources._should_yield(self._priority, self._opened_at)
 
     def __getattr__(self, name):
         return getattr(self._capture, name)
 
     def release(self):
-        capture, self._capture = self._capture, None
-        if capture is not None:
-            try:
-                capture.release()
-            finally:
-                self._resources._release_capture(self._priority)
+        with self._release_lock:
+            capture, self._capture = self._capture, None
+            if capture is not None:
+                try:
+                    capture.release()
+                finally:
+                    self._resources._release_capture(self._priority)
 
 
 class ImageCache(MutableMapping):
