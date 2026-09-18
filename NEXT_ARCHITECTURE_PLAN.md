@@ -166,6 +166,10 @@ SessionContext 包含当前数据源、赛事目录、store/service 句柄与 ge
 
 ## 8. 阶段 D：判读状态和名单投影分离
 
+issue-4 首批 D 边界已开始实施：`review_session.py` 保存无界面判读身份、原帧、胶卷位置、
+高清帧和请求 generation；`roster_projection.py` 保存名单顺序、筛选、状态和局部变化集合。
+当前 QTableWidget 仍是显示控件，后续接线必须继续保持已有增量更新和人工操作语义。
+
 这是后续里程碑，不与接收/会话改造一次性混合。
 
 建议按依赖顺序逐块抽取：

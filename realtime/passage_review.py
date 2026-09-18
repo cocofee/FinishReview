@@ -93,6 +93,8 @@ from .race_metadata import (
     RaceMetadataStore,
 )
 from .review_selection import ReviewSelectionController, ReviewSelectionPlan
+from .review_session import ReviewSessionState
+from .roster_projection import RosterProjection
 from .review_clip import PassageReviewBindingStore
 from .runtime_metrics import RuntimeMetrics
 from .thread_lifecycle import retire_qthread, track_qthread
@@ -2785,6 +2787,8 @@ class PassageReviewSurface(QDialog):
         self._regular_panes_by_camera: dict[int, PassageEvidencePane] = {}
         self._external_location_revision = 0
         self._visible_events: list[PassageEvent] = []
+        self._roster_projection = RosterProjection()
+        self._review_session_state = ReviewSessionState()
         self._lookups: dict[str, PassageVideoLookup] = {}
         self._lookup_cache: dict[str, tuple[tuple, PassageVideoLookup]] = {}
         self._timeline_signature: tuple = ()
@@ -5188,6 +5192,9 @@ class PassageReviewSurface(QDialog):
                     self._event_review_statuses.get(event.event_id, "待核对")
                 )
             ]
+        self._roster_projection.set_statuses(self._event_review_statuses)
+        self._roster_projection.replace(self._visible_events, changed_event_ids=changed_event_ids)
+        self._visible_events = list(self._roster_projection.visible_events())
 
         self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
@@ -6281,6 +6288,15 @@ class PassageReviewSurface(QDialog):
                 # camera timeline.
                 self._shared_delta_ms = 0
         self._selected_event_id = event.event_id
+        self._review_session_state = (
+            self._review_session_state.locate_identity(event.event_id, event.revision)
+            if plan.locate_target
+            else self._review_session_state.select_identity(
+                event.event_id,
+                event.revision,
+                preserve_frame=preserve_current_frame is not None,
+            )
+        )
         if self._batch_mode:
             batch = self._review_batch_by_event_id.get(event.event_id)
             self._active_review_batch_id = batch.batch_id if batch is not None else ""
@@ -7763,6 +7779,7 @@ class PassageReviewSurface(QDialog):
         self._pending_filmstrip_position = None
         self._shared_delta_ms = 0
         self._selected_event_id = ""
+        self._review_session_state = self._review_session_state.clear_selection()
         metadata = self._current_metadata()
         self.race_value.setText(
             (metadata.race_name.strip() or metadata.race_id)
