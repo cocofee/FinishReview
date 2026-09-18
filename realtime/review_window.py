@@ -45,6 +45,9 @@ from PyQt5.QtWidgets import (
 )
 
 from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
+from .ui_metrics import UiLatencyProbe
+from .recording_catalog import RecordingCatalog, RecordingCatalogJob
+from .evidence_pipeline import EvidencePassage, EvidencePipeline, EvidenceRefreshJob, group_ready_windows
 from .capture_refresh import (
     ArchiveRefreshJob,
     CaptureRefreshRequest,
@@ -2764,14 +2767,9 @@ class FinishReviewWindow(PassageReviewSurface):
             )
         self.auto_advance_checkbox.setChecked(False)
         self.auto_advance_checkbox.hide()
-        try:
-            if self._publish_archive_segments():
-                self._lookup_cache.clear()
-                self.refresh()
-        except Exception as exc:  # noqa: BLE001 - recovery remains operator-visible.
-            self._capture_error = sanitize_recording_message(exc)
-            logger.exception("Failed to recover archived recording sessions")
+        self._request_capture_refresh()
         self._clock_timer.start()
+        self._ui_latency_probe = UiLatencyProbe(self.runtime_metrics, self)
         if self.high_speed_dir is not None:
             track_qthread(self._high_speed_scan_worker)
             self._high_speed_scan_worker.start()
@@ -4169,7 +4167,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 if camera_index not in active_recorders
             ]
             segment_counts = {
-                camera_index: len(ring_buffer.segments())
+                camera_index: len(ring_buffer.status_segments())
                 for camera_index, ring_buffer in self._ring_buffers.items()
             }
             waiting = [
@@ -4481,10 +4479,6 @@ class FinishReviewWindow(PassageReviewSurface):
                 {},
             )
             self._archive_publishers.extend(archive_publishers)
-            for event in self._events_for_current_metadata(
-                self.passage_store.events()
-            ):
-                self._register_passage(event, scan=False)
             self._started = True
             self._stop_requested = False
             self._recording_started_at = time.monotonic()
@@ -4497,7 +4491,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._capture_error = ""
             self._workspace_notice = ""
             self._refresh_timer.start()
-            self._refresh_capture_windows()
+            self._request_capture_refresh()
             self._lookup_cache.clear()
             self.refresh()
         except Exception:
@@ -5028,73 +5022,15 @@ class FinishReviewWindow(PassageReviewSurface):
             if self._has_published_passage(camera_index, event, window.passage_timestamp_ms):
                 continue
             pending.append((window, event, key))
-        pending.sort(
-            key=lambda item: (
-                item[1].race_id,
-                item[0].started_at_ms,
-                item[0].passage_timestamp_ms,
-                item[0].event_id,
-            )
-        )
-        groups = []
-        for item in pending:
-            window, event, _key = item
-            media_started_at_ms = window.segments[0].started_at_ms
-            media_ended_at_ms = window.segments[-1].ended_at_ms
-            if not groups:
-                groups.append(
-                    {
-                        "items": [item],
-                        "race_id": event.race_id,
-                        "window_end_ms": window.ended_at_ms,
-                        "media_start_ms": media_started_at_ms,
-                        "media_end_ms": media_ended_at_ms,
-                    }
-                )
-                continue
-            current = groups[-1]
-            combined_duration_ms = (
-                max(current["media_end_ms"], media_ended_at_ms)
-                - min(current["media_start_ms"], media_started_at_ms)
-            )
-            if (
-                event.race_id == current["race_id"]
-                and window.started_at_ms <= current["window_end_ms"]
-                and combined_duration_ms <= DEFAULT_MAX_SHARED_REVIEW_CLIP_MS
-            ):
-                current["items"].append(item)
-                current["window_end_ms"] = max(
-                    current["window_end_ms"],
-                    window.ended_at_ms,
-                )
-                current["media_start_ms"] = min(
-                    current["media_start_ms"],
-                    media_started_at_ms,
-                )
-                current["media_end_ms"] = max(
-                    current["media_end_ms"],
-                    media_ended_at_ms,
-                )
-            else:
-                groups.append(
-                    {
-                        "items": [item],
-                        "race_id": event.race_id,
-                        "window_end_ms": window.ended_at_ms,
-                        "media_start_ms": media_started_at_ms,
-                        "media_end_ms": media_ended_at_ms,
-                    }
-                )
-
         published_event_ids = set()
-        for group in groups:
-            items = group["items"]
+        for group in group_ready_windows([(window, event) for window, event, _key in pending]):
             publisher.publish_many(
-                tuple((window, event.revision) for window, event, _key in items),
-                race_id=group["race_id"],
+                tuple((window, event.revision) for window, event in group),
+                race_id=group[0][1].race_id,
             )
-            for window, _event, key in items:
-                self._published_keys.add(key)
+            for window, event in group:
+                self._published_keys.add((camera_index, window.event_id, event.revision,
+                                          window.passage_timestamp_ms))
                 published_event_ids.add(window.event_id)
         return published_event_ids
 
@@ -5402,57 +5338,31 @@ class FinishReviewWindow(PassageReviewSurface):
         pending_events = tuple(self._pending_passages.values())
         self._pending_passages.clear()
         if not pending_events:
-            self._update_runtime_status()
             return
-        metadata = (
-            self.metadata_store.current() if self.metadata_store is not None else None
-        )
-
-        def belongs_to_current_context(event: PassageEvent) -> bool:
-            if metadata is None and self.timing_provider == "racetiger":
-                return not self.racetiger_rid or event.race_id == self.racetiger_rid
-            return metadata is None or (
-                event.race_id == metadata.race_id
-                and event.stage_id == metadata.stage_id
-            )
-
-        changed_event_ids = {event.event_id for event in pending_events}
-        try:
-            active_events = tuple(
-                event
-                for event in pending_events
-                if event.is_active and belongs_to_current_context(event)
-            )
-            if active_events:
-                for ring_buffer in self._ring_buffers.values():
-                    ring_buffer.scan()
-            archive_segments = (
-                self._publish_archive_segments() if active_events else ()
-            )
-            for event in pending_events:
-                if event.is_active and belongs_to_current_context(event):
-                    self._register_passage(event, scan=False)
-                else:
-                    self._discard_registered_passage(
-                        event.event_id,
-                        revision=event.revision,
-                    )
-            for camera_index in self._coordinators:
-                changed_event_ids.update(
-                    self._publish_ready_windows(camera_index)
+        started = time.perf_counter()
+        # These events are already durable. Show corrections and withdrawals
+        # without waiting for disk scans, pin journals or media publication.
+        changed = {event.event_id for event in pending_events}
+        for event in pending_events:
+            if event.is_active and self._evidence_timestamp(event) is None:
+                self._unsupported_event_ids.add(event.event_id)
+            else:
+                self._unsupported_event_ids.discard(event.event_id)
+        for event_id in changed:
+            for windows in self._capture_windows_by_camera.values():
+                windows.pop(event_id, None)
+        self.refresh_events(changed)
+        displayed_at_ms = int(time.time() * 1000)
+        for event in pending_events:
+            if event.received_at_ms > 0:
+                self.runtime_metrics.observe(
+                    "passage_received_to_visible",
+                    max(0, displayed_at_ms - event.received_at_ms),
+                    item_count=1,
                 )
-            if archive_segments:
-                changed_event_ids.update(
-                    self._event_ids_for_archive_segments(archive_segments)
-                )
-            self._capture_error = ""
-        except Exception as exc:
-            self._capture_error = sanitize_recording_message(exc)
-            logger.exception("Failed to prepare passage review evidence")
-        # Passage delivery is already durable. An evidence failure must never
-        # hide a new time, correction or withdrawal from the operator.
-        self.refresh_events(changed_event_ids)
         self._apply_pending_focus()
+        self._request_capture_refresh()
+        self._observe_runtime_metric("passage_batch_apply", started, item_count=len(changed))
         self._update_runtime_status()
 
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
@@ -5487,9 +5397,12 @@ class FinishReviewWindow(PassageReviewSurface):
                 event.race_id != metadata.race_id
                 or event.stage_id != metadata.stage_id
             ):
-                self._discard_registered_passage(event_id)
+                for windows in self._capture_windows_by_camera.values():
+                    windows.pop(event_id, None)
+                self._unsupported_event_ids.discard(event_id)
         self.refresh()
         self._apply_pending_focus()
+        self._request_capture_refresh()
         self._update_runtime_status()
 
     def _on_racetiger_status(self, status: RaceTigerStatus) -> None:
@@ -5603,7 +5516,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 or window.state is PassageReviewState.READY
             ):
                 continue
-            preview = publisher.preview(window, race_id=event.race_id)
+            preview = getattr(self, "_capture_previews", {}).get((camera_index, event.event_id))
             if (
                 preview is None
                 or preview.media_started_at_ms is None
@@ -5657,49 +5570,113 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _invalidate_capture_refresh(self) -> None:
         self._capture_refresh_generation += 1
-        self._capture_refresh_worker.invalidate(
-            self._capture_refresh_generation
-        )
+        if not self._capture_refresh_worker.invalidate_and_wait(
+            self._capture_refresh_generation, timeout=5.0,
+        ):
+            raise RecordingError("后台证据处理尚未停止，请稍后重试")
 
-    def _request_capture_refresh(self) -> None:
-        if not self._coordinators or not self._ring_buffers:
-            self._update_runtime_status()
-            return
+    def _capture_refresh_request(self, *, cleanup=False) -> CaptureRefreshRequest:
         try:
             race_id = self._current_archive_race_id()
         except ExternalClipImportError:
             race_id = ""
-        recording = self._recording_any_active()
-        active_recorders = {
-            recorder
-            for recorder in self._recorders.values()
-            if recorder.is_running
-        }
+        active_recorders = {recorder for recorder in self._recorders.values() if recorder.is_running}
         archive_jobs = tuple(
-            ArchiveRefreshJob(
-                publisher=publisher,
-                race_id=str(race_id),
-                recording=bool(
-                    recording and publisher.recorder in active_recorders
-                ),
-            )
-            for publisher in self._archive_publishers
-            if race_id
+            ArchiveRefreshJob(publisher, str(race_id), publisher.recorder in active_recorders)
+            for publisher in self._archive_publishers if race_id
         )
+        key = (self.review_binding_store, tuple(self._coordinators.items()),
+               tuple(self._publishers.items()))
+        if key != getattr(self, "_evidence_pipeline_key", None):
+            self._evidence_pipeline_key = key
+            self._evidence_pipeline = EvidencePipeline(
+                self._coordinators, self._publishers, self.review_binding_store,
+            )
+            self._capture_previews = {}
+        if not hasattr(self, "_recording_catalog"):
+            self._recording_catalog = RecordingCatalog()
+        all_events = self.passage_store.events(include_inactive=True)
+        eligible = {event.event_id for event in self._events_for_current_metadata(all_events)}
+        passages = tuple(EvidencePassage(
+            event.event_id, event.revision, event.race_id, self._evidence_timestamp(event),
+            event.is_active, event.event_id in eligible,
+        ) for event in all_events)
+        return CaptureRefreshRequest(
+            generation=self._capture_refresh_generation,
+            ring_buffers=tuple(self._ring_buffers.values()), archive_jobs=archive_jobs,
+            cleanup=cleanup, current_time_ms=int(time.time() * 1000.0),
+            evidence_job=EvidenceRefreshJob(self._evidence_pipeline, passages),
+            catalog_job=RecordingCatalogJob(
+                self._recording_catalog, self.timeline_store,
+                self._camera_one_pane().camera_index, str(race_id), tuple(self._ring_buffers.values()),
+            ),
+        )
+
+    def _recording_sources_for_filmstrip(self, pane, race_id):
+        if not hasattr(self, "_capture_refresh_worker"):
+            return (), 0
+        context = (str(self.timeline_store.journal_path.absolute()), race_id, pane.camera_index)
+        snapshot = getattr(self, "_recording_catalog_snapshot", None)
+        key = (context, self.timeline_store.revision)
+        if ((snapshot is None or snapshot.context != context or snapshot.revision != key[1]
+                or time.monotonic() - getattr(self, "_catalog_refreshed_at", 0.0) >= 2.0)
+                and key != getattr(self, "_catalog_requested_key", None)):
+            self._catalog_requested_key = key
+            QTimer.singleShot(0, self._request_capture_refresh)
+        if snapshot is None or snapshot.context != context:
+            return (), 1 if self._recording_any_active() else 0
+        sources = tuple(replace(source, location=replace(
+            source.location, clock_offset_ms=self._continuous_offset_for_location(source.location),
+        )) for source in snapshot.sources)
+        pending = snapshot.pending
+        if self._recording_any_active() and not any(
+            source.location.segment.end_reason == "live_filmstrip_tail" for source in sources
+        ):
+            pending = max(1, pending)
+        return sources, pending
+
+    def _request_capture_refresh(self) -> None:
         now = time.monotonic()
         cleanup = now - self._last_cleanup_at >= 5.0
         if cleanup:
             self._last_cleanup_at = now
-        self._capture_refresh_worker.submit(
-            CaptureRefreshRequest(
-                generation=self._capture_refresh_generation,
-                ring_buffers=tuple(self._ring_buffers.values()),
-                archive_jobs=archive_jobs,
-                cleanup=False,
-                current_time_ms=int(time.time() * 1000.0),
-                cleanup_after_apply=cleanup,
-            )
-        )
+        self._capture_refresh_worker.submit(self._capture_refresh_request(cleanup=cleanup))
+
+    def _apply_evidence_snapshot(self, snapshot) -> set[str]:
+        changed = set()
+        valid = {}
+        eligible = {event.event_id for event in self._events_for_current_metadata(
+            self.passage_store.events(include_inactive=True)
+        )}
+        for passage in snapshot.passages:
+            current = self.passage_store.get(passage.event_id)
+            if (current is not None and current.revision == passage.revision
+                    and current.is_active == passage.active
+                    and passage.eligible == (passage.event_id in eligible)
+                    and self._evidence_timestamp(current) == passage.timestamp_ms):
+                valid[passage.event_id] = passage
+        previews = dict(getattr(self, "_capture_previews", {}))
+        for camera, windows in snapshot.windows:
+            previous = self._capture_windows_by_camera.setdefault(camera, {})
+            incoming = {window.event_id: window for window in windows if window.event_id in valid}
+            for event_id in valid:
+                window = incoming.get(event_id)
+                if previous.get(event_id) != window:
+                    changed.add(event_id)
+                if window is None:
+                    previous.pop(event_id, None)
+                else:
+                    previous[event_id] = window
+                previews.pop((camera, event_id), None)
+        for camera, event_id, preview in snapshot.previews:
+            if event_id in valid:
+                if self._capture_previews.get((camera, event_id)) != preview:
+                    changed.add(event_id)
+                previews[camera, event_id] = preview
+        self._capture_previews = previews
+        self._unsupported_event_ids = {passage.event_id for passage in valid.values()
+                                       if passage.active and passage.eligible and passage.timestamp_ms is None}
+        return changed
 
     def _on_capture_refresh_finished(self, result: CaptureRefreshResult) -> None:
         if (
@@ -5708,14 +5685,22 @@ class FinishReviewWindow(PassageReviewSurface):
         ):
             return
         apply_started = time.perf_counter()
+        self._catalog_requested_key = None
+        if result.catalog is not None:
+            self._recording_catalog_snapshot = result.catalog
+            self._catalog_refreshed_at = time.monotonic()
         failed = bool(result.error)
         apply_failed = False
         changed_event_ids: set[str] = set()
         if result.apply_state:
             try:
-                changed_event_ids = self._apply_capture_refresh_state(
-                    result.archive_segments
-                )
+                if result.evidence is not None:
+                    changed_event_ids = self._apply_evidence_snapshot(result.evidence)
+                if result.archive_segments:
+                    changed_event_ids.update(self._event_ids_for_archive_segments(result.archive_segments))
+                if changed_event_ids:
+                    self.refresh_events(changed_event_ids)
+                self._poll_recording_health(now=time.monotonic())
             except Exception as exc:
                 failed = True
                 apply_failed = True
@@ -5723,15 +5708,17 @@ class FinishReviewWindow(PassageReviewSurface):
                 logger.exception("Failed to apply background capture refresh")
         if result.error:
             self._capture_error = sanitize_recording_message(result.error)
+        elif result.evidence is not None and not apply_failed:
+            self._capture_error = ""
         # A newly published HLS segment extends the time-film tail before the
         # five-minute archive is sealed. Refresh only the lightweight source
         # index here; visible thumbnails are still decoded lazily by the panel.
-        if (result.apply_state and result.discovered_segment_count) or result.deleted_paths:
+        if result.catalog is not None or (result.apply_state and (result.discovered_segment_count or result.archive_segments)) or result.deleted_paths:
             try:
                 self._update_filmstrip()
             except Exception:  # noqa: BLE001 - a preview refresh must not stop capture.
                 logger.exception("Failed to refresh live filmstrip tail")
-        if result.cleanup_after_apply and not apply_failed:
+        if result.cleanup_after_apply and not failed:
             self._capture_refresh_worker.submit(
                 CaptureRefreshRequest(
                     generation=self._capture_refresh_generation,
@@ -5752,81 +5739,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_operator_controls()
         self._update_runtime_status()
 
-    def _apply_capture_refresh_state(
-        self,
-        archive_segments=(),
-    ) -> set[str]:
-        changed_event_ids: set[str] = set()
-        timeline_changed = (
-            self._timeline_cache_signature() != self._timeline_signature
-        )
-        if archive_segments:
-            changed_event_ids.update(
-                self._event_ids_for_archive_segments(archive_segments)
-            )
-        for camera_index, coordinator in self._coordinators.items():
-            windows = self._capture_windows_by_camera.setdefault(
-                camera_index,
-                {},
-            )
-            for window in coordinator.refresh(scan=False):
-                previous = windows.get(window.event_id)
-                windows[window.event_id] = window
-                if previous is not None and previous.state is not window.state:
-                    changed_event_ids.add(window.event_id)
-                elif previous is not None and previous.segments != window.segments:
-                    changed_event_ids.add(window.event_id)
-            changed_event_ids.update(self._publish_ready_windows(camera_index))
-        self._poll_recording_health(now=time.monotonic())
-        if changed_event_ids:
-            self.refresh_events(changed_event_ids)
-        elif timeline_changed:
-            # A cancelled background request may have committed an idempotent
-            # archive record before its result was discarded. Force lookup
-            # reconciliation even when no publisher returns that path again.
-            self._lookup_cache.clear()
-            self.refresh()
-        return changed_event_ids
-
     def _refresh_capture_windows(self) -> None:
-        """Synchronous refresh retained for startup, shutdown, and tests."""
-        if not self._coordinators or not self._ring_buffers:
-            self._update_runtime_status()
-            return
-        refresh_started = time.perf_counter()
-        refresh_failed = False
-        changed_event_ids: set[str] = set()
-        try:
-            for ring_buffer in self._ring_buffers.values():
-                with self.runtime_metrics.measure("ring_buffer_scan"):
-                    ring_buffer.scan()
-            archive_started = time.perf_counter()
-            archive_segments = self._publish_archive_segments()
-            self._observe_runtime_metric(
-                "archive_publish",
-                archive_started,
-                item_count=len(archive_segments),
-            )
-            changed_event_ids = self._apply_capture_refresh_state(archive_segments)
-            now = time.monotonic()
-            if now - self._last_cleanup_at >= 5.0:
-                current_time_ms = int(time.time() * 1000.0)
-                for ring_buffer in self._ring_buffers.values():
-                    with self.runtime_metrics.measure("ring_buffer_cleanup"):
-                        ring_buffer.cleanup(current_time_ms=current_time_ms)
-                self._last_cleanup_at = now
-        except Exception as exc:
-            refresh_failed = True
-            self._capture_error = sanitize_recording_message(exc)
-            logger.exception("Failed to refresh passage review capture")
-        self._observe_runtime_metric(
-            "capture_refresh",
-            refresh_started,
-            item_count=len(changed_event_ids),
-            failed=refresh_failed,
-        )
-        self._update_operator_controls()
-        self._update_runtime_status()
+        """Drain and finish evidence work for explicit lifecycle/test callers."""
+        self._invalidate_capture_refresh()
+        result = CaptureRefreshWorker(lambda _result: None)._process(self._capture_refresh_request())
+        self._on_capture_refresh_finished(result)
 
     def _publish_archive_segments(
         self,
@@ -5867,7 +5784,7 @@ class FinishReviewWindow(PassageReviewSurface):
         configured_sources = tuple(self._configured_recording_sources())
         recording_active = self._recording_any_active()
         segments_by_camera = {
-            camera_index: tuple(ring_buffer.segments())
+            camera_index: tuple(ring_buffer.status_segments())
             for camera_index, ring_buffer in self._ring_buffers.items()
         }
         metadata = (
@@ -6859,6 +6776,8 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def closeEvent(self, event) -> None:
         self._clock_timer.stop()
+        if hasattr(self, "_ui_latency_probe"):
+            self._ui_latency_probe.stop()
         if not self.stop():
             event.ignore()
             self.setEnabled(False)

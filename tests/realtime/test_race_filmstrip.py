@@ -325,7 +325,8 @@ def manual_worker(monkeypatch):
             self.stopped = False
             self.instances.append(self)
 
-        def start(self):
+        def start(self, priority=None):
+            self.priority = priority
             pass
 
         def request_stop(self):
@@ -341,6 +342,21 @@ def result(recording, timestamp):
     image.fill(0)
     position = timestamp - recording.start_ms
     return RaceFilmstripFrame(recording, timestamp, position, position // 50, image)
+
+
+def test_operator_busy_defers_thumbnails_but_allows_explicit_click(qapp, tmp_path, manual_worker):
+    recording = source(tmp_path / "video", duration=60000)
+    panel = RaceFilmstripPanel()
+    panel.show()
+    panel.set_operator_busy(True)
+    panel.set_sources((recording,))
+    panel._load_visible()
+    assert panel._worker is None
+    panel.open_time(10500)
+    panel._load_visible()
+    assert panel._worker is not None
+    assert panel._worker.jobs == ((recording, 10500),)
+    panel.close()
 
 
 def wheel(panel, *, angle=0, pixels=0):

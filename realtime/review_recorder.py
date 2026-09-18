@@ -937,6 +937,7 @@ class ReviewRingBuffer:
         )
         self._lock = threading.RLock()
         self._segments: dict[str, ReviewSegment] = {}
+        self._status_segments: tuple[ReviewSegment, ...] = ()
         self._playlist_segment_ids: set[str] = set()
         self._segment_revision = 0
         self._pins_by_event: dict[str, set[str]] = {}
@@ -1249,6 +1250,7 @@ class ReviewRingBuffer:
             duration_ms = None
             current_start_ms = None
         self._playlist_segment_ids = playlist_segment_ids
+        self._status_segments = self.segments()
         return tuple(discovered)
 
     def filmstrip_segments(self) -> tuple[ReviewSegment, ...]:
@@ -1410,6 +1412,16 @@ class ReviewRingBuffer:
                     key=lambda item: (item.started_at_ms, item.segment_id),
                 )
             )
+
+    def status_segments(self) -> tuple[ReviewSegment, ...]:
+        """UI diagnostics must not wait behind a filesystem operation."""
+        if not self._lock.acquire(blocking=False):
+            return self._status_segments
+        try:
+            self._status_segments = self.segments()
+            return self._status_segments
+        finally:
+            self._lock.release()
 
     def acquire_scan_leases(self, segments: Iterable[ReviewSegment]) -> bool:
         """Reserve current segments against cleanup for one scanner operation."""

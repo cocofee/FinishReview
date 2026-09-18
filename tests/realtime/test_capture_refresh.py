@@ -95,7 +95,7 @@ def test_capture_refresh_coalesces_pending_requests_and_keeps_cleanup():
 
     def receive(result):
         results.append(result)
-        if result.generation == 3:
+        if len(results) == 2:
             completed.set()
 
     worker = CaptureRefreshWorker(receive)
@@ -103,13 +103,13 @@ def test_capture_refresh_coalesces_pending_requests_and_keeps_cleanup():
     worker.submit(_request(1, ring_buffer))
     assert ring_buffer.scan_started.wait(2)
 
-    worker.submit(_request(2, ring_buffer, cleanup=True, current_time_ms=2_000))
-    worker.submit(_request(3, ring_buffer, cleanup=False, current_time_ms=3_000))
+    worker.submit(_request(1, ring_buffer, cleanup=True, current_time_ms=2_000))
+    worker.submit(_request(1, ring_buffer, cleanup=False, current_time_ms=3_000))
     ring_buffer.release_scan.set()
 
     assert completed.wait(2)
     assert worker.stop()
-    assert [result.generation for result in results] == [1, 3]
+    assert [result.generation for result in results] == [1, 1]
     assert ring_buffer.cleanup_times == []
     assert results[-1].cleanup_after_apply
 

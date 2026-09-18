@@ -10,6 +10,8 @@ import time
 from typing import Callable
 
 from .runtime_metrics import RuntimeMetrics
+from .evidence_pipeline import EvidenceRefreshJob, EvidenceSnapshot
+from .recording_catalog import RecordingCatalogJob, RecordingCatalogSnapshot
 
 
 logger = logging.getLogger("FinishReview.CaptureRefresh")
@@ -32,6 +34,8 @@ class CaptureRefreshRequest:
     scan: bool = True
     apply_state: bool = True
     cleanup_after_apply: bool = False
+    evidence_job: EvidenceRefreshJob | None = None
+    catalog_job: RecordingCatalogJob | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,8 @@ class CaptureRefreshResult:
     error: str = ""
     apply_state: bool = True
     cleanup_after_apply: bool = False
+    evidence: EvidenceSnapshot | None = None
+    catalog: RecordingCatalogSnapshot | None = None
 
 
 class CaptureRefreshWorker:
@@ -91,7 +97,7 @@ class CaptureRefreshWorker:
             ):
                 return
             pending = self._pending
-            if pending is not None:
+            if pending is not None and pending.generation == request.generation:
                 cleanup_needed = bool(
                     request.cleanup
                     or request.cleanup_after_apply
@@ -106,6 +112,13 @@ class CaptureRefreshWorker:
                         int(request.current_time_ms),
                         int(pending.current_time_ms),
                     ),
+                    # A cleanup-only request must not replace pending evidence
+                    # work. Full event snapshots supersede older snapshots.
+                    evidence_job=request.evidence_job or pending.evidence_job,
+                    catalog_job=request.catalog_job or pending.catalog_job,
+                    scan=request.scan or pending.scan,
+                    archive_jobs=request.archive_jobs or pending.archive_jobs,
+                    apply_state=request.apply_state or pending.apply_state,
                 )
             self._pending = request
             self._condition.notify_all()
@@ -225,6 +238,8 @@ class CaptureRefreshWorker:
         archive_segments: list[object] = []
         deleted_paths: list[Path] = []
         errors: list[str] = []
+        evidence = None
+        catalog = None
         for ring_buffer in request.ring_buffers if request.scan else ():
             if self._is_cancelled(request):
                 break
@@ -264,7 +279,20 @@ class CaptureRefreshWorker:
                 started,
                 item_count=len(published),
             )
-        if request.cleanup:
+        if request.evidence_job is not None and not self._is_cancelled(request):
+            started = time.perf_counter()
+            try:
+                job = request.evidence_job
+                evidence = job.pipeline.refresh(job.passages, lambda: self._is_cancelled(request))
+                self._observe("background_evidence_publish", started, item_count=len(job.passages))
+            except Exception as error:  # noqa: BLE001 - retry from durable events.
+                errors.append(f"evidence: {error}")
+                self._observe("background_evidence_publish", started, failed=True)
+                logger.exception("Background evidence preparation failed")
+        with self._condition:
+            pending_evidence = self._pending is not None and self._pending.evidence_job is not None
+        # Failed or queued registrations must retain media until they can pin it.
+        if request.cleanup and not (request.evidence_job is not None and errors) and not pending_evidence:
             for ring_buffer in request.ring_buffers:
                 if self._is_cancelled(request):
                     break
@@ -286,6 +314,16 @@ class CaptureRefreshWorker:
                     started,
                     item_count=len(deleted),
                 )
+        if request.catalog_job is not None and not self._is_cancelled(request):
+            started = time.perf_counter()
+            try:
+                job = request.catalog_job
+                catalog = job.catalog.refresh(job, deleted_paths=deleted_paths)
+                self._observe("background_recording_catalog", started, item_count=len(catalog.sources))
+            except Exception as error:  # noqa: BLE001 - keep evidence progress.
+                errors.append(f"catalog: {error}")
+                self._observe("background_recording_catalog", started, failed=True)
+                logger.exception("Background recording catalog refresh failed")
         self._observe(
             "capture_refresh_background",
             refresh_started,
@@ -300,6 +338,8 @@ class CaptureRefreshWorker:
             error="; ".join(errors),
             apply_state=request.apply_state,
             cleanup_after_apply=request.cleanup_after_apply,
+            evidence=evidence,
+            catalog=catalog,
         )
 
 

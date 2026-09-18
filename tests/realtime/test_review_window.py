@@ -289,6 +289,15 @@ def _window(tmp_path, *, passage_batch_interval_ms=0):
     )
 
 
+def _wait_until(qapp, predicate, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        qapp.processEvents()
+        QTest.qWait(5)
+    qapp.processEvents()
+    assert predicate()
+
+
 def test_concrete_review_windows_are_sibling_types():
     assert not issubclass(FinishReviewWindow, passage_review.PassageReviewDialog)
     assert issubclass(FinishReviewWindow, passage_review.PassageReviewSurface)
@@ -324,6 +333,7 @@ def test_live_filmstrip_confirmation_reopens_after_cleanup_and_archive(qapp, tmp
     window.refresh()
     window.auto_advance_checkbox.setChecked(False)
     panel = window.video_filmstrip.full_race
+    _wait_until(qapp, lambda: any(s.location.video_path == video for s in panel.index.sources))
     source = next(s for s in panel.index.sources if s.location.video_path == video)
     image = QImage(640, 360, QImage.Format_RGB888)
     image.fill(0)
@@ -351,6 +361,7 @@ def test_live_filmstrip_confirmation_reopens_after_cleanup_and_archive(qapp, tmp
             end_reason="continuous_archive_fallback", race_id=event.race_id,
         )
         window._update_filmstrip()
+        _wait_until(qapp, lambda: panel.index.span_at(start + 520).source.location.video_path == archive)
         assert panel.index.span_at(start + 520).source.location.video_path == archive
         assert window._continuous_offset_for_location(panel.index.span_at(start + 520).source.location) == -480
     finally:
@@ -989,7 +1000,7 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
 
     window.start()
     _FakeReceiver.instances[0].deliver(_event())
-    qapp.processEvents()
+    _wait_until(qapp, lambda: window.regular_pane.location is not None)
 
     assert window.recorder.is_running
     assert window.receiver.is_running
@@ -1248,7 +1259,7 @@ def test_live_passage_shows_preview_before_full_post_roll_is_ready(
     )
     window.start()
     _FakeReceiver.instances[-1].deliver(_event())
-    qapp.processEvents()
+    _wait_until(qapp, lambda: window.regular_pane.location is not None)
 
     preview_location = window.regular_pane.location
     assert preview_location is not None
@@ -1307,10 +1318,10 @@ def test_evidence_failure_does_not_hide_received_passage(qapp, tmp_path, monkeyp
     receiver = _FakeReceiver.instances[0]
     event = _event()
 
-    def fail_publish(_camera_index):
+    def fail_publish(*_args, **_kwargs):
         raise RuntimeError("evidence unavailable")
 
-    monkeypatch.setattr(window, "_publish_ready_windows", fail_publish)
+    monkeypatch.setattr(window._publishers[1], "publish_many", fail_publish)
     try:
         receiver.deliver(event)
         qapp.processEvents()
@@ -1318,7 +1329,7 @@ def test_evidence_failure_does_not_hide_received_passage(qapp, tmp_path, monkeyp
         window._flush_passage_batch()
         assert window.table.rowCount() == 1
         assert window.table.item(0, 1).text() == event.bib
-        assert window._capture_error == "evidence unavailable"
+        _wait_until(qapp, lambda: "evidence unavailable" in window._capture_error)
         withdrawn = replace(event, revision=2, is_active=False)
         receiver.deliver(withdrawn)
         qapp.processEvents()
@@ -1359,6 +1370,41 @@ def test_restarted_recording_reuses_persisted_binding_without_regrouping(qapp, t
         window.close()
 
 
+def test_slow_evidence_does_not_delay_visible_withdrawal(qapp, tmp_path, monkeypatch):
+    import threading
+
+    window = _window(tmp_path)
+    window.start()
+    entered = threading.Event()
+    release = threading.Event()
+    publisher = window._publishers[1]
+    publish = publisher.publish_many
+
+    def blocked_publish(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "publish_many", blocked_publish)
+    event = _event()
+    try:
+        _FakeReceiver.instances[0].deliver(event)
+        _wait_until(qapp, entered.is_set)
+        assert window.table.rowCount() == 1
+        assert window.table.item(0, 1).text() == event.bib
+        _FakeReceiver.instances[0].deliver(replace(event, revision=2, is_active=False))
+        _wait_until(qapp, lambda: window.table.rowCount() == 0)
+        assert not release.is_set()
+        release.set()
+        _wait_until(qapp, lambda: window._evidence_pipeline._registered.get(event.event_id)
+                    is not None and not window._evidence_pipeline._registered[event.event_id].active)
+        assert window.table.rowCount() == 0
+        assert window.review_binding_store.active_bindings(event.event_id, 1) == ()
+    finally:
+        release.set()
+        window.close()
+
+
 def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
     qapp,
     tmp_path,
@@ -1367,20 +1413,18 @@ def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
     window = _window(tmp_path, passage_batch_interval_ms=1_000)
     window.start_receiver()
     window.start_recording()
+    # Drain the initial filmstrip/catalog refresh scheduled by the window
+    # before observing the passage-triggered refresh below.
+    qapp.processEvents()
     receiver = _FakeReceiver.instances[0]
     refreshed_batches = []
-    archive_calls = 0
+    requests = []
 
     def record_refresh(event_ids):
         refreshed_batches.append(set(event_ids))
 
-    def record_archive(**_kwargs):
-        nonlocal archive_calls
-        archive_calls += 1
-        return ()
-
     monkeypatch.setattr(window, "refresh_events", record_refresh)
-    monkeypatch.setattr(window, "_publish_archive_segments", record_archive)
+    monkeypatch.setattr(window._capture_refresh_worker, "submit", requests.append)
     for sequence in range(1, 4):
         receiver.deliver(
             _event(
@@ -1404,7 +1448,8 @@ def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
             "race-1-stage-1-passage-3",
         }
     ]
-    assert archive_calls == 1
+    assert len(requests) == 1
+    assert len(requests[0].evidence_job.passages) == 3
     assert "本次收到 3 条" in window.receiver_status_label.text()
     window.close()
 
@@ -3464,24 +3509,26 @@ def test_periodic_capture_refresh_keeps_one_context_generation(
 
 def test_stale_capture_refresh_result_is_not_applied(qapp, tmp_path, monkeypatch):
     from realtime.capture_refresh import CaptureRefreshResult
+    from realtime.evidence_pipeline import EvidenceSnapshot
 
     window = _window(tmp_path)
     window.start_recording()
     applied = []
     monkeypatch.setattr(
         window,
-        "_apply_capture_refresh_state",
-        lambda segments=(): applied.append(tuple(segments)) or set(),
+        "_apply_evidence_snapshot",
+        lambda snapshot: applied.append(snapshot) or set(),
     )
 
+    snapshot = EvidenceSnapshot((), (), ())
     window._on_capture_refresh_finished(
-        CaptureRefreshResult(window._capture_refresh_generation - 1)
+        CaptureRefreshResult(window._capture_refresh_generation - 1, evidence=snapshot)
     )
     window._on_capture_refresh_finished(
-        CaptureRefreshResult(window._capture_refresh_generation)
+        CaptureRefreshResult(window._capture_refresh_generation, evidence=snapshot)
     )
 
-    assert applied == [()]
+    assert applied == [snapshot]
     window.close()
 
 

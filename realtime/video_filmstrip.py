@@ -1024,6 +1024,7 @@ class VideoFilmstripWidget(QFrame):
         """Pause low-priority future-window decoding during active review."""
 
         self._operator_busy = bool(busy)
+        self.full_race.set_operator_busy(busy)
         if self._operator_busy:
             self.stop_prefetch()
 

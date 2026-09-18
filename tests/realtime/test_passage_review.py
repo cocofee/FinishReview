@@ -5794,25 +5794,43 @@ def test_more_menu_preserves_frame_step_and_disabled_actions(qapp, tmp_path, fak
         dialog.close()
 
 
-def test_large_incremental_batch_falls_back_to_one_full_refresh(
-    qapp,
-    tmp_path,
-    monkeypatch,
-):
-    dialog = PassageReviewDialog(
-        PassageEventStore(tmp_path / "passages.jsonl"),
-        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
-    )
-    refresh_calls = 0
+def test_large_incremental_batch_preserves_unchanged_rows(qapp, tmp_path, monkeypatch):
+    store = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(event_id="first", passage_time_ms=10000)
+    store.append(first)
+    dialog = PassageReviewDialog(store, VideoTimelineStore(tmp_path / "timeline.jsonl"))
+    item = dialog.table.item(0, 1)
+    monkeypatch.setattr(dialog, "refresh", lambda: pytest.fail("unexpected full refresh"))
+    for index in range(65):
+        store.append(_event(event_id=f"new-{index}", passage_time_ms=20000 + index))
+    dialog.refresh_events(f"new-{index}" for index in range(65))
+    assert dialog.table.rowCount() == 66
+    assert dialog.table.item(0, 1) is item
+    assert dialog._selected_event_id == first.event_id
+    dialog.close()
 
-    def counted_refresh():
-        nonlocal refresh_calls
-        refresh_calls += 1
 
-    monkeypatch.setattr(dialog, "refresh", counted_refresh)
-    dialog.refresh_events(f"passage-{index}" for index in range(65))
-
-    assert refresh_calls == 1
+@pytest.mark.parametrize("filter_kind", ["group", "search"])
+def test_filtered_incremental_changes_preserve_unrelated_items(qapp, tmp_path, monkeypatch, filter_kind):
+    store = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(event_id="first", bib="151", passage_time_ms=10000)
+    second = _event(event_id="second", bib="152", passage_time_ms=11000)
+    store.append(first)
+    store.append(second)
+    dialog = PassageReviewDialog(store, VideoTimelineStore(tmp_path / "timeline.jsonl"))
+    if filter_kind == "group":
+        dialog.group_combo.setCurrentIndex(dialog.group_combo.findData(first.group_id))
+    else:
+        dialog.identity_search.setText("15")
+        dialog._search_refresh_timer.stop()
+        dialog._refresh_filtered_view()
+    item = dialog.table.item(0, 1)
+    monkeypatch.setattr(dialog, "refresh", lambda: pytest.fail("unexpected full refresh"))
+    store.append(replace(second, revision=2, is_active=False))
+    dialog.refresh_events((second.event_id,))
+    assert dialog.table.rowCount() == 1
+    assert dialog.table.item(0, 1) is item
+    assert dialog._selected_event_id == first.event_id
     dialog.close()
 
 

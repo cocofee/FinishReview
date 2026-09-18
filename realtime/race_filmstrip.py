@@ -6,7 +6,6 @@ from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-import heapq
 import math
 from pathlib import Path
 
@@ -19,6 +18,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QKeySequence
 
+from .recording_catalog import FilmstripSource, RecordingSpan, RaceRecordingIndex, recording_sources
 from .thread_lifecycle import retire_qthread, track_qthread
 from .video_timeline import DEFAULT_CLOCK_SOURCE, PassageVideoLocation
 from .filmstrip_checks import FilmstripCheckStore, merge_ranges, subtract_ranges
@@ -48,162 +48,6 @@ def format_duration(milliseconds):
     minutes, seconds = divmod(int(seconds), 60)
     hours, minutes = divmod(minutes, 60)
     return (f"{hours} 小时 " if hours else "") + f"{minutes} 分 {seconds} 秒"
-
-
-@dataclass(frozen=True)
-class FilmstripSource:
-    location: PassageVideoLocation
-    start_ms: int
-    end_ms: int
-    available: bool
-    priority: int = 0
-
-    @property
-    def key(self):
-        # Source identity must survive a live HLS playlist growing at its
-        # right edge. Coverage end is tracked separately by ``set_sources``;
-        # keeping it out of this key preserves already decoded thumbnails.
-        return (str(self.location.video_path.absolute()), self.start_ms,
-                self.location.segment.segment_id)
-
-
-@dataclass(frozen=True)
-class RecordingSpan:
-    start_ms: int
-    end_ms: int
-    source: FilmstripSource | None
-
-
-class RaceRecordingIndex:
-    """Non-overlapping recording spans, including uncompressed real gaps."""
-
-    def __init__(self, sources=()):
-        self.sources = tuple(sorted(sources, key=lambda source: (source.start_ms, source.key)))
-        events = {}
-        for index, source in enumerate(self.sources):
-            if source.end_ms <= source.start_ms:
-                continue
-            events.setdefault(source.start_ms, []).append((True, index))
-            events.setdefault(source.end_ms, []).append((False, index))
-        points = sorted(events)
-        active = set()
-        heap = []
-        spans = []
-        for point_index, point in enumerate(points[:-1]):
-            for begins, index in events[point]:
-                if begins:
-                    active.add(index)
-                    source = self.sources[index]
-                    heapq.heappush(heap, (not source.available, source.priority,
-                                         -(source.end_ms - source.start_ms), index))
-                else:
-                    active.discard(index)
-            while heap and heap[0][-1] not in active:
-                heapq.heappop(heap)
-            source = self.sources[heap[0][-1]] if heap else None
-            end = points[point_index + 1]
-            if spans and spans[-1].source == source:
-                spans[-1] = RecordingSpan(spans[-1].start_ms, end, source)
-            else:
-                spans.append(RecordingSpan(point, end, source))
-        self.spans = tuple(spans)
-        self.starts = tuple(span.start_ms for span in spans)
-        self.start_ms = points[0] if points else 0
-        self.end_ms = points[-1] if points else 0
-
-    def span_at(self, timestamp):
-        index = bisect_right(self.starts, timestamp) - 1
-        if index >= 0 and timestamp < self.spans[index].end_ms:
-            return self.spans[index]
-        return None
-
-    def sample_at(self, timestamp, interval_ms):
-        span = self.span_at(timestamp)
-        if span is not None and span.source is not None:
-            return span.source, timestamp
-        # Even a recording shorter than the selected spacing gets a tile.
-        index = bisect_right(self.starts, timestamp)
-        if index < len(self.spans):
-            next_span = self.spans[index]
-            if next_span.start_ms < timestamp + interval_ms and next_span.source is not None:
-                return next_span.source, next_span.start_ms
-        return None, timestamp
-
-
-def recording_sources(
-    store,
-    camera_index: int,
-    race_id: str = "",
-    *,
-    offset_for_location=None,
-    live_location: PassageVideoLocation | None = None,
-    live_locations=(),
-):
-    """Use recording coverage, never the roster or its filters, for the rail."""
-    sources = []
-    pending = 0
-    for segment in store.segments():
-        if segment.camera_index != camera_index or segment.clock_source != DEFAULT_CLOCK_SOURCE:
-            continue
-        if race_id and segment.race_id and segment.race_id != race_id:
-            continue
-        if segment.media_started_at_ms is None or segment.media_duration_ms is None:
-            pending += 1
-            continue
-        start = int(segment.media_started_at_ms)
-        end = start + int(segment.media_duration_ms)
-        path = store.resolve_video_path(segment)
-        available = path.is_file()
-        continuous = "archive" in path.stem or "archive" in segment.end_reason
-        priority = 0 if continuous else 2 if path.suffix.lower() == ".m3u8" else 1
-        location = PassageVideoLocation(segment, path, 0, 0, 0,
-                                        segment.timing_error_ms, "located" if available else "missing_file")
-        if offset_for_location is not None:
-            location = replace(location, clock_offset_ms=offset_for_location(location))
-        sources.append(FilmstripSource(location, start, end, available, priority))
-    # The archive writer deliberately leaves the current five-minute file out
-    # until it is sealed and duration-probed.  Keep the already published HLS
-    # tail in the same chronological index so the operator can review the
-    # newest arrivals without waiting for that seal.  Archive sources have a
-    # higher priority and therefore replace this overlap automatically once
-    # the long-form file is published.
-    live_values = tuple(live_locations)
-    if live_location is not None:
-        live_values = (*live_values, live_location)
-    for live_location in live_values:
-        segment = live_location.segment
-        if (
-            segment.camera_index == camera_index
-            and segment.media_started_at_ms is not None
-            and segment.media_duration_ms is not None
-            and (not race_id or not segment.race_id or segment.race_id == race_id)
-        ):
-            path = Path(live_location.video_path)
-            # Each live source is one closed TS segment.  Validate only that
-            # immutable file; validating a rolling playlist makes an otherwise
-            # healthy tail fail when its old head has already been cleaned up.
-            try:
-                available = path.is_file() and path.stat().st_size > 0
-            except OSError:
-                available = False
-            if path.suffix.lower() == ".m3u8":
-                available = available and store.video_path_is_playable(path)
-            location = live_location
-            if offset_for_location is not None:
-                location = replace(location, clock_offset_ms=offset_for_location(location))
-            sources.append(
-                FilmstripSource(
-                    location,
-                    int(segment.media_started_at_ms),
-                    int(segment.media_started_at_ms + segment.media_duration_ms),
-                    available,
-                    2,
-                )
-            )
-            # This is an active tail, not a missing interval.  The caller
-            # renders a separate processing notice; keep ``pending`` reserved
-            # for archive segments that have no temporary playback source.
-    return tuple(sources), pending
 
 
 @dataclass(frozen=True)
@@ -556,6 +400,7 @@ class RaceFilmstripPanel(QWidget):
         self.errors = OrderedDict()
         self._worker = None
         self._closed = False
+        self._operator_busy = False
         self._signature = None
         self._sources_by_key = {}
         self._initial_positioned = False
@@ -1056,13 +901,24 @@ class RaceFilmstripPanel(QWidget):
         elif key in self.errors:
             self.status_label.setText(self.errors[key] + "；可点“刷新录像”重试。")
         else:
-            self._pending = key
             self.status_label.setText("正在读取这张图片；读到准确原帧后跳到机位 1。")
+            # Showing the notice can synchronously resize the viewport.
+            # Keep the explicit request after that layout pass.
+            self._pending = key
             self._cancel_decode()
             QTimer.singleShot(0, self._load_visible)
 
+    def set_operator_busy(self, busy):
+        self._operator_busy = bool(busy)
+        if busy and self._pending is None:
+            self._cancel_decode()
+        elif not busy and not self._closed:
+            self._load_timer.start()
+
     def _load_visible(self):
         if self._closed or not self.isVisible() or self._worker is not None:
+            return
+        if self._operator_busy and self._pending is None:
             return
         jobs = []
         if self._pending is not None:
@@ -1087,7 +943,7 @@ class RaceFilmstripPanel(QWidget):
         worker.failed.connect(self._failed)
         worker.finished.connect(self._finished)
         track_qthread(worker)
-        worker.start()
+        worker.start(QThread.NormalPriority if self._pending is not None else QThread.LowPriority)
 
     def _frame_ready(self, frame):
         if self.sender() is not self._worker or self._closed:
