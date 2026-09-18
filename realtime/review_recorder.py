@@ -1166,10 +1166,25 @@ class ReviewRingBuffer:
         with self._lock:
             return self._scan_unlocked()
 
+    def _read_playlist(self) -> list[str]:
+        # FFmpeg atomically replaces the live playlist. Windows can briefly
+        # deny an open during that handover; retry only this read, before any
+        # index/pin state changes. Persistent access errors must still reach
+        # the caller so evidence cleanup is not mistaken for a healthy scan.
+        delays = (0.01, 0.02)
+        for attempt in range(len(delays) + 1):
+            try:
+                return self.playlist_path.read_text(encoding="utf-8").splitlines()
+            except PermissionError:
+                if attempt == len(delays):
+                    raise
+                time.sleep(delays[attempt])
+        raise AssertionError("unreachable playlist retry")
+
     def _scan_unlocked(self) -> tuple[ReviewSegment, ...]:
         """Load completed segments currently published by the HLS playlist."""
         try:
-            lines = self.playlist_path.read_text(encoding="utf-8").splitlines()
+            lines = self._read_playlist()
         except FileNotFoundError:
             return ()
         discovered = []
