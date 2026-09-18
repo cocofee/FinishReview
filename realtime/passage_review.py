@@ -1230,6 +1230,7 @@ class PassageEvidencePane(QFrame):
     scrub_preview_requested = pyqtSignal(int)
     initial_frame_ready = pyqtSignal(str)
     preview_frame_ready = pyqtSignal(object, int, int)
+    detail_requested = pyqtSignal(object)
 
     MAX_SCRUB_SPAN_MS = 6_000
     SCRUB_PREVIEW_INTERVAL_MS = 80
@@ -1286,6 +1287,7 @@ class PassageEvidencePane(QFrame):
         self._current_position_ms = 0
         self._timeline_dragging = False
         self._last_full_resolution_request = -1
+        self._full_resolution_enabled = True
         self._scrub_origin_delta_ms = 0
         self._video_scrubbing = False
         self._pending_scrub_delta_ms: Optional[int] = None
@@ -1332,11 +1334,14 @@ class PassageEvidencePane(QFrame):
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.status_label.setObjectName("evidencePaneStatus")
         self._set_status_label("未选择")
+        self.quality_label = QLabel("")
+        self.quality_label.setVisible(self.source_kind == REGULAR_SOURCE and self.camera_index == 1)
         header.addWidget(self.title_label)
         header.addWidget(self.active_badge)
         header.addWidget(self.frame_indicator_label)
         header.addWidget(self.camera_combo)
         header.addStretch()
+        header.addWidget(self.quality_label)
         header.addWidget(self.status_label)
         layout.addLayout(header)
 
@@ -1345,7 +1350,7 @@ class PassageEvidencePane(QFrame):
         self.video_view.clear_frame("选择一条通过记录后自动定位")
         self.video_view.zoom_changed.connect(self._on_zoom_changed)
         self.video_view.full_resolution_requested.connect(
-            self._schedule_full_resolution_request
+            self._on_detail_requested
         )
         self.video_view.maximize_requested.connect(
             lambda: self.maximize_requested.emit(self)
@@ -1402,6 +1407,9 @@ class PassageEvidencePane(QFrame):
         self.fit_btn.setToolTip("适应当前窗格")
         self.zoom_in_btn = QPushButton("+")
         self.zoom_in_btn.setToolTip("放大")
+        self.hd_btn = QPushButton("高清")
+        self.hd_btn.setToolTip("暂停并读取当前帧原图；滚轮放大，中键拖动查看号码")
+        self.hd_btn.setVisible(self.source_kind == REGULAR_SOURCE and self.camera_index == 1)
         self.maximize_btn = QPushButton("放大")
         self.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
         self.mark_btn = QPushButton("标线")
@@ -1422,6 +1430,7 @@ class PassageEvidencePane(QFrame):
         controls.addWidget(self.actual_size_btn)
         controls.addWidget(self.fit_btn)
         controls.addWidget(self.zoom_in_btn)
+        controls.addWidget(self.hd_btn)
         controls.addWidget(self.maximize_btn)
         controls.addWidget(self.mark_btn)
         controls.addWidget(self.confirm_btn)
@@ -1435,6 +1444,7 @@ class PassageEvidencePane(QFrame):
         self.actual_size_btn.clicked.connect(self.video_view.set_actual_size)
         self.fit_btn.clicked.connect(self.video_view.fit_to_window)
         self.zoom_in_btn.clicked.connect(lambda: self.video_view.zoom_by(1.2))
+        self.hd_btn.clicked.connect(self._on_detail_requested)
         self.maximize_btn.clicked.connect(lambda: self.maximize_requested.emit(self))
         self._maximize_shortcut = QShortcut(QKeySequence(Qt.Key_F), self)
         self._maximize_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
@@ -1835,6 +1845,7 @@ class PassageEvidencePane(QFrame):
         self._current_frame_index = -1
         self._current_position_ms = 0
         self._last_full_resolution_request = -1
+        self.quality_label.clear()
         self.timeline.setProperty("initial_frame_index", None)
         self._full_resolution_timer.stop()
         self._reset_video_scrub()
@@ -1927,7 +1938,9 @@ class PassageEvidencePane(QFrame):
                 worker = VideoPlaybackWorker(
                     location.video_path,
                     self,
-                    reverse_prefetch=not self._low_resource_mode,
+                    # Continuous reverse playback uses one bounded lookahead;
+                    # paused single-frame review still avoids idle decoding.
+                    reverse_prefetch=True,
                     idle_prefetch=not self._low_resource_mode,
                 )
             except TypeError:
@@ -1935,11 +1948,12 @@ class PassageEvidencePane(QFrame):
                 # compatible with the historical two-argument constructor.
                 worker = VideoPlaybackWorker(location.video_path, self)
                 if self._low_resource_mode:
-                    if hasattr(worker, "_reverse_prefetch_enabled"):
-                        worker._reverse_prefetch_enabled = False
                     if hasattr(worker, "_idle_prefetch_enabled"):
                         worker._idle_prefetch_enabled = False
         worker.media_locator = str(location.media_locator)
+        set_presentation_ack = getattr(worker, "set_presentation_ack_enabled", None)
+        if callable(set_presentation_ack):
+            set_presentation_ack(True)
         set_idle_prefetch = getattr(worker, "set_idle_prefetch_enabled", None)
         if callable(set_idle_prefetch):
             set_idle_prefetch(self._idle_prefetch_enabled)
@@ -2036,6 +2050,7 @@ class PassageEvidencePane(QFrame):
 
     def clear_passage(self, message: str = "没有通过记录") -> None:
         self._stop_worker()
+        self.quality_label.clear()
         self._event = None
         self._location = None
         self._lookup_status = ""
@@ -2116,6 +2131,7 @@ class PassageEvidencePane(QFrame):
     def _on_frame_ready(self, image, position_ms: int, frame_index: int) -> None:
         if self.sender() is not self._worker:
             return
+        worker = self._worker
         previous_frame_index = self._current_frame_index
         self._current_frame_index = int(frame_index)
         self._current_position_ms = int(position_ms)
@@ -2133,6 +2149,7 @@ class PassageEvidencePane(QFrame):
             source_width=self._source_width,
             source_height=self._source_height,
         )
+        self._update_frame_quality(image)
         self._update_status_label()
         self._set_transport_enabled(True)
         self.video_view.set_marker_mode(self._marking_enabled)
@@ -2148,6 +2165,10 @@ class PassageEvidencePane(QFrame):
         self._schedule_paused_frame_detail()
         if previous_frame_index < 0 and self._event is not None:
             self.initial_frame_ready.emit(self._event.event_id)
+        needs_presentation = getattr(worker, "frame_needs_presentation", None)
+        if callable(needs_presentation) and needs_presentation(frame_index):
+            self.video_view.viewport().repaint()
+            worker.acknowledge_presented_frame(frame_index)
 
     def _on_full_resolution_ready(
         self,
@@ -2157,7 +2178,8 @@ class PassageEvidencePane(QFrame):
     ) -> None:
         if self.sender() is not self._worker:
             return
-        if (int(frame_index) != self._current_frame_index or self._playing
+        if (not self._full_resolution_enabled
+                or int(frame_index) != self._current_frame_index or self._playing
                 or self._video_scrubbing or self._timeline_dragging):
             return
         self.video_view.set_frame(
@@ -2166,16 +2188,60 @@ class PassageEvidencePane(QFrame):
             source_height=self._source_height,
         )
         self._current_position_ms = int(position_ms)
+        self._update_frame_quality(image)
         self._render_marker()
         self._update_time_label(position_ms)
         self._update_frame_indicator(position_ms)
-        self.preview_frame_ready.emit(image, int(position_ms), int(frame_index))
+        # Camera 1 originals belong to the judging view. The overview and
+        # timeline keep their lightweight previews for spotting passages.
+        if self.source_kind != REGULAR_SOURCE or self.camera_index != 1:
+            self.preview_frame_ready.emit(image, int(position_ms), int(frame_index))
 
-    def _on_full_resolution_error(self, message: str) -> None:
+    def _on_full_resolution_error(self, message: str, frame_index=None) -> None:
         if self.sender() is not self._worker:
             return
+        if (not self._full_resolution_enabled or self._playing
+                or self._video_scrubbing or self._timeline_dragging
+                or (frame_index is not None and int(frame_index) != self._current_frame_index)):
+            return
         self._last_full_resolution_request = -1
+        self.quality_label.setText("原图读取失败，可点高清重试")
         self._set_status_label(self._availability_status(), str(message))
+
+    def _update_frame_quality(self, image) -> None:
+        original = (self._source_width > 0 and self._source_height > 0
+                    and image.width() >= self._source_width
+                    and image.height() >= self._source_height)
+        kind = "原图" if original else "预览"
+        self.quality_label.setText(f"{kind} {image.width()}×{image.height()}")
+
+    def set_full_resolution_enabled(self, enabled: bool) -> None:
+        """Only the judging popup needs original pixels in single-camera mode."""
+        if self._full_resolution_enabled == bool(enabled):
+            return
+        self._full_resolution_enabled = bool(enabled)
+        self._full_resolution_timer.stop()
+        self._last_full_resolution_request = -1
+        if enabled:
+            self._schedule_paused_frame_detail()
+        elif self.video_view.has_frame:
+            image = self.video_view._pixmap_item.pixmap().toImage()
+            if image.width() > 1280 or image.height() > 720:
+                image = image.scaled(1280, 720, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.video_view.set_frame(image, source_width=self._source_width,
+                                     source_height=self._source_height)
+            self._update_frame_quality(image)
+
+    def _on_detail_requested(self) -> None:
+        if not self._full_resolution_enabled or self._current_frame_index < 0:
+            return
+        if self.source_kind == REGULAR_SOURCE and self.camera_index == 1:
+            was_playing = self._playing
+            position_ms, frame_index = self._current_position_ms, self._current_frame_index
+            self.detail_requested.emit(self)
+            if was_playing:
+                self.seek_media_frame(position_ms, frame_index)
+        self._schedule_full_resolution_request()
 
     def _update_time_label(self, position_ms: int) -> None:
         event = self._event
@@ -2213,17 +2279,19 @@ class PassageEvidencePane(QFrame):
     def _request_full_resolution(self) -> None:
         worker = self._worker
         frame_index = self._current_frame_index
-        if (worker is None or frame_index < 0 or self._playing
+        if (not self._full_resolution_enabled or worker is None or frame_index < 0 or self._playing
                 or self._video_scrubbing or self._timeline_dragging):
             return
         if frame_index == self._last_full_resolution_request:
             return
         self._last_full_resolution_request = frame_index
+        self.quality_label.setText("原图读取中…")
         worker.request_full_resolution(frame_index)
 
     def _schedule_full_resolution_request(self) -> None:
         if (
-            self._worker is None
+            not self._full_resolution_enabled
+            or self._worker is None
             or self._current_frame_index < 0
             or self._playing
             or self._video_scrubbing
@@ -2513,6 +2581,7 @@ class PassageEvidencePane(QFrame):
         )
 
     def _set_transport_enabled(self, enabled: bool) -> None:
+        self.hd_btn.setEnabled(enabled and self.video_view.has_frame)
         self.previous_frame_btn.setEnabled(enabled)
         self.play_btn.setEnabled(enabled)
         self.next_frame_btn.setEnabled(enabled)
@@ -3482,6 +3551,7 @@ class PassageReviewSurface(QDialog):
             )
         )
         pane.play_requested.connect(lambda current=pane: self._toggle_pane(current))
+        pane.detail_requested.connect(self._on_pane_detail_requested)
         pane.passage_delta_requested.connect(
             lambda delta, current=pane: self._seek_pane_delta(
                 current, delta, preview=False
@@ -5618,6 +5688,8 @@ class PassageReviewSurface(QDialog):
             return
         if self._uses_popup_judging():
             self._set_continuous_results_table(False)
+            pane = self._camera_one_pane()
+            pane.set_full_resolution_enabled(pane is self._maximized_pane)
             self.evidence_splitter.hide()
             self.workspace_splitter.setMinimumHeight(180)
             self.workspace_splitter.setHandleWidth(0)
@@ -8457,7 +8529,12 @@ class PassageReviewSurface(QDialog):
     def _toggle_active_pane(self) -> None:
         self._toggle_pane(self._active_playback_pane())
 
+    def _on_pane_detail_requested(self, pane: PassageEvidencePane) -> None:
+        self._mark_filmstrip_operator_busy()
+        self._activate_pane(pane, align=False)
+
     def _toggle_pane(self, pane: PassageEvidencePane) -> None:
+        self._mark_filmstrip_operator_busy()
         was_sync_playing = self._sync_playing
         if was_sync_playing:
             self._set_sync_playing(False, seek_final=False)
@@ -8478,6 +8555,7 @@ class PassageReviewSurface(QDialog):
         pane: PassageEvidencePane,
         frame_delta: int,
     ) -> None:
+        self._mark_filmstrip_operator_busy()
         if abs(int(frame_delta)) == CTRL_FRAME_STEP:
             direction = 1 if int(frame_delta) > 0 else -1
             if self._navigate_video_candidate(direction, pane):
@@ -8797,6 +8875,7 @@ class PassageReviewSurface(QDialog):
         *,
         preview: bool,
     ) -> None:
+        self._mark_filmstrip_operator_busy()
         self._activate_pane(pane, align=False)
         # Preview clips from camera 1/2 are one temporary evidence window. A
         # scrub or seek on either preview pane must move both cameras together;
@@ -9062,6 +9141,9 @@ class PassageReviewSurface(QDialog):
         pane_index = self.evidence_splitter.indexOf(pane)
         if pane_index < 0:
             return
+        if self._uses_popup_judging():
+            pane.set_playing(False)
+            pane.set_full_resolution_enabled(True)
         window = QDialog(
             self,
             Qt.Window
@@ -9335,6 +9417,7 @@ class PassageReviewSurface(QDialog):
         QTimer.singleShot(0, self._distribute_evidence_panes)
         if self._uses_popup_judging():
             self.evidence_splitter.hide()
+            pane.set_full_resolution_enabled(False)
             pane.set_playing(False)
             if return_state is not None:
                 self.review_content_splitter.setSizes(return_state[0])

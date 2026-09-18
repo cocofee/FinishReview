@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -47,6 +48,21 @@ logger = logging.getLogger("FinishReview.Playback")
 
 
 SUPPORTED_VIDEO_SUFFIXES = {".mkv", ".mp4", ".avi", ".mov", ".m4v"}
+REVERSE_DECODER_THREADS = min(4, os.cpu_count() or 1)
+
+
+def _open_reverse_capture(video_path):
+    """Keep the lookahead decoder's native frame/thread buffers bounded."""
+    try:
+        capture = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_N_THREADS, REVERSE_DECODER_THREADS,
+        ])
+    except (cv2.error, AttributeError):
+        return cv2.VideoCapture(str(video_path))
+    if capture.isOpened():
+        return capture
+    capture.release()
+    return cv2.VideoCapture(str(video_path))
 
 
 def _open_video_capture(
@@ -395,6 +411,7 @@ class VideoPlaybackWorker(QThread):
     metadata_ready = pyqtSignal(int, float, int, int, int)
     frame_ready = pyqtSignal(QImage, int, int)
     full_resolution_ready = pyqtSignal(QImage, int, int)
+    full_resolution_error = pyqtSignal(str, int)
     playback_finished = pyqtSignal()
     step_boundary_reached = pyqtSignal(int)
     playback_error = pyqtSignal(str)
@@ -455,6 +472,9 @@ class VideoPlaybackWorker(QThread):
         self._navigation_samples = 0
         self._navigation_cache_hits = 0
         self._navigation_boundary_misses = 0
+        self._presentation_ack_enabled = False
+        self._pending_presentation: Optional[tuple[int, int]] = None
+        self._last_frame_emitted_at = 0.0
 
     @property
     def _frame_cache_bytes(self):
@@ -469,6 +489,23 @@ class VideoPlaybackWorker(QThread):
     def current_frame_index(self) -> int:
         with self._condition:
             return self._current_frame_index
+
+    def set_presentation_ack_enabled(self, enabled: bool) -> None:
+        """Let a GUI consumer pace exact reverse frames after painting them."""
+        with self._condition:
+            self._presentation_ack_enabled = bool(enabled)
+            self._pending_presentation = None
+            self._condition.notify_all()
+
+    def acknowledge_presented_frame(self, frame_index: int) -> None:
+        with self._condition:
+            if self._pending_presentation is not None and self._pending_presentation[1] == frame_index:
+                self._pending_presentation = None
+                self._condition.notify_all()
+
+    def frame_needs_presentation(self, frame_index: int) -> bool:
+        with self._condition:
+            return self._pending_presentation == (self._request_generation, frame_index)
 
     def play(self) -> None:
         self.set_shuttle_speed(1.0)
@@ -938,16 +975,20 @@ class VideoPlaybackWorker(QThread):
         capture = None
         try:
             while True:
-                if capture is not None:
+                if capture is not None and (
+                    not self._playing or self._direction >= 0
+                    or capture.should_yield()
+                ):
                     capture.release()
                     capture = None
                 with self._condition:
-                    while (
+                    if (
                         self._reverse_prefetch_task is None
                         and not self._stop_requested
                         and not self._reverse_prefetch_shutdown
                     ):
-                        self._condition.wait(timeout=0.1)
+                        self._condition.wait(timeout=0.05)
+                        continue
                     if self._stop_requested or self._reverse_prefetch_shutdown:
                         return
                     task = self._reverse_prefetch_task
@@ -957,8 +998,10 @@ class VideoPlaybackWorker(QThread):
                     continue
                 window_start, window_end, generation, serial = task
                 if capture is None:
+                    factory = (_open_reverse_capture if self._capture_factory is cv2.VideoCapture
+                               else self._capture_factory)
                     capture = DECODE_RESOURCES.open_capture(
-                        self.video_path, self._capture_factory, priority=PREFETCH,
+                        self.video_path, factory, priority=PREFETCH,
                         cancelled=lambda: (self._stop_requested or self._reverse_prefetch_shutdown
                                            or generation != self._request_generation
                                            or serial != self._reverse_prefetch_serial),
@@ -1018,13 +1061,21 @@ class VideoPlaybackWorker(QThread):
                         and not self._stop_requested
                         and not self._reverse_prefetch_shutdown
                     ):
-                        for frame_index, image in decoded.items():
+                        transferred = 0
+                        for frame_index in tuple(decoded):
+                            image = decoded.pop(frame_index, None)
+                            if image is None:
+                                # Another consumer may evict staged prefetch
+                                # images while claiming the shared budget.
+                                continue
                             self._cache_image(frame_index, image)
-                        self._reverse_prefetched_window = (
-                            window_start,
-                            window_end,
-                            generation,
-                        )
+                            transferred += 1
+                        if transferred == window_end - window_start + 1:
+                            self._reverse_prefetched_window = (
+                                window_start,
+                                window_end,
+                                generation,
+                            )
                     if self._reverse_prefetch_active == task:
                         self._reverse_prefetch_active = None
                     self._condition.notify_all()
@@ -1100,6 +1151,11 @@ class VideoPlaybackWorker(QThread):
             or not self._reverse_prefetch_thread.is_alive()
         ):
             return
+        with self._condition:
+            # Discrete backward steps already fill their nearby frame window.
+            # The second decoder is useful only while continuously reversing.
+            if not self._playing or self._direction >= 0:
+                return
         self._update_reverse_window_for_target(target, generation)
         with self._condition:
             current = self._reverse_current_window
@@ -1152,7 +1208,21 @@ class VideoPlaybackWorker(QThread):
             self._current_position_ms = position_ms
             if self._seek_frame is None and self._step_frame is None:
                 self._navigation_frame_index = frame_index
+            presentation = None
+            if (self._presentation_ack_enabled and self._playing
+                    and self._direction < 0 and self._speed <= 1.0):
+                presentation = (self._request_generation, frame_index)
+                self._pending_presentation = presentation
+            self._last_frame_emitted_at = time.monotonic()
         self.frame_ready.emit(image, position_ms, frame_index)
+        if presentation is not None:
+            with self._condition:
+                while (self._pending_presentation == presentation
+                       and self._request_generation == presentation[0]
+                       and not self._stop_requested):
+                    self._condition.wait(timeout=0.05)
+                if self._pending_presentation == presentation:
+                    self._pending_presentation = None
         return True
 
     def _decode_target(
@@ -1569,12 +1639,19 @@ class VideoPlaybackWorker(QThread):
 
                 if full_resolution_frame is not None:
                     requested_frame, generation = full_resolution_frame
-                    _, capture_next_frame = self._decode_full_resolution(
-                        capture,
-                        self._clamp_frame(requested_frame),
-                        capture_next_frame,
-                        generation=generation,
-                    )
+                    try:
+                        ok, capture_next_frame = self._decode_full_resolution(
+                            capture,
+                            self._clamp_frame(requested_frame),
+                            capture_next_frame,
+                            generation=generation,
+                        )
+                    except cv2.error:
+                        ok = False
+                    if not ok and not self._decode_request_cancelled(generation):
+                        self.full_resolution_error.emit(
+                            "当前帧原图读取失败，请重试或逐帧选择相邻画面。", requested_frame,
+                        )
                     continue
 
                 if not playing:
@@ -1637,8 +1714,11 @@ class VideoPlaybackWorker(QThread):
                     continue
                 if not self._decode_request_cancelled(request_generation):
                     last_frame_index = target
+                    # A slow decode must not create a burst of back-to-back
+                    # frames that the GUI merges into one repaint.
                     next_reverse_frame_at = max(
-                        next_reverse_frame_at + 1.0 / (self._fps * speed), time.monotonic(),
+                        self._last_frame_emitted_at + 1.0 / (self._fps * speed),
+                        time.monotonic(),
                     )
         except Exception as exc:
             self.playback_error.emit(f"录像回放失败: {exc}")
@@ -1715,6 +1795,9 @@ class VideoPlaybackDialog(QDialog):
                 self.worker, "_reverse_prefetch_enabled"
             ):
                 self.worker._reverse_prefetch_enabled = False
+        set_presentation_ack = getattr(self.worker, "set_presentation_ack_enabled", None)
+        if callable(set_presentation_ack):
+            set_presentation_ack(True)
         self.worker.metadata_ready.connect(self._on_metadata_ready)
         self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.playback_finished.connect(self._on_playback_finished)
@@ -1953,6 +2036,13 @@ class VideoPlaybackDialog(QDialog):
         self._update_target_status(self.timeline.value())
 
     def _on_frame_ready(self, image: QImage, position_ms: int, frame_index: int) -> None:
+        needs_presentation = getattr(self.worker, "frame_needs_presentation", None)
+        if callable(needs_presentation) and needs_presentation(frame_index):
+            self._pending_frame = None
+            self._render_frame_now(image, position_ms, frame_index)
+            self.video_label.repaint()
+            self.worker.acknowledge_presented_frame(frame_index)
+            return
         self._pending_frame = (image, int(position_ms), int(frame_index))
         if self._frame_update_scheduled:
             return

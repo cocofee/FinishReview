@@ -64,6 +64,7 @@ class _FakePlaybackWorker(QObject):
     metadata_ready = pyqtSignal(int, float, int, int, int)
     frame_ready = pyqtSignal(object, int, int)
     full_resolution_ready = pyqtSignal(object, int, int)
+    full_resolution_error = pyqtSignal(str, int)
     playback_finished = pyqtSignal()
     step_boundary_reached = pyqtSignal(int)
     playback_error = pyqtSignal(str)
@@ -4015,6 +4016,61 @@ def test_review_rejects_external_clip_from_another_race(qapp, tmp_path):
     dialog.close()
 
 
+@pytest.mark.parametrize("action", ["play", "step", "seek"])
+def test_single_video_controls_suspend_filmstrip_until_idle(qapp, tmp_path, fake_playback, action):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "videos" / "camera.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10_000, ended_at_ms=30_000)
+    dialog = PassageReviewDialog(passages, timeline, low_resource_mode=True,
+                                 regular_camera_indexes=(1,), show_high_speed_pane=False)
+    dialog.show()
+    qapp.processEvents()
+    try:
+        pane = dialog.regular_pane
+        filmstrip = dialog.video_filmstrip.full_race
+        dialog.video_filmstrip.set_operator_busy(False)
+        if action == "play":
+            pane.play_requested.emit()
+        elif action == "step":
+            pane.step_requested.emit(-1)
+        else:
+            pane.passage_delta_requested.emit(500)
+        assert filmstrip._operator_busy
+        if action == "play":
+            assert pane.is_playing
+            dialog._on_filmstrip_operator_idle()
+            assert filmstrip._operator_busy
+            pane.play_requested.emit()
+        dialog._on_filmstrip_operator_idle()
+        assert not filmstrip._operator_busy
+    finally:
+        dialog.close()
+
+
+def test_single_video_enables_reverse_lookahead_without_idle_prefetch(qapp, tmp_path, monkeypatch):
+    class ConfiguredWorker(_FakePlaybackWorker):
+        def __init__(self, path, parent=None, *, reverse_prefetch=True, idle_prefetch=True):
+            super().__init__(path, parent, idle_prefetch=idle_prefetch)
+            self.reverse_prefetch = reverse_prefetch
+
+    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", ConfiguredWorker)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "videos" / "camera.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10_000, ended_at_ms=30_000)
+    dialog = PassageReviewDialog(passages, timeline, low_resource_mode=True,
+                                 regular_camera_indexes=(1,), show_high_speed_pane=False)
+    try:
+        worker = dialog.regular_pane._worker
+        assert worker.reverse_prefetch
+        assert not any(worker.idle_prefetch_calls)
+    finally:
+        dialog.close()
+
+
 def test_frame_step_controls_only_focused_pane_at_its_native_frame_rate(
     qapp,
     tmp_path,
@@ -4341,6 +4397,7 @@ def test_zoom_requests_full_resolution_without_replacing_the_worker(
     )
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
+    dialog._toggle_maximized_pane(dialog.regular_pane)
     worker = fake_playback.instances[0]
     preview = QImage(1280, 720, QImage.Format_RGB888)
     preview.fill(0)
@@ -4381,6 +4438,7 @@ def test_full_resolution_request_waits_for_the_latest_paused_frame(
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
     pane = dialog.regular_pane
+    dialog._toggle_maximized_pane(pane)
     worker = fake_playback.instances[0]
     preview = QImage(1280, 720, QImage.Format_RGB888)
     preview.fill(0)
@@ -4414,6 +4472,7 @@ def test_paused_fitted_video_restores_original_and_rejects_stale_detail(
     try:
         qapp.processEvents()
         pane = dialog.regular_pane
+        dialog._toggle_maximized_pane(pane)
         worker = fake_playback.instances[0]
         preview = QImage(1280, 720, QImage.Format_RGB888)
         preview.fill(Qt.red)
@@ -4448,6 +4507,75 @@ def test_paused_fitted_video_restores_original_and_rejects_stale_detail(
         pane.set_playing(True)
         worker.full_resolution_ready.emit(original, 5040, 252)
         assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("action", ["button", "zoom", "actual_size"])
+def test_camera_one_originals_only_load_in_judging_and_can_retry(
+    qapp, tmp_path, fake_playback, monkeypatch, action,
+):
+    from realtime.race_filmstrip import RaceFilmstripPanel
+
+    monkeypatch.setattr(RaceFilmstripPanel, "_load_visible", lambda self: None)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(passage_time_ms=15000))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01",
+                 camera_index=1, started_at_ms=10000, ended_at_ms=20000)
+    dialog = PassageReviewDialog(passages, timeline)
+    try:
+        qapp.processEvents()
+        pane = dialog.regular_pane
+        worker = pane._worker
+        preview = QImage(1280, 720, QImage.Format_RGB888)
+        preview.fill(Qt.red)
+        original = QImage(2560, 1440, QImage.Format_RGB888)
+        original.fill(Qt.green)
+        worker.frame_ready.emit(preview, 5000, 250)
+        QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 50)
+        assert worker.full_resolution_calls == []
+        dialog._toggle_maximized_pane(pane)
+        assert _wait_until(lambda: worker.full_resolution_calls == [250])
+        worker.full_resolution_ready.emit(original, 5000, 250)
+        assert pane.video_view._pixmap_item.pixmap().size() == original.size()
+        assert pane.quality_label.text() == "原图 2560×1440"
+        assert dialog.preview_video_view._pixmap_item.pixmap().size() == preview.size()
+
+        pane.set_playing(True)
+        worker.frame_ready.emit(preview, 5040, 252)
+        before = worker.pause_calls
+        if action == "button":
+            pane.hd_btn.click()
+        elif action == "zoom":
+            pane.video_view.zoom_by(1.2)
+        else:
+            pane.video_view.set_actual_size()
+        assert not pane.is_playing
+        assert worker.pause_calls > before
+        assert worker.seek_calls[-1] == 5040
+        worker.frame_ready.emit(preview, 5040, 252)
+        pane._on_marker_position_selected(0.4, 0.6)
+        transform = pane.video_view.transform()
+        marker = pane.video_view._marker
+        assert _wait_until(lambda: worker.full_resolution_calls == [250, 252])
+        worker.full_resolution_error.emit("cannot read original", 252)
+        assert "读取失败" in pane.quality_label.text()
+        assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+        pane.hd_btn.click()
+        assert _wait_until(lambda: worker.full_resolution_calls == [250, 252, 252])
+        worker.full_resolution_ready.emit(original, 5040, 252)
+        assert pane.video_view.transform() == transform
+        assert pane.video_view._marker == marker
+        assert (pane._current_frame_index, pane._current_position_ms) == (252, 5040)
+        assert dialog.preview_video_view._pixmap_item.pixmap().size() == preview.size()
+
+        dialog._restore_maximized_pane()
+        worker.full_resolution_ready.emit(original, 5040, 252)
+        assert pane.video_view._pixmap_item.pixmap().size() == preview.size()
+        worker.frame_ready.emit(preview, 5080, 254)
+        QTest.qWait(pane.FULL_RESOLUTION_IDLE_MS + 50)
+        assert worker.full_resolution_calls == [250, 252, 252]
     finally:
         dialog.close()
 
@@ -5012,6 +5140,7 @@ def test_video_scrub_defers_full_resolution_until_exact_frame(
     dialog = PassageReviewDialog(passage_store, timeline_store)
     qapp.processEvents()
     pane = dialog.regular_pane
+    dialog._toggle_maximized_pane(pane)
     worker = fake_playback.instances[0]
     frame = QImage(1280, 720, QImage.Format_RGB888)
     frame.fill(0)

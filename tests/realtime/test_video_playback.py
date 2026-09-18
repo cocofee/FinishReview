@@ -181,6 +181,28 @@ class _BlockingCapture(_FakeCapture):
         return super().read()
 
 
+@pytest.mark.parametrize("supported", [True, False])
+def test_reverse_capture_limits_native_threads_and_falls_back_if_unsupported(monkeypatch, supported):
+    calls, captures = [], []
+
+    def factory(*args):
+        calls.append(args)
+        capture = _FakeCapture()
+        capture.isOpened = lambda: supported or len(args) == 1
+        captures.append(capture)
+        return capture
+
+    monkeypatch.setattr(video_playback.cv2, "VideoCapture", factory)
+    capture = video_playback._open_reverse_capture("video.mp4")
+    assert calls[0] == ("video.mp4", cv2.CAP_FFMPEG,
+                        [cv2.CAP_PROP_N_THREADS, video_playback.REVERSE_DECODER_THREADS])
+    assert capture is captures[-1]
+    if not supported:
+        assert captures[0].released
+        assert calls[1] == ("video.mp4",)
+    capture.release()
+
+
 class _BlockingFrameCapture(_FakeCapture):
     def __init__(self, frame_count=30, *, block_position: int):
         super().__init__(frame_count=frame_count)
@@ -486,6 +508,76 @@ def test_dialog_reports_target_beyond_real_media_duration(qapp):
     dialog.close()
 
 
+@pytest.mark.parametrize("failure", [None, "read", "exception", "wrong_frame"])
+def test_paused_original_keeps_source_pixels_and_recovers_read_failure(qapp, failure):
+    capture = _FakeCapture(frame_count=3)
+    source = np.zeros((1440, 2560, 3), dtype=np.uint8)
+    source[550:555, 1300:1305] = (11, 77, 233)
+    capture.frames = [np.zeros_like(source), source, np.full_like(source, 200)]
+    original_read = capture.read
+    reads = 0
+
+    def read():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            if failure == "read":
+                return False, None
+            if failure == "exception":
+                raise cv2.error("synthetic original read failure")
+            if failure == "wrong_frame":
+                capture.position = 2
+        return original_read()
+
+    capture.read = read
+    opened = []
+    worker = VideoPlaybackWorker(Path("original.mkv"),
+                                 capture_factory=lambda path: opened.append(path) or capture,
+                                 reverse_prefetch=False, idle_prefetch=False)
+    worker.pause()
+    worker.seek_frame(1)
+    previews, originals, errors, playback_errors = [], [], [], []
+    loop = QEventLoop()
+
+    def preview(image, position, index):
+        previews.append((image, position, index))
+        worker.request_full_resolution(index)
+
+    def failed(message, index):
+        errors.append((message, index))
+        worker.request_full_resolution(index)
+
+    def original(image, position, index):
+        originals.append((image, position, index))
+        loop.quit()
+
+    worker.frame_ready.connect(preview)
+    worker.full_resolution_ready.connect(original)
+    worker.full_resolution_error.connect(failed)
+    worker.playback_error.connect(playback_errors.append)
+    timer = QTimer()
+    timer.setSingleShot(True)
+    timer.timeout.connect(loop.quit)
+    timer.start(5000)
+    worker.start()
+    try:
+        loop.exec_()
+        assert len(originals) == 1
+        image, position, index = originals[0]
+        assert (image.width(), image.height(), position, index) == (2560, 1440, 50, 1)
+        assert image.pixelColor(1302, 552).getRgb() == (233, 77, 11, 255)
+        assert image.pixelColor(1306, 552).getRgb() == (0, 0, 0, 255)
+        assert len(previews) == 1
+        assert (previews[0][0].width(), previews[0][0].height()) == (1280, 720)
+        assert len(opened) == 1
+        assert len(errors) == (0 if failure is None else 1)
+        assert not playback_errors
+    finally:
+        timer.stop()
+        worker.stop()
+        assert worker.wait(2000)
+
+
 def test_playback_worker_decodes_frames_and_stops_cleanly(qapp):
     capture = _FakeCapture()
     worker = VideoPlaybackWorker(
@@ -698,6 +790,76 @@ def test_worker_drops_frame_from_obsolete_seek_generation(qapp):
     assert worker.current_frame_index == 2
 
 
+@pytest.mark.parametrize("finish", ["ack", "pause", "seek", "stop"])
+def test_exact_reverse_waits_for_paint_and_navigation_cancels_wait(finish):
+    worker = VideoPlaybackWorker(Path("recording.mkv"))
+    worker.set_shuttle_speed(-1)
+    worker.set_presentation_ack_enabled(True)
+    generation = worker._request_generation
+    delivered, returned = threading.Event(), threading.Event()
+    worker.frame_ready.connect(lambda *_args: delivered.set(), Qt.DirectConnection)
+    image = QImage(32, 24, QImage.Format_RGB888)
+
+    def emit():
+        worker._emit_image(image, 10, generation=generation)
+        returned.set()
+
+    thread = threading.Thread(target=emit)
+    thread.start()
+    try:
+        assert delivered.wait(1)
+        assert worker.frame_needs_presentation(10)
+        worker.acknowledge_presented_frame(9)
+        assert not returned.wait(0.03)
+        if finish == "ack":
+            worker.acknowledge_presented_frame(10)
+        elif finish == "pause":
+            worker.pause()
+        elif finish == "seek":
+            worker.seek_frame(30)
+        else:
+            worker.stop()
+        assert returned.wait(1)
+        assert not worker.frame_needs_presentation(10)
+    finally:
+        worker.stop()
+        thread.join(1)
+
+
+def test_dialog_exact_reverse_does_not_merge_frames_when_painting_is_slow(qapp):
+    def factory(path, parent=None, **kwargs):
+        return VideoPlaybackWorker(path, parent, capture_factory=lambda _path: _FakeCapture(80), **kwargs)
+
+    dialog = VideoPlaybackDialog(Path("recording.mkv"), worker_factory=factory, autoplay=False)
+    frames = []
+    render = dialog._render_frame_now
+    loop = QEventLoop()
+
+    def slow_render(image, position, index):
+        frames.append(index)
+        time.sleep(0.065)
+        render(image, position, index)
+        if len(frames) == 8:
+            dialog.worker.pause()
+            loop.quit()
+
+    try:
+        dialog.show()
+        QTest.qWait(30)
+        dialog._render_frame_now = slow_render
+        dialog.worker.seek_and_play(2000, -1)
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(3000)
+        loop.exec_()
+        timer.stop()
+        assert frames == list(range(40, 32, -1))
+        assert dialog.worker._presentation_ack_enabled
+    finally:
+        dialog.close()
+
+
 def test_seek_and_play_emits_requested_frame_before_continuing(qapp):
     capture = _FakeCapture(frame_count=100)
     worker = VideoPlaybackWorker(
@@ -770,6 +932,37 @@ def test_reverse_window_uses_one_seek_then_serves_cached_frames(qapp):
     assert capture.set_positions == [5]
     assert capture.read_positions == [5, 6, 7, 8, 9, 10]
     assert emitted == [10, 9]
+
+
+def test_backward_steps_keep_the_decoded_window_without_opening_prefetch():
+    captures = []
+
+    def factory(_path):
+        captures.append(_FakeCapture(100))
+        return captures[-1]
+
+    worker = VideoPlaybackWorker(Path("recording.mkv"), capture_factory=factory)
+    worker.pause()
+    worker._fps = 20
+    worker._frame_count = 100
+    worker._reverse_window_frames = 10
+    primary = _FakeCapture(100)
+    worker._start_reverse_prefetcher()
+    try:
+        next_frame = 100
+        for index in range(60, 50, -1):
+            worker.seek_frame(index)
+            ok, next_frame = worker._decode_target(
+                primary, index, next_frame, generation=worker._request_generation,
+                reverse_window=True,
+            )
+            assert ok
+        assert primary.set_positions == [51]
+        assert primary.read_positions == list(range(51, 61))
+        assert not captures
+    finally:
+        worker.stop()
+        worker._stop_reverse_prefetcher()
 
 
 def test_reverse_window_stops_before_seek_when_request_is_obsolete():
@@ -1138,6 +1331,61 @@ def test_reverse_playback_prefetches_next_window_with_secondary_capture(qapp):
     assert captures[1].read_positions == list(range(55, 65))
     assert frame_indexes == sorted(frame_indexes, reverse=True)
     assert all(capture.released for capture in captures)
+
+
+@pytest.mark.parametrize("finish_mode", ["pause", "forward", "thumbnail", "step"])
+def test_reverse_decoder_reused_across_windows_and_yields_when_idle(qapp, monkeypatch, finish_mode):
+    from realtime.decode_resources import DecodeResources, THUMBNAIL
+
+    pool = DecodeResources(max_captures=2, max_background=1)
+    monkeypatch.setattr(video_playback, "DECODE_RESOURCES", pool)
+    captures, frames = [], []
+
+    def factory(_path):
+        capture = _FakeCapture(frame_count=200)
+        captures.append(capture)
+        return capture
+
+    worker = VideoPlaybackWorker(Path("recording.mkv"), capture_factory=factory, idle_prefetch=False)
+    worker.set_shuttle_speed(-1)
+    worker.seek_frame(150)
+    loop = QEventLoop()
+    timeout = QTimer()
+    timeout.setSingleShot(True)
+    timeout.timeout.connect(loop.quit)
+    worker.frame_ready.connect(lambda _image, _ms, index: (
+        frames.append(index), loop.quit() if len(frames) == 32 else None,
+    ))
+    worker.start()
+    try:
+        timeout.start(4000)
+        loop.exec_()
+        timeout.stop()
+        assert frames == list(range(150, 118, -1))
+        assert len(captures) == 2
+        secondary = captures[1]
+        assert len(secondary.set_positions) >= 3
+        assert not secondary.released
+        if finish_mode == "pause":
+            worker.pause()
+        elif finish_mode == "forward":
+            worker.set_shuttle_speed(1)
+        elif finish_mode == "step":
+            worker.step(-1)
+        else:
+            lease = pool.open_capture("thumbnail", lambda _path: _FakeCapture(),
+                                      priority=THUMBNAIL, timeout=1)
+            assert lease is not None
+            lease.release()
+        deadline = time.monotonic() + 1
+        while not secondary.released and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert secondary.released
+    finally:
+        worker.stop()
+        assert worker.wait(2000)
+    assert all(capture.released for capture in captures)
+    assert pool.snapshot().captures == pool.snapshot().waiting == 0
 
 
 @pytest.mark.parametrize("cancel", [False, True])

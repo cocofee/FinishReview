@@ -1077,7 +1077,7 @@ class FinishReviewWindow(PassageReviewSurface):
             target_position_ms=session.target_position_ms,
             context_text=context_text,
             autoplay=True,
-            reverse_prefetch=not self._low_resource_mode,
+            reverse_prefetch=True,
             window_title=f"定点回放 - {identity}号",
         )
         pause_token = self._pause_video_scan_workers()
@@ -3998,7 +3998,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 f"机位 {getattr(candidate, 'camera_index', '?')}"
             ),
             autoplay=False,
-            reverse_prefetch=not self._low_resource_mode,
+            reverse_prefetch=True,
             window_title="视频异常复核",
         )
         pause_token = self._pause_video_scan_workers()
@@ -4064,7 +4064,7 @@ class FinishReviewWindow(PassageReviewSurface):
             target_position_ms=session.target_position_ms,
             context_text=f"视觉异常：{getattr(item, 'anomaly', '待复核')}",
             autoplay=False,
-            reverse_prefetch=not self._low_resource_mode,
+            reverse_prefetch=True,
             window_title="视觉异常复核",
         )
         pause_token = self._pause_video_scan_workers()
