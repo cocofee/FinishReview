@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from bisect import bisect_right
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -301,6 +302,8 @@ class VideoTimelineStore:
         self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
         self._rebuild_indexes()
+        self._segment_changes = deque(maxlen=2048)
+        self._change_floor = self._revision
 
     @property
     def recovered_incomplete_tail(self) -> bool:
@@ -311,6 +314,24 @@ class VideoTimelineStore:
     def revision(self) -> int:
         with self._lock:
             return self._revision
+
+    def segment_changes_since(self, revision: int):
+        """Return one atomic delta, or a complete snapshot after history expiry."""
+        with self._lock:
+            if revision == self._revision:
+                return self._revision, False, ()
+            if revision < self._change_floor or revision > self._revision:
+                return self._revision, True, self.segments()
+            identifiers = dict.fromkeys(
+                segment_id for changed_at, segment_id in self._segment_changes
+                if changed_at > revision
+            )
+            return self._revision, False, tuple(self._segments[key] for key in identifiers)
+
+    def _record_segment_change(self, segment):
+        if len(self._segment_changes) == self._segment_changes.maxlen:
+            self._change_floor = self._segment_changes[0][0]
+        self._segment_changes.append((self._revision, segment.segment_id))
 
     def _load_existing(self) -> None:
         if not self.journal_path.exists():
@@ -710,6 +731,7 @@ class VideoTimelineStore:
                 self._segment_order.append(segment.segment_id)
                 self._index_segment(segment, len(self._segment_order) - 1)
                 self._revision += 1
+                self._record_segment_change(segment)
         return segment
 
     def finish_segment(
@@ -773,6 +795,7 @@ class VideoTimelineStore:
                     )
                     self._index_closed_bounds(updated)
                 self._revision += 1
+                self._record_segment_change(updated)
             return updated
 
     def add_completed_segment(
@@ -834,6 +857,7 @@ class VideoTimelineStore:
                 self._segment_order.append(segment.segment_id)
                 self._index_segment(segment, len(self._segment_order) - 1)
                 self._revision += 2
+                self._record_segment_change(segment)
         return segment
 
     def segments(self) -> tuple[RecordingSegment, ...]:

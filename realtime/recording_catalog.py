@@ -1,10 +1,13 @@
 """Recording coverage and file availability, independent of Qt widgets."""
 
 from bisect import bisect_right
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 import heapq
+from itertools import islice
 from pathlib import Path
 import time
+from .runtime_metrics import RuntimeMetrics
 
 from .video_timeline import DEFAULT_CLOCK_SOURCE, DEFAULT_TIMING_ERROR_MS, PassageVideoLocation, RecordingSegment
 
@@ -98,11 +101,12 @@ def recording_sources(
     live_location: PassageVideoLocation | None = None,
     live_locations=(),
     path_available=None,
+    segments=None,
 ):
     """Use recording coverage, never the roster or its filters, for the rail."""
     sources = []
     pending = 0
-    for segment in store.segments():
+    for segment in store.segments() if segments is None else segments:
         if segment.camera_index != camera_index or segment.clock_source != DEFAULT_CLOCK_SOURCE:
             continue
         if race_id and segment.race_id and segment.race_id != race_id:
@@ -187,30 +191,89 @@ class RecordingCatalogSnapshot:
 
 
 class RecordingCatalog:
-    """Worker-owned availability cache, scoped to the current source set."""
+    """Worker-owned delta projection with bounded rolling file revalidation."""
+
+    RECHECK_BATCH = 32
 
     def __init__(self):
-        self._availability = {}
+        self._availability = OrderedDict()
+        self._store = None
+        self._context = None
+        self._revision = -1
+        self._entries = {}
+        self._path_segments = {}
+        self._sources = ()
+        self._pending = 0
+        self.metrics = RuntimeMetrics()
 
     def refresh(self, job, *, deleted_paths=()):
-        for path in deleted_paths:
-            self._availability.pop((str(path), False), None)
-            self._availability.pop((str(path), True), None)
-        used = set()
+        context = (str(job.store.journal_path.absolute()), job.race_id, job.camera_index)
+        if job.store is not self._store or context != self._context:
+            self._store, self._context = job.store, context
+            self._revision = -1
+            self._availability.clear()
+            self._entries.clear()
+            self._path_segments.clear()
+        revision, reset, changed = job.store.segment_changes_since(self._revision)
+        if reset:
+            self._entries.clear()
+            self._path_segments.clear()
+        dirty = reset or bool(changed)
         now = time.monotonic()
+        invalidated = set()
+        for path in deleted_paths:
+            for nonempty in (False, True):
+                key = (str(path), nonempty)
+                self._availability.pop(key, None)
+                invalidated.add(key)
 
         def available(path, require_nonempty):
             key = (str(path), require_nonempty)
-            used.add(key)
             cached = self._availability.get(key)
-            if cached is not None and now - cached[0] < 2.0:
+            if cached is not None:
                 return cached[1]
+            started = time.perf_counter()
             try:
                 value = path.is_file() and (not require_nonempty or path.stat().st_size > 0)
             except OSError:
                 value = False
+            self.metrics.observe("catalog.file_check", (time.perf_counter() - started) * 1000,
+                                 item_count=1)
             self._availability[key] = (now, value)
             return value
+
+        # Files may be removed/restored outside the recorder. Sweep a bounded
+        # slice each refresh, rather than stat every file whenever a TTL expires.
+        for key in tuple(islice(self._availability, self.RECHECK_BATCH)):
+            checked_at, previous = self._availability[key]
+            if now - checked_at < 2.0:
+                break
+            self._availability.pop(key)
+            if available(Path(key[0]), key[1]) != previous:
+                invalidated.add(key)
+
+        for segment in changed:
+            sources, pending = recording_sources(
+                job.store, job.camera_index, job.race_id, segments=(segment,), path_available=available,
+            )
+            self._entries[segment.segment_id] = (sources, pending)
+            if sources:
+                key = (str(sources[0].location.video_path), False)
+                self._path_segments.setdefault(key, set()).add(segment.segment_id)
+        for key in invalidated:
+            for segment_id in self._path_segments.get(key, ()):
+                sources, pending = self._entries[segment_id]
+                value = available(Path(key[0]), key[1])
+                self._entries[segment_id] = (tuple(
+                    replace(source, available=value, location=replace(
+                        source.location, status="located" if value else "missing_file"))
+                    for source in sources
+                ), pending)
+                dirty = True
+        if dirty:
+            self._sources = tuple(source for sources, _ in self._entries.values() for source in sources)
+            self._pending = sum(pending for _, pending in self._entries.values())
+        self._revision = revision
 
         live = []
         for ring in job.ring_buffers:
@@ -229,12 +292,11 @@ class RecordingCatalog:
                 )
                 live.append(PassageVideoLocation(segment, path, 0, 0, 0,
                                                   DEFAULT_TIMING_ERROR_MS, "unverified"))
-        sources, pending = recording_sources(job.store, job.camera_index, job.race_id,
-                                              live_locations=live, path_available=available)
-        self._availability = {key: value for key, value in self._availability.items() if key in used}
+        live_sources, _ = recording_sources(job.store, job.camera_index, job.race_id,
+                                           segments=(), live_locations=live, path_available=available)
+        used = set(self._path_segments)
+        used.update((str(source.location.video_path), True) for source in live_sources)
+        self._availability = OrderedDict((key, value) for key, value in self._availability.items() if key in used)
         return RecordingCatalogSnapshot(
-            (str(job.store.journal_path.absolute()), job.race_id, job.camera_index), sources, pending,
-            job.store.revision,
+            context, self._sources + live_sources, self._pending, revision,
         )
-
-
