@@ -30,7 +30,8 @@ def test_windows_executable_version_matches_release_version():
         encoding="utf-8"
     )
 
-    assert 'version=str(ROOT / "packaging" / "version_info.txt")' in spec
+    assert 'version=os.environ.get("FINISH_REVIEW_VERSION_INFO"' in spec
+    assert 'ROOT / "packaging" / "version_info.txt"' in spec
     assert 'StringStruct("FileVersion", "0.24.8")' in version_info
     assert 'StringStruct("ProductVersion", "0.24.8")' in version_info
     assert "filevers=(0, 24, 8, 0)" in version_info
@@ -60,7 +61,7 @@ def test_finish_review_package_excludes_detection_and_ocr_runtimes():
 def test_finish_review_has_a_dedicated_production_build_script():
     script = (ROOT / "packaging" / "build.ps1").read_text(encoding="utf-8")
 
-    build_index = script.index("& $ResolvedPython -m PyInstaller")
+    build_index = script.index("& $ResolvedPython -m tools.build_release")
     assert script.index("$ResolvedFfmpeg =") < build_index
     assert "[string]$PythonPath" in script
     assert 'Join-Path $RepoRoot ".venv\\Scripts\\python.exe"' in script

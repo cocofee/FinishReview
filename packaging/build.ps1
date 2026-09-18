@@ -1,6 +1,8 @@
 param(
     [string]$FfmpegPath,
-    [string]$PythonPath
+    [string]$PythonPath,
+    [ValidateSet("onedir", "onefile", "both")]
+    [string]$Mode = "onedir"
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,15 +69,17 @@ $env:FINISH_REVIEW_FFMPEG = $ResolvedFfmpeg
 Push-Location $RepoRoot
 try {
     Write-Host "Build Python: $ResolvedPython"
-    & $ResolvedPython -m PyInstaller --noconfirm --clean --distpath $DistRoot --workpath $BuildRoot $Spec
+    & $ResolvedPython -m tools.build_release --ffmpeg $ResolvedFfmpeg --mode $Mode
     if ($LASTEXITCODE -ne 0) {
-        throw "PyInstaller failed with exit code $LASTEXITCODE"
+        throw "Build or validation failed with exit code $LASTEXITCODE"
     }
 } finally {
     Pop-Location
     Remove-Item Env:FINISH_REVIEW_FFMPEG -ErrorAction SilentlyContinue
 }
 
-& (Join-Path $PSScriptRoot "assert_clean_distribution.ps1") -AppDir $AppDir
+if ($Mode -ne "onefile") {
+    & (Join-Path $PSScriptRoot "assert_clean_distribution.ps1") -AppDir $AppDir
+}
 
-Write-Host "Built: $AppDir"
+Write-Host "Built and smoke-tested: $DistRoot ($Mode)"

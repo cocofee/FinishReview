@@ -63,13 +63,13 @@ jobs:
 
       - name: Build clean distribution
         shell: pwsh
-        run: .\packaging\build.ps1
+        run: .\packaging\build.ps1 -Mode both
 
       - name: Smoke-test packaged executable
         shell: pwsh
         run: |
           $executable = ".\artifacts\dist\FinishReviewConsole\FinishReviewConsole.exe"
-          $process = Start-Process -FilePath $executable -ArgumentList "--smoke-test" -PassThru
+          $process = Start-Process -FilePath $executable -ArgumentList "--smoke-test" -PassThru -WindowStyle Hidden
           if (-not $process.WaitForExit(30000)) {
             Stop-Process -Id $process.Id -Force
             throw "Packaged executable smoke test timed out"

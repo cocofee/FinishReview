@@ -37,6 +37,9 @@ from .runtime_status import (
 )
 from .decode_resources import DECODE_RESOURCES
 from .background_wait import wait_for_background
+from .event_ingestion import EventIngestion, EventCommit, IngestionContext, merge_events
+from .session_context import SessionContext, SessionSnapshot, prepare_session
+from .session_controller import SessionController, SessionPhase
 from .recording_catalog import RecordingCatalog, RecordingCatalogJob
 from .evidence_pipeline import EvidencePassage, EvidencePipeline, EvidenceRefreshJob
 from .capture_refresh import (
@@ -308,6 +311,8 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
 
 class _PassageSignalBridge(QObject):
     accepted = pyqtSignal(object)
+    event_committed = pyqtSignal(object)
+    ingestion_error = pyqtSignal(object)
     metadata_accepted = pyqtSignal(object)
     focus_accepted = pyqtSignal(object)
     timing_status = pyqtSignal(object)
@@ -756,6 +761,14 @@ class FinishReviewWindow(PassageReviewSurface):
         self._pending_passages: dict[str, PassageEvent] = {}
 
         self._signal_bridge = _PassageSignalBridge(self)
+        self._session_controller = SessionController()
+        self._session_busy = False
+        self._session_metadata_pending = None
+        self._ingestion = None
+        self._commit_timings = {}
+        self._applied_event_revisions: dict[str, int] = {}
+        self._signal_bridge.event_committed.connect(self._drain_event_commits)
+        self._signal_bridge.ingestion_error.connect(self._on_ingestion_error)
         self._signal_bridge.accepted.connect(self._on_passage_received)
         self._signal_bridge.metadata_accepted.connect(self._on_metadata_received)
         self._signal_bridge.focus_accepted.connect(self._on_focus_received)
@@ -805,6 +818,22 @@ class FinishReviewWindow(PassageReviewSurface):
         self._request_capture_refresh()
         self._clock_timer.start()
         self._ui_latency_probe = UiLatencyProbe(self.runtime_metrics, self)
+        self._session_controller.activate(SessionContext(
+            snapshot=SessionSnapshot(0, self.timing_provider, self.output_dir,
+                self.metadata_store.current() if self.metadata_store else None,
+                self.passage_store.events(include_inactive=True)),
+            passage_store=self.passage_store, metadata_store=self.metadata_store,
+            timeline_store=self.timeline_store, review_binding_store=self.review_binding_store,
+            association_store=self.association_store, calibration_store=self.calibration_store,
+            preflight_journal=self._preflight_journal, archive_publishers=tuple(self._archive_publishers),
+            receiver_passage_store=self._receiver_passage_store,
+            receiver_metadata_store=self._receiver_metadata_store,
+            finish_line_store=self._finish_line_store, video_review_journal=self._video_review_journal,
+            video_arrival_store=self.video_arrival_store, video_discovery_store=self.video_discovery_store,
+            continuous_marker_store=self.continuous_marker_store,
+        ))
+        self._bind_event_ingestion()
+        self._ingestion.recover()
         if self.high_speed_dir is not None:
             track_qthread(self._high_speed_scan_worker)
             self._high_speed_scan_worker.start()
@@ -813,6 +842,104 @@ class FinishReviewWindow(PassageReviewSurface):
     @property
     def recorder(self) -> FfmpegReviewRecorder | None:
         return self._recorder
+
+    def _bind_event_ingestion(self):
+        metadata = self.metadata_store.current() if self.metadata_store else None
+        self._ingestion = EventIngestion(
+            IngestionContext(
+                self._session_controller.generation, self.timing_provider,
+                metadata.race_id if metadata else "",
+                self._receiver_passage_store if self.timing_provider == "cyclerace" else self.passage_store,
+                self.passage_store,
+            ), self._signal_bridge.event_committed.emit,
+            lambda error, generation=self._session_controller.generation:
+                self._signal_bridge.ingestion_error.emit((generation, error)),
+            known_revisions={event.event_id: event.revision
+                             for event in self.passage_store.events(include_inactive=True)},
+        )
+
+    def _on_ingestion_error(self, result):
+        generation, error = result
+        if generation != self._session_controller.generation or self._session_busy:
+            return
+        previous = getattr(self, "_ingestion_error", "")
+        self._ingestion_error = sanitize_recording_message(error) if error else ""
+        if error:
+            self._capture_error = self._ingestion_error
+        elif self._capture_error == previous:
+            self._capture_error = ""
+        self._update_runtime_status()
+
+    def _run_session_task(self, operation, *, phase=SessionPhase.PREPARING):
+        return wait_for_background(self._session_controller.submit(operation, phase=phase), self)
+
+    def _session_transition(self, operation):
+        if self._session_busy or getattr(self, "_shutdown_requested", False):
+            return False
+        if not self._session_controller.begin_transition():
+            return False
+        self._session_busy = True
+        self._passage_batch_timer.stop()
+        old_store = self.passage_store
+        old_events = {event.event_id: event for event in old_store.events(include_inactive=True)}
+        pending_ids = set(self._pending_passages)
+        self._session_evidence_drained = False
+        try:
+            # Stop the old event writer before opening another handle to its log.
+            try:
+                wait_for_background(self._session_controller.drain_events(self._ingestion), self)
+            except Exception as error:
+                self._capture_error = sanitize_recording_message(error)
+                return False
+            return operation()
+        except Exception as error:
+            self._runtime_error = sanitize_recording_message(error)
+            logger.exception("Session transition failed; retaining active services")
+            self._update_runtime_status()
+            return False
+        finally:
+            self._session_controller.reset()
+            if self.passage_store is old_store:
+                changed = pending_ids | {
+                    event.event_id for event in old_store.events(include_inactive=True)
+                    if old_events.get(event.event_id) != event
+                    # The writer may have committed before the transition while
+                    # its Qt notification is still queued. A failed preparation
+                    # must reconcile those revisions with the retained roster.
+                    or self._applied_event_revisions.get(event.event_id, 0) < event.revision
+                }
+                self._evidence_timestamp_overrides = _historical_evidence_timestamp_overrides(old_store.events())
+                self._pending_passages.clear()
+                if changed:
+                    self.refresh_events(changed)
+            self._session_busy = False
+            self._bind_event_ingestion()
+            if self._workspace_mode == "live":
+                self._ingestion.recover()
+            pending = self._session_metadata_pending
+            self._session_metadata_pending = None
+            if pending is not None:
+                QTimer.singleShot(0, lambda: self._on_metadata_received(pending))
+            if getattr(self, "_close_after_session", False):
+                self._close_after_session = False
+                QTimer.singleShot(0, self.close)
+            self._request_capture_refresh()
+
+    def _drain_session_evidence(self):
+        if self._session_evidence_drained:
+            return
+        self._session_evidence_drained = True
+        # Register the final committed revisions before abandoning this UI.
+        # This explicit task is not a coalescible scan and preserves media pins.
+        self._evidence_timestamp_overrides = _historical_evidence_timestamp_overrides(self.passage_store.events())
+        request = self._capture_refresh_request(cleanup=False)
+        job = request.evidence_job
+        if job is not None:
+            wait_for_background(self._capture_refresh_worker.submit_task(
+                lambda: job.pipeline.refresh(job.passages, lambda: False)), self)
+        self._capture_refresh_generation += 1
+        wait_for_background(self._session_controller.drain_evidence(
+            self._capture_refresh_worker, self._capture_refresh_generation), self)
 
     def _observe_runtime_metric(
         self,
@@ -1408,6 +1535,9 @@ class FinishReviewWindow(PassageReviewSurface):
         return summarize_event_workspace(workspace)
 
     def _open_saved_event_workspace(self, path: Path) -> bool:
+        return self._session_transition(lambda: self._open_saved_event_workspace_impl(path))
+
+    def _open_saved_event_workspace_impl(self, path: Path) -> bool:
         if self.timing_provider != "cyclerace":
             QMessageBox.warning(self, "无法打开赛事", "打开赛事仅支持 CycleRace。")
             return False
@@ -1415,7 +1545,8 @@ class FinishReviewWindow(PassageReviewSurface):
             QMessageBox.warning(self, "无法打开赛事", "请先停止普通录像。")
             return False
         try:
-            workspace = validate_event_workspace(path, self.workspace_root)
+            root = self.workspace_root
+            workspace = self._run_session_task(lambda: validate_event_workspace(path, root))
         except EventWorkspaceError as error:
             QMessageBox.warning(self, "无法打开赛事", str(error))
             return False
@@ -1423,7 +1554,7 @@ class FinishReviewWindow(PassageReviewSurface):
             return True
 
         self._export_review_summary()
-        applied = self._apply_settings(
+        applied = self._apply_settings_impl(
             self._current_settings(output_dir=workspace.path),
             persist_settings=False,
             update_workspace_root=False,
@@ -1440,6 +1571,9 @@ class FinishReviewWindow(PassageReviewSurface):
         return True
 
     def _return_to_live_event(self) -> bool:
+        return self._session_transition(self._return_to_live_event_impl)
+
+    def _return_to_live_event_impl(self) -> bool:
         if self._workspace_mode != "archive":
             return True
         metadata = self._receiver_metadata_store.current()
@@ -1451,7 +1585,7 @@ class FinishReviewWindow(PassageReviewSurface):
             )
             return False
         try:
-            applied = self._activate_cyclerace_workspace(
+            applied = self._activate_cyclerace_workspace_impl(
                 metadata,
                 force=True,
                 preserve_cyclerace_receiver=True,
@@ -1521,7 +1655,10 @@ class FinishReviewWindow(PassageReviewSurface):
                 return
         self._apply_settings(settings, stop_recording=disruptive_change)
 
-    def _apply_settings(
+    def _apply_settings(self, settings, **kwargs) -> bool:
+        return self._session_transition(lambda: self._apply_settings_impl(settings, **kwargs))
+
+    def _apply_settings_impl(
         self,
         settings: FinishReviewSettings,
         *,
@@ -1530,6 +1667,7 @@ class FinishReviewWindow(PassageReviewSurface):
         update_workspace_root: bool = True,
         preserve_cyclerace_receiver: bool = False,
         reload_data_source: bool = False,
+        session_metadata: RaceMetadata | None = None,
     ) -> bool:
         self._runtime_error = ""
         self._auto_recording_error = ""
@@ -1580,94 +1718,29 @@ class FinishReviewWindow(PassageReviewSurface):
             or (self.timing_provider == "racetiger" and racetiger_changed)
         ) and not preserve_running_receiver
         prepared_data_source = None
+        if not data_source_changed or output_dir == self.output_dir:
+            self._drain_session_evidence()
         if data_source_changed:
             try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                passage_store = PassageEventStore(
-                    output_dir
-                    / (
-                        "racetiger_passage_events.jsonl"
-                        if next_timing_provider == "racetiger"
-                        else "cyclerace_passage_events.jsonl"
-                    )
-                )
-                metadata_store = (
-                    None
-                    if next_timing_provider == "racetiger"
-                    else RaceMetadataStore(
-                        output_dir / "cyclerace_race_metadata.json"
-                    )
-                )
-                timeline_store = VideoTimelineStore(
-                    output_dir / "video_timeline.jsonl"
-                )
-                review_binding_store = PassageReviewBindingStore(
-                    output_dir / "review_clips.jsonl"
-                )
-                association_store = PassageEvidenceAssociationStore(
-                    output_dir / "passage_evidence_associations.jsonl"
-                )
-                calibration_store = VideoClockCalibrationStore(
-                    output_dir / "video_clock_calibrations.jsonl"
-                )
-                preflight_journal = PreflightJournal(
-                    output_dir / "preflight_tests.jsonl"
-                )
-                historical_events = passage_store.events()
-                evidence_timestamp_overrides = (
-                    _historical_evidence_timestamp_overrides(historical_events)
-                    if next_timing_provider == "cyclerace"
-                    else {}
-                )
-                archive_publishers = [
-                    ArchiveTimelinePublisher(session, timeline_store)
-                    for session in load_archive_recording_sessions(output_dir)
-                ]
-                receiver_passage_store = self._receiver_passage_store
-                receiver_metadata_store = self._receiver_metadata_store
-                if workspace_root_changed:
-                    inbox_dir = requested_output_dir / CYCLERACE_INBOX_DIRNAME
-                    receiver_passage_store = PassageEventStore(
-                        inbox_dir / "cyclerace_passage_inbox.jsonl"
-                    )
-                    receiver_metadata_store = RaceMetadataStore(
-                        inbox_dir / "cyclerace_metadata_inbox.json"
-                    )
-                prepared_data_source = (
-                    passage_store,
-                    metadata_store,
-                    timeline_store,
-                    review_binding_store,
-                    association_store,
-                    calibration_store,
-                    preflight_journal,
-                    historical_events,
-                    evidence_timestamp_overrides,
-                    archive_publishers,
-                    receiver_passage_store,
-                    receiver_metadata_store,
-                )
+                inbox = self._receiver_passage_store
+                inbox_metadata = self._receiver_metadata_store
+                sources = (self.passage_store,)
+                generation = self._session_controller.generation + 1
+                prepared_data_source = self._run_session_task(lambda: prepare_session(
+                    output_dir, next_timing_provider, generation, inbox, inbox_metadata,
+                    workspace_root=requested_output_dir if workspace_root_changed else None,
+                    metadata=session_metadata, merge_sources=sources,
+                ))
             except Exception as exc:  # noqa: BLE001 - validate before runtime mutation.
                 self._runtime_error = sanitize_recording_message(exc)
                 QMessageBox.warning(self, "设置无法应用", self._runtime_error)
                 self._update_runtime_status()
                 return False
+        self._drain_session_evidence()
         previous_runtime_settings = self._current_settings()
-        if data_source_changed:
-            self._capture_refresh_generation += 1
-            if not self._capture_refresh_worker.invalidate_and_wait(
-                self._capture_refresh_generation,
-                timeout=5.0,
-            ):
-                QMessageBox.warning(
-                    self,
-                    "设置无法应用",
-                    "后台录像刷新仍在运行，设置未切换。",
-                )
-                return False
         if persist_settings and self._settings_saver is not None:
             try:
-                self._settings_saver(settings)
+                self._run_session_task(lambda: self._settings_saver(settings))
             except Exception as exc:  # noqa: BLE001 - keep current runtime unchanged.
                 QMessageBox.warning(self, "设置未保存", str(exc))
                 return False
@@ -1676,7 +1749,7 @@ class FinishReviewWindow(PassageReviewSurface):
             if any(failure.still_running for failure in failures):
                 if persist_settings and self._settings_saver is not None:
                     try:
-                        self._settings_saver(previous_runtime_settings)
+                        self._run_session_task(lambda: self._settings_saver(previous_runtime_settings))
                     except Exception:
                         logger.exception("Failed to roll back settings after stop failure")
                 QMessageBox.warning(
@@ -1687,6 +1760,13 @@ class FinishReviewWindow(PassageReviewSurface):
                 return False
         if receiver_restart_needed:
             self.stop_receiver()
+            if (self._receiver is not None and self._receiver.is_running
+                    or self._racetiger_source is not None and self._racetiger_source.is_running):
+                if persist_settings and self._settings_saver is not None:
+                    self._run_session_task(lambda: self._settings_saver(previous_runtime_settings))
+                self._runtime_error = "接收器尚未停止，赛事未切换"
+                self._update_runtime_status()
+                return False
         if data_source_changed:
             self._stop_archive_video_scan_workers()
             self._passage_batch_timer.stop()
@@ -1757,37 +1837,40 @@ class FinishReviewWindow(PassageReviewSurface):
             self._sync_evidence_pane_layout(include_recorded=False)
         if data_source_changed:
             assert prepared_data_source is not None
+            self._restore_maximized_pane()
+            self._clear_selection_details()
+            for dialog in tuple(self._video_candidate_dialogs):
+                dialog.close()
+            self._video_candidate_dialogs.clear()
             self.video_filmstrip.full_race.set_recording_start(None)
-            (
-                passage_store,
-                metadata_store,
-                timeline_store,
-                review_binding_store,
-                association_store,
-                calibration_store,
-                preflight_journal,
-                historical_events,
-                evidence_timestamp_overrides,
-                archive_publishers,
-                receiver_passage_store,
-                receiver_metadata_store,
-            ) = prepared_data_source
+            context = prepared_data_source
+            passage_store = context.passage_store
+            metadata_store = context.metadata_store
+            timeline_store = context.timeline_store
+            review_binding_store = context.review_binding_store
+            association_store = context.association_store
+            calibration_store = context.calibration_store
+            preflight_journal = context.preflight_journal
+            historical_events = tuple(event for event in context.snapshot.events if event.is_active)
+            evidence_timestamp_overrides = (
+                _historical_evidence_timestamp_overrides(historical_events)
+                if next_timing_provider == "cyclerace" else {}
+            )
+            archive_publishers = list(context.archive_publishers)
             if workspace_root_changed:
                 self.workspace_root = requested_output_dir
-                self._receiver_passage_store = receiver_passage_store
-                self._receiver_metadata_store = receiver_metadata_store
+                self._receiver_passage_store = context.receiver_passage_store
+                self._receiver_metadata_store = context.receiver_metadata_store
             self.output_dir = output_dir
-            self._finish_line_store = FinishLineStore(
-                self.output_dir / "finish_lines.json"
-            )
+            self._finish_line_store = context.finish_line_store
             self._finish_line_rois = self._finish_line_store.rois()
-            self._video_review_journal = VideoReviewJournal(
-                self.output_dir / "video_review.jsonl"
-            )
-            self.video_arrival_store = VideoArrivalCandidateStore(
-                self.output_dir / "video_arrival_candidates.jsonl",
-                metrics=self.runtime_metrics,
-            )
+            self._video_review_journal = context.video_review_journal
+            self.video_arrival_store = context.video_arrival_store
+            self.video_discovery_store = context.video_discovery_store
+            self.continuous_marker_store = context.continuous_marker_store
+            self._session_controller.activate(context)
+            self._commit_timings.clear()
+            self._applied_event_revisions.clear()
             self._video_reconciliation_by_id.clear()
             self._video_candidate_cache = {
                 str(candidate.candidate_id): candidate
@@ -2155,7 +2238,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 self.passage_host,
                 self.passage_port,
                 self._receiver_passage_store,
-                on_accepted=self._signal_bridge.accepted.emit,
+                on_accepted=lambda event, store=self._receiver_passage_store: self._signal_bridge.accepted.emit((store, event)),
                 metadata_store=self._receiver_metadata_store,
                 on_metadata_accepted=self._signal_bridge.metadata_accepted.emit,
                 on_focus_accepted=self._signal_bridge.focus_accepted.emit,
@@ -2177,7 +2260,7 @@ class FinishReviewWindow(PassageReviewSurface):
             rid=self.racetiger_rid,
             store=self.passage_store,
             poll_interval_seconds=self.racetiger_poll_interval_seconds,
-            on_event=lambda event, _generation: self._signal_bridge.accepted.emit(event),
+            on_event=lambda event, _generation, store=self.passage_store: self._signal_bridge.accepted.emit((store, event)),
             on_status=lambda status, _generation: self._signal_bridge.timing_status.emit(status),
         )
         self._racetiger_source = source
@@ -2444,6 +2527,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_runtime_status()
 
     def start_recording(self) -> None:
+        if self._session_busy or getattr(self, "_shutdown_requested", False):
+            return
         if self._workspace_mode == "archive":
             raise RecordingError("历史赛事模式不能开始录像，请先返回当前赛事")
         if self._recording_all_active():
@@ -2808,7 +2893,7 @@ class FinishReviewWindow(PassageReviewSurface):
         )
 
     def _poll_recording_health(self, *, now: float | None = None) -> None:
-        if getattr(self, "_capture_task_waiting", False):
+        if getattr(self, "_capture_task_waiting", False) or getattr(self, "_session_busy", False):
             return
         if self._stop_requested or not self._started:
             return
@@ -2918,7 +3003,10 @@ class FinishReviewWindow(PassageReviewSurface):
         return timestamp_ms
 
 
-    def _activate_cyclerace_workspace(
+    def _activate_cyclerace_workspace(self, metadata, **kwargs) -> bool:
+        return self._session_transition(lambda: self._activate_cyclerace_workspace_impl(metadata, **kwargs))
+
+    def _activate_cyclerace_workspace_impl(
         self,
         metadata: RaceMetadata,
         *,
@@ -2933,31 +3021,29 @@ class FinishReviewWindow(PassageReviewSurface):
             and current_metadata is not None
             and current_metadata.race_id == metadata.race_id
         ):
-            self.metadata_store.store(metadata)
-            self._merge_cyclerace_events(self.passage_store, metadata.race_id)
+            store = self.metadata_store
+            target = self.passage_store
+            inbox = self._receiver_passage_store
+            def update_metadata():
+                store.store(metadata)
+                merge_events(target, (inbox,), metadata.race_id)
+            self._run_session_task(update_metadata)
             self.refresh()
             return False
 
         self._export_review_summary()
-        target_dir = _event_workspace_dir(self.workspace_root, metadata)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_metadata_store = RaceMetadataStore(
-            target_dir / "cyclerace_race_metadata.json"
-        )
-        target_metadata_store.store(metadata)
-        target_passage_store = PassageEventStore(
-            target_dir / "cyclerace_passage_events.jsonl"
-        )
-        self._merge_cyclerace_events(target_passage_store, metadata.race_id)
+        root = self.workspace_root
+        target_dir = self._run_session_task(lambda: _event_workspace_dir(root, metadata))
 
         recording_was_active = self._recording_any_active()
-        applied = self._apply_settings(
+        applied = self._apply_settings_impl(
             self._current_settings(output_dir=target_dir),
             stop_recording=recording_was_active,
             persist_settings=False,
             update_workspace_root=False,
             preserve_cyclerace_receiver=preserve_cyclerace_receiver,
             reload_data_source=force,
+            session_metadata=metadata,
         )
         if applied:
             self._workspace_mode = "live"
@@ -2978,28 +3064,11 @@ class FinishReviewWindow(PassageReviewSurface):
         with the workspace or an older active passage can be resurrected when
         switching back from an archive or restarting the application.
         """
-        events_by_id: dict[str, PassageEvent] = {}
-        stores = [target_store, self._receiver_passage_store]
-        # During ``__init__`` the Qt base class has not been initialised yet,
-        # so attribute lookup through QObject can raise RuntimeError.
+        stores = [self._receiver_passage_store]
         existing_store = self.__dict__.get("passage_store")
         if existing_store is not None and existing_store is not target_store:
             stores.append(existing_store)
-        for store in stores:
-            for event in store.events(include_inactive=True):
-                if event.race_id != race_id:
-                    continue
-                current = events_by_id.get(event.event_id)
-                if current is None or event.revision > current.revision:
-                    events_by_id[event.event_id] = event
-        merged = 0
-        for event in events_by_id.values():
-            current = target_store.get(event.event_id)
-            if current is not None and current.revision >= event.revision:
-                continue
-            target_store.append(event)
-            merged += 1
-        return merged
+        return merge_events(target_store, tuple(stores), race_id)
 
     def _is_test_passage(self, event: PassageEvent) -> bool:
         event_key = (event.race_id, event.stage_id, event.event_id)
@@ -3093,7 +3162,17 @@ class FinishReviewWindow(PassageReviewSurface):
         return True
 
     def _on_passage_received(self, event: PassageEvent) -> None:
-        if self._defer_capture_callback(self._on_passage_received, event):
+        if isinstance(event, tuple):
+            source, event = event
+            current_source = (self._receiver_passage_store if self.timing_provider == "cyclerace"
+                              else self.passage_store)
+            if source is not current_source:
+                return
+            committed = source.get(event.event_id)
+            if committed is not None and committed.revision == event.revision:
+                event = committed
+        if self._session_busy or getattr(self, "_shutdown_requested", False):
+            # Already durable in the receiver log; activation replays its watermark.
             return
         if self.timing_provider == "cyclerace":
             if self._workspace_mode == "archive":
@@ -3132,13 +3211,32 @@ class FinishReviewWindow(PassageReviewSurface):
                 return
         if self.timing_provider == "cyclerace" and event.received_at_ms <= 0:
             event = replace(event, received_at_ms=int(time.time() * 1000.0))
-        try:
-            self.passage_store.append(event)
-        except Exception as exc:
-            self._capture_error = sanitize_recording_message(exc)
-            logger.exception("Failed to store passage in active event workspace")
-            self._update_runtime_status()
+        self._ingestion.submit(event)
+
+    def _drain_event_commits(self, worker):
+        # Drain even during a transition/close so the writer can finish. The
+        # activation snapshot below catches changes whose UI result is obsolete.
+        for commit in worker.take_completed():
+            self._on_event_committed(commit)
+
+    def _on_event_committed(self, commit: EventCommit) -> None:
+        if self._session_busy or getattr(self, "_shutdown_requested", False):
             return
+        if (commit.generation != self._session_controller.generation
+                or commit.journal != str(self.passage_store.journal_path)
+                or self._workspace_mode == "archive"):
+            return
+        event = commit.event
+        if self._applied_event_revisions.get(event.event_id, 0) >= event.revision:
+            return
+        self._applied_event_revisions[event.event_id] = event.revision
+        current = self.passage_store.get(event.event_id)
+        if current is None or current.revision != event.revision:
+            return
+        self._commit_timings[event.event_id] = commit
+        if commit.durable_at:
+            self.runtime_metrics.observe("passage_durable_to_commit",
+                max(0.0, (commit.committed_at - commit.durable_at) * 1000), item_count=1)
         self._received_passage_sequence += 1
         event_key = (event.race_id, event.stage_id, event.event_id)
         self._received_event_order[event_key] = self._received_passage_sequence
@@ -3166,14 +3264,28 @@ class FinishReviewWindow(PassageReviewSurface):
         self._historical_passage_count = len(self.passage_store)
         self._last_passage_monotonic = time.monotonic()
         self._include_high_speed_event_date(event)
-        self._auto_start_recording_for_passage(event)
         self._pending_passages[event.event_id] = event
         if not self._passage_batch_timer.isActive():
             self._passage_batch_timer.start()
+        if self._passage_batch_timer.interval() == 0:
+            # Preserve the zero-batch-latency mode used by tests and low-rate
+            # live intake while keeping durable append off this thread.
+            self._flush_passage_batch()
         self._update_runtime_status()
 
+    def _start_recording_for_committed_event(self, event, generation):
+        if (generation != self._session_controller.generation or self._session_busy
+                or getattr(self, "_shutdown_requested", False)):
+            return
+        if self._defer_capture_callback(self._start_recording_for_committed_event, event, generation):
+            return
+        current = self.passage_store.get(event.event_id)
+        if current is not None and current.revision == event.revision:
+            self._auto_start_recording_for_passage(current)
+            self._update_runtime_status()
+
     def _flush_passage_batch(self) -> None:
-        if self._defer_capture_callback(self._flush_passage_batch):
+        if self._session_busy or getattr(self, "_shutdown_requested", False):
             return
         pending_events = tuple(self._pending_passages.values())
         self._pending_passages.clear()
@@ -3192,20 +3304,33 @@ class FinishReviewWindow(PassageReviewSurface):
             for windows in self._capture_windows_by_camera.values():
                 windows.pop(event_id, None)
         self.refresh_events(changed)
-        displayed_at_ms = int(time.time() * 1000)
+        displayed_at = time.perf_counter()
         for event in pending_events:
-            if event.received_at_ms > 0:
+            commit = self._commit_timings.pop(event.event_id, None)
+            if commit is not None:
+                self.runtime_metrics.observe("passage_commit_to_visible",
+                    max(0.0, (displayed_at - commit.committed_at) * 1000), item_count=1)
+            if commit is not None and commit.durable_at:
                 self.runtime_metrics.observe(
-                    "passage_received_to_visible",
-                    max(0, displayed_at_ms - event.received_at_ms),
+                    "passage_durable_to_visible",
+                    max(0.0, (displayed_at - commit.durable_at) * 1000),
                     item_count=1,
                 )
         self._apply_pending_focus()
         self._request_capture_refresh()
         self._observe_runtime_metric("passage_batch_apply", started, item_count=len(changed))
         self._update_runtime_status()
+        candidate = next((event for event in pending_events
+                          if event.is_active and not self._is_test_passage(event)
+                          and self._is_live_passage(event)), None)
+        if candidate is not None:
+            generation = self._session_controller.generation
+            QTimer.singleShot(0, lambda: self._start_recording_for_committed_event(candidate, generation))
 
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
+        if self._session_busy:
+            self._session_metadata_pending = metadata
+            return
         if self._defer_capture_callback(self._on_metadata_received, metadata):
             return
         if self._workspace_mode == "archive":
@@ -3293,12 +3418,12 @@ class FinishReviewWindow(PassageReviewSurface):
         if self.timing_provider == "racetiger" and not self.racetiger_rid:
             return None
         try:
-            return export_review_summary(
-                self.output_dir,
-                self._events_for_current_metadata(self.passage_store.events()),
-                self.association_store,
-                metadata,
-            )
+            output_dir = self.output_dir
+            events = self._events_for_current_metadata(self.passage_store.events())
+            associations = self.association_store
+            return self._run_session_task(lambda: export_review_summary(
+                output_dir, events, associations, metadata,
+            ))
         except Exception as error:  # noqa: BLE001 - review operation must not be blocked.
             logger.exception("Failed to export the event review summary")
             if show_warning:
@@ -3480,7 +3605,7 @@ class FinishReviewWindow(PassageReviewSurface):
         return sources, pending
 
     def _request_capture_refresh(self) -> None:
-        if getattr(self, "_capture_task_waiting", False):
+        if getattr(self, "_capture_task_waiting", False) or getattr(self, "_session_busy", False):
             return
         now = time.monotonic()
         cleanup = now - self._last_cleanup_at >= 5.0
@@ -3520,8 +3645,19 @@ class FinishReviewWindow(PassageReviewSurface):
                     changed.add(event_id)
                 previews[camera, event_id] = preview
         self._capture_previews = previews
-        self._unsupported_event_ids = {passage.event_id for passage in valid.values()
-                                       if passage.active and passage.eligible and passage.timestamp_ms is None}
+        unsupported = {passage.event_id for passage in valid.values()
+                       if passage.active and passage.eligible and passage.timestamp_ms is None}
+        # A freshly committed event can be visible before the first evidence
+        # snapshot reaches the GUI. Preserve that durable projection while the
+        # media worker catches up; a later revision/removal clears it above.
+        unsupported.update(
+            event.event_id
+            for event in self.passage_store.events(include_inactive=True)
+            if event.is_active
+            and event.event_id in getattr(self, "_unsupported_event_ids", set())
+            and self._evidence_timestamp(event) is None
+        )
+        self._unsupported_event_ids = unsupported
         return changed
 
     def _on_capture_refresh_finished(self, result: CaptureRefreshResult) -> None:
@@ -4134,7 +4270,7 @@ class FinishReviewWindow(PassageReviewSurface):
         return failures
 
     def stop_receiver(self) -> None:
-        errors = self._receiver_controller.stop()
+        errors = self._run_session_task(self._receiver_controller.stop, phase=SessionPhase.DRAINING)
         self._receiver = self._receiver_controller.receiver
         self._racetiger_source = self._receiver_controller.racetiger_source
         if errors:
@@ -4142,19 +4278,32 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_runtime_status()
 
     def stop(self) -> bool:
+        if getattr(self, "_stop_complete", False):
+            return True
         self._shutdown_requested = True
         self._refresh_timer.stop()
-        if not self._capture_refresh_worker.stop(timeout=0.1):
+        self.stop_receiver()
+        if (self._receiver is not None and self._receiver.is_running
+                or self._racetiger_source is not None and self._racetiger_source.is_running):
+            return False
+        if self._workspace_mode == "live":
+            self._ingestion.recover()
+        try:
+            wait_for_background(self._ingestion.close(), self)
+        except Exception as error:
+            # The receiver journal is the durable recovery source on restart.
+            logger.error("Event projection remains recoverable in inbox: %s", error)
+        if not self._run_session_task(lambda: self._capture_refresh_worker.stop(timeout=0.1), phase=SessionPhase.CLOSING):
             return False
         self._passage_batch_timer.stop()
         self._pending_passages.clear()
         worker = getattr(self, "_high_speed_scan_worker", None)
         if worker is not None and worker.isRunning():
             worker.stop()
-            if not worker.wait(1_000):
+            if not self._run_session_task(lambda: worker.wait(1_000), phase=SessionPhase.CLOSING):
                 return False
         recording_failures = self.stop_recording()
-        if not self._capture_refresh_worker.stop(timeout=0.1):
+        if not self._run_session_task(lambda: self._capture_refresh_worker.stop(timeout=0.1), phase=SessionPhase.CLOSING):
             return False
         if any(failure.still_running for failure in recording_failures):
             return False
@@ -4165,9 +4314,14 @@ class FinishReviewWindow(PassageReviewSurface):
         self._video_candidate_dialogs.clear()
         self._update_runtime_status()
         self._log_runtime_metrics()
+        self._stop_complete = True
         return True
 
     def closeEvent(self, event) -> None:
+        if getattr(self, "_session_busy", False):
+            self._close_after_session = True
+            event.ignore()
+            return
         if getattr(self, "_capture_task_waiting", False):
             self._defer_capture_callback(self.close)
             event.ignore()
@@ -4181,7 +4335,10 @@ class FinishReviewWindow(PassageReviewSurface):
             self.setWindowTitle(f"{APP_WINDOW_TITLE} - 正在停止后台扫描")
             QTimer.singleShot(100, self.close)
             return
-        self._export_review_summary()
+        if not getattr(self, "_session_closed", False):
+            self._export_review_summary()
+            self._session_controller.shutdown()
+            self._session_closed = True
         super().closeEvent(event)
 
 

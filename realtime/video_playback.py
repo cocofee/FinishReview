@@ -1750,6 +1750,7 @@ class VideoPlaybackDialog(QDialog):
         window_title: str = "",
     ):
         super().__init__(parent)
+        self._closed = False
         self.video_path = Path(video_path)
         self._duration_ms = 0
         self._fps = 25.0
@@ -2151,6 +2152,8 @@ class VideoPlaybackDialog(QDialog):
         self._set_shuttle_indicator(0.0)
 
     def _on_playback_error(self, message: str) -> None:
+        if self._closed or getattr(self.parent(), "_shutdown_requested", False):
+            return
         self._set_playing(False)
         self._set_shuttle_indicator(0.0)
         QMessageBox.critical(self, "录像回放失败", message)
@@ -2196,6 +2199,10 @@ class VideoPlaybackDialog(QDialog):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
+        if self._closed:
+            event.accept()
+            return
+        self._closed = True
         self._slider_preview_timer.stop()
         self.worker.request_stop()
         if not self.worker.wait(3_000):

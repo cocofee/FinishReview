@@ -18,12 +18,12 @@ CycleRace / RaceTiger 过线事件接入、奥亚特高速相机文件读取和�
 
 ## 相机 1 连续判读
 
-上方“时间胶卷”下沿显示与画面共用刻度的判读时间线：红色游标表示当前原帧，
+上方“时间胶卷”下沿使用录像北京时间刻度：红色游标表示当前原帧，
 号码标记按录像中的实际位置排列，滚动、调整间隔和大小时一起对齐。
 点击号码直接回看保存的原帧；单机位模式会打开判读窗口。同帧或密集号码显示为
 可展开的组合标记，每条记录仍可独立选择。右上角“判读记录”展开整场判读记录列表，
 切换运动员、筛选组别和切换录像文件后仍保留，重启后从赛事判读日志恢复。
-胶卷、机位和记录统一显示校时后的判读时间；原始录像时钟和帧位置保持不变。
+时间胶卷刻度使用录像北京时间；悬停另列校时后的判读时间。机位判读和记录继续使用校准时间，原始录像时钟、帧位置和已保存关联保持不变。
 机位录像定位条从左向右推进时间，支持拖动；拖动中的请求合并预览，松开后精确定位。
 日常操作是单击名单选择身份、左右方向键逐帧查看、标线后按 Enter 确认；
 双击名单则定位该运动员的芯片时间。
@@ -101,6 +101,8 @@ $env:FINISH_REVIEW_FFMPEG = "C:\path\to\ffmpeg.exe"
 
 ```powershell
 .\packaging\build.ps1
+# 同时生成目录版和单文件版
+.\packaging\build.ps1 -Mode both -FfmpegPath C:\path\to\ffmpeg.exe
 ```
 
 脚本优先使用仓库 `.venv\Scripts\python.exe`。需要使用其他隔离环境时显式指定：
@@ -111,6 +113,12 @@ $env:FINISH_REVIEW_FFMPEG = "C:\path\to\ffmpeg.exe"
 
 输出位于 `artifacts\dist\FinishReviewConsole`。打包脚本显式排除检测、OCR 和模型框架，
 并检查发布目录没有混入比赛数据、日志、本机配置或已知的非项目依赖。
+单文件版位于 `artifacts\dist\onefile\FinishReviewConsole.exe`，也可单独使用 `-Mode onefile`。
+目录版同时生成 `artifacts\dist\FinishReviewConsole.zip`，冒烟检查使用其解压副本。
+脚本从程序版本生成 Windows 版本资源，检查 Qt 平台插件，并在临时目录中分别使用
+offscreen 和 Windows 插件执行 `--smoke-test`。构建日志、源码摘要、依赖版本、FFmpeg
+摘要、各文件 SHA-256 和启动结果写入 `artifacts\build-records\<UTC时间>\`。
+构建记录明确标注提交及未提交改动；开发包不能视为已发布的比赛版本。
 
 ## Performance and field validation
 
@@ -118,6 +126,8 @@ $env:FINISH_REVIEW_FFMPEG = "C:\path\to\ffmpeg.exe"
 
 ```powershell
 .\.venv\Scripts\python.exe -m tools.benchmark_review --sizes 500 2000 5000
+.\.venv\Scripts\python.exe -m tools.benchmark_session_io --delay 0.2 --output artifacts\session-slow.json
+.\.venv\Scripts\python.exe -m tools.benchmark_session_io --delay 0 --output artifacts\session-normal.json
 ```
 
 真实设备、网络故障、磁盘不足和长时间运行的发布前检查见

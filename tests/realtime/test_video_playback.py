@@ -317,6 +317,17 @@ def test_dialog_retires_slow_worker_without_force_termination(
     assert retired == [dialog.worker]
 
 
+def test_closed_dialog_ignores_queued_error_and_can_close_again(qapp, monkeypatch):
+    dialog = VideoPlaybackDialog(Path("recording.mkv"), worker_factory=_FakeDialogWorker)
+    errors = []
+    monkeypatch.setattr(video_playback.QMessageBox, "critical", lambda *args: errors.append(args))
+    QTimer.singleShot(0, lambda: dialog._on_playback_error("late decoder failure"))
+    dialog.close()
+    qapp.processEvents()
+    dialog.close()
+    assert errors == []
+
+
 def test_space_pauses_and_resumes_selected_slow_speed(qapp):
     dialog = VideoPlaybackDialog(Path("recording.mkv"), worker_factory=_FakeDialogWorker)
     dialog.show()

@@ -3,9 +3,24 @@
 import os
 import shutil
 from pathlib import Path
+from PyInstaller.utils.hooks.qt import pyqt5_library_info
 
 
 ROOT = Path(SPECPATH).resolve().parent
+# Some Windows PyQt5 wheels encode their embedded qt.conf prefix through the
+# system code page. Recover paths from the installed wheel when that prefix is
+# lossy (e.g. a Chinese user directory); never modify the user's installation.
+qt_info = pyqt5_library_info
+qt_root = Path(qt_info.package_location) / "Qt5"
+if not Path(qt_info.location["PluginsPath"]).is_dir() and (qt_root / "plugins").is_dir():
+    old_prefix = qt_info.location["PrefixPath"]
+    for key, value in tuple(qt_info.location.items()):
+        if value.startswith(old_prefix):
+            qt_info.location[key] = str(qt_root) + value[len(old_prefix):]
+    qt_info.qt_inside_package = True
+    qt_info.qt_lib_dir = (qt_root / "bin").resolve()
+
+onefile = os.environ.get("FINISH_REVIEW_BUILD_MODE") == "onefile"
 binaries = []
 icon_path = ROOT / "assets" / "finishreview.ico"
 if not icon_path.is_file():
@@ -46,12 +61,16 @@ a = Analysis(
     optimize=0,
 )
 pyz = PYZ(a.pure)
+for required_plugin in ("qwindows.dll", "qoffscreen.dll"):
+    if not any(Path(entry[0]).name == required_plugin for entry in a.binaries):
+        raise SystemExit(f"Required Qt platform plugin was not collected: {required_plugin}")
 
 exe = EXE(
     pyz,
     a.scripts,
-    [],
-    exclude_binaries=True,
+    a.binaries if onefile else [],
+    a.datas if onefile else [],
+    exclude_binaries=not onefile,
     name="FinishReviewConsole",
     debug=False,
     bootloader_ignore_signals=False,
@@ -61,13 +80,14 @@ exe = EXE(
     icon=str(icon_path),
     disable_windowed_traceback=False,
     argv_emulation=False,
-    version=str(ROOT / "packaging" / "version_info.txt"),
+    version=os.environ.get("FINISH_REVIEW_VERSION_INFO", str(ROOT / "packaging" / "version_info.txt")),
 )
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    name="FinishReviewConsole",
-)
+if not onefile:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="FinishReviewConsole",
+    )

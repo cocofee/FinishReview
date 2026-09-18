@@ -10,7 +10,7 @@ import os
 import socket
 import threading
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -194,6 +194,8 @@ class PassageEvent:
     team_name: str = ""
     is_active: bool = True
     received_at_ms: WallClockMs = WallClockMs(0)
+    # Process-local timing only: deliberately omitted from the JSONL protocol.
+    durable_monotonic: float = field(default=0.0, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -343,6 +345,7 @@ class PassageEventStore:
             raise ValueError("passage event journal path is required")
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._write_lock = threading.Lock()
         self._events: dict[str, PassageEvent] = {}
         self._event_order: list[str] = []
         self._race_ids: set[str] = set()
@@ -424,7 +427,7 @@ class PassageEventStore:
     def append(self, event: PassageEvent) -> PassageIngestResult:
         if not isinstance(event, PassageEvent):
             raise TypeError("event must be a PassageEvent")
-        with self._lock:
+        with self._write_lock:
             current = self._events.get(event.event_id)
             result = PassageIngestResult.ACCEPTED
             if current is not None:
@@ -479,10 +482,13 @@ class PassageEventStore:
                     f"failed to append passage event journal: {self.journal_path}"
                 ) from error
 
-            if current is None:
-                self._event_order.append(event.event_id)
-            self._events[event.event_id] = event
-            self._race_ids.add(event.race_id)
+            # Readers see only committed events and never wait for fsync.
+            event = replace(event, durable_monotonic=time.perf_counter())
+            with self._lock:
+                if current is None:
+                    self._event_order.append(event.event_id)
+                self._events[event.event_id] = event
+                self._race_ids.add(event.race_id)
             return result
 
     def get(self, event_id: str) -> Optional[PassageEvent]:

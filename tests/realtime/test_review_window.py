@@ -206,7 +206,7 @@ class _FakeReceiver:
 
     def deliver(self, event):
         self.store.append(event)
-        self.on_accepted(event)
+        self.on_accepted(self.store.get(event.event_id))
 
     def deliver_metadata(self, metadata):
         self.metadata_store.store(metadata)
@@ -297,6 +297,13 @@ def _wait_until(qapp, predicate, timeout=5):
         QTest.qWait(5)
     qapp.processEvents()
     assert predicate()
+
+
+def _settle_passages(qapp, window):
+    # Append and GUI commit now complete on separate event-loop turns.
+    _wait_until(qapp, lambda: window._ingestion.idle)
+    qapp.processEvents()
+    qapp.processEvents()
 
 
 def test_modal_disk_task_keeps_qt_alive_and_defers_context_changes(qapp, tmp_path, monkeypatch):
@@ -689,7 +696,7 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     )
 
     receiver.deliver_metadata(metadata)
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     event_dir = root / "2026 城市公路自行车赛"
     assert window.workspace_root == root.resolve()
@@ -704,7 +711,7 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     active_receiver = _FakeReceiver.instances[-1]
     event = _event(race_id=metadata.race_id, event_id="race-2026-passage-15")
     active_receiver.deliver(event)
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     stored_event = window.passage_store.get(event.event_id)
     assert stored_event is not None
@@ -1103,7 +1110,7 @@ def test_first_live_formal_passage_auto_starts_recording(qapp, tmp_path):
     window.start_receiver()
 
     _FakeReceiver.instances[-1].deliver(_event())
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window.recorder is not None and window.recorder.is_running
     assert len(_FakeRecorder.instances) == 1
@@ -1196,7 +1203,7 @@ def test_live_test_group_passage_does_not_auto_start_recording(
     _FakeReceiver.instances[-1].deliver(
         _event(group_id="test-group", group_name="")
     )
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window.recorder is None
     assert window.table.rowCount() == 1
@@ -1213,7 +1220,7 @@ def test_live_test_group_id_without_metadata_does_not_auto_start_recording(
     _FakeReceiver.instances[-1].deliver(
         _event(group_id="test-group", group_name="")
     )
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window.recorder is None
     assert window.table.rowCount() == 1
@@ -1241,15 +1248,15 @@ def test_first_formal_passage_after_test_group_starts_only_one_recorder(
     receiver = _FakeReceiver.instances[-1]
 
     receiver.deliver(_event(group_id="test-group", group_name="检测组"))
-    qapp.processEvents()
+    _settle_passages(qapp, window)
     assert window.recorder is None
 
     receiver.deliver(_event(event_id="formal-first", sequence=16))
-    qapp.processEvents()
+    _settle_passages(qapp, window)
     assert window.recorder is not None and window.recorder.is_running
 
     receiver.deliver(_event(event_id="formal-second", sequence=17))
-    qapp.processEvents()
+    _settle_passages(qapp, window)
     assert len(_FakeRecorder.instances) == 1
     window.close()
 
@@ -1262,7 +1269,7 @@ def test_historical_passage_does_not_auto_start_recording(qapp, tmp_path):
     _FakeReceiver.instances[-1].deliver(
         _event(passage_timestamp_ms=historical_timestamp_ms)
     )
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window.recorder is None
     assert window.table.rowCount() == 1
@@ -1288,7 +1295,7 @@ def test_auto_recording_failure_does_not_drop_live_passage(qapp, tmp_path):
     window.start_receiver()
 
     _FakeReceiver.instances[-1].deliver(_event())
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window.recorder is None
     assert window.passage_store.get("race-1-stage-1-passage-15") is not None
@@ -1379,7 +1386,7 @@ def test_received_passage_uses_incremental_table_refresh(
 
     monkeypatch.setattr(window, "refresh", counted_refresh)
     _FakeReceiver.instances[0].deliver(_event())
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert full_refresh_calls == 0
     assert window.table.rowCount() == 1
@@ -1399,7 +1406,7 @@ def test_evidence_failure_does_not_hide_received_passage(qapp, tmp_path, monkeyp
     monkeypatch.setattr(window._publishers[1], "publish_many", fail_publish)
     try:
         receiver.deliver(event)
-        qapp.processEvents()
+        _settle_passages(qapp, window)
         window._passage_batch_timer.stop()
         window._flush_passage_batch()
         assert window.table.rowCount() == 1
@@ -1407,7 +1414,7 @@ def test_evidence_failure_does_not_hide_received_passage(qapp, tmp_path, monkeyp
         _wait_until(qapp, lambda: "evidence unavailable" in window._capture_error)
         withdrawn = replace(event, revision=2, is_active=False)
         receiver.deliver(withdrawn)
-        qapp.processEvents()
+        _settle_passages(qapp, window)
         window._passage_batch_timer.stop()
         window._flush_passage_batch()
         assert window.table.rowCount() == 0
@@ -1490,7 +1497,7 @@ def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
     window.start_recording()
     # Drain the initial filmstrip/catalog refresh scheduled by the window
     # before observing the passage-triggered refresh below.
-    qapp.processEvents()
+    _settle_passages(qapp, window)
     receiver = _FakeReceiver.instances[0]
     refreshed_batches = []
     requests = []
@@ -1508,11 +1515,13 @@ def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
                 bib=str(sequence),
             )
         )
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert refreshed_batches == []
     assert "待处理 3" in window.receiver_status_label.text()
 
+    # Exclude periodic/initial media refreshes delivered while awaiting disk.
+    requests.clear()
     window._passage_batch_timer.stop()
     window._flush_passage_batch()
 
@@ -1692,7 +1701,7 @@ def test_focus_before_passage_shows_roster_then_auto_selects_passage(
             emitted_at_ms=2,
         )
     )
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window._selected_event_id == ""
     assert window.selected_identity_value.text() == "15"
@@ -1702,7 +1711,7 @@ def test_focus_before_passage_shows_roster_then_auto_selects_passage(
     )
 
     receiver.deliver(_event())
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window._selected_event_id == "race-1-stage-1-passage-15"
     assert window.selected_identity_value.text() == "15"
@@ -1764,7 +1773,7 @@ def test_legacy_time_of_day_is_not_matched_as_an_epoch(qapp, tmp_path):
     window.start()
 
     _FakeReceiver.instances[0].deliver(_event(absolute=False))
-    qapp.processEvents()
+    _settle_passages(qapp, window)
 
     assert window.table.rowCount() == 1
     assert len(window.timeline_store.segments()) == 0
@@ -2673,6 +2682,7 @@ def test_auth_failure_pauses_retries_without_stopping_passage_intake(qapp, tmp_p
     try:
         # A fresh passage may arrive before the health timer notices the failure.
         window.receiver.deliver(event)
+        _settle_passages(qapp, window)
         for offset in (1, 120, 3600):
             window._poll_recording_health(now=time.monotonic() + offset)
         window._update_runtime_status()
@@ -3258,7 +3268,9 @@ def test_live_evidence_date_aligns_without_changing_formal_passage_time(
     )
     window = _window(tmp_path)
 
+    window._receiver_passage_store.append(event)
     window._on_passage_received(event)
+    _settle_passages(qapp, window)
     window._passage_batch_timer.stop()
 
     assert event.timeline_timestamp_ms == formal_timestamp_ms

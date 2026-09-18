@@ -188,6 +188,7 @@ class RaceMetadataStore:
         self.snapshot_path = Path(snapshot_path).expanduser().absolute()
         self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._write_lock = threading.Lock()
         self._current: Optional[RaceMetadata] = None
         self._load_existing()
 
@@ -205,7 +206,7 @@ class RaceMetadataStore:
     def store(self, metadata: RaceMetadata) -> RaceMetadataIngestResult:
         if not isinstance(metadata, RaceMetadata):
             raise TypeError("metadata must be RaceMetadata")
-        with self._lock:
+        with self._write_lock:
             current = self._current
             same_context = current is not None and (
                 metadata.race_id,
@@ -239,7 +240,8 @@ class RaceMetadataStore:
             finally:
                 if temporary.exists():
                     temporary.unlink()
-            self._current = metadata
+            with self._lock:
+                self._current = metadata
             return RaceMetadataIngestResult.ACCEPTED
 
     def current(self) -> Optional[RaceMetadata]:
