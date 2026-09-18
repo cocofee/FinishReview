@@ -2443,6 +2443,50 @@ def test_two_rtsp_sources_start_independent_review_pipelines(qapp, tmp_path):
     window.close()
 
 
+def test_recording_start_and_reconnect_keep_dispatching_qt(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    gui_thread = threading.get_ident()
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    original_start, original_stop = _FakeRecorder.start, _FakeRecorder.stop
+
+    def blocked_start(recorder):
+        calls.append(("start", threading.get_ident()))
+        release.clear()
+        entered.set()
+        assert release.wait(2), "recording start blocked Qt dispatch"
+        return original_start(recorder)
+
+    def blocked_stop(recorder):
+        calls.append(("stop", threading.get_ident()))
+        release.clear()
+        entered.set()
+        assert release.wait(2), "recording stop blocked Qt dispatch"
+        return original_stop(recorder)
+
+    def tick():
+        if entered.is_set():
+            entered.clear()
+            release.set()
+
+    timer = QTimer()
+    timer.timeout.connect(tick)
+    timer.start(5)
+    monkeypatch.setattr(_FakeRecorder, "start", blocked_start)
+    monkeypatch.setattr(_FakeRecorder, "stop", blocked_stop)
+    try:
+        window.start_recording()
+        window._restart_recording_camera(1, window.source)
+        window.stop_recording()
+        assert [kind for kind, _thread in calls] == ["start", "stop", "start", "stop"]
+        assert all(thread != gui_thread for _kind, thread in calls)
+        assert len({thread for _kind, thread in calls}) == 1
+    finally:
+        release.set()
+        timer.stop()
+        window.close()
+
+
 def test_recording_watchdog_uses_monotonic_segment_progress(qapp, tmp_path):
     window = _window(tmp_path)
     window.start_recording()

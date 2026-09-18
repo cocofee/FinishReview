@@ -9,7 +9,7 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +32,9 @@ from PyQt5.QtWidgets import (
 
 from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
 from .ui_metrics import UiLatencyProbe
+from .runtime_status import (
+    RuntimeStatusSnapshot as RuntimeStatusSnapshot, RuntimeStatusPresenter, STATUS_WIDGET_NAMES,
+)
 from .decode_resources import DECODE_RESOURCES
 from .background_wait import wait_for_background
 from .recording_catalog import RecordingCatalog, RecordingCatalogJob
@@ -86,8 +89,9 @@ from .review_export import export_review_summary
 from .review_clip import PassageReviewBindingStore
 from .receiver_controller import ReceiverController
 from .recording_controller import (
-    RecordingPipeline,
+    PendingRecordingPassage,
     RecordingSessionController,
+    RecordingRecoveryState,
     RecordingStopFailure,
 )
 from .settings import FinishReviewSettings
@@ -151,60 +155,12 @@ class _VideoCandidatePersistenceFailure:
     message: str
 
 
-@dataclass(frozen=True)
-class RuntimeStatusSnapshot:
-    beijing_clock_text: str
-    epoch_now_ms: int
-    configured_sources: tuple[tuple[int, str], ...]
-    recording_active: bool
-    recording_all_active: bool
-    segments_by_camera: Mapping[int, tuple[object, ...]]
-    reconnecting_cameras: tuple[int, ...]
-    reconnect_errors: Mapping[int, str]
-    running_recorder_cameras: frozenset[int]
-    auto_recording_error: str
-    archive_scan_active: bool
-    anomaly_count: int
-    archive_candidate_count: int
-    visual_failed: bool
-    visual_status: str
-    video_scan_active: bool
-    finish_line_count: int
-    visual_detection_enabled: bool
-    workspace_mode: str
-    runtime_error: str
-    recording_elapsed_seconds: int
-    receiver_running: bool
-    receiver_metadata: RaceMetadata | None
-    pending_passage_count: int
-    archive_background_passage_count: int
-    received_passage_count: int
-    historical_passage_count: int
-    receiver_error: str
-    timing_provider: str
-    racetiger_running: bool
-    racetiger_status: RaceTigerStatus | None
-    racetiger_configured: bool
-    high_speed_result: AuyatScanResult
-    high_speed_root: Path | None
-    high_speed_remote: bool
-    storage_free_gb: float | None
-    storage_error: str
-    capture_counts: Mapping[PassageReviewState, int]
-    aligned_event_count: int
-    capture_error: str
-    available_evidence_count: int
-    unsupported_event_count: int
-    workspace_notice: str
 
 IS_WINDOWS = os.name == "nt"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
 CYCLERACE_INBOX_DIRNAME = ".finishreview"
-CAMERA_RECONNECT_BASE_SECONDS = 2.0
-CAMERA_RECONNECT_MAX_SECONDS = 30.0
-CAMERA_STALL_TIMEOUT_SECONDS = 60.0
 _TEST_GROUP_NAMES = frozenset({"test", "testgroup"})
 _TEST_GROUP_MARKERS = ("测试", "检测")
 _INVALID_EVENT_FOLDER_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -785,14 +741,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self._racetiger_generation = 0
         self._last_cleanup_at = 0.0
         self._recording_started_at = 0.0
-        self._camera_reconnect_attempts: dict[int, int] = {}
-        self._camera_reconnect_not_before: dict[int, float] = {}
-        self._camera_reconnect_errors: dict[int, str] = {}
-        self._camera_auth_failed_sources: dict[int, str] = {}
-        self._camera_segment_progress: dict[
-            int,
-            tuple[int | None, float],
-        ] = {}
+        self._recording_recovery = RecordingRecoveryState()
+        self._camera_reconnect_attempts = self._recording_recovery.attempts
+        self._camera_reconnect_not_before = self._recording_recovery.not_before
+        self._camera_reconnect_errors = self._recording_recovery.errors
+        self._camera_auth_failed_sources = self._recording_recovery.auth_failed_sources
+        self._camera_segment_progress = self._recording_recovery.segment_progress
         self._historical_passage_count = len(passage_store)
         self._received_passage_count = 0
         self._last_passage_monotonic = 0.0
@@ -2514,7 +2468,7 @@ class FinishReviewWindow(PassageReviewSurface):
             raise RecordingError("赛事存储空间不足 1 GB，无法开始录像")
         archive_publishers = []
         try:
-            pipelines = self._recording_controller.start(
+            pipelines = self._run_capture_task(lambda: self._recording_controller.start(
                 sources=configured_sources,
                 output_dir=self.output_dir,
                 ffmpeg_path=self.ffmpeg_path,
@@ -2522,7 +2476,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 timeline_store=self.timeline_store,
                 timing_error_ms=self.timing_error_ms,
                 binding_store=self.review_binding_store,
-            )
+            ))
             self._recorders = self._recording_controller.recorders
             self._ring_buffers = self._recording_controller.ring_buffers
             self._coordinators = self._recording_controller.coordinators
@@ -2594,10 +2548,11 @@ class FinishReviewWindow(PassageReviewSurface):
             self._started = True
             self._stop_requested = False
             self._recording_started_at = time.monotonic()
-            self._camera_segment_progress = {
+            self._camera_segment_progress.clear()
+            self._camera_segment_progress.update({
                 camera_index: (None, self._recording_started_at)
                 for camera_index in recorders
-            }
+            })
             self._runtime_error = ""
             self._auto_recording_error = ""
             self._capture_error = ""
@@ -2607,9 +2562,9 @@ class FinishReviewWindow(PassageReviewSurface):
             self._lookup_cache.clear()
             self.refresh()
         except Exception:
-            rollback_failures = self._recording_controller.stop()
-            for worker in self._video_scan_workers.values():
-                worker.stop()
+            rollback_failures = self._run_capture_task(self._recording_controller.stop)
+            workers = tuple(self._video_scan_workers.values())
+            self._run_capture_task(lambda: [worker.stop() for worker in workers])
             self._video_scan_workers = {}
             self._stop_visual_workers()
             self._recorders = self._recording_controller.recorders
@@ -2633,42 +2588,61 @@ class FinishReviewWindow(PassageReviewSurface):
         finally:
             self._update_runtime_status()
 
-    def _restart_recording_camera(
-        self,
-        camera_index: int,
-        source: str,
-    ) -> None:
+    def _restart_recording_camera(self, camera_index: int, source: str) -> None:
         self._invalidate_capture_refresh()
         camera_index = max(1, int(camera_index))
         token = object()
         with self._video_scan_state_lock:
             self._video_scan_tokens[camera_index] = token
         previous_worker = self._video_scan_workers.pop(camera_index, None)
-        if previous_worker is not None:
-            previous_worker.stop()
-        recorder = self._recorder_factory(
-            source,
-            self.output_dir,
-            camera_index=camera_index,
-            ffmpeg_path=self.ffmpeg_path,
-            review_retention_seconds=self.review_retention_seconds,
+        previous_windows = dict(self._capture_windows_by_camera.get(camera_index, {}))
+        replacement_windows = {
+            event_id: window for event_id, window in previous_windows.items()
+            if window.state is not PassageReviewState.WAITING
+        }
+        pending_passages = []
+        for event_id, window in previous_windows.items():
+            if window.state is not PassageReviewState.WAITING:
+                continue
+            event = self.passage_store.get(event_id)
+            timestamp_ms = self._evidence_timestamp(event) if event is not None else None
+            if event is not None and event.is_active and timestamp_ms is not None:
+                pending_passages.append(PendingRecordingPassage(
+                    event_id, timestamp_ms, event.revision, event.race_id,
+                ))
+        restart_kwargs = dict(
+            camera_index=camera_index, source=str(source), output_dir=self.output_dir,
+            ffmpeg_path=self.ffmpeg_path, review_retention_seconds=self.review_retention_seconds,
+            timeline_store=self.timeline_store, timing_error_ms=self.timing_error_ms,
+            binding_store=self.review_binding_store, pending_passages=tuple(pending_passages),
         )
+
+        def restart():
+            if previous_worker is not None:
+                previous_worker.stop()
+            return self._recording_controller.restart_camera(**restart_kwargs)
+
+        try:
+            pipeline, waiting_windows = self._run_capture_task(restart)
+        finally:
+            self._recorders = self._recording_controller.recorders
+            self._ring_buffers = self._recording_controller.ring_buffers
+            self._coordinators = self._recording_controller.coordinators
+            self._publishers = self._recording_controller.timeline_publishers
+            self._recorder = self._recorders.get(self.camera_index)
+            self._ring_buffer = self._ring_buffers.get(self.camera_index)
+            self._coordinator = self._coordinators.get(self.camera_index)
+            self._publisher = self._publishers.get(self.camera_index)
+        replacement_windows.update(waiting_windows)
+        self._capture_windows_by_camera[camera_index] = replacement_windows
+        if camera_index == self.camera_index:
+            self._capture_windows = replacement_windows
+        self._camera_segment_progress[camera_index] = (None, time.monotonic())
+        self._archive_publishers.append(pipeline.archive_publisher)
+        self._lookup_cache.clear()
+        ring_buffer = pipeline.ring_buffer
         scan_worker = None
         try:
-            playlist_path = recorder.start()
-            ring_buffer = ReviewRingBuffer(
-                playlist_path,
-                camera_index=camera_index,
-                retention_seconds=self.review_retention_seconds,
-            )
-            ring_buffer.scan()
-            coordinator = PassageReviewCoordinator(ring_buffer)
-            publisher = PassageReviewTimelinePublisher(
-                ring_buffer,
-                self.timeline_store,
-                timing_error_ms=self.timing_error_ms,
-                binding_store=self.review_binding_store,
-            )
             if self._video_assist_enabled():
                 callback = (
                     lambda candidates, generation=self._video_scan_generation,
@@ -2713,73 +2687,10 @@ class FinishReviewWindow(PassageReviewSurface):
                         pause()
         except Exception:
             if scan_worker is not None:
-                scan_worker.stop()
-            try:
-                recorder.stop()
-            except Exception:  # noqa: BLE001 - retain the original restart error.
-                pass
+                self._run_capture_task(scan_worker.stop)
             raise
-
-        try:
-            previous_windows = self._capture_windows_by_camera.get(camera_index, {})
-            replacement_windows = {
-                event_id: window
-                for event_id, window in previous_windows.items()
-                if window.state is not PassageReviewState.WAITING
-            }
-            for event_id, window in previous_windows.items():
-                if window.state is not PassageReviewState.WAITING:
-                    continue
-                event = self.passage_store.get(event_id)
-                timestamp_ms = (
-                    self._evidence_timestamp(event) if event is not None else None
-                )
-                if event is None or not event.is_active or timestamp_ms is None:
-                    continue
-                replacement_windows[event_id] = coordinator.register(
-                    event_id,
-                    passage_timestamp_ms=timestamp_ms,
-                    scan=False,
-                    revision=event.revision,
-                    race_id=event.race_id,
-                )
-        except Exception:
-            if scan_worker is not None:
-                scan_worker.stop()
-            try:
-                recorder.stop()
-            except Exception:  # noqa: BLE001 - retain the registration error.
-                pass
-            raise
-
-        archive_publisher = ArchiveTimelinePublisher(recorder, self.timeline_store)
-        self._recording_controller.replace_pipeline(
-            RecordingPipeline(
-                source=str(source),
-                camera_index=camera_index,
-                recorder=recorder,
-                ring_buffer=ring_buffer,
-                coordinator=coordinator,
-                timeline_publisher=publisher,
-                archive_publisher=archive_publisher,
-            )
-        )
-        self._recorders = self._recording_controller.recorders
-        self._ring_buffers = self._recording_controller.ring_buffers
-        self._coordinators = self._recording_controller.coordinators
-        self._publishers = self._recording_controller.timeline_publishers
         if scan_worker is not None:
             self._video_scan_workers[camera_index] = scan_worker
-        self._capture_windows_by_camera[camera_index] = replacement_windows
-        self._camera_segment_progress[camera_index] = (None, time.monotonic())
-        self._archive_publishers.append(archive_publisher)
-        if camera_index == self.camera_index:
-            self._recorder = recorder
-            self._ring_buffer = ring_buffer
-            self._coordinator = coordinator
-            self._publisher = publisher
-            self._capture_windows = replacement_windows
-        self._lookup_cache.clear()
 
     def _live_location_for_filmstrip(
         self,
@@ -2889,15 +2800,9 @@ class FinishReviewWindow(PassageReviewSurface):
         ring_buffer = self._ring_buffers.get(int(camera_index))
         if ring_buffer is None:
             return ""
-        signature = ring_buffer.segment_revision
-        previous = self._camera_segment_progress.get(int(camera_index))
-        if previous is None or previous[0] != signature:
-            self._camera_segment_progress[int(camera_index)] = (signature, now)
-            return ""
-        stalled_seconds = max(0.0, now - previous[1])
-        if stalled_seconds < CAMERA_STALL_TIMEOUT_SECONDS:
-            return ""
-        return f"录像进程仍在运行，但 {stalled_seconds:.0f} 秒没有产生新片段"
+        return self._recording_recovery.stall_error(
+            int(camera_index), ring_buffer.segment_revision, now=now,
+        )
 
     def _poll_recording_health(self, *, now: float | None = None) -> None:
         if getattr(self, "_capture_task_waiting", False):
@@ -2933,38 +2838,23 @@ class FinishReviewWindow(PassageReviewSurface):
         now: float,
     ) -> bool:
         camera_index = max(1, int(camera_index))
-        if now < self._camera_reconnect_not_before.get(camera_index, 0.0):
+        if not self._recording_recovery.can_retry(camera_index, now=now):
             return False
         source = dict(self._configured_recording_sources()).get(camera_index)
         if not source:
             return False
         if _is_rtsp_auth_error(recorder_error):
-            self._camera_auth_failed_sources[camera_index] = source
-            self._camera_reconnect_not_before[camera_index] = float("inf")
             detail = (
                 _format_rtsp_probe_error(recorder_error)
                 + " 自动重试已暂停；修改凭据后，点击开始录像重试。"
             )
-            self._camera_reconnect_errors[camera_index] = detail
+            self._recording_recovery.pause_auth(camera_index, source, detail)
             self._runtime_error = f"机位{camera_index}：{detail}"
             self._auto_recording_error = self._runtime_error
             logger.warning("Camera %s authentication failed; automatic retries paused", camera_index)
             return False
-        attempt = self._camera_reconnect_attempts.get(camera_index, 0) + 1
         reconnect_started = time.perf_counter()
         try:
-            current_recorder = self._recorders.get(camera_index)
-            if current_recorder is not None and current_recorder.is_running:
-                try:
-                    current_recorder.stop()
-                except Exception:  # noqa: BLE001 - only a live process blocks replacement.
-                    if current_recorder.is_running:
-                        raise
-                    logger.warning(
-                        "Camera %s stopped with an error before reconnect",
-                        camera_index,
-                        exc_info=True,
-                    )
             self._restart_recording_camera(camera_index, source)
         except Exception as exc:  # noqa: BLE001 - reconnect remains operator-visible.
             self._observe_runtime_metric(
@@ -2973,13 +2863,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 item_count=1,
                 failed=True,
             )
-            delay_seconds = min(
-                CAMERA_RECONNECT_MAX_SECONDS,
-                CAMERA_RECONNECT_BASE_SECONDS * (2 ** min(attempt - 1, 10)),
-            )
+            attempt, delay_seconds = self._recording_recovery.failed(camera_index, now=now)
             detail = sanitize_recording_message(exc)
-            self._camera_reconnect_attempts[camera_index] = attempt
-            self._camera_reconnect_not_before[camera_index] = now + delay_seconds
             self._camera_reconnect_errors[camera_index] = (
                 f"{recorder_error}；重连失败：{detail}；"
                 f"{delay_seconds:g}秒后重试"
@@ -2997,9 +2882,7 @@ class FinishReviewWindow(PassageReviewSurface):
             )
             return False
 
-        self._camera_reconnect_attempts.pop(camera_index, None)
-        self._camera_reconnect_not_before.pop(camera_index, None)
-        self._camera_reconnect_errors.pop(camera_index, None)
+        self._recording_recovery.succeeded(camera_index)
         self._observe_runtime_metric(
             "camera_reconnect",
             reconnect_started,
@@ -3780,6 +3663,7 @@ class FinishReviewWindow(PassageReviewSurface):
             counts[state] += 1
 
         return RuntimeStatusSnapshot(
+            output_dir=self.output_dir, video_assist_enabled=self._video_assist_enabled(),
             beijing_clock_text=datetime.now(
                 timezone(timedelta(hours=8))
             ).strftime("%H:%M:%S"),
@@ -3862,473 +3746,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self._render_runtime_status(self._collect_runtime_status())
 
     def _render_runtime_status(self, snapshot: RuntimeStatusSnapshot) -> None:
-        self.beijing_clock_label.setText(snapshot.beijing_clock_text)
-        self.race_dir_label.setText(f"证据目录：{self.output_dir.name}")
-        self.race_dir_label.setToolTip(str(self.output_dir))
+        if not hasattr(self, "_status_presenter"):
+            self._status_presenter = RuntimeStatusPresenter(
+                {name: getattr(self, name) for name in STATUS_WIDGET_NAMES},
+            )
+        self._status_presenter.render(snapshot)
         self._update_event_header()
-
-        configured_sources = snapshot.configured_sources
-        recording_active = snapshot.recording_active
-        recording_all_active = snapshot.recording_all_active
-        segments_by_camera = snapshot.segments_by_camera
-        reconnecting = snapshot.reconnecting_cameras
-        if reconnecting:
-            auth_failed = any(
-                _is_rtsp_auth_error(snapshot.reconnect_errors[index])
-                for index in reconnecting
-            )
-            camera_text = "录像设备: 认证失败" if auth_failed else "录像设备: 自动重连中"
-            camera_color = "#b54747"
-            camera_state = "error"
-            camera_tooltip = "\n".join(
-                f"机位{camera_index}: {snapshot.reconnect_errors[camera_index]}"
-                for camera_index in reconnecting
-            )
-        elif recording_active:
-            missing = [
-                camera_index
-                for camera_index, _source in configured_sources
-                if camera_index not in snapshot.running_recorder_cameras
-            ]
-            waiting = [
-                camera_index
-                for camera_index in snapshot.running_recorder_cameras
-                if not segments_by_camera.get(camera_index)
-            ]
-            stale = []
-            for camera_index, segments in segments_by_camera.items():
-                if (
-                    segments
-                    and snapshot.epoch_now_ms - segments[-1].ended_at_ms > 8_000
-                ):
-                    stale.append(camera_index)
-            if missing:
-                camera_text, camera_color = "录像设备: 机位异常", "#b54747"
-                camera_state = "error"
-                camera_tooltip = "未运行：" + "、".join(
-                    f"机位{camera_index}" for camera_index in missing
-                )
-            elif stale:
-                camera_text, camera_color = "录像设备: 无新画面", "#b54747"
-                camera_state = "error"
-                camera_tooltip = "超过8秒无新画面：" + "、".join(
-                    f"机位{camera_index}" for camera_index in stale
-                )
-            elif waiting:
-                camera_text, camera_color = "录像设备: 正在检查", "#a56300"
-                camera_state = "busy"
-                camera_tooltip = "等待首个2秒片段：" + "、".join(
-                    f"机位{camera_index}" for camera_index in waiting
-                )
-            else:
-                camera_text, camera_color = "录像设备: 全部已连接", "#247a52"
-                camera_state = "ready"
-                camera_tooltip = f"{len(configured_sources)} 个普通机位持续生成可判读画面"
-        elif snapshot.auto_recording_error and configured_sources:
-            camera_text, camera_color = "录像设备: 自动启动失败", "#b54747"
-            camera_state = "error"
-            camera_tooltip = snapshot.auto_recording_error
-        elif configured_sources:
-            camera_text, camera_color = "录像设备: 已配置", "#526170"
-            camera_state = "waiting"
-            camera_tooltip = f"已配置 {len(configured_sources)} 个普通机位，开始录像后验证画面"
-        else:
-            camera_text, camera_color = "录像设备: 未配置", "#b54747"
-            camera_state = "error"
-            camera_tooltip = "请打开设备设置并选择USB/Type-C摄像头"
-        self.camera_status_label.setStatus(camera_text, camera_state)
-        self.camera_status_label.setToolTip(camera_tooltip)
-        self.camera_status_label.setStyleSheet(f"color: {camera_color};")
-
-        anomaly_count = snapshot.anomaly_count
-        if not recording_active and snapshot.archive_scan_active:
-            candidate_count = snapshot.archive_candidate_count
-            video_text = (
-                f"视频辅助: 候选 {candidate_count}"
-                if candidate_count
-                else "视频辅助: 扫描中"
-            )
-            video_state = "ready" if candidate_count else "busy"
-            video_tip = "正在扫描已录制录像；Ctrl+右/左可跳到下一个/上一个有人通过位置"
-        elif not recording_active:
-            video_text, video_state = "视频辅助: 待机", "waiting"
-            video_tip = "开始普通录像后自动扫描疑似过线批次"
-        elif snapshot.visual_failed:
-            video_text = "视频辅助: 视觉检测异常"
-            video_state = "error"
-            video_tip = snapshot.visual_status or "实时视觉检测失败"
-        elif snapshot.video_scan_active:
-            video_text = f"视频辅助: {anomaly_count} 个异常" if anomaly_count else "视频辅助: 扫描中"
-            video_state = "error" if anomaly_count else "busy"
-            configured_lines = snapshot.finish_line_count
-            video_tip = (
-                f"已配置 {configured_lines} 个机位终点线；只提示异常批次"
-                if configured_lines
-                else "当前使用默认终点线区域；可通过设置接口调整"
-            )
-            if snapshot.visual_detection_enabled and snapshot.visual_status:
-                video_tip += f"；实时视觉：{snapshot.visual_status}"
-        else:
-            video_text, video_state = "视频辅助: 未启动", "error"
-            video_tip = "普通录像运行时辅助扫描器未启动"
-        self.video_assist_status_label.setStatus(video_text, video_state)
-        self.video_assist_status_label.setToolTip(video_tip)
-        self.video_assist_status_label.setVisible(self._video_assist_enabled())
-        if hasattr(self, "archive_scan_button"):
-            archive_mode = snapshot.workspace_mode == "archive" and not recording_active
-            archive_scan_available = archive_mode and self._video_assist_enabled()
-            self.archive_scan_button.setVisible(archive_scan_available)
-            self.archive_scan_button.setEnabled(archive_scan_available)
-            self.archive_scan_button.setText(
-                "停止视频分析"
-                if snapshot.archive_scan_active
-                else "分析历史视频"
-            )
-
-        if snapshot.workspace_mode == "archive" and not recording_active:
-            recording_text, recording_color = "普通录像: 历史查看", "#667085"
-            recording_tooltip = "返回当前赛事后可开始录像"
-        elif snapshot.runtime_error and not recording_all_active:
-            recording_text, recording_color = "普通录像: 异常", "#b54747"
-            recording_tooltip = snapshot.runtime_error
-        elif recording_all_active:
-            elapsed = snapshot.recording_elapsed_seconds
-            hours, remainder = divmod(elapsed, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            recording_text = f"普通录像: {hours:02d}:{minutes:02d}:{seconds:02d}"
-            recording_color = "#247a52"
-            recording_tooltip = f"{len(configured_sources)} 个机位：5分钟赛事存档 + 2秒判读时间片"
-        elif recording_active:
-            recording_text, recording_color = "普通录像: 部分机位异常", "#b54747"
-            recording_tooltip = "请停止录像并检查异常机位后重新开始"
-        else:
-            recording_text, recording_color = "普通录像: 待机", "#667085"
-            recording_tooltip = "点击开始录像后持续保存整场赛事"
-        self.recording_status_label.setText(recording_text)
-        self.recording_status_label.setToolTip(recording_tooltip)
-        self.recording_status_label.setStyleSheet(f"color: {recording_color};")
-        self.record_button.setText(
-            "停止录像"
-            if recording_active
-            else "历史查看中"
-            if snapshot.workspace_mode == "archive"
-            else "开始录像"
-        )
-        self.record_button.setEnabled(
-            recording_active or snapshot.workspace_mode != "archive"
-        )
-        self.record_button.setStyleSheet(
-            "background: #a33d4b; color: white; border: 1px solid #a33d4b;"
-            if recording_active
-            else "background: #eef1f4; color: #667085; border: 1px solid #cfd7df;"
-            if snapshot.workspace_mode == "archive"
-            else "background: #247a52; color: white; border: 1px solid #247a52;"
-        )
-
-        if snapshot.receiver_running:
-            metadata = snapshot.receiver_metadata
-            pending_count = snapshot.pending_passage_count
-            if snapshot.workspace_mode == "archive":
-                background_count = snapshot.archive_background_passage_count
-                self.receiver_status_label.setStatus(
-                    "CycleRace: 后台监听，"
-                    + (
-                        f"已收到 {background_count} 条"
-                        if background_count
-                        else "当前查看历史赛事"
-                    ),
-                    "ready" if background_count else "waiting",
-                )
-                self.receiver_status_label.setStyleSheet(
-                    "color: #247a52;" if background_count else "color: #a56300;"
-                )
-                self.receiver_status_label.setToolTip(
-                    "实时数据继续保存到独立收件箱，不会写入当前历史赛事目录。"
-                )
-            elif pending_count:
-                self.receiver_status_label.setStatus(
-                    "CycleRace: 监听中，正在处理；"
-                    f"本次收到 {snapshot.received_passage_count} 条，待处理 {pending_count}",
-                    "busy",
-                )
-                self.receiver_status_label.setStyleSheet("color: #a56300;")
-                self.receiver_status_label.setToolTip(
-                    "通过记录已先写入本地审计日志，正在合并刷新录像定位和判读列表。"
-                    "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
-                )
-            elif snapshot.received_passage_count:
-                self.receiver_status_label.setStatus(
-                    f"CycleRace: 监听中，本次收到 {snapshot.received_passage_count} 条",
-                    "ready",
-                )
-                self.receiver_status_label.setStyleSheet("color: #247a52;")
-                self.receiver_status_label.setToolTip(
-                    "本次运行已收到CycleRace通过记录。"
-                    "当前协议没有持续心跳，不能判断发送端持续在线。"
-                )
-            elif metadata is not None:
-                race_label = metadata.race_name.strip() or metadata.race_id
-                stage_label = metadata.stage_name.strip() or metadata.stage_id
-                self.receiver_status_label.setStatus(
-                    f"CycleRace: 监听中，已加载赛事 {race_label} / {stage_label}",
-                    "waiting",
-                )
-                self.receiver_status_label.setStyleSheet("color: #a56300;")
-                self.receiver_status_label.setToolTip(
-                    f"已读取 {len(metadata.groups)} 个组别、"
-                    f"{len(metadata.athletes)} 名运动员；这些资料可能来自本地缓存。"
-                    "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
-                )
-            elif snapshot.historical_passage_count:
-                self.receiver_status_label.setStatus(
-                    "CycleRace: 监听中，"
-                    f"已加载历史 {snapshot.historical_passage_count} 条",
-                    "waiting",
-                )
-                self.receiver_status_label.setStyleSheet("color: #a56300;")
-                self.receiver_status_label.setToolTip(
-                    "历史记录已加载，但本次运行还没有收到CycleRace新数据。"
-                    "监听状态只表示本机接收服务已启动，不能判断发送端持续在线。"
-                )
-            else:
-                self.receiver_status_label.setStatus(
-                    "CycleRace: 监听中，等待数据", "waiting"
-                )
-                self.receiver_status_label.setStyleSheet("color: #a56300;")
-                self.receiver_status_label.setToolTip(
-                    "本机接收服务已启动，等待CycleRace主动发送数据。"
-                    "当前协议没有持续心跳，不能判断发送端是否在线。"
-                )
-        else:
-            self.receiver_status_label.setStatus(
-                "CycleRace: 异常" if snapshot.receiver_error else "CycleRace: 未监听",
-                "error",
-            )
-            self.receiver_status_label.setStyleSheet("color: #b54747;")
-            self.receiver_status_label.setToolTip(
-                snapshot.receiver_error or "CycleRace接收服务未启动"
-            )
-
-        if snapshot.timing_provider == "racetiger":
-            status = snapshot.racetiger_status
-            if snapshot.racetiger_running:
-                pending_count = snapshot.pending_passage_count
-                if status is not None and status.state == "error":
-                    self.receiver_status_label.setStatus("赛虎: API 错误", "error")
-                    self.receiver_status_label.setStyleSheet("color: #b54747;")
-                    self.receiver_status_label.setToolTip(status.message)
-                elif pending_count:
-                    self.receiver_status_label.setStatus(
-                        "赛虎: 正在处理，"
-                        f"已读取 {snapshot.received_passage_count}，待处理 {pending_count}",
-                        "busy",
-                    )
-                    self.receiver_status_label.setStyleSheet("color: #a56300;")
-                    self.receiver_status_label.setToolTip(
-                        "赛虎终点记录已写入本地只读日志，正在准备视频定位"
-                    )
-                elif status is not None and status.state == "ok":
-                    self.receiver_status_label.setStatus(
-                        f"赛虎: 已读取 {status.count} 条", "ready"
-                    )
-                    self.receiver_status_label.setStyleSheet("color: #247a52;")
-                    self.receiver_status_label.setToolTip(status.message)
-                else:
-                    self.receiver_status_label.setStatus("赛虎: 正在读取", "busy")
-                    self.receiver_status_label.setStyleSheet("color: #a56300;")
-                    self.receiver_status_label.setToolTip("正在轮询赛虎 FINISH 记录")
-            else:
-                configured = snapshot.racetiger_configured
-                self.receiver_status_label.setStatus(
-                    "赛虎: 异常"
-                    if snapshot.receiver_error
-                    else ("赛虎: 未启动" if configured else "赛虎: 未配置"),
-                    "error",
-                )
-                self.receiver_status_label.setStyleSheet("color: #b54747;")
-                self.receiver_status_label.setToolTip(
-                    snapshot.receiver_error or "请在设备与赛事设置中填写赛虎接口参数"
-                )
-
-        high_speed_result = snapshot.high_speed_result
-        high_speed_root = snapshot.high_speed_root
-        high_speed_remote = snapshot.high_speed_remote
-        if high_speed_root is None:
-            self.high_speed_status_label.setStatus(
-                "高速摄像: 未配置共享目录", "error"
-            )
-            self.high_speed_status_label.setStyleSheet("color: #b54747;")
-        elif high_speed_result.status == "checking":
-            self.high_speed_status_label.setStatus(
-                (
-                    "高速摄像: 正在连接共享目录"
-                    if high_speed_remote
-                    else "高速摄像: 正在检查本机测试目录"
-                ),
-                "busy",
-            )
-            self.high_speed_status_label.setStyleSheet("color: #a56300;")
-        elif high_speed_result.status == "unavailable":
-            self.high_speed_status_label.setStatus(
-                (
-                    "高速摄像: 共享目录未连接"
-                    if high_speed_remote
-                    else "高速摄像: 本机测试目录不可用"
-                ),
-                "error",
-            )
-            self.high_speed_status_label.setStyleSheet("color: #b54747;")
-        elif high_speed_result.waiting_file_count:
-            self.high_speed_status_label.setStatus(
-                (
-                    "高速摄像: 共享目录可访问，等待原厂软件完成判读"
-                    if high_speed_remote
-                    else "高速摄像: 本机测试目录可读，等待原厂软件完成判读"
-                ),
-                "waiting",
-            )
-            self.high_speed_status_label.setStyleSheet("color: #a56300;")
-        elif high_speed_result.status == "waiting":
-            self.high_speed_status_label.setStatus(
-                (
-                    "高速摄像: 共享目录可访问，等待高速画面"
-                    if high_speed_remote
-                    else "高速摄像: 本机测试目录可读，等待测试数据"
-                ),
-                "waiting",
-            )
-            self.high_speed_status_label.setStyleSheet("color: #a56300;")
-        else:
-            self.high_speed_status_label.setStatus(
-                f"高速摄像: {'共享目录可访问' if high_speed_remote else '本机测试数据可读'}，"
-                f"{len(high_speed_result.captures)} 段",
-                "ready",
-            )
-            self.high_speed_status_label.setStyleSheet("color: #247a52;")
-        self.high_speed_status_label.setToolTip(
-            "\n".join(
-                value
-                for value in (
-                    str(high_speed_root or "未配置高速摄像共享目录"),
-                    high_speed_result.message,
-                )
-                if value
-            )
-        )
-
-        storage_alert = ""
-        storage_alert_tooltip = ""
-        storage_alert_color = "#b54747"
-        free_gb = snapshot.storage_free_gb
-        if free_gb is not None:
-            storage_color = (
-                "#b54747"
-                if free_gb < 5
-                else "#a56300"
-                if free_gb < 20
-                else "#247a52"
-            )
-            self.storage_status_label.setText(f"存储: {free_gb:.1f} GB")
-            self.storage_status_label.setStyleSheet(f"color: {storage_color};")
-            self.storage_status_label.setToolTip(str(self.output_dir))
-            if free_gb < 5:
-                storage_alert = "磁盘空间严重不足"
-                storage_alert_tooltip = (
-                    f"证据目录仅剩 {free_gb:.1f} GB：{self.output_dir}"
-                )
-            elif free_gb < 20:
-                storage_alert = "磁盘空间不足"
-                storage_alert_tooltip = (
-                    f"证据目录剩余 {free_gb:.1f} GB：{self.output_dir}"
-                )
-                storage_alert_color = "#a56300"
-        elif snapshot.storage_error:
-            self.storage_status_label.setText("存储: 不可用")
-            self.storage_status_label.setStyleSheet("color: #b54747;")
-            self.storage_status_label.setToolTip(snapshot.storage_error)
-            storage_alert = "存储不可用"
-            storage_alert_tooltip = (
-                f"无法读取证据目录磁盘状态：{snapshot.storage_error}"
-            )
-        else:
-            self.storage_status_label.setText("存储: 检查中")
-            self.storage_status_label.setStyleSheet("color: #667085;")
-            self.storage_status_label.setToolTip(str(self.output_dir))
-
-        counts = snapshot.capture_counts
-        aligned_event_count = snapshot.aligned_event_count
-        if snapshot.capture_error:
-            self.capture_status_label.setText(f"证据处理异常：{snapshot.capture_error}")
-            self.capture_status_label.setToolTip(snapshot.capture_error)
-            self.capture_status_label.setStyleSheet(
-                "color: #b54747; font-weight: 700;"
-            )
-        else:
-            alignment_text = (
-                f"  |  证据日期已对齐 {aligned_event_count} 条"
-                if aligned_event_count
-                else ""
-            )
-            self.capture_status_label.setText(
-                f"本次待封口 {counts[PassageReviewState.WAITING]}  |  "
-                f"本次可核对 {counts[PassageReviewState.READY]}  |  "
-                f"本次缺口 {counts[PassageReviewState.PARTIAL]}  |  "
-                f"已有证据 {snapshot.available_evidence_count}  |  "
-                f"缺少绝对时间 {snapshot.unsupported_event_count}"
-                f"{alignment_text}"
-            )
-            self.capture_status_label.setToolTip(
-                "仅将证据检索日期对齐到实时接收日期；CycleRace正式通过时间未改变。"
-                if aligned_event_count
-                else ""
-            )
-            self.capture_status_label.setStyleSheet(
-                "color: #667085; font-weight: 500;"
-            )
-        alert_entries = []
-        if snapshot.capture_error:
-            alert_entries.append(
-                ("证据处理异常", snapshot.capture_error, "#b54747")
-            )
-        if storage_alert:
-            alert_entries.append(
-                (storage_alert, storage_alert_tooltip, storage_alert_color)
-            )
-        if snapshot.workspace_notice:
-            alert_entries.append(
-                (
-                    snapshot.workspace_notice,
-                    f"当前赛事目录：{self.output_dir}",
-                    "#a56300",
-                )
-            )
-        if len(alert_entries) > 1:
-            self.runtime_alert_label.setText("多项运行异常")
-            self.runtime_alert_label.setToolTip(
-                "\n".join(
-                    f"{title}：{detail}" if detail else title
-                    for title, detail, _color in alert_entries
-                )
-            )
-            alert_color = (
-                "#b54747"
-                if any(color == "#b54747" for _title, _detail, color in alert_entries)
-                else "#a56300"
-            )
-        elif alert_entries:
-            title, detail, alert_color = alert_entries[0]
-            self.runtime_alert_label.setText(title)
-            self.runtime_alert_label.setToolTip(detail)
-        else:
-            self.runtime_alert_label.clear()
-            self.runtime_alert_label.setToolTip("")
-            self.runtime_alert_label.hide()
-            alert_color = ""
-        if alert_color:
-            self.runtime_alert_label.setStyleSheet(
-                f"color: {alert_color}; font-size: 9pt; font-weight: 700;"
-            )
-            self.runtime_alert_label.show()
         self._update_operator_controls()
 
     def set_finish_line_roi(
@@ -4658,12 +4081,17 @@ class FinishReviewWindow(PassageReviewSurface):
         with self._video_scan_state_lock:
             self._video_scan_generation += 1
             self._video_scan_tokens.clear()
-        for worker in self._video_scan_workers.values():
-            worker.stop()
+        workers = tuple(self._video_scan_workers.values())
         self._video_scan_workers = {}
         self._stop_visual_workers()
         had_recorders = bool(self._recorders)
-        failures = self._run_capture_task(self._recording_controller.stop)
+
+        def stop_pipeline():
+            for worker in workers:
+                worker.stop()
+            return self._recording_controller.stop()
+
+        failures = self._run_capture_task(stop_pipeline)
         if had_recorders:
             try:
                 self._refresh_capture_windows()
