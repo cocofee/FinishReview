@@ -10,7 +10,8 @@ from typing import ClassVar
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+import realtime.launch_dialog as launch_dialog_module
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QApplication,
@@ -296,6 +297,43 @@ def _wait_until(qapp, predicate, timeout=5):
         QTest.qWait(5)
     qapp.processEvents()
     assert predicate()
+
+
+def test_modal_disk_task_keeps_qt_alive_and_defers_context_changes(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    caller = threading.get_ident()
+    threads = []
+    changes = []
+    timer = QTimer()
+    timer.setInterval(5)
+
+    def tick():
+        if entered.is_set():
+            assert not window.isEnabled()
+            assert window._defer_capture_callback(changes.append, "metadata")
+            assert changes == []
+            release.set()
+            timer.stop()
+
+    def disk_task():
+        threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(2), "Qt stopped dispatching while disk task was blocked"
+        return "prepared"
+
+    timer.timeout.connect(tick)
+    timer.start()
+    try:
+        assert window._run_capture_task(disk_task) == "prepared"
+        assert window.isEnabled()
+        assert threads != [caller]
+        _wait_until(qapp, lambda: changes == ["metadata"])
+    finally:
+        release.set()
+        timer.stop()
+        window.close()
 
 
 def test_concrete_review_windows_are_sibling_types():
@@ -1357,14 +1395,14 @@ def test_restarted_recording_reuses_persisted_binding_without_regrouping(qapp, t
         clip_id=clip.clip_id, passage_timestamp_ms=15000, passage_offset_ms=5000,
     )
     # Restart forgets only the in-memory publication set, never the durable binding.
-    window._published_keys.clear()
-    coordinator = SimpleNamespace(register=lambda *a, **k: pytest.fail("must reuse saved binding"))
+    coordinator = SimpleNamespace(register=lambda *a, **k: pytest.fail("must reuse saved binding"), refresh=lambda **k: ())
     window._coordinators = {1: coordinator}
     try:
-        window._register_passage(event, scan=False)
-        assert (1, event.event_id, event.revision, 15000) in window._published_keys
-        assert not window._has_published_passage(1, replace(event, revision=2), 15000)
-        assert not window._has_published_passage(1, event, 16000)
+        request = window._capture_refresh_request()
+        request.evidence_job.pipeline.publishers[1] = SimpleNamespace()
+        request.evidence_job.pipeline.refresh(request.evidence_job.passages, lambda: False)
+        assert window.review_binding_store.active_bindings(event.event_id, event.revision)
+        assert not window.review_binding_store.active_bindings(event.event_id, 2)
     finally:
         window._coordinators = {}
         window.close()
@@ -1503,9 +1541,16 @@ def test_ready_windows_are_grouped_by_overlap_and_twenty_second_limit(
         1: {capture_window.event_id: capture_window for capture_window in windows}
     }
 
-    published = window._publish_ready_windows(1)
-
-    assert published == {"passage-1", "passage-2", "passage-3"}
+    from types import SimpleNamespace
+    from realtime.evidence_pipeline import EvidencePassage, EvidencePipeline
+    pipeline = EvidencePipeline(
+        {1: SimpleNamespace(register=lambda *a, **k: None, refresh=lambda **k: windows)},
+        window._publishers, window.review_binding_store,
+    )
+    passages = tuple(EvidencePassage(event.event_id, event.revision, event.race_id,
+                                    event.timeline_timestamp_ms)
+                     for event in window.passage_store.events())
+    pipeline.refresh(passages, lambda: False)
     assert [len(group) for group, _race_id in calls] == [2, 1]
     assert all(race_id == "race-1" for _group, race_id in calls)
     window.close()
@@ -1545,7 +1590,8 @@ def test_archive_refresh_only_targets_events_in_range_without_binding(
         race_id="race-1",
     )
 
-    assert window._event_ids_for_archive_segments((segment,)) == {
+    job = window._capture_refresh_request().evidence_job
+    assert job.pipeline.archive_affected_events(job.passages, (segment,), window.timeline_store) == {
         in_range.event_id
     }
 
@@ -1568,7 +1614,7 @@ def test_archive_refresh_only_targets_events_in_range_without_binding(
         passage_offset_ms=5_000,
     )
 
-    assert window._event_ids_for_archive_segments((segment,)) == set()
+    assert job.pipeline.archive_affected_events(job.passages, (segment,), window.timeline_store) == set()
     window.close()
 
 
@@ -1756,7 +1802,7 @@ def test_event_settings_show_and_open_active_cyclerace_workspace(
     event_dir.mkdir()
     operations = []
     monkeypatch.setattr(
-        review_window_module,
+        launch_dialog_module,
         "_open_event_directory",
         lambda path: operations.append(("open", path)) or True,
     )
@@ -1799,14 +1845,14 @@ def test_windows_event_directory_opens_in_a_new_explorer_window(
     monkeypatch,
 ):
     launched = []
-    monkeypatch.setattr(review_window_module, "IS_WINDOWS", True)
+    monkeypatch.setattr(launch_dialog_module, "IS_WINDOWS", True)
     monkeypatch.setattr(
-        review_window_module.subprocess,
+        launch_dialog_module.subprocess,
         "Popen",
         lambda command: launched.append(command),
     )
 
-    assert review_window_module._open_event_directory(tmp_path)
+    assert launch_dialog_module._open_event_directory(tmp_path)
 
     assert launched == [["explorer.exe", "/n,", str(tmp_path)]]
 
@@ -3046,7 +3092,7 @@ def test_low_storage_is_visible_in_runtime_alert(qapp, tmp_path, monkeypatch):
     window = _window(tmp_path)
     disk_usage = type("DiskUsage", (), {"free": 10 * 1024**3})()
     monkeypatch.setattr(review_window_module.shutil, "disk_usage", lambda _path: disk_usage)
-
+    window._refresh_capture_windows()
     window._update_runtime_status()
 
     assert window.runtime_alert_label.text() == "磁盘空间不足"
@@ -3067,6 +3113,7 @@ def test_storage_failure_and_capture_error_share_runtime_alert(
         raise OSError("disk unavailable")
 
     monkeypatch.setattr(review_window_module.shutil, "disk_usage", fail_disk_usage)
+    window._refresh_capture_windows()
     window._capture_error = "timeline publish failed"
     window._update_runtime_status()
 

@@ -59,6 +59,32 @@ class EvidencePipeline:
         self.binding_store = binding_store
         self._registered = {}
 
+    def archive_affected_events(self, passages, segments, timeline_store):
+        affected = set()
+        for passage in passages:
+            if not passage.active or not passage.eligible or passage.timestamp_ms is None:
+                continue
+            candidates = tuple(segment for segment in segments
+                               if (not segment.race_id or segment.race_id == passage.race_id)
+                               and (segment.media_started_at_ms if segment.media_started_at_ms is not None
+                                    else segment.started_at_ms) <= passage.timestamp_ms
+                               <= (segment.media_started_at_ms + segment.media_duration_ms
+                                   if segment.media_started_at_ms is not None and segment.media_duration_ms is not None
+                                   else segment.ended_at_ms or segment.started_at_ms))
+            if not candidates:
+                continue
+            bound_cameras = set()
+            for binding in self.binding_store.active_bindings(passage.event_id, passage.revision):
+                clip = self.binding_store.get_clip(binding.clip_id)
+                segment = timeline_store.get_segment(clip.timeline_segment_id) if clip else None
+                if segment is not None and timeline_store.video_path_is_playable(
+                    timeline_store.resolve_video_path(segment),
+                ):
+                    bound_cameras.add(binding.camera_index)
+            if any(segment.camera_index not in bound_cameras for segment in candidates):
+                affected.add(passage.event_id)
+        return frozenset(affected)
+
     def refresh(self, passages: tuple[EvidencePassage, ...],
                 cancelled: Callable[[], bool]) -> EvidenceSnapshot:
         by_id = {passage.event_id: passage for passage in passages}

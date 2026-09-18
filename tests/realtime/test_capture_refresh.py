@@ -1,4 +1,5 @@
 import threading
+import pytest
 
 from realtime.capture_refresh import (
     ArchiveRefreshJob,
@@ -6,6 +7,39 @@ from realtime.capture_refresh import (
     CaptureRefreshWorker,
 )
 from realtime.runtime_metrics import RuntimeMetrics
+
+
+def test_explicit_tasks_share_scan_owner_and_stop_drains_accepted_tasks():
+    ring = _RingBuffer(block_scan=True)
+    worker = CaptureRefreshWorker(lambda _result: None)
+    worker.start()
+    worker.submit(_request(1, ring))
+    assert ring.scan_started.wait(2)
+    threads = []
+    first = worker.submit_task(lambda: threads.append(threading.get_ident()))
+    second = worker.submit_task(lambda: threads.append(threading.get_ident()))
+    assert not worker.stop(timeout=0.01)
+    ring.release_scan.set()
+    assert first.result(timeout=2) is None
+    assert second.result(timeout=2) is None
+    assert worker.stop()
+    assert threads == ring.scan_threads * 2
+
+
+def test_explicit_task_failure_does_not_drop_next_task():
+    worker = CaptureRefreshWorker(lambda _result: None)
+
+    def fail():
+        raise OSError("disk failure")
+
+    try:
+        failed = worker.submit_task(fail)
+        next_task = worker.submit_task(lambda: "recovered")
+        with pytest.raises(OSError, match="disk failure"):
+            failed.result(timeout=2)
+        assert next_task.result(timeout=2) == "recovered"
+    finally:
+        assert worker.stop()
 
 
 class _RingBuffer:
