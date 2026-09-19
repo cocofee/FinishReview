@@ -75,6 +75,17 @@ def test_find_ffmpeg_uses_pyinstaller_resource_directory(monkeypatch, tmp_path):
     assert find_ffmpeg_executable(environ={}, which=lambda _name: None) == executable.resolve()
 
 
+def test_find_ffmpeg_checks_pyinstaller_internal_directory(monkeypatch, tmp_path):
+    internal = tmp_path / "app" / "_internal"
+    internal.mkdir(parents=True)
+    executable = internal / "ffmpeg.exe"
+    executable.write_bytes(b"binary")
+    monkeypatch.setattr(stream_recorder, "application_dir", lambda: tmp_path / "app")
+    monkeypatch.setattr(stream_recorder, "resource_dir", lambda: tmp_path / "missing")
+
+    assert find_ffmpeg_executable(environ={}, which=lambda _name: None) == executable.resolve()
+
+
 def test_recorder_uses_packet_copy_and_stops_cleanly(tmp_path):
     ffmpeg = tmp_path / "ffmpeg.exe"
     ffmpeg.write_bytes(b"binary")

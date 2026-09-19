@@ -123,9 +123,12 @@ def find_ffmpeg_executable(
         if resolved_root not in runtime_roots:
             runtime_roots.append(resolved_root)
     for runtime_root in runtime_roots:
-        bundled = runtime_root / executable_name
-        if bundled.is_file():
-            return bundled.resolve()
+        for bundled in (
+            runtime_root / executable_name,
+            runtime_root / "_internal" / executable_name,
+        ):
+            if bundled.is_file():
+                return bundled.resolve()
 
     resolved = which("ffmpeg")
     if not resolved:

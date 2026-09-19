@@ -39,6 +39,7 @@ from realtime.settings import FinishReviewSettings
 from realtime.thread_lifecycle import install_qthread_shutdown
 from realtime.stream_recorder import (
     apply_rtsp_credentials,
+    find_ffmpeg_executable,
     is_rtsp_source,
     sanitize_recording_message,
     split_rtsp_credentials,
@@ -628,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
     ffmpeg_path = (
         resolve_runtime_path(args.ffmpeg, base_dir=runtime_root)
         if args.ffmpeg
-        else None
+        else find_ffmpeg_executable(base_dir=runtime_root)
     )
     config_path = default_config_path()
     saved_settings = load_review_settings(

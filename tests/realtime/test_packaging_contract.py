@@ -44,6 +44,7 @@ def test_finish_review_package_excludes_detection_and_ocr_runtimes():
     assert 'ROOT / "realtime" / "review_main.py"' in spec
     assert 'name="FinishReviewConsole"' in spec
     assert "FINISH_REVIEW_FFMPEG" in spec
+    assert 'binaries.append((str(ffmpeg_path), "."))' in spec
     assert "collect_data_files" not in spec
     for package in (
         "ultralytics",
