@@ -92,7 +92,11 @@ from .race_metadata import (
     RaceMetadata,
     RaceMetadataStore,
 )
-from .review_selection import ReviewSelectionController, ReviewSelectionPlan
+from .review_selection import (
+    ReviewSelectionContext,
+    ReviewSelectionController,
+    ReviewSelectionPlan,
+)
 from .review_session import ReviewSessionState
 from .roster_projection import RosterProjection
 from .review_clip import PassageReviewBindingStore
@@ -2943,7 +2947,25 @@ class PassageReviewSurface(QDialog):
         self.setMinimumSize(1100, 700)
         self._init_ui()
         self.selection_controller = ReviewSelectionController(
-            self,
+            context=ReviewSelectionContext(
+                event_for_id=lambda event_id: self.passage_store.get(event_id),
+                lookup_for_id=lambda event_id: self._lookups.get(event_id),
+                regular_panes=lambda: self.regular_panes,
+                evidence_panes=lambda: self.evidence_panes,
+                high_speed_pane=lambda: self.high_speed_pane,
+                active_pane=lambda: self._active_pane,
+                batch_mode=lambda: bool(self._batch_mode),
+                selected_event_id=lambda: self._selected_event_id,
+                regular_location_for_camera=self._regular_location_for_camera,
+                regular_summary_location=self._regular_summary_location,
+                location_on_current_media=self._location_on_current_media,
+                active_playback_pane=self._active_playback_pane,
+                show_high_speed_pane=lambda: bool(self._show_high_speed_pane),
+                apply_selection_plan=self._apply_selection_plan,
+                refresh=self.refresh,
+                continuous_lookup_for_camera=self._continuous_lookup_for_camera,
+                clear_active_video_identity=self._clear_active_video_identity,
+            ),
             high_speed_location=lambda lookup: source_location(
                 lookup,
                 high_speed=True,
@@ -6221,6 +6243,16 @@ class PassageReviewSurface(QDialog):
             playback_position_ms=playback_ms,
             clock_offset_ms=offset_ms,
         )
+
+    def _clear_active_video_identity(self) -> None:
+        """Reset the transient filmstrip identity cue before a selection."""
+
+        if not self._active_video_discovered_entry_id:
+            return
+        self._active_video_discovered_entry_id = ""
+        for pane in self.evidence_panes:
+            pane.mark_btn.setEnabled(True)
+            pane.video_view.clear_identity_cue()
 
     def _select_event(
         self,

@@ -1784,6 +1784,28 @@ def test_review_orders_equal_passage_times_by_event_id(
     dialog.close()
 
 
+def test_selection_reads_rebound_event_store_and_refreshed_lookup(qapp, tmp_path):
+    old_store = PassageEventStore(tmp_path / "old.jsonl")
+    old_store.append(_event(bib="23"))
+    dialog = PassageReviewDialog(
+        old_store, VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    try:
+        old_lookups = dialog._lookups
+        new_store = PassageEventStore(tmp_path / "new.jsonl")
+        new_store.append(_event(bib="42", revision=2))
+        dialog.passage_store = new_store
+
+        dialog.refresh()
+
+        assert dialog._lookups is not old_lookups
+        assert dialog.selected_identity_value.text() == "42"
+        assert dialog._review_session_state.event_revision == 2
+        assert old_store.get("passage-1").bib == "23"
+    finally:
+        dialog.close()
+
+
 def test_review_displays_absolute_passage_in_beijing_time(qapp, tmp_path):
     passage_store = PassageEventStore(tmp_path / "passages.jsonl")
     passage_store.append(
