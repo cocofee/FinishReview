@@ -559,6 +559,64 @@ def test_filmstrip_recording_time_and_saved_judgment_keep_distinct_clocks(
     dialog.close()
 
 
+def test_first_finish_confirmation_projects_all_chips_and_restores_after_reopen(
+    qapp, tmp_path, fake_playback, monkeypatch,
+):
+    from realtime.race_filmstrip import RaceFilmstripPanel
+
+    monkeypatch.setattr(RaceFilmstripPanel, "_load_visible", lambda self: None)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(bib="068")
+    second = _event(event_id="second", sequence=2, bib="126", group_id="other", passage_time_ms=16000)
+    passages.append(first)
+    passages.append(second)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01_archive.mkv", source_id="camera_01", camera_index=1,
+                 started_at_ms=10000, ended_at_ms=70000)
+    dialog = PassageReviewDialog(passages, timeline)
+    dialog.auto_advance_checkbox.setChecked(False)
+    dialog._select_event(first.event_id, locate_target=True)
+    dialog._update_filmstrip()
+    panel, pane = dialog.video_filmstrip.full_race, dialog.regular_pane
+    assert panel._chip_times == (15000, 16000)
+    image = QImage(800, 600, QImage.Format_RGB32)
+    image.fill(0)
+    pane._worker.frame_ready.emit(image, 5400, 270)
+    pane._on_marker_position_selected(0.5, 0.5)
+    assert dialog._confirm_pending_marker(pane)
+    assert panel._chip_times == (15400, 16400)
+    assert [(m.event_id, m.recorder_time_ms) for m in panel.chips_between(10000, 20000)] == [("second", 16400)]
+    assert [record.label for record in panel._judgments] == ["068"]
+    assert len(dialog.association_store.associations()) == 1
+    # The entire race remains annotated even with a roster search active.
+    dialog.identity_search.setText("068")
+    dialog._refresh_filtered_view()
+    assert [m.label for m in panel.chips_between(10000, 20000)] == ["126"]
+    third = _event(event_id="third", sequence=3, bib="200", passage_time_ms=17000)
+    passages.append(third)
+    seeks = list(pane._worker.seek_calls)
+    dialog.refresh_events((third.event_id,))
+    assert panel._chip_times == (15400, 16400, 17400)
+    assert pane._worker.seek_calls == seeks
+    assert dialog._selected_event_id == first.event_id
+    second = replace(second, revision=2, passage_time_ms=16200)
+    passages.append(second)
+    dialog.refresh_events((second.event_id,))
+    assert panel._chip_times == (15400, 16600, 17400)
+    passages.append(replace(third, revision=2, is_active=False))
+    dialog.refresh_events((third.event_id,))
+    assert panel._chip_times == (15400, 16600)
+    dialog.close()
+    reopened = PassageReviewDialog(PassageEventStore(passages.journal_path), VideoTimelineStore(timeline.journal_path))
+    reopened._update_filmstrip()
+    panel = reopened.video_filmstrip.full_race
+    assert panel._chip_times == (15400, 16600)
+    assert [m.label for m in panel.chips_between(10000, 20000)] == ["126"]
+    assert [record.label for record in panel._judgments] == ["068"]
+    assert len(reopened.association_store.associations()) == 1
+    reopened.close()
+
+
 def test_evidence_view_maps_full_resolution_tile_to_source_coordinates(qapp):
     view = passage_review.EvidenceImageView()
     preview = QImage(50, 20, QImage.Format_RGB888)

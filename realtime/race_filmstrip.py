@@ -31,6 +31,42 @@ MAX_CACHE = 160
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 MAX_BATCH = 16
 BEIJING = timezone(timedelta(hours=8))
+CHIP_COLOR = "#2563eb"
+JUDGMENT_COLOR = "#1bbf83"
+
+
+@dataclass(frozen=True)
+class ChipTimeMarker:
+    event_id: str
+    label: str
+    chip_time_ms: int
+    recorder_time_ms: int
+
+
+def chip_time_markers(events, index, default_offset_ms=0):
+    """Project active chips onto each recording session's calibrated clock.
+
+    The canonical non-overlapping spans prevent live/archive duplicates.
+    Bisect the passage times rather than scanning the full roster per segment.
+    Gaps retain chip references without claiming there is video evidence.
+    """
+    events = tuple(sorted((event for event in events if event.is_active),
+                          key=lambda event: (event.timeline_timestamp_ms, event.event_id)))
+    times = tuple(int(event.timeline_timestamp_ms) for event in events)
+    markers = []
+    for span in index.spans:
+        location = span.source.location if span.source is not None else None
+        offset = location.clock_offset_ms if location is not None else default_offset_ms
+        race_id = location.segment.race_id if location is not None else ""
+        start = bisect_left(times, span.start_ms - offset)
+        stop = bisect_left(times, span.end_ms - offset)
+        for event in events[start:stop]:
+            if race_id and race_id != event.race_id:
+                continue
+            timestamp = int(event.timeline_timestamp_ms)
+            markers.append(ChipTimeMarker(event.event_id, event.bib.strip() or "未知",
+                                          timestamp, timestamp + offset))
+    return tuple(sorted(markers, key=lambda marker: (marker.recorder_time_ms, marker.event_id)))
 
 
 def format_time(timestamp: int, *, date: bool = False) -> str:
@@ -243,6 +279,28 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
             source, sample = owner.index.sample_at(owner.time_at(tile), owner.interval_ms)
             label = owner.display_time(owner.time_at(tile), source)
             painter.drawText(int(x + 4), ruler_y + 16, label if source else "录像缺口")
+        # A saved judgment is a green reference at its exact recording time.
+        # This is a time-axis line, not a copied spatial mark on a moving rider.
+        left, right = owner.visible_times()
+        for record in owner.judgments_between(left, right):
+            x = owner.x_for_time(record.recorder_time_ms)
+            painter.setPen(QPen(QColor("#b45309" if record.unknown else JUDGMENT_COLOR), 2))
+            painter.drawLine(QPointF(x, IMAGE_TOP), QPointF(x, ruler_y - 29))
+        for marker in owner.chips_between(left, right):
+            x = owner.x_for_time(marker.recorder_time_ms)
+            painter.setPen(QPen(QColor(CHIP_COLOR), 2, Qt.DashLine))
+            painter.drawLine(QPointF(x, IMAGE_TOP), QPointF(x, ruler_y - 29))
+        for rect, references in self.reference_regions():
+            kinds = {reference[2] for reference in references}
+            kind = next(iter(kinds)) if len(kinds) == 1 else "记录"
+            color = CHIP_COLOR if kind == "芯片" else JUDGMENT_COLOR if kind == "已判" else "#b45309" if kind == "待补录" else "#475569"
+            label = f"{kind} · {references[0][1]}"
+            if len(references) > 1:
+                label += f" +{len(references) - 1}"
+            painter.fillRect(rect, QColor(color))
+            painter.setPen(QColor("#07120e" if kind == "已判" else "white"))
+            painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignCenter,
+                             self.fontMetrics().elidedText(label, Qt.ElideRight, int(rect.width() - 8)))
         for rect, records in self.judgment_regions():
             selected = any(record.event_id == owner.selected_event_id and not record.unknown for record in records)
             color = QColor("#1976c9" if selected else "#b45309" if all(record.unknown for record in records) else "#15803d")
@@ -259,6 +317,33 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
             x = owner.x_for_time(owner.current_time)
             painter.setPen(QPen(QColor("#ef4444"), 2))
             painter.drawLine(QPointF(x, ruler_y - 4), QPointF(x, ruler_y + 6))
+
+    def reference_regions(self):
+        """Group nearby time labels without dropping simultaneous finishers."""
+        owner = self.owner
+        left, right = owner.visible_times()
+        references = [(marker.recorder_time_ms, marker.label, "芯片",
+                       f"芯片时间：{format_time(marker.chip_time_ms)}")
+                      for marker in owner.chips_between(left, right)]
+        references.extend((record.recorder_time_ms, record.label,
+                           "待补录" if record.unknown else "已判",
+                           f"判读时间：{record.time_label}")
+                          for record in owner.judgments_between(left, right))
+        width = self.viewport().width()
+        badge_width = min(width, max(110, self.fontMetrics().horizontalAdvance("芯片 · 0000 +99") + 12))
+        clusters = []
+        for reference in sorted(references, key=lambda item: item[0]):
+            x = owner.x_for_time(reference[0])
+            if not 0 <= x < width:
+                continue
+            x = max(0, min(x, width - badge_width))
+            if clusters and x < clusters[-1][0] + badge_width + 4:
+                clusters[-1][1].append(reference)
+            else:
+                clusters.append((x, [reference]))
+        ruler_y = self.viewport().height() - IMAGE_FOOTER + 5
+        return tuple((QRectF(x, ruler_y - 28, badge_width, 24), tuple(items))
+                     for x, items in clusters)
 
     def judgment_regions(self):
         owner = self.owner
@@ -305,7 +390,12 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
         if self._press is None:
             records = next((records for rect, records in self.judgment_regions() if rect.contains(QPointF(event.pos()))), ())
             tooltip = "\n".join(f"{record.label} · {record.time_label}" for record in records)
-            if not records and event.y() < self.viewport().height() - IMAGE_FOOTER:
+            references = next((items for rect, items in self.reference_regions() if rect.contains(QPointF(event.pos()))), ())
+            if references:
+                tooltip = "\n".join(f"{kind} · {label} · {detail} · 录像时间：{format_time(timestamp)}"
+                                    for timestamp, label, kind, detail in references)
+                tooltip += "\n蓝色虚线为芯片预计过线时间，绿色实线为人工已判位置。"
+            if not records and not references and event.y() < self.viewport().height() - IMAGE_FOOTER:
                 tile = (self.horizontalScrollBar().value() + event.x()) // self.owner.tile_pitch
                 source, sample = self.owner.index.sample_at(self.owner.time_at(tile), self.owner.interval_ms)
                 frame = self.owner.cache.get((source.key, sample)) if source else None
@@ -404,6 +494,11 @@ class RaceFilmstripPanel(QWidget):
         self._judgments = ()
         self._judgment_times = ()
         self.selected_event_id = ""
+        self._passages = ()
+        self._chip_markers = ()
+        self._chip_times = ()
+        self._chip_default_offset_ms = 0
+        self._judged_event_ids = set()
         self.cache = ImageCache(priority=THUMBNAIL, image_of=lambda frame: frame.image,
                                 max_items=MAX_CACHE, max_bytes=MAX_CACHE_BYTES)
         self.errors = OrderedDict()
@@ -634,6 +729,7 @@ class RaceFilmstripPanel(QWidget):
         left = self.index.start_ms + scroll / self.tile_pitch * self.interval_ms
         had_spans = bool(self.index.spans)
         self.index = RaceRecordingIndex(sources)
+        self._project_chips()
         self._sources_by_key = {source.key: source for source in sources}
         def request_available(key):
             source = self._sources_by_key.get(key[0])
@@ -666,7 +762,7 @@ class RaceFilmstripPanel(QWidget):
             self._initial_positioned = True
         bar.blockSignals(previously_blocked)
         if self.index.spans:
-            self.range_label.setText("时间胶卷 · 机位 1 · 录像时间")
+            self.range_label.setText("时间胶卷 · 机位 1 · 录像时间 · 蓝虚线芯片 · 绿实线已判")
             self.range_label.setToolTip(
                 f"录像时间（北京时间）：{format_time(self.index.start_ms, date=True)} — {format_time(self.index.end_ms, date=True)}\n"
                 f"校时后判读时间：{self.judgment_time(self.index.start_ms)} — {self.judgment_time(self.index.end_ms)}\n"
@@ -861,9 +957,29 @@ class RaceFilmstripPanel(QWidget):
         self._judgments = tuple(sorted((record for record in records if record.recorder_time_ms is not None),
                                       key=lambda record: record.recorder_time_ms))
         self._judgment_times = tuple(record.recorder_time_ms for record in self._judgments)
+        self._judged_event_ids = {record.event_id for record in self._judgments if not record.unknown}
         self.selected_event_id = selected_event_id
         self.markers = tuple(sorted((record.recorder_time_ms, record.label) for record in records if record.recorder_time_ms is not None))
         self.canvas.viewport().update()
+
+    def set_passages(self, events, default_offset_ms=0):
+        """Receipts update references only; never seek, select or confirm."""
+        events = tuple(events)
+        if events == self._passages and default_offset_ms == self._chip_default_offset_ms:
+            return
+        self._passages = events
+        self._chip_default_offset_ms = int(default_offset_ms)
+        self._project_chips()
+
+    def _project_chips(self):
+        self._chip_markers = chip_time_markers(self._passages, self.index, self._chip_default_offset_ms)
+        self._chip_times = tuple(marker.recorder_time_ms for marker in self._chip_markers)
+        self.canvas.viewport().update()
+
+    def chips_between(self, left, right):
+        return tuple(marker for marker in self._chip_markers[
+            bisect_left(self._chip_times, left):bisect_left(self._chip_times, right)]
+            if marker.event_id not in self._judged_event_ids)
 
     def _position_scroll(self, timestamp, *, center=True):
         pixel = round((timestamp - self.index.start_ms) / self.interval_ms * self.tile_pitch)
@@ -1077,6 +1193,10 @@ class RaceFilmstripPanel(QWidget):
         self._judgment_times = ()
         self.selected_event_id = ""
         self._active_frame = None
+        self._passages = ()
+        self._chip_markers = ()
+        self._chip_times = ()
+        self._judged_event_ids.clear()
         self._pending_judgment = None
         self.current_time = None
         self._initial_positioned = False

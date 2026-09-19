@@ -18,6 +18,7 @@ from realtime.race_filmstrip import (
 )
 from realtime.video_timeline import PassageVideoLocation, RecordingSegment, VideoTimelineStore
 from realtime.camera_judgments import CameraJudgment
+from realtime.passage_receiver import PassageEvent
 
 
 @pytest.fixture(scope="module")
@@ -30,6 +31,89 @@ def source(path, start=10000, duration=10000, *, priority=0, available=True, cam
                                start + duration, duration, start, race_id=race)
     location = PassageVideoLocation(segment, path, 0, 0, 0, 0, "located")
     return FilmstripSource(location, start, start + duration, available, priority)
+
+
+def chip(timestamp, bib="068", event_id="chip-068", **kwargs):
+    return PassageEvent(event_id=event_id, bib=bib, race_id="race-1", stage_id="stage-1",
+                        group_id="group-1", sequence=1, passage_timestamp_ms=timestamp, **kwargs)
+
+
+def test_chip_references_use_calibrated_sessions_and_do_not_duplicate_archive_overlap(tmp_path):
+    archive = source(tmp_path / "archive", start=10000, duration=10000)
+    archive = replace(archive, location=replace(archive.location, clock_offset_ms=1000))
+    live = replace(archive, priority=2)
+    later = source(tmp_path / "later", start=21000, duration=10000)
+    later = replace(later, location=replace(later.location, clock_offset_ms=-500))
+    index = RaceRecordingIndex((live, archive, later))
+    events = (chip(9500), chip(23000, "126", "second"),
+              chip(10000, "099", "withdrawn", is_active=False),
+              replace(chip(10000, "777", "other-race"), race_id="race-2"),
+              chip(19999, "222", "gap"))
+    markers = filmstrip.chip_time_markers(events, index, default_offset_ms=1000)
+    assert [(m.event_id, m.chip_time_ms, m.recorder_time_ms) for m in markers] == [
+        ("chip-068", 9500, 10500), ("gap", 19999, 20999), ("second", 23000, 22500)]
+
+
+def test_chip_receipts_and_judgments_update_without_navigation(qapp, tmp_path, manual_worker):
+    panel = RaceFilmstripPanel()
+    panel.resize(1200, 450)
+    panel.show()
+    recording = source(tmp_path / "archive", duration=60000)
+    panel.set_sources((recording,))
+    qapp.processEvents()
+    panel.browse_to(12500)
+    panel.set_current_frame(recording.location, 2500)
+    before = panel.canvas.horizontalScrollBar().value()
+    requested = QSignalSpy(panel.frame_requested)
+    first, second = chip(12400), chip(12500, "126", "second")
+    panel.set_passages((first, second))
+    assert len(panel.chips_between(12000, 13000)) == 2
+    assert not panel._judgments
+    regions = panel.canvas.reference_regions()
+    references = [item for _, items in regions for item in items]
+    assert {item[1] for item in references} == {"068", "126"}
+    assert {item[2] for item in references} == {"芯片"}
+    # A saved manual judgment replaces that event's chip hint without
+    # falsely confirming the neighbouring rider, even at the same frame.
+    record = CameraJudgment("event:chip-068", first.event_id, "archive", 2400, 12400,
+                            "068", "08:00:12.400")
+    panel.set_judgments((record,), second.event_id)
+    assert [m.event_id for m in panel.chips_between(12000, 13000)] == ["second"]
+    references = [item for _, items in panel.canvas.reference_regions() for item in items]
+    assert {(item[1], item[2]) for item in references} == {("068", "已判"), ("126", "芯片")}
+    # Rendering the real widget must show both kinds and preserve navigation.
+    rendered = panel.canvas.viewport().grab().toImage()
+    colors = {rendered.pixelColor(x, y).name() for x in range(rendered.width())
+              for y in (50, 55, 60, 65)}
+    assert filmstrip.CHIP_COLOR in colors
+    assert filmstrip.JUDGMENT_COLOR in colors
+    assert panel.canvas.horizontalScrollBar().value() == before
+    assert panel.current_time == 12500 and panel.selected_event_id == second.event_id
+    assert panel.interval_ms == 500 and not requested
+    panel.set_passages((replace(second, revision=2, passage_timestamp_ms=12600),))
+    assert panel._chip_times == (12600,)
+    panel.set_passages((replace(second, revision=3, is_active=False),))
+    assert not panel._chip_markers
+    panel.clear()
+    assert not panel._passages and not panel._chip_times and not panel._judged_event_ids
+    panel.close()
+
+
+def test_chip_references_reproject_when_calibration_or_scope_changes(qapp, tmp_path, manual_worker):
+    panel = RaceFilmstripPanel()
+    old = source(tmp_path / "old", start=10000, duration=10000)
+    new = source(tmp_path / "new", start=30000, duration=10000)
+    panel.set_sources((old, new))
+    panel.set_passages((chip(15000), chip(35000, "126", "second")))
+    assert panel._chip_times == (15000, 35000)
+    new = replace(new, location=replace(new.location, clock_offset_ms=600))
+    panel.set_sources((old, new))
+    assert panel._chip_times == (15000, 35600)
+    panel.set_recording_start(30000)
+    assert panel._chip_times == (35600,)
+    panel.scope_combo.setCurrentIndex(panel.scope_combo.findData("all"))
+    assert panel._chip_times == (15000, 35600)
+    panel.close()
 
 
 def test_new_recording_scope_hides_history_but_allows_explicit_browsing(qapp, tmp_path, manual_worker):

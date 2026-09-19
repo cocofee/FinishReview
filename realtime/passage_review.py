@@ -6962,6 +6962,10 @@ class PassageReviewSurface(QDialog):
         panel.set_check_context(self.timeline_store.journal_path.parent / "filmstrip_checks.jsonl",
                                 race_id, pane.camera_index)
         panel.set_sources(sources, pending)
+        panel.set_passages(
+            self._events_for_current_metadata(self.passage_store.events()),
+            self._clock_offset_for_camera(pane.camera_index),
+        )
         if pane.location is not None and pane._current_frame_index >= 0:
             panel.set_current_frame(pane.location, pane._current_position_ms)
         panel.set_judgments(self._camera_judgment_records(pane), self._selected_event_id)
@@ -7204,6 +7208,10 @@ class PassageReviewSurface(QDialog):
     def _refresh_camera_judgments(self) -> None:
         pane = self._camera_one_pane()
         records = self._camera_judgment_records(pane)
+        self.video_filmstrip.full_race.set_passages(
+            self._events_for_current_metadata(self.passage_store.events()),
+            self._clock_offset_for_camera(pane.camera_index),
+        )
         self.video_filmstrip.full_race.set_judgments(records, self._selected_event_id)
         self.video_filmstrip.judgment_track.set_records(
             records, self._selected_event_id,
@@ -8061,6 +8069,9 @@ class PassageReviewSurface(QDialog):
         self.batch_context_label.setToolTip(
             f"机位 {location.segment.camera_index} 已按首人校准 {offset_ms:+d} ms"
         )
+        # Reproject every chip onto the newly calibrated recording clock;
+        # preserve the overview viewport and the operator's current frame.
+        self._update_filmstrip()
         return True
 
     def _confirm_pending_marker(self, pane: PassageEvidencePane) -> bool:
