@@ -526,40 +526,39 @@ def test_newer_revision_replaces_latest_and_stale_revision_is_duplicate(
     assert len(store.journal_path.read_text(encoding="utf-8").splitlines()) == 2
 
 
-def test_later_sender_generation_accepts_lower_revision_reset_tombstone(
+def test_chip_after_reset_accepts_new_revision_with_unchanged_emission_time(
     running_receiver,
 ):
     receiver, store, accepted = running_receiver
+    # CycleRace deliberately preserves the first emitted_at_ms in its outbox,
+    # including when a reset deletes and then reuses a SQLite passage id.
+    for revision, active in ((1, True), (2, False), (3, True)):
+        status, ack = post_json(
+            receiver,
+            passage_payload(revision=revision, is_active=active, emitted_at_ms=1000),
+        )
+        assert status == 201
+        assert ack["status"] == "accepted"
+        assert len(store) == int(active)
+    assert [event.is_active for event in accepted] == [True, False, True]
+    reopened = PassageEventStore(store.journal_path)
+    assert len(reopened) == 1
+    assert reopened.events()[0].revision == 3
 
-    assert post_json(
+
+def test_later_emission_time_cannot_override_newer_revision(running_receiver):
+    receiver, store, accepted = running_receiver
+    assert post_json(receiver, passage_payload(revision=26, emitted_at_ms=1000))[0] == 201
+    status, ack = post_json(
         receiver,
-        passage_payload(revision=26, emitted_at_ms=1_000),
-    )[0] == 201
-    reset_status, reset_ack = post_json(
-        receiver,
-        passage_payload(
-            revision=4,
-            emitted_at_ms=2_000,
-            is_active=False,
-        ),
+        passage_payload(revision=4, emitted_at_ms=2000, is_active=False),
     )
-
-    assert reset_status == 201
-    assert reset_ack["status"] == "accepted"
-    assert store.events() == ()
-    assert store.get("race-1-stage-1-passage-7").revision == 4
-    assert [event.is_active for event in accepted] == [True, False]
-
-    # A delayed packet from the previous database generation cannot resurrect
-    # the reset passage even though its local revision is higher.
-    stale_status, stale_ack = post_json(
-        receiver,
-        passage_payload(revision=27, emitted_at_ms=1_500),
-    )
-    assert stale_status == 200
-    assert stale_ack["status"] == "duplicate"
-    assert store.events() == ()
-    assert store.get("race-1-stage-1-passage-7").revision == 4
+    assert status == 200
+    assert ack["status"] == "duplicate"
+    assert len(store) == 1
+    assert store.events()[0].revision == 26
+    assert len(accepted) == 1
+    assert len(PassageEventStore(store.journal_path)) == 1
 
 
 def test_inactive_revision_is_retained_for_audit_but_hidden_from_active_events(
