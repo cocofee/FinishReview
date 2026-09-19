@@ -3083,84 +3083,6 @@ class FinishReviewWindow(PassageReviewSurface):
             group_names.append(metadata.group_label(event.group_id))
         return any(_is_test_group_name(name) for name in group_names)
 
-    def _is_live_passage(self, event: PassageEvent) -> bool:
-        timestamp_ms = self._evidence_timestamp(event)
-        if timestamp_ms is None:
-            return False
-        received_at_ms = (
-            event.received_at_ms
-            if event.received_at_ms > 0
-            else int(time.time() * 1000.0)
-        )
-        return (
-            abs(int(timestamp_ms) - int(received_at_ms))
-            <= LIVE_EVIDENCE_DATE_TOLERANCE_MS
-        )
-
-    def _camera_auth_retry_blocked(self) -> bool:
-        self._poll_recording_health()
-        return any(
-            self._camera_auth_failed_sources.get(camera_index) == source
-            for camera_index, source in self._configured_recording_sources()
-        )
-
-    def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
-        if (
-            self._workspace_mode != "live"
-            or not event.is_active
-            or self._camera_auth_retry_blocked()
-            or self._recording_any_active()
-            or self._is_test_passage(event)
-            or not self._is_live_passage(event)
-        ):
-            return False
-        try:
-            self.start_recording()
-        except Exception as error:  # noqa: BLE001 - passage storage must survive.
-            self._runtime_error = sanitize_recording_message(error)
-            self._auto_recording_error = self._runtime_error
-            logger.exception(
-                "Failed to auto-start recording for live passage %s",
-                event.event_id,
-            )
-            return False
-        logger.info(
-            "Recording auto-started for live passage %s in group %s",
-            event.event_id,
-            event.group_id,
-        )
-        return True
-
-    def _auto_start_recording_for_metadata(self, metadata: RaceMetadata) -> bool:
-        if (
-            self._workspace_mode != "live"
-            or self._camera_auth_retry_blocked()
-            or self._recording_any_active()
-            or not any(
-                not _is_test_group_name(group.name)
-                and not _is_test_group_name(group.group_id)
-                for group in metadata.groups
-            )
-        ):
-            return False
-        try:
-            self.start_recording()
-        except Exception as error:  # noqa: BLE001 - metadata handling must survive.
-            self._runtime_error = sanitize_recording_message(error)
-            self._auto_recording_error = self._runtime_error
-            logger.exception(
-                "Failed to auto-start recording for live metadata %s/%s",
-                metadata.race_id,
-                metadata.stage_id,
-            )
-            return False
-        logger.info(
-            "Recording auto-started for live metadata %s/%s",
-            metadata.race_id,
-            metadata.stage_id,
-        )
-        return True
-
     def _on_passage_received(self, event: PassageEvent) -> None:
         if isinstance(event, tuple):
             source, event = event
@@ -3273,17 +3195,6 @@ class FinishReviewWindow(PassageReviewSurface):
             self._flush_passage_batch()
         self._update_runtime_status()
 
-    def _start_recording_for_committed_event(self, event, generation):
-        if (generation != self._session_controller.generation or self._session_busy
-                or getattr(self, "_shutdown_requested", False)):
-            return
-        if self._defer_capture_callback(self._start_recording_for_committed_event, event, generation):
-            return
-        current = self.passage_store.get(event.event_id)
-        if current is not None and current.revision == event.revision:
-            self._auto_start_recording_for_passage(current)
-            self._update_runtime_status()
-
     def _flush_passage_batch(self) -> None:
         if self._session_busy or getattr(self, "_shutdown_requested", False):
             return
@@ -3320,12 +3231,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self._request_capture_refresh()
         self._observe_runtime_metric("passage_batch_apply", started, item_count=len(changed))
         self._update_runtime_status()
-        candidate = next((event for event in pending_events
-                          if event.is_active and not self._is_test_passage(event)
-                          and self._is_live_passage(event)), None)
-        if candidate is not None:
-            generation = self._session_controller.generation
-            QTimer.singleShot(0, lambda: self._start_recording_for_committed_event(candidate, generation))
 
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
         if self._session_busy:
@@ -3344,7 +3249,6 @@ class FinishReviewWindow(PassageReviewSurface):
             logger.exception("Failed to activate CycleRace event workspace")
             self._update_runtime_status()
             return
-        self._auto_start_recording_for_metadata(metadata)
         pending_focus = self._pending_focus
         if pending_focus is not None and (
             pending_focus.race_id != metadata.race_id

@@ -1105,20 +1105,50 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert receiver.stopped
 
 
-def test_first_live_formal_passage_auto_starts_recording(qapp, tmp_path):
+def test_live_passage_is_visible_while_recording_waits_for_operator(qapp, tmp_path):
     window = _window(tmp_path)
     window.start_receiver()
 
     _FakeReceiver.instances[-1].deliver(_event())
     _settle_passages(qapp, window)
 
-    assert window.recorder is not None and window.recorder.is_running
-    assert len(_FakeRecorder.instances) == 1
+    assert window.recorder is None
+    assert not _FakeRecorder.instances
+    assert window.table.rowCount() == 1
     assert window.passage_store.get("race-1-stage-1-passage-15") is not None
+    window.start_recording()
+    assert window.recorder.is_running
+    assert len(_FakeRecorder.instances) == 1
     window.close()
 
 
-def test_live_formal_metadata_starts_recording_before_first_passage(
+def test_reset_then_new_chip_updates_roster_with_same_emission_time(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+    first = _event()
+    receiver = _FakeReceiver.instances[-1]
+    try:
+        for event in (first, replace(first, revision=2, is_active=False),
+                      replace(first, revision=3, bib="443")):
+            receiver.deliver(event)
+            _settle_passages(qapp, window)
+            assert window.table.rowCount() == int(event.is_active)
+            assert window.passage_store.get(event.event_id).revision == event.revision
+        assert window.table.item(0, 1).text() == "443"
+        assert window.recorder is None
+    finally:
+        window.close()
+    reopened = _window(tmp_path)
+    try:
+        assert reopened.table.rowCount() == 1
+        assert reopened.table.item(0, 1).text() == "443"
+        assert reopened.passage_store.get(first.event_id).revision == 3
+        assert reopened.recorder is None
+    finally:
+        reopened.close()
+
+
+def test_live_formal_metadata_keeps_recording_idle(
     qapp,
     tmp_path,
 ):
@@ -1138,8 +1168,8 @@ def test_live_formal_metadata_starts_recording_before_first_passage(
     )
     qapp.processEvents()
 
-    assert window.recorder is not None and window.recorder.is_running
-    assert len(_FakeRecorder.instances) == 1
+    assert window.recorder is None
+    assert not _FakeRecorder.instances
     assert window.passage_store.events() == ()
     window.close()
 
@@ -1227,7 +1257,7 @@ def test_live_test_group_id_without_metadata_does_not_auto_start_recording(
     window.close()
 
 
-def test_first_formal_passage_after_test_group_starts_only_one_recorder(
+def test_test_then_formal_passages_do_not_restart_manually_stopped_recording(
     qapp,
     tmp_path,
 ):
@@ -1253,11 +1283,16 @@ def test_first_formal_passage_after_test_group_starts_only_one_recorder(
 
     receiver.deliver(_event(event_id="formal-first", sequence=16))
     _settle_passages(qapp, window)
+    assert window.recorder is None
+    window.start_recording()
     assert window.recorder is not None and window.recorder.is_running
+    window.stop_recording()
 
     receiver.deliver(_event(event_id="formal-second", sequence=17))
     _settle_passages(qapp, window)
     assert len(_FakeRecorder.instances) == 1
+    assert not _FakeRecorder.instances[0].is_running
+    assert window.table.rowCount() == 3
     window.close()
 
 
@@ -1276,7 +1311,7 @@ def test_historical_passage_does_not_auto_start_recording(qapp, tmp_path):
     window.close()
 
 
-def test_auto_recording_failure_does_not_drop_live_passage(qapp, tmp_path):
+def test_unavailable_camera_does_not_block_passage_intake_while_idle(qapp, tmp_path):
     class _FailRecorder(_FakeRecorder):
         def start(self):
             raise RuntimeError("camera unavailable")
@@ -1300,9 +1335,8 @@ def test_auto_recording_failure_does_not_drop_live_passage(qapp, tmp_path):
     assert window.recorder is None
     assert window.passage_store.get("race-1-stage-1-passage-15") is not None
     assert window.table.rowCount() == 1
-    assert window._runtime_error == "camera unavailable"
-    assert window.camera_status_label.text() == "录像设备: 自动启动失败"
-    assert window.camera_status_label.toolTip() == "camera unavailable"
+    assert not _FailRecorder.instances
+    assert window._runtime_error == ""
     window.close()
 
 
@@ -2692,13 +2726,6 @@ def test_auth_failure_pauses_retries_without_stopping_passage_intake(qapp, tmp_p
         assert window.receiver.is_running
         assert window.camera_status_label._detail_label.text() == "认证失败"
         assert "自动重试已暂停" in window.camera_status_label.toolTip()
-
-        metadata = RaceMetadata(
-            race_id="race-1", stage_id="stage-1", revision=1, emitted_at_ms=1,
-            groups=(RaceGroupMetadata(group_id="men-open", name="男子公开组"),),
-        )
-        assert not window._auto_start_recording_for_metadata(metadata)
-        assert len(_FakeRecorder.instances) == 1
 
         # An explicit retry after correcting the device is still possible.
         window.start_recording()
