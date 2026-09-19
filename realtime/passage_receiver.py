@@ -307,6 +307,42 @@ def _same_protocol_event(left: PassageEvent, right: PassageEvent) -> bool:
     return replace(left, received_at_ms=0) == replace(right, received_at_ms=0)
 
 
+def _is_newer_sender_generation(
+    incoming: PassageEvent,
+    current: PassageEvent,
+) -> bool:
+    """Recognize a restarted sender that reused a stable passage identity.
+
+    CycleRace databases can be copied for a new run while retaining the same
+    event/competition identity.  The copied database starts its local revision
+    counter again, so a reset tombstone may legitimately carry a smaller
+    revision than the one already retained by FinishReview.  The sender's
+    emission clock is the only cross-database ordering signal available in the
+    v1 protocol; a later emitted timestamp therefore starts a newer sender
+    generation.  Older packets still follow the normal revision fence.
+    """
+
+    return (
+        incoming.emitted_at_ms > current.emitted_at_ms
+        and incoming.source == current.source
+        and incoming.race_id == current.race_id
+        and incoming.stage_id == current.stage_id
+    )
+
+
+def _is_stale_after_withdrawal(
+    incoming: PassageEvent,
+    current: PassageEvent,
+) -> bool:
+    """Keep delayed active packets from resurrecting a reset passage."""
+
+    return (
+        not current.is_active
+        and incoming.is_active
+        and not _is_newer_sender_generation(incoming, current)
+    )
+
+
 def _looks_like_incomplete_json(value: str) -> bool:
     in_string = False
     escaped = False
@@ -400,7 +436,10 @@ class PassageEventStore:
             self._event_order.append(event.event_id)
             self._events[event.event_id] = event
             return
-        if event.revision < current.revision:
+        if _is_stale_after_withdrawal(event, current) or (
+            event.revision < current.revision
+            and not _is_newer_sender_generation(event, current)
+        ):
             return
         if event.revision == current.revision:
             if not _same_protocol_event(event, current):
@@ -431,7 +470,10 @@ class PassageEventStore:
             current = self._events.get(event.event_id)
             result = PassageIngestResult.ACCEPTED
             if current is not None:
-                if event.revision < current.revision:
+                if _is_stale_after_withdrawal(event, current) or (
+                    event.revision < current.revision
+                    and not _is_newer_sender_generation(event, current)
+                ):
                     return PassageIngestResult.DUPLICATE
                 if event.revision == current.revision:
                     if not _same_protocol_event(event, current):
@@ -525,6 +567,7 @@ class PassageEventIngestor:
         self._on_accepted = on_accepted
         self._delivery_lock = threading.RLock()
         self._delivered_revisions: dict[str, int] = {}
+        self._delivered_events: dict[str, PassageEvent] = {}
 
     def ingest_payload(self, payload: Mapping[str, Any]) -> PassageIngestResult:
         event = PassageEvent.from_payload(payload)
@@ -542,12 +585,20 @@ class PassageEventIngestor:
 
         with self._delivery_lock:
             delivered_revision = self._delivered_revisions.get(event.event_id, 0)
-            if self._on_accepted is not None and delivered_revision < event.revision:
+            delivered_event = self._delivered_events.get(event.event_id)
+            should_deliver = delivered_revision < event.revision
+            if delivered_event is not None:
+                should_deliver = (
+                    event.revision > delivered_event.revision
+                    or _is_newer_sender_generation(event, delivered_event)
+                )
+            if self._on_accepted is not None and should_deliver:
                 try:
                     self._on_accepted(current)
                 except Exception as error:
                     raise PassageEventDeliveryError(str(error)) from error
                 self._delivered_revisions[event.event_id] = event.revision
+                self._delivered_events[event.event_id] = current
         return result
 
 

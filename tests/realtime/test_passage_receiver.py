@@ -526,6 +526,42 @@ def test_newer_revision_replaces_latest_and_stale_revision_is_duplicate(
     assert len(store.journal_path.read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_later_sender_generation_accepts_lower_revision_reset_tombstone(
+    running_receiver,
+):
+    receiver, store, accepted = running_receiver
+
+    assert post_json(
+        receiver,
+        passage_payload(revision=26, emitted_at_ms=1_000),
+    )[0] == 201
+    reset_status, reset_ack = post_json(
+        receiver,
+        passage_payload(
+            revision=4,
+            emitted_at_ms=2_000,
+            is_active=False,
+        ),
+    )
+
+    assert reset_status == 201
+    assert reset_ack["status"] == "accepted"
+    assert store.events() == ()
+    assert store.get("race-1-stage-1-passage-7").revision == 4
+    assert [event.is_active for event in accepted] == [True, False]
+
+    # A delayed packet from the previous database generation cannot resurrect
+    # the reset passage even though its local revision is higher.
+    stale_status, stale_ack = post_json(
+        receiver,
+        passage_payload(revision=27, emitted_at_ms=1_500),
+    )
+    assert stale_status == 200
+    assert stale_ack["status"] == "duplicate"
+    assert store.events() == ()
+    assert store.get("race-1-stage-1-passage-7").revision == 4
+
+
 def test_inactive_revision_is_retained_for_audit_but_hidden_from_active_events(
     running_receiver,
 ):
