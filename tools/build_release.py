@@ -122,8 +122,14 @@ def build(ffmpeg, mode):
                         case_env = dict(smoke_environment, QT_QPA_PLATFORM=qt_platform)
                         if override == "missing":
                             case_env["FINISH_REVIEW_FFMPEG"] = str(isolated / "removed" / "ffmpeg.exe")
+                        # A one-file build must unpack PyQt5, OpenCV and the
+                        # bundled FFmpeg into a fresh temporary directory on
+                        # first launch.  On Windows this can exceed one
+                        # minute under Defender or a busy disk; the smoke
+                        # test validates completion rather than imposing a
+                        # production startup SLA.
                         subprocess.run([str(smoke_executable), "--smoke-test"], cwd=temporary,
-                                       env=case_env, timeout=60, check=True,
+                                       env=case_env, timeout=180, check=True,
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                         smoke_cases.append({"platform": qt_platform, "ffmpeg_override": override,
                                             "path": "", "exit_code": 0})
