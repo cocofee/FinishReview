@@ -198,6 +198,19 @@ def test_packaged_smoke_test_creates_real_qt_window(monkeypatch):
     app.processEvents()
 
 
+def test_packaged_smoke_test_rejects_missing_ffmpeg(monkeypatch, tmp_path):
+    monkeypatch.setattr(review_main, "find_ffmpeg_executable", lambda: None)
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        review_main.verify_packaged_ffmpeg(tmp_path)
+
+
+def test_packaged_smoke_test_rejects_external_ffmpeg(monkeypatch, tmp_path):
+    monkeypatch.setattr(review_main, "find_ffmpeg_executable", lambda: tmp_path / "external.exe")
+    monkeypatch.setattr(review_main, "resource_dir", lambda: tmp_path / "bundle")
+    with pytest.raises(RuntimeError, match="outside the bundle"):
+        review_main.verify_packaged_ffmpeg(tmp_path)
+
+
 def test_installer_arguments_build_usb_camera_source():
     parser = build_argument_parser()
     args = parser.parse_args(

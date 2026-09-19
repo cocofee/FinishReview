@@ -115,11 +115,18 @@ def build(ffmpeg, mode):
                 local_data = isolated / "localappdata"
                 local_data.mkdir()
                 smoke_environment["LOCALAPPDATA"] = str(local_data)
+                smoke_environment["PATH"] = ""
+                smoke_cases = []
                 for qt_platform in ("offscreen", "windows"):
-                    subprocess.run([str(smoke_executable), "--smoke-test"], cwd=temporary,
-                                   env=dict(smoke_environment, QT_QPA_PLATFORM=qt_platform),
-                                   timeout=45, check=True,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    for override in ("unset", "missing"):
+                        case_env = dict(smoke_environment, QT_QPA_PLATFORM=qt_platform)
+                        if override == "missing":
+                            case_env["FINISH_REVIEW_FFMPEG"] = str(isolated / "removed" / "ffmpeg.exe")
+                        subprocess.run([str(smoke_executable), "--smoke-test"], cwd=temporary,
+                                       env=case_env, timeout=60, check=True,
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                        smoke_cases.append({"platform": qt_platform, "ffmpeg_override": override,
+                                            "path": "", "exit_code": 0})
                 for log_file in local_data.rglob("*.log"):
                     shutil.copy2(log_file, record_dir / f"{kind}-{log_file.name}")
             files = ([executable] if kind == "onefile" else
@@ -132,6 +139,7 @@ def build(ffmpeg, mode):
             record["packages"].append({"mode": kind, "executable": str(executable),
                                        "sha256": digest(executable), "smoke_exit_code": 0,
                                        "smoke_platforms": ["offscreen", "windows"],
+                                       "ffmpeg_smoke_cases": smoke_cases,
                                        "files_sha256": checksums, "command": command})
         record["status"] = "passed"
     except Exception as error:

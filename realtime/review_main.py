@@ -8,6 +8,7 @@ import logging
 import math
 import multiprocessing
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -578,14 +579,58 @@ def configure_application_icon(app: QApplication) -> None:
         app.setWindowIcon(icon)
 
 
+def verify_packaged_ffmpeg(output_dir: Path) -> None:
+    """Exercise runtime discovery and synthetic recording inside the EXE."""
+    executable = find_ffmpeg_executable()
+    if executable is None:
+        raise RuntimeError("Packaged FFmpeg discovery failed")
+    bundle = resource_dir().resolve()
+    if not executable.is_relative_to(bundle):
+        raise RuntimeError(f"Smoke test resolved FFmpeg outside the bundle: {executable}")
+    logger.info("Packaged FFmpeg resolved: %s", executable)
+
+    def run(*arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(executable), *arguments], cwd=output_dir,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=15, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    version = run("-version").stdout.splitlines()[0]
+    # Use a local synthetic source; no camera, receiver, configuration or race
+    # data is touched. Exercise the encoders and both recording output formats.
+    run(
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i",
+        "testsrc2=size=320x180:rate=25",
+        "-t", "2", "-map", "0:v:0", "-c:v", "libx264", "-preset", "ultrafast",
+        "-g", "25", "-pix_fmt", "yuv420p", "archive.mkv",
+        "-t", "2", "-map", "0:v:0", "-c:v", "libx264", "-preset", "ultrafast",
+        "-g", "25", "-pix_fmt", "yuv420p", "-f", "hls", "-hls_time", "1",
+        "-hls_segment_filename", "review_%02d.ts", "review.m3u8",
+    )
+    for name in ("archive.mkv", "review.m3u8"):
+        if not (output_dir / name).is_file() or (output_dir / name).stat().st_size == 0:
+            raise RuntimeError(f"Packaged FFmpeg did not write {name}")
+        run("-hide_banner", "-loglevel", "error", "-nostdin", "-i", name,
+            "-frames:v", "50", "-f", "null", "-")
+    logger.info("Packaged FFmpeg MKV/HLS smoke test passed: %s", version)
+
+
 def run_packaged_smoke_test(app_argv: list[str]) -> int:
-    """Create the packaged Qt window without starting external services."""
+    """Check Qt and bundled FFmpeg without starting external services."""
 
     app = QApplication.instance() or QApplication(app_argv)
     install_qthread_shutdown(app)
     configure_application_font(app)
     configure_application_icon(app)
     with tempfile.TemporaryDirectory(prefix="FinishReview-smoke-") as temp_dir:
+        if getattr(sys, "frozen", False):
+            try:
+                verify_packaged_ffmpeg(Path(temp_dir))
+            except Exception:
+                logger.exception("Packaged FFmpeg smoke test failed")
+                return 1
         window = FinishReviewWindow(
             "",
             Path(temp_dir),
@@ -631,6 +676,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.ffmpeg
         else find_ffmpeg_executable(base_dir=runtime_root)
     )
+    logger.info("FFmpeg discovery: executable=%s; resource_dir=%s; resolved=%s",
+                sys.executable, resource_dir(), ffmpeg_path)
     config_path = default_config_path()
     saved_settings = load_review_settings(
         config_path,

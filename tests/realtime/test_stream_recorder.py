@@ -86,6 +86,35 @@ def test_find_ffmpeg_checks_pyinstaller_internal_directory(monkeypatch, tmp_path
     assert find_ffmpeg_executable(environ={}, which=lambda _name: None) == executable.resolve()
 
 
+@pytest.mark.parametrize("layout", ["internal", "extracted", "system"])
+def test_find_ffmpeg_recovers_from_stale_environment_override(monkeypatch, tmp_path, layout):
+    app = tmp_path / "app"
+    extracted = tmp_path / "_MEI_test"
+    root = {"internal": app / "_internal", "extracted": extracted,
+            "system": tmp_path / "system"}[layout]
+    root.mkdir(parents=True)
+    executable = root / "ffmpeg.exe"
+    executable.write_bytes(b"binary")
+    monkeypatch.setattr(stream_recorder, "application_dir", lambda: app)
+    monkeypatch.setattr(stream_recorder, "resource_dir", lambda: extracted)
+    monkeypatch.setenv("FINISH_REVIEW_FFMPEG", str(tmp_path / "removed" / "ffmpeg.exe"))
+
+    assert find_ffmpeg_executable(
+        which=lambda _name: str(executable) if layout == "system" else None,
+    ) == executable.resolve()
+
+
+def test_find_ffmpeg_honors_existing_environment_override(monkeypatch, tmp_path):
+    bundled = tmp_path / "app" / "ffmpeg.exe"
+    bundled.parent.mkdir()
+    bundled.write_bytes(b"bundled")
+    configured = tmp_path / "custom-ffmpeg.exe"
+    configured.write_bytes(b"configured")
+    monkeypatch.setenv("FINISH_REVIEW_FFMPEG", str(configured))
+
+    assert find_ffmpeg_executable(base_dir=bundled.parent, which=lambda _name: None) == configured.resolve()
+
+
 def test_recorder_uses_packet_copy_and_stops_cleanly(tmp_path):
     ffmpeg = tmp_path / "ffmpeg.exe"
     ffmpeg.write_bytes(b"binary")

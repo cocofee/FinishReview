@@ -108,7 +108,11 @@ def find_ffmpeg_executable(
     configured = str(env.get("FINISH_REVIEW_FFMPEG") or "").strip()
     if configured:
         path = Path(configured).expanduser()
-        return path.resolve() if path.is_file() else None
+        # A stale machine/user override must not hide the copy shipped with
+        # the executable.  This commonly occurs after moving a release build
+        # to another workstation; continue with bundled and PATH discovery.
+        if path.is_file():
+            return path.resolve()
 
     executable_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
     runtime_roots = []

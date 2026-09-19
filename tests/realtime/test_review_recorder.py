@@ -11,6 +11,7 @@ import pytest
 
 import realtime.durable_jsonl as durable_jsonl
 import realtime.review_recorder as review_recorder
+import realtime.stream_recorder as stream_recorder
 from realtime.review_clip import PassageReviewBindingStore
 from realtime.review_recorder import (
     ArchiveTimelinePublisher,
@@ -79,6 +80,27 @@ def _write_playlist(root: Path, entries):
     playlist = root / "camera_01.m3u8"
     playlist.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return playlist
+
+
+def test_review_recorder_starts_with_bundled_ffmpeg_despite_stale_override(monkeypatch, tmp_path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    executable = bundle / "ffmpeg.exe"
+    executable.write_bytes(b"binary")
+    monkeypatch.setenv("FINISH_REVIEW_FFMPEG", str(tmp_path / "removed" / "ffmpeg.exe"))
+    monkeypatch.setattr(stream_recorder, "application_dir", lambda: bundle)
+    monkeypatch.setattr(stream_recorder, "resource_dir", lambda: bundle)
+    factory = _ProcessFactory()
+    recorder = FfmpegReviewRecorder(
+        "rtsp://camera/live", tmp_path / "race", camera_index=1,
+        popen_factory=factory,
+    )
+    try:
+        recorder.start()
+        assert recorder.is_running
+        assert Path(factory.calls[0][0][0]) == executable
+    finally:
+        recorder.stop()
 
 
 def test_directshow_device_discovery_returns_video_inputs_only(tmp_path):
