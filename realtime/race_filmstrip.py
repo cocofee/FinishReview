@@ -695,10 +695,17 @@ class RaceFilmstripPanel(QWidget):
         self.finish_line_button.setText("返回普通胶卷" if checked else "终点线胶卷")
         if checked:
             self._finish_focus_previous_interval = self.interval_ms
-            if self.interval_ms != 500:
-                index = self.density_combo.findData(500)
-                if index >= 0:
-                    self.density_combo.setCurrentIndex(index)
+            index = self.density_combo.findData(500)
+            if index >= 0:
+                # Keep the operator's finish-line view deterministic even if
+                # a prior asynchronous refresh restored another density.
+                self.density_combo.blockSignals(True)
+                self.density_combo.setCurrentIndex(index)
+                self.density_combo.blockSignals(False)
+            self.interval_ms = 500
+            self._pending = None
+            self._cancel_decode()
+            self._set_scroll_range()
             center = (self._active_frame.recorder_time_ms if self._active_frame is not None
                       else self.current_time if self.current_time is not None
                       else sum(self.visible_times()) // 2)
