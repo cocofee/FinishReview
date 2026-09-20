@@ -3407,6 +3407,7 @@ class PassageReviewSurface(QDialog):
         self.video_filmstrip.full_race.saved_judgment_requested.connect(self._open_camera_judgment)
         self.video_filmstrip.full_race.refresh_requested.connect(self._update_filmstrip)
         self.video_filmstrip.full_race.enlarge_requested.connect(self._toggle_filmstrip_size)
+        self.video_filmstrip.full_race.finish_anchor_requested.connect(self._align_finish_film)
         self.video_filmstrip.judgment_track.show()
         self.video_filmstrip.judgment_track.judgment_requested.connect(
             self._open_camera_judgment
@@ -8027,6 +8028,8 @@ class PassageReviewSurface(QDialog):
         pane: PassageEvidencePane,
         position_ms: int,
         calibrated_at_ms: int,
+        *,
+        replace_existing: bool = False,
     ) -> bool:
         location = pane.location
         if (
@@ -8039,14 +8042,13 @@ class PassageReviewSurface(QDialog):
             location.segment.camera_index,
             self._recording_session_key(location),
         )
-        if key in self._continuous_clock_offsets or self.calibration_store.get(*key) is not None:
+        if not replace_existing and (key in self._continuous_clock_offsets or self.calibration_store.get(*key) is not None):
             return False
         offset_ms = (
             int(location.segment.media_started_at_ms)
             + int(position_ms)
             - int(event.timeline_timestamp_ms)
         )
-        self._continuous_clock_offsets[key] = offset_ms
         try:
             self.calibration_store.record(
                 camera_index=location.segment.camera_index,
@@ -8058,6 +8060,8 @@ class PassageReviewSurface(QDialog):
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             logger.warning("failed to persist camera calibration: %s", error)
+            return False
+        self._continuous_clock_offsets[key] = offset_ms
         self._continuous_calibration_revision += 1
         self._update_batch_controls(event.event_id)
         self._lookup_cache.clear()
@@ -8073,6 +8077,21 @@ class PassageReviewSurface(QDialog):
         # preserve the overview viewport and the operator's current frame.
         self._update_filmstrip()
         return True
+
+    def _align_finish_film(self) -> None:
+        panel = self.video_filmstrip.full_race.finish_panel
+        pane = self._camera_one_pane()
+        event = self.passage_store.get(self._selected_event_id)
+        if (event is None or not event.is_active or pane.location is None
+                or pane._current_frame_index < 0 or pane.is_playing):
+            panel.status.setText("先选首人的号码，把原帧停在实际过白线的位置，再对齐。")
+            return
+        if self._calibrate_continuous_session_at_position(
+            event, pane, pane._current_position_ms, int(time.time() * 1000), replace_existing=True,
+        ):
+            panel.status.setText(f"已按 {event.bib} 当前原帧对齐本次录像的芯片参考线；其他人无需逐人确认。")
+        else:
+            panel.status.setText("校时未保存，芯片参考线未修改。请检查录像时间和磁盘。")
 
     def _confirm_pending_marker(self, pane: PassageEvidencePane) -> bool:
         event = self.passage_store.get(self._selected_event_id)

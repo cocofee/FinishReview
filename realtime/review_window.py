@@ -500,6 +500,12 @@ class FinishReviewWindow(PassageReviewSurface):
 
     FILMSTRIP_ALWAYS_AVAILABLE = True
 
+    @staticmethod
+    def _display_confirmation_status(status: str) -> str:
+        # Receipt is useful on its own; manual judging is optional unless an
+        # operator finds a mismatch. Never manufacture a saved confirmation.
+        return "已确认" if status == "已确认" else "芯片已收到"
+
     def __init__(
         self,
         source: str,
@@ -688,6 +694,10 @@ class FinishReviewWindow(PassageReviewSurface):
             low_resource_mode=len(regular_camera_indexes) == 1,
         )
         self._runtime_metrics_reported = False
+        self.review_filter_labels.update(pending="有录像", blocked="暂无录像")
+        self.review_filter_buttons["pending"].setToolTip("芯片已收到且有录像参考，无需逐人确认；按需核对异常")
+        self.review_filter_buttons["blocked"].setToolTip("芯片已收到但暂无对应录像；不等于漏芯片或必须人工确认")
+        self._render_summary()
 
         self.setWindowTitle(APP_WINDOW_TITLE)
         self.setMinimumSize(1180, 760)

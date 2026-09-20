@@ -3213,6 +3213,36 @@ def test_first_confirmation_calibrates_in_default_review_and_survives_reopen(
         reopened.close()
 
 
+def test_finish_film_anchor_realigns_reference_without_confirming_roster(qapp, tmp_path, fake_playback):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(event_id="first", bib="101", passage_time_ms=15_000)
+    second = _event(event_id="second", bib="102", sequence=2, passage_time_ms=16_000)
+    passages.append(first)
+    passages.append(second)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01_session_archive_0000.mkv",
+                 source_id="camera_01_review", camera_index=1,
+                 started_at_ms=10_000, ended_at_ms=70_000)
+    dialog = PassageReviewDialog(passages, timeline)
+    dialog.show()
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    pane._worker.frame_ready.emit(frame, 3_700, 185)
+    assert dialog._calibrate_continuous_session_at_position(first, pane, 3700, 99000)
+    before = dialog.video_filmstrip.full_race.canvas.horizontalScrollBar().value()
+    pane._worker.frame_ready.emit(frame, 4_000, 200)
+    dialog._align_finish_film()
+    assert dialog.calibration_store.calibrations()[0].offset_ms == -1000
+    assert dialog.calibration_store.calibrations()[0].revision == 2
+    assert not dialog.association_store.associations()
+    assert dialog._selected_event_id == first.event_id
+    assert dialog.video_filmstrip.full_race.canvas.horizontalScrollBar().value() == before
+    assert dialog.video_filmstrip.full_race._chip_times == (14000, 15000)
+    dialog.close()
+
+
 def test_continuous_mode_seeds_first_saved_confirmation_for_session(
     qapp,
     tmp_path,

@@ -23,6 +23,8 @@ from .thread_lifecycle import retire_qthread, track_qthread
 from .video_timeline import DEFAULT_CLOCK_SOURCE, PassageVideoLocation
 from .filmstrip_checks import FilmstripCheckStore, merge_ranges, subtract_ranges
 from .decode_resources import DECODE_RESOURCES, FOREGROUND, THUMBNAIL, ImageCache
+from .finish_line import FinishLine
+from .finish_line_film import FinishLinePanel
 
 TILE_GAP = 8
 IMAGE_TOP = 4
@@ -250,6 +252,24 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
                 size = frame.image.size().scaled(int(rect.width()), int(rect.height()), Qt.KeepAspectRatio)
                 target = QRectF(rect.x() + (rect.width() - size.width()) / 2, rect.y() + (rect.height() - size.height()) / 2, size.width(), size.height())
                 painter.drawImage(target, frame.image)
+                # Keep the configured camera-1 finish line in the actual
+                # picture coordinate system.  Chip/judgment references below
+                # remain time-axis markers; this line is the operator's
+                # spatial reference for deciding whether a rider reached the
+                # white finish line.
+                finish_line = owner.finish_line
+                if finish_line is not None:
+                    painter.setPen(QPen(QColor("#f97316"), 3))
+                    painter.drawLine(
+                        QPointF(
+                            target.left() + finish_line.x1 * target.width(),
+                            target.top() + finish_line.y1 * target.height(),
+                        ),
+                        QPointF(
+                            target.left() + finish_line.x2 * target.width(),
+                            target.top() + finish_line.y2 * target.height(),
+                        ),
+                    )
                 if frame.recorder_time_ms == owner.current_time:
                     # 描边收在实际图片内，不能覆盖时间刻度和下方判读标记。
                     painter.setPen(QPen(QColor("#ef4444"), 2))
@@ -481,6 +501,7 @@ class RaceFilmstripPanel(QWidget):
     saved_judgment_requested = pyqtSignal(str)
     refresh_requested = pyqtSignal()
     enlarge_requested = pyqtSignal()
+    finish_anchor_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -498,6 +519,7 @@ class RaceFilmstripPanel(QWidget):
         self._chip_markers = ()
         self._chip_times = ()
         self._chip_default_offset_ms = 0
+        self.finish_line: FinishLine | None = None
         self._judged_event_ids = set()
         self.cache = ImageCache(priority=THUMBNAIL, image_of=lambda frame: frame.image,
                                 max_items=MAX_CACHE, max_bytes=MAX_CACHE_BYTES)
@@ -520,6 +542,7 @@ class RaceFilmstripPanel(QWidget):
         self._all_pending_sources = 0
         self._active_frame = None
         self._pending_judgment = None
+        self._finish_focus_previous_interval = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(3)
@@ -553,6 +576,13 @@ class RaceFilmstripPanel(QWidget):
         current_button.setToolTip("回到当前判读原帧所在的时间")
         current_button.clicked.connect(self.browse_camera)
         summary.addWidget(current_button)
+        self.finish_line_button = QPushButton("终点线胶卷", self)
+        self.finish_line_button.setCheckable(True)
+        self.finish_line_button.setToolTip(
+            "进入终点线核对模式：保留每 500 ms 一张的完整画面，并叠加实际终点线、芯片和判读标记"
+        )
+        self.finish_line_button.toggled.connect(self._finish_line_visibility_changed)
+        summary.addWidget(self.finish_line_button)
         self.inspection_label = QLabel(self)
         self.inspection_label.setStyleSheet("color: #b45309; font-size: 9pt;")
         self.inspection_label.hide()
@@ -608,6 +638,10 @@ class RaceFilmstripPanel(QWidget):
         menu.aboutToShow.connect(lambda: next_unchecked_action.setEnabled(self.next_unchecked_button.isEnabled()))
         self.canvas = RaceFilmstripCanvas(self)
         layout.addWidget(self.canvas, 1)
+        self.finish_panel = FinishLinePanel(self)
+        self.finish_panel.hide()
+        self.finish_panel.anchor_requested.connect(self.finish_anchor_requested.emit)
+        layout.addWidget(self.finish_panel, 1)
         self._load_timer = QTimer(self)
         self._load_timer.setSingleShot(True)
         self._load_timer.setInterval(90)
@@ -647,6 +681,48 @@ class RaceFilmstripPanel(QWidget):
         # The browsing ruler uses the recorder's Beijing time. Calibrating an
         # athlete's chip/video association must not relabel live recording time.
         return format_time(timestamp)
+
+    def _finish_line_visibility_changed(self, checked: bool) -> None:
+        # Finish focus deliberately uses the same readable full-frame canvas as
+        # the normal filmstrip.  The former implementation replaced it with a
+        # one-pixel-wide spatial slit; with this oblique camera that produced
+        # horizontal bands and made it impossible to tell who crossed.  Keep
+        # the 500 ms full pictures, orange finish line, and time-axis markers.
+        self.canvas.setVisible(True)
+        self.finish_panel.setVisible(checked)
+        self.finish_panel.set_compact(checked)
+        self.density_combo.setVisible(True)
+        self.finish_line_button.setText("返回普通胶卷" if checked else "终点线胶卷")
+        if checked:
+            self._finish_focus_previous_interval = self.interval_ms
+            if self.interval_ms != 500:
+                index = self.density_combo.findData(500)
+                if index >= 0:
+                    self.density_combo.setCurrentIndex(index)
+            center = (self._active_frame.recorder_time_ms if self._active_frame is not None
+                      else self.current_time if self.current_time is not None
+                      else sum(self.visible_times()) // 2)
+            self._position_scroll(center)
+            self.status_label.setText(
+                "终点线模式：每 500 ms 一张完整画面；橙线是实际白色终点线。"
+                "蓝虚线为芯片，绿实线为人工判读，只查无线和疑似一人多芯片。"
+            )
+            self.status_label.show()
+        else:
+            previous = self._finish_focus_previous_interval
+            self._finish_focus_previous_interval = None
+            if previous is not None and previous != self.interval_ms:
+                index = self.density_combo.findData(previous)
+                if index >= 0:
+                    self.density_combo.setCurrentIndex(index)
+            self.status_label.setText("")
+
+    def set_finish_line(self, finish_line: FinishLine | None) -> None:
+        """Set the spatial finish line drawn over every loaded thumbnail."""
+        if self.finish_line == finish_line:
+            return
+        self.finish_line = finish_line
+        self.canvas.viewport().update()
 
     def judgment_time(self, timestamp, source=None):
         if source is None:
@@ -829,6 +905,7 @@ class RaceFilmstripPanel(QWidget):
         if context == self._check_context:
             return
         self._check_context = context
+        self.finish_panel.set_context(path, race_id, camera_index)
         self._check_store = None
         self._check_error = ""
         try:
@@ -961,6 +1038,7 @@ class RaceFilmstripPanel(QWidget):
         self.selected_event_id = selected_event_id
         self.markers = tuple(sorted((record.recorder_time_ms, record.label) for record in records if record.recorder_time_ms is not None))
         self.canvas.viewport().update()
+        self.finish_panel.update_markers()
 
     def set_passages(self, events, default_offset_ms=0):
         """Receipts update references only; never seek, select or confirm."""
@@ -975,6 +1053,7 @@ class RaceFilmstripPanel(QWidget):
         self._chip_markers = chip_time_markers(self._passages, self.index, self._chip_default_offset_ms)
         self._chip_times = tuple(marker.recorder_time_ms for marker in self._chip_markers)
         self.canvas.viewport().update()
+        self.finish_panel.update_markers()
 
     def chips_between(self, left, right):
         return tuple(marker for marker in self._chip_markers[
@@ -1180,6 +1259,9 @@ class RaceFilmstripPanel(QWidget):
         self._viewport_changed()
 
     def clear(self):
+        self.finish_panel.clear()
+        self.set_finish_line(None)
+        self.finish_line_button.setChecked(False)
         self._cancel_decode()
         self._signature = None
         self._all_sources = ()
@@ -1220,6 +1302,7 @@ class RaceFilmstripPanel(QWidget):
             self._load_timer.start()
 
     def stop(self):
+        self.finish_panel.stop()
         self._closed = True
         self.canvas.stop_scroll()
         self._load_timer.stop()

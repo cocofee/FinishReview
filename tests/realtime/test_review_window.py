@@ -1092,7 +1092,9 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert window.race_value.text() == "2026 城市自行车赛"
     assert window.stage_value.text() == "第一赛段"
     assert window.group_value.text() == "男子公开组"
-    assert window.operator_identity_label.text() == "男子公开组 · 1 / 1 · 未确认"
+    assert window.operator_identity_label.text() == "男子公开组 · 1 / 1 · 芯片已收到"
+    assert window.table.item(0, 8).text() == "芯片已收到"
+    assert not window.association_store.associations()
     assert window.table.item(0, 6).text() == "未确认"
     assert len(window.timeline_store.segments()) == 1
     assert "可核对 1" in window.capture_status_label.text()
