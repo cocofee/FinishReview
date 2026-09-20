@@ -405,6 +405,11 @@ class FinishLinePanel(QWidget):
         self.owner.set_finish_line(self.line)
         self.line_changed.emit(self.line)
         self._requested = None
+        if self._compact:
+            # Finish focus uses the ordinary readable full-frame filmstrip;
+            # never start the legacy spatial-slit worker behind that view.
+            self.status.setText("终点线已保存；完整画面上的橙色终点线已刷新。")
+            return
         self.show_range(frame.recorder_time_ms - PAGE_MS // 2)
 
     def show_range(self, start_ms):
