@@ -1995,6 +1995,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self.settings_button.setToolTip("设备与赛事设置")
         self.settings_button.clicked.connect(self._configure_devices)
         top_layout.addWidget(self.settings_button)
+        self.count_review_button = QPushButton("计数对账", panel)
+        self.count_review_button.setObjectName("finishCountReviewButton")
+        self.count_review_button.setFixedHeight(32)
+        self.count_review_button.clicked.connect(self._open_count_review)
+        top_layout.addWidget(self.count_review_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2090,6 +2095,15 @@ class FinishReviewWindow(PassageReviewSurface):
         self.event_path_label.setToolTip(
             f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
         )
+
+    def _open_count_review(self) -> None:
+        from .count_review import CountReviewDialog
+        metadata = self._current_metadata()
+        dialog = CountReviewDialog(self.output_dir, self,
+                                   race_id=metadata.race_id if metadata else "",
+                                   stage_id=metadata.stage_id if metadata else "")
+        dialog.exec_()
+        dialog.deleteLater()
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label

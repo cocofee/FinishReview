@@ -6,6 +6,20 @@ CycleRace / RaceTiger 过线事件接入、奥亚特高速相机文件读取和�
 本项目不包含目标检测、YOLO、Ultralytics、Torch、OCR、模型权重、训练数据或
 自动生成正式比赛成绩的逻辑。CycleRace 仍是正式计时和成绩的唯一权威。
 
+## 独立计数对账入口
+
+上方“计数对账”可读取外部 VideoPipe 计数服务的 `count_reconciliation.json`。
+选择该服务的输出目录，默认只显示补扫后仍未决的短窗，提供数量差异、质量原因、
+关键帧和短片；取消筛选可查看等待数据及补扫中的集团。读入时校验当前赛事与赛段。
+没有芯片完整性水位时结果标为暂定，迟到及修订仍会更新。
+
+启动配置和当前验收限制见 [独立计数说明](https://github.com/cocofee/VideoPipe/blob/bd4c67248d90f039ac47f8b3bfe80cd42a7dab94/docs/INDEPENDENT_COUNTING.md)。
+计数模型运行在外部服务，FinishReview 本身只读取报告与证据，不新增模型依赖。
+
+下面是**合成数据界面示例**，预览图不含真实赛事数据：
+
+![独立计数未决短窗界面](docs/images/count-review-demo.png)
+
 ## Source baseline
 
 - Source repository: `cocofee/VideoPipe`
