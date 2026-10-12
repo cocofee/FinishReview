@@ -2491,6 +2491,106 @@ def test_batch_mode_records_video_discovered_bib_without_creating_passage(
     dialog.close()
 
 
+def test_video_discovery_reopens_original_file_and_frame_after_restart(qapp, tmp_path, fake_playback, monkeypatch):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="first", passage_time_ms=15_000))
+    passages.append(_event(event_id="second", sequence=2, passage_time_ms=45_000))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    original = tmp_path / "original.mkv"
+    other = tmp_path / "other.mkv"
+    _add_segment(timeline, original, source_id="camera_01", camera_index=1,
+                 started_at_ms=10_000, ended_at_ms=40_000)
+    _add_segment(timeline, other, source_id="camera_01", camera_index=1,
+                 started_at_ms=40_000, ended_at_ms=70_000)
+    frame_seeks = []
+    monkeypatch.setattr(_FakePlaybackWorker, "seek_frame",
+                        lambda worker, frame: frame_seeks.append((worker.video_path, frame)), raising=False)
+    monkeypatch.setattr(passage_review.QInputDialog, "getText", lambda *_args: ("319", True))
+    dialog = PassageReviewDialog(passages, timeline)
+    try:
+        assert dialog._enter_batch_mode("first")
+        dialog.regular_pane._current_position_ms = 5250
+        dialog.regular_pane._current_frame_index = 263
+        dialog._add_video_discovered_bib()
+        saved, = dialog.video_discovery_store.records()
+        assert saved.video_path == str(original.absolute())
+        assert saved.segment_id == dialog.regular_pane.location.segment.segment_id
+    finally:
+        dialog.close()
+    reopened = PassageReviewDialog(passages, timeline)
+    try:
+        assert reopened._enter_batch_mode("second")
+        assert reopened.regular_pane.location.video_path == other
+        entry, = reopened._video_discovered_entries
+        reopened._focus_video_discovered_entry(entry)
+        assert reopened.regular_pane.location.video_path == original
+        assert frame_seeks[-1] == (original, 263)
+        assert not reopened.regular_pane.mark_btn.isEnabled()
+        assert len(passages.events()) == 2
+        # Missing original media must never seek the currently open file.
+        reopened._select_event("second")
+        before = len(frame_seeks)
+        is_file = Path.is_file
+        monkeypatch.setattr(Path, "is_file", lambda path: False if path == original else is_file(path))
+        reopened._focus_video_discovered_entry(entry)
+        assert len(frame_seeks) == before
+        assert reopened.regular_pane.location.video_path == other
+        assert "原录像不可用" in reopened.summary_label.toolTip()
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("correction", [{"is_active": False}, {"bib": "other"}, {"passage_time_ms": 60_000}])
+def test_video_discovery_reopens_when_matching_chip_is_retracted_or_corrected(qapp, tmp_path, correction):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    dialog = PassageReviewDialog(passages, timeline)
+    try:
+        record = dialog.video_discovery_store.add(discovery_id="discovery", race_id="race-1", stage_id="stage-1",
+            batch_id="batch", bib="319", camera_index=1, frame_index=10, position_ms=400,
+            started_at_ms=15_000, ended_at_ms=18_000)
+        entry = {**record.to_payload(), "entry_id": record.discovery_id}
+        dialog._video_discovered_entries.append(entry)
+        chip = _event(event_id="chip", bib="319", passage_time_ms=16_000)
+        passages.append(chip)
+        dialog.refresh()
+        assert entry["status"] == "resolved"
+        passages.append(replace(chip, revision=2, **correction))
+        dialog.refresh()
+        assert entry["status"] == "pending_manual_entry"
+        from realtime.video_discovery import VideoDiscoveryStore
+        assert VideoDiscoveryStore(dialog.video_discovery_store.journal_path).records()[0].status == "pending_manual_entry"
+        # A later valid revision resolves it again without adding a second record.
+        passages.append(replace(chip, revision=3))
+        dialog.refresh()
+        assert entry["status"] == "resolved"
+        assert len(dialog.video_discovery_store.records()) == 1
+    finally:
+        dialog.close()
+
+
+def test_video_discovery_status_does_not_change_when_journal_write_fails(qapp, tmp_path, monkeypatch):
+    from realtime.video_discovery import VideoDiscoveryError
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    dialog = PassageReviewDialog(passages, timeline)
+    try:
+        record = dialog.video_discovery_store.add(discovery_id="discovery", race_id="race-1", stage_id="stage-1",
+            batch_id="batch", bib="319", camera_index=1, frame_index=10, position_ms=400,
+            started_at_ms=15_000, ended_at_ms=18_000)
+        entry = {**record.to_payload(), "entry_id": record.discovery_id}
+        dialog._video_discovered_entries.append(entry)
+        passages.append(_event(event_id="chip", bib="319", passage_time_ms=16_000))
+        def fail_write(*_args):
+            raise VideoDiscoveryError("disk unavailable")
+        monkeypatch.setattr(dialog.video_discovery_store, "update_status", fail_write)
+        dialog.refresh()
+        assert entry["status"] == "pending_manual_entry"
+        assert dialog.video_discovery_store.records()[0].status == "pending_manual_entry"
+    finally:
+        dialog.close()
+
+
 def test_batch_confirmation_advances_without_returning_to_confirmed_position(
     qapp,
     tmp_path,

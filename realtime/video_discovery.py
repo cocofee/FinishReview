@@ -34,6 +34,10 @@ class VideoDiscoveryRecord:
     status: str = "pending_manual_entry"
     created_at_ms: int = 0
     revision: int = 1
+    segment_id: str = ""
+    video_path: str = ""
+    media_locator: str = ""
+    clock_offset_ms: int = 0
 
     def __post_init__(self) -> None:
         if not self.discovery_id.strip():
@@ -52,6 +56,12 @@ class VideoDiscoveryRecord:
             raise VideoDiscoveryError("unsupported discovery status")
         if self.created_at_ms < 0 or self.revision <= 0:
             raise VideoDiscoveryError("invalid discovery metadata")
+        if any(not isinstance(value, str) for value in (self.segment_id, self.video_path, self.media_locator)):
+            raise VideoDiscoveryError("invalid discovery media reference")
+        if bool(self.segment_id) != bool(self.video_path):
+            raise VideoDiscoveryError("segment_id and video_path must be supplied together")
+        if type(self.clock_offset_ms) is not int:
+            raise VideoDiscoveryError("clock_offset_ms must be an integer")
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -142,6 +152,8 @@ class VideoDiscoveryStore:
                     "revision",
                 )
             }
+            for name, default in (("segment_id", ""), ("video_path", ""), ("media_locator", ""), ("clock_offset_ms", 0)):
+                fields[name] = payload.get(name, default)
             return VideoDiscoveryRecord(**fields)
         except (KeyError, TypeError, AttributeError, ValueError) as error:
             raise VideoDiscoveryError("invalid video discovery record") from error
@@ -189,6 +201,10 @@ class VideoDiscoveryStore:
         position_ms: int,
         started_at_ms: int,
         ended_at_ms: int,
+        segment_id: str = "",
+        video_path: str = "",
+        media_locator: str = "",
+        clock_offset_ms: int = 0,
     ) -> VideoDiscoveryRecord:
         with self._lock:
             record = VideoDiscoveryRecord(
@@ -203,6 +219,10 @@ class VideoDiscoveryStore:
                 started_at_ms=int(started_at_ms),
                 ended_at_ms=int(ended_at_ms),
                 created_at_ms=int(time.time() * 1000),
+                segment_id=segment_id,
+                video_path=video_path,
+                media_locator=media_locator,
+                clock_offset_ms=clock_offset_ms,
             )
             if record.discovery_id in self._latest:
                 raise VideoDiscoveryError("duplicate discovery_id")

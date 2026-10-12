@@ -95,6 +95,7 @@ from .recording_controller import (
     RecordingStopFailure,
 )
 from .settings import FinishReviewSettings
+from .video_discovery import VideoDiscoveryStore
 from .review_recorder import (
     ArchiveTimelinePublisher,
     FfmpegReviewRecorder,
@@ -782,6 +783,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._clock_timer.setInterval(1_000)
         self._clock_timer.timeout.connect(self._on_clock_tick)
         self._init_runtime_status()
+        self._init_count_reconciliation()
         self._init_operator_controls()
         self._high_speed_scan_worker = AuyatRgbScanWorker(
             self._high_speed_catalog,
@@ -1610,6 +1612,9 @@ class FinishReviewWindow(PassageReviewSurface):
                 calibration_store = VideoClockCalibrationStore(
                     output_dir / "video_clock_calibrations.jsonl"
                 )
+                video_discovery_store = VideoDiscoveryStore(
+                    output_dir / "video_discoveries.jsonl"
+                )
                 preflight_journal = PreflightJournal(
                     output_dir / "preflight_tests.jsonl"
                 )
@@ -1640,6 +1645,7 @@ class FinishReviewWindow(PassageReviewSurface):
                     review_binding_store,
                     association_store,
                     calibration_store,
+                    video_discovery_store,
                     preflight_journal,
                     historical_events,
                     evidence_timestamp_overrides,
@@ -1765,6 +1771,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 review_binding_store,
                 association_store,
                 calibration_store,
+                video_discovery_store,
                 preflight_journal,
                 historical_events,
                 evidence_timestamp_overrides,
@@ -1813,6 +1820,8 @@ class FinishReviewWindow(PassageReviewSurface):
             self.review_binding_store = review_binding_store
             self.association_store = association_store
             self.calibration_store = calibration_store
+            self.video_discovery_store = video_discovery_store
+            self._reload_video_discoveries()
             self._lookup_cache.clear()
             self._timeline_signature = ()
             self._selected_event_id = ""
@@ -1831,6 +1840,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._received_event_order.clear()
             self._capture_error = ""
             self.refresh()
+            self._refresh_count_reconciliation()
             if self._video_candidate_cache:
                 self._reconcile_video_candidates(
                     tuple(self._video_candidate_cache.values())
@@ -1995,6 +2005,13 @@ class FinishReviewWindow(PassageReviewSurface):
         self.settings_button.setToolTip("设备与赛事设置")
         self.settings_button.clicked.connect(self._configure_devices)
         top_layout.addWidget(self.settings_button)
+        self.count_review_button = QPushButton("对数", panel)
+        self.count_review_button.setObjectName("finishCountReviewButton")
+        self.count_review_button.setFixedHeight(32)
+        self.count_review_button.setCheckable(True)
+        self.count_review_button.setToolTip("在通过记录中展开集团数量对账")
+        self.count_review_button.clicked.connect(self._open_count_review)
+        top_layout.addWidget(self.count_review_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2004,6 +2021,7 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
+        self.count_review_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.setMinimumWidth(88)
@@ -2037,6 +2055,9 @@ class FinishReviewWindow(PassageReviewSurface):
         status_layout.addWidget(self.camera_status_label)
         status_layout.addWidget(self.high_speed_status_label)
         status_layout.addWidget(self.video_assist_status_label)
+        self.count_status_label = QLabel("对数：未接入", status_strip)
+        self.count_status_label.setStyleSheet("color: #667085; font-size: 9pt;")
+        status_layout.addWidget(self.count_status_label)
         status_layout.addStretch(1)
         panel_layout.addWidget(status_strip)
         self.runtime_status_strip = status_strip
@@ -2090,6 +2111,110 @@ class FinishReviewWindow(PassageReviewSurface):
         self.event_path_label.setToolTip(
             f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
         )
+
+    def _open_count_review(self) -> None:
+        expanded = self.count_review_button.isChecked()
+        if not expanded:
+            self.count_panel.clear_scope()
+        self.count_panel.setVisible(expanded)
+        self._set_count_layout(expanded)
+        self._refresh_count_reconciliation()
+
+    def _set_count_layout(self, expanded: bool) -> None:
+        before = getattr(self, "_count_layout_before", None)
+        if expanded and before is None:
+            sizes = self.review_content_splitter.sizes()
+            self._count_layout_before = (self.preview_panel.minimumHeight(), self.video_filmstrip.minimumHeight(),
+                                        self.results_panel.minimumHeight(), self.table.minimumHeight(),
+                                        self._review_split_manually_sized, sizes)
+            self.preview_panel.setMinimumHeight(300)
+            self.video_filmstrip.setMinimumHeight(240)
+            self.results_panel.setMinimumHeight(300)
+            self.table.setMinimumHeight(100)
+            self._review_split_manually_sized = True
+            if sum(sizes):
+                transfer = min(120, max(0, sizes[0] - 300))
+                self.review_content_splitter.setSizes([sizes[0] - transfer, sizes[1] + transfer])
+        elif not expanded and before is not None:
+            preview_minimum, filmstrip_minimum, results_minimum, table_minimum, manually_sized, sizes = before
+            self.preview_panel.setMinimumHeight(preview_minimum)
+            self.video_filmstrip.setMinimumHeight(filmstrip_minimum)
+            self.results_panel.setMinimumHeight(results_minimum)
+            self.table.setMinimumHeight(table_minimum)
+            self._review_split_manually_sized = manually_sized
+            if sum(sizes):
+                self.review_content_splitter.setSizes(sizes)
+            self._count_layout_before = None
+
+    def _init_count_reconciliation(self) -> None:
+        from .count_panel import CountReconciliationPanel
+        self.count_panel = CountReconciliationPanel(self.output_dir, self.results_panel)
+        self.results_panel.layout().insertWidget(1, self.count_panel)
+        self.count_panel.hide()
+        self.count_panel.group_selected.connect(self._select_count_group)
+        self.count_panel.scope_cleared.connect(lambda: self.set_count_event_scope(None))
+        self.count_panel.locate_requested.connect(self._locate_count_group)
+        self.count_panel.discovery_requested.connect(self._record_count_discovery)
+        self.count_panel.summary_changed.connect(self.count_status_label.setText)
+        self._refresh_count_reconciliation()
+
+    def _count_context(self):
+        metadata = self._current_metadata()
+        if metadata is not None:
+            return metadata.race_id, metadata.stage_id
+        scopes = {(event.race_id, event.stage_id) for event in self.passage_store.events() if event.is_active}
+        return next(iter(scopes)) if len(scopes) == 1 else ("", "")
+
+    def _refresh_count_reconciliation(self) -> None:
+        if not hasattr(self, "count_panel"):
+            return
+        race_id, stage_id = self._count_context()
+        self.count_panel.set_context(self.output_dir, race_id, stage_id)
+        self.count_panel.refresh()
+
+    def _count_group_is_current(self, row) -> bool:
+        race_id, stage_id = self._count_context()
+        context = (str(self.output_dir.absolute()), race_id, stage_id)
+        if context != self.count_panel.context or not race_id or not stage_id:
+            self.count_panel.hint.setText("请先选择对应赛事和赛段，再使用集团对账。")
+            return False
+        return bool(self.count_panel.report and any(
+            item["window_id"] == row["window_id"] for item in self.count_panel.report["groups"]))
+
+    def _select_count_group(self, row) -> None:
+        if self._count_group_is_current(row):
+            scope = self.count_panel.report["scope"]
+            self.set_count_event_scope(row.get("chip_event_ids", []), window=row,
+                                       race_id=scope["race_id"], stage_id=scope["stage_id"],
+                                       calibrated=self.count_panel.report.get("clock", {}).get("calibrated", False))
+
+    def _locate_count_group(self, row) -> None:
+        if not self._count_group_is_current(row):
+            return
+        if not self.count_panel.report.get("clock", {}).get("calibrated", False):
+            self.count_panel.hint.setText("计数时间待校准，暂不按时间跳转录像。")
+            return
+        self._set_sync_playing(False, seek_final=False)
+        self._update_filmstrip()
+        panel = self.video_filmstrip.full_race
+        chip_time = row.get("evidence_start_ms", row["start_ms"])
+        candidates = []
+        for source in panel.index.sources:
+            target = chip_time + source.location.clock_offset_ms
+            if source.available and source.start_ms <= target < source.end_ms:
+                candidates.append((source.priority, source.key, target))
+        if not candidates:
+            self.count_panel.hint.setText("该集团暂时没有可用原录像；索引尚未就绪或该时段无录像，请检查录像与校时。")
+            return
+        target = min(candidates)[2]
+        panel.browse_to(target)
+        panel.open_time(target)
+        self.count_panel.hint.setText("已定位集团前方原录像，请沿用逐帧判读、号码查找和待补录操作核实。")
+
+    def _record_count_discovery(self, row) -> None:
+        if self._count_group_is_current(row):
+            self._add_video_discovered_bib()
+            self.count_panel.hint.setText(self.summary_label.toolTip())
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label
@@ -2830,6 +2955,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 )
 
     def _on_clock_tick(self) -> None:
+        self._refresh_count_reconciliation()
         self._poll_recording_health()
         self._update_runtime_status()
 

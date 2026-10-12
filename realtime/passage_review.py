@@ -2861,22 +2861,7 @@ class PassageReviewSurface(QDialog):
         self._video_anomaly_dialog_refresh: Optional[Callable[[], None]] = None
         self._video_arrival_dialog: Optional[QDialog] = None
         self._video_arrival_dialog_refresh: Optional[Callable[[], None]] = None
-        self._video_discovered_entries: list[dict[str, object]] = [
-            {
-                "entry_id": record.discovery_id,
-                "race_id": record.race_id,
-                "stage_id": record.stage_id,
-                "batch_id": record.batch_id,
-                "bib": record.bib,
-                "camera_index": record.camera_index,
-                "frame_index": record.frame_index,
-                "position_ms": record.position_ms,
-                "started_at_ms": record.started_at_ms,
-                "ended_at_ms": record.ended_at_ms,
-                "status": record.status,
-            }
-            for record in self.video_discovery_store.records()
-        ]
+        self._reload_video_discoveries()
         self._active_video_discovered_entry_id = ""
         self._active_review_filter = "all"
         self._total_event_count = 0
@@ -5189,6 +5174,10 @@ class PassageReviewSurface(QDialog):
                 )
             ]
 
+        count_scope = getattr(self, "_count_window_event_ids", None)
+        if count_scope is not None:
+            self._visible_events = [event for event in self._visible_events if event.event_id in count_scope]
+
         self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
         desired_ids = [event.event_id for event in self._visible_events]
@@ -5253,6 +5242,9 @@ class PassageReviewSurface(QDialog):
             self._clear_selection_details()
 
     def _active_review_batch(self) -> Optional[PassageReviewBatch]:
+        count_batch = getattr(self, "_count_review_batch", None)
+        if count_batch is not None:
+            return count_batch
         if not self._active_review_batch_id:
             return None
         return next(
@@ -5276,8 +5268,9 @@ class PassageReviewSurface(QDialog):
             )
 
     def _update_batch_controls(self, event_id: str = "") -> None:
-        batch = self._review_batch_by_event_id.get(str(event_id))
-        if not self._visible_events:
+        count_batch = getattr(self, "_count_review_batch", None)
+        batch = count_batch or self._review_batch_by_event_id.get(str(event_id))
+        if not self._visible_events and count_batch is None:
             self.batch_context_label.clear()
             self.batch_context_label.setToolTip("")
             self.batch_review_btn.setVisible(False)
@@ -5293,7 +5286,10 @@ class PassageReviewSurface(QDialog):
         )
         # The split review workflow is always active; no mode toggle is shown.
         self.batch_review_btn.setVisible(False)
-        self.video_discovered_btn.setEnabled(self._batch_mode and batch is not None)
+        can_discover = self._batch_mode or count_batch is not None
+        if count_batch is not None:
+            can_discover = getattr(self, "_count_review_calibrated", False)
+        self.video_discovered_btn.setEnabled(can_discover and batch is not None)
         self._update_batch_roster_overlays(batch)
         self._refresh_video_discovered_table()
 
@@ -5379,11 +5375,18 @@ class PassageReviewSurface(QDialog):
             )
         self._begin_marking(pane)
 
+    def _reload_video_discoveries(self) -> None:
+        self._video_discovered_entries = [
+            {**record.to_payload(), "entry_id": record.discovery_id}
+            for record in self.video_discovery_store.records()
+        ]
+        self._active_video_discovered_entry_id = ""
+
     def _refresh_video_discovered_table(self) -> None:
         table = getattr(self, "video_discovered_table", None)
         if table is None:
             return
-        batch = self._active_review_batch() if self._batch_mode else None
+        batch = self._active_review_batch() if self._batch_mode or getattr(self, "_count_review_batch", None) is not None else None
         metadata = self._current_metadata()
         race_id = metadata.race_id if metadata is not None else ""
         stage_id = metadata.stage_id if metadata is not None else ""
@@ -5423,7 +5426,7 @@ class PassageReviewSurface(QDialog):
                 item.setData(Qt.UserRole, str(entry.get("entry_id", "")))
                 table.setItem(row, column, item)
         table.blockSignals(False)
-        table.setVisible(bool(entries) and self._batch_mode)
+        table.setVisible(bool(entries) and batch is not None)
         table.resizeColumnsToContents()
         table.setColumnWidth(4, max(180, table.columnWidth(4)))
 
@@ -5454,7 +5457,7 @@ class PassageReviewSurface(QDialog):
         events: tuple[PassageEvent, ...],
     ) -> None:
         for entry in self._video_discovered_entries:
-            if entry.get("status") != "pending_manual_entry":
+            if entry.get("status") not in {"pending_manual_entry", "resolved"}:
                 continue
             entry_race_id = str(entry.get("race_id", ""))
             entry_stage_id = str(entry.get("stage_id", ""))
@@ -5462,7 +5465,8 @@ class PassageReviewSurface(QDialog):
             started_at_ms = int(entry.get("started_at_ms", 0))
             ended_at_ms = int(entry.get("ended_at_ms", started_at_ms))
             resolved = any(
-                event.race_id == entry_race_id
+                event.is_active
+                and event.race_id == entry_race_id
                 and event.stage_id == entry_stage_id
                 and event.bib.strip().casefold() == entry_bib
                 and started_at_ms - self.REVIEW_BATCH_GAP_MS
@@ -5470,20 +5474,61 @@ class PassageReviewSurface(QDialog):
                 <= ended_at_ms + self.REVIEW_BATCH_GAP_MS
                 for event in events
             )
-            if not resolved:
+            status = "resolved" if resolved else "pending_manual_entry"
+            if status == entry.get("status"):
                 continue
-            entry["status"] = "resolved"
             try:
                 self.video_discovery_store.update_status(
-                    str(entry.get("entry_id", "")), "resolved"
+                    str(entry.get("entry_id", "")), status
                 )
             except VideoDiscoveryError:
                 logger.exception("failed to update resolved video discovery")
+                continue
+            entry["status"] = status
 
     def _add_video_discovered_bib(self) -> None:
         batch = self._active_review_batch()
-        if not self._batch_mode or batch is None:
+        count_batch = getattr(self, "_count_review_batch", None)
+        if (not self._batch_mode and count_batch is None) or batch is None:
             return
+        if count_batch is not None and not getattr(self, "_count_review_calibrated", False):
+            self.summary_label.setToolTip("计数时间待校准，请先完成校时再记录该集团的漏读号码。")
+            return
+        pane = self._active_pane if self._active_pane in self.evidence_panes else self.regular_pane
+        if count_batch is not None and (pane.location is None or pane._current_frame_index < 0):
+            self.summary_label.setToolTip("请先定位原录像的实际帧，再记录视频发现号码。")
+            return
+        self._set_sync_playing(False, seek_final=False)
+        position_ms = int(pane._current_position_ms)
+        frame_index = int(pane._current_frame_index)
+        camera_index = int(pane.camera_index)
+        location = pane.location
+        if count_batch is not None:
+            count_window = self._count_review_window
+            origin = location.segment.media_started_at_ms
+            if origin is None:
+                origin = location.segment.started_at_ms
+            frame_time = origin + position_ms - location.clock_offset_ms
+            start = count_window.get("evidence_start_ms", batch.started_at_ms - 700)
+            end = count_window.get("evidence_end_ms", batch.ended_at_ms + 700)
+            if (not start <= frame_time <= end
+                    or location.segment.race_id and location.segment.race_id != self._count_review_context[0]):
+                self.summary_label.setToolTip("当前原帧不属于选中集团，请先定位该集团录像。")
+                return
+        if location is not None:
+            try:
+                location = self._persist_filmstrip_location(location)
+            except (OSError, RuntimeError, ValueError) as error:
+                self.summary_label.setToolTip(f"无法保留视频发现原帧：{error}")
+                return
+            if not location.video_path.is_file():
+                self.summary_label.setToolTip("原录像文件不可用，无法保存视频发现原帧。")
+                return
+        context = self._current_metadata()
+        selected_event = self.passage_store.get(self._selected_event_id)
+        count_race, count_stage = getattr(self, "_count_review_context", ("", ""))
+        race_id = context.race_id if context is not None else selected_event.race_id if selected_event else count_race
+        stage_id = context.stage_id if context is not None else selected_event.stage_id if selected_event else count_stage
         bib, accepted = QInputDialog.getText(
             self,
             "添加视频发现号码",
@@ -5492,6 +5537,9 @@ class PassageReviewSurface(QDialog):
         bib = str(bib).strip()
         if not accepted or not bib:
             return
+        if self._active_review_batch() != batch or self._current_metadata() != context:
+            self.summary_label.setToolTip("集团或赛事已更新，请核对后重新记录视频发现号码。")
+            return
         if any(
             entry.get("batch_id") == batch.batch_id
             and str(entry.get("bib", "")).casefold() == bib.casefold()
@@ -5499,22 +5547,6 @@ class PassageReviewSurface(QDialog):
         ):
             self.summary_label.setToolTip(f"集团中已经记录视频发现号码 {bib}")
             return
-        pane = self._active_pane if self._active_pane in self.evidence_panes else self.regular_pane
-        position_ms = int(getattr(pane, "_current_position_ms", 0))
-        frame_index = int(getattr(pane, "_current_frame_index", -1))
-        camera_index = int(getattr(pane, "camera_index", 1))
-        metadata = self._current_metadata()
-        selected_event = self.passage_store.get(self._selected_event_id)
-        race_id = (
-            metadata.race_id
-            if metadata is not None
-            else (selected_event.race_id if selected_event is not None else "")
-        )
-        stage_id = (
-            metadata.stage_id
-            if metadata is not None
-            else (selected_event.stage_id if selected_event is not None else "")
-        )
         discovery_id = f"{batch.batch_id}:video:{time.time_ns()}"
         try:
             record = self.video_discovery_store.add(
@@ -5528,23 +5560,15 @@ class PassageReviewSurface(QDialog):
                 position_ms=position_ms,
                 started_at_ms=batch.started_at_ms,
                 ended_at_ms=batch.ended_at_ms,
+                segment_id=location.segment.segment_id if location is not None else "",
+                video_path=str(location.video_path.absolute()) if location is not None else "",
+                media_locator=location.media_locator if location is not None else "",
+                clock_offset_ms=int(location.clock_offset_ms) if location is not None else 0,
             )
         except (VideoDiscoveryError, OSError, ValueError) as error:
             self.summary_label.setToolTip(f"无法保存视频发现号码 {bib}: {error}")
             return
-        entry = {
-            "entry_id": record.discovery_id,
-            "race_id": record.race_id,
-            "stage_id": record.stage_id,
-            "batch_id": record.batch_id,
-            "bib": record.bib,
-            "position_ms": record.position_ms,
-            "frame_index": record.frame_index,
-            "camera_index": record.camera_index,
-            "started_at_ms": record.started_at_ms,
-            "ended_at_ms": record.ended_at_ms,
-            "status": record.status,
-        }
+        entry = {**record.to_payload(), "entry_id": record.discovery_id}
         self._video_discovered_entries.append(entry)
         self._refresh_video_discovered_table()
         self._focus_video_discovered_entry(entry)
@@ -5556,6 +5580,9 @@ class PassageReviewSurface(QDialog):
         bib = str(entry.get("bib", "")).strip()
         if not bib:
             return
+        pane = self._pane_for_camera(int(entry.get("camera_index", 1)))
+        if not self._restore_video_discovery_frame(entry, pane):
+            return
         self._active_video_discovered_entry_id = str(entry.get("entry_id", ""))
         self.selected_identity_value.setText(bib)
         self.athlete_value.setText("视频发现号码")
@@ -5563,19 +5590,52 @@ class PassageReviewSurface(QDialog):
         self.selected_time_value.setText(
             f"视频位置 {max(0, int(entry.get('position_ms', 0))) / 1000.0:.3f} s"
         )
-        self.source_value.setText("视频发现 · 芯片缺失 · 待补录")
-        self.current_passage_label.setText(f"视频发现 {bib}（尚无芯片记录）")
-        self.current_context_label.setText("集团复核 · 待补录")
-        pane = self._pane_for_camera(int(entry.get("camera_index", 1)))
-        position_ms = int(entry.get("position_ms", 0))
-        worker = getattr(pane, "_worker", None)
-        if worker is not None and worker.isRunning():
-            worker.seek(max(0, position_ms))
-            pane.timeline.setValue(min(max(0, position_ms), pane.timeline.maximum()))
-            pane._current_position_ms = position_ms
+        status_text = self._video_discovery_status_label(str(entry.get("status", "")))
+        self.source_value.setText(status_text)
+        self.current_passage_label.setText(f"视频发现 {bib}")
+        self.current_context_label.setText(status_text)
         pane.mark_btn.setEnabled(False)
         pane.video_view.set_marker_mode(False)
-        pane.video_view.set_identity_cue(bib, "视频发现 · 待补录")
+        pane.video_view.set_identity_cue(bib, status_text)
+
+    def _restore_video_discovery_frame(self, entry, pane) -> bool:
+        segment_id = str(entry.get("segment_id", ""))
+        segment = self.timeline_store.get_segment(segment_id) if segment_id else None
+        current = pane.location
+        if segment is None and current is not None and current.segment.segment_id == segment_id:
+            segment = current.segment
+        if segment is None:
+            self.summary_label.setToolTip("该记录缺少可用的原录像索引，请按集团时间人工查找；未跳转当前录像。")
+            return False
+        path = self.timeline_store.resolve_video_path(segment)
+        if (not path.is_file() or segment.camera_index != int(entry["camera_index"])
+                or segment.race_id and segment.race_id != entry["race_id"]):
+            self.summary_label.setToolTip("该记录的原录像不可用或赛事不匹配，未跳转当前录像。")
+            return False
+        position = int(entry["position_ms"])
+        offset = int(entry.get("clock_offset_ms", 0))
+        origin = segment.media_started_at_ms if segment.media_started_at_ms is not None else segment.started_at_ms
+        location = PassageVideoLocation(segment, path, position, position, offset,
+                                        segment.timing_error_ms, "located", str(entry.get("media_locator", "")))
+        event = SimpleNamespace(event_id="", bib=str(entry["bib"]), timeline_timestamp_ms=origin + position - offset)
+        self._set_sync_playing(False, seek_final=False)
+        self._deferred_start_timer.stop()
+        self._deferred_selection_panes.clear()
+        self._selection_pending_panes.clear()
+        self._filmstrip_preview_timer.stop()
+        self._pending_filmstrip_preview_position = None
+        self._activate_pane(pane, align=False)
+        self._pause_inactive_panes(pane)
+        if not pane.rebind_passage(event, location, None):
+            pane.set_passage(event, location, None)
+        frame = int(entry.get("frame_index", -1))
+        if frame >= 0:
+            pane.seek_media_frame(position, frame)
+        elif pane._worker is not None:
+            pane._worker.seek(position)
+        self._shared_delta_ms = 0
+        self._update_shared_time_label()
+        return True
 
     def _pane_for_camera(self, camera_index: int) -> PassageEvidencePane:
         camera_index = max(1, int(camera_index))
@@ -5875,6 +5935,38 @@ class PassageReviewSurface(QDialog):
         self._total_event_count = len(events)
         self._render_filtered_queue(events, self._selected_event_id, set())
 
+    def set_count_event_scope(self, event_ids, *, window=None, race_id="", stage_id="", calibrated=False) -> None:
+        """Filter the native chip queue without creating or pairing passages."""
+        scope = None if event_ids is None else frozenset(event_ids)
+        batch = None
+        if scope is not None and window is not None:
+            members = window.get("video_event_uids") or window.get("chip_event_ids") or [window["window_id"]]
+            batch = PassageReviewBatch(f"count:{members[0]}", tuple(event_ids), window["start_ms"], window["end_ms"])
+        self._count_review_window = window
+        calibration_changed = calibrated != getattr(self, "_count_review_calibrated", False)
+        self._count_review_calibrated = calibrated
+        if (scope == getattr(self, "_count_window_event_ids", None)
+                and batch == getattr(self, "_count_review_batch", None)
+                and (race_id, stage_id) == getattr(self, "_count_review_context", ("", ""))):
+            if calibration_changed:
+                self._update_batch_controls(self._selected_event_id)
+            return
+        self._count_window_event_ids = scope
+        self._count_review_batch = batch
+        self._count_review_context = (race_id, stage_id)
+        if scope is not None:
+            self._exit_batch_mode()
+            self.group_combo.blockSignals(True)
+            self.group_combo.setCurrentIndex(0)
+            self.group_combo.blockSignals(False)
+            self.identity_search.blockSignals(True)
+            self.identity_search.clear()
+            self.identity_search.blockSignals(False)
+            self._active_review_filter = "all"
+            self._sync_review_filter_buttons()
+        self._refresh_filtered_view()
+        self._update_batch_controls(self._selected_event_id)
+
     def refresh(self) -> None:
         previous_event_id = self._selected_event_id
         metadata = self._current_metadata()
@@ -5910,7 +6002,7 @@ class PassageReviewSurface(QDialog):
             for batch in self._review_batches
             for event_id in batch.event_ids
         }
-        self._reconcile_video_discoveries(events)
+        self._reconcile_video_discoveries(self.passage_store.events())
         if self._active_review_batch_id and not any(
             batch.batch_id == self._active_review_batch_id
             for batch in self._review_batches
@@ -6012,7 +6104,7 @@ class PassageReviewSurface(QDialog):
         self._review_batch_by_event_id = {
             event_id: batch for batch in self._review_batches for event_id in batch.event_ids
         }
-        self._reconcile_video_discoveries(events)
+        self._reconcile_video_discoveries(self.passage_store.events())
         if self._active_review_batch_id and not any(
             batch.batch_id == self._active_review_batch_id for batch in self._review_batches
         ):
