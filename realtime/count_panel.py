@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .count_review import REASONS, STATUSES, read_count_report
+from .count_history import apply_reviews, history_hint, read_jsonl
 from .race_filmstrip import format_time
 
 
@@ -19,6 +20,7 @@ class CountReconciliationPanel(QFrame):
     scope_cleared = pyqtSignal()
     locate_requested = pyqtSignal(object)
     discovery_requested = pyqtSignal(object)
+    review_requested = pyqtSignal(object)
     summary_changed = pyqtSignal(str)
 
     def __init__(self, output_dir, parent=None):
@@ -38,7 +40,7 @@ class CountReconciliationPanel(QFrame):
         self.summary = QLabel("等待计数结果", self)
         self.summary.setWordWrap(True)
         controls.addWidget(self.summary, 1)
-        self.only_anomalies = QCheckBox("只看异常 / 等待", self)
+        self.only_anomalies = QCheckBox("异常 / 等待 / 历史", self)
         self.only_anomalies.setChecked(True)
         self.only_anomalies.toggled.connect(self._render)
         controls.addWidget(self.only_anomalies)
@@ -56,6 +58,10 @@ class CountReconciliationPanel(QFrame):
         self.discovery_button.setEnabled(False)
         self.discovery_button.clicked.connect(self._discover)
         controls.addWidget(self.discovery_button)
+        self.verify_button = QPushButton("核实人数", self)
+        self.verify_button.setEnabled(False)
+        self.verify_button.clicked.connect(lambda: self.review_requested.emit(self._selected_group))
+        controls.addWidget(self.verify_button)
         layout.addLayout(controls)
         self.table = QTableWidget(0, 8, self)
         self.table.setObjectName("finishCountGroupTable")
@@ -107,21 +113,30 @@ class CountReconciliationPanel(QFrame):
         path = self.output_dir / "count_reconciliation.json"
         try:
             stat = path.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
+            review_path = self.output_dir / "count_reviews.jsonl"
+            review_stat = review_path.stat() if review_path.exists() else None
+            signature = (stat.st_mtime_ns, stat.st_size,
+                         (review_stat.st_mtime_ns, review_stat.st_size) if review_stat else None)
             if signature != self._signature:
                 race_id, stage_id = self.context[1:] if self.context else ("", "")
                 report = read_count_report(path, race_id=race_id, stage_id=stage_id)
+                if review_stat is not None:
+                    report = apply_reviews(report, read_jsonl(review_path))
                 if self.report is not None and report["scope"] != self.report["scope"]:
                     self.clear_scope()
                 self.report = report
                 self._signature = signature
                 self._render()
             stale = int(time.time() * 1000) - self.report.get("updated_at_ms", 0) > 5000
-            video = sum(row["video_count"] for row in self.report["groups"])
-            chip = sum(row["chip_count"] for row in self.report["groups"])
+            counted = [r for r in self.report["groups"] if not r.get("history_only", False)]
+            video = sum(row["video_count"] for row in counted)
+            chip = sum(row["chip_count"] for row in counted)
             unresolved = sum(row["status"] == "unresolved" for row in self.report["groups"])
+            resolved = sum(row["status"] == "resolved" for row in self.report["groups"])
             text = f"视频 {video} · 芯片 {chip} · 差额 {video-chip:+d} · 待核 {unresolved}"
-            text += " · 更新已停止" if stale else " · 滚动暂定" if self.report.get("chip_watermark_ms") is None else ""
+            if resolved:
+                text += f" · 已处理 {resolved}"
+            text += " · 离线回放" if self.report.get("source_mode") == "offline_replay" else " · 更新已停止" if stale else " · 滚动暂定" if self.report.get("chip_watermark_ms") is None else ""
             if not self.report.get("clock", {}).get("calibrated", False):
                 text += " · 校时待确认"
             if self.report.get("runtime_quality"):
@@ -188,7 +203,9 @@ class CountReconciliationPanel(QFrame):
         row = self._selected_group
         self.locate_button.setEnabled(bool(self.report.get("clock", {}).get("calibrated", False)))
         self.discovery_button.setEnabled(self.locate_button.isEnabled())
+        self.verify_button.setEnabled(self.locate_button.isEnabled())
         self.hint.setText(f"当前集团：视频 {row['video_count']} / 芯片 {row['chip_count']}。定位录像后，沿用逐帧判读与待补录操作。"
+                          + (" " + history_hint(row) + "。" if history_hint(row) else "")
                           + (" 校时待确认，暂不按时间跳转。" if not self.locate_button.isEnabled() else ""))
         self.group_selected.emit(row)
 
@@ -201,6 +218,7 @@ class CountReconciliationPanel(QFrame):
         self.table.blockSignals(False)
         self.locate_button.setEnabled(False)
         self.discovery_button.setEnabled(False)
+        self.verify_button.setEnabled(False)
         self.hint.setText("选中集团后，原有通过记录显示该集团已扫人员。")
         if had_selection:
             self.scope_cleared.emit()

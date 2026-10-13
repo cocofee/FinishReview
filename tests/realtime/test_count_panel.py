@@ -104,6 +104,61 @@ def test_uncalibrated_or_stale_count_report_is_not_presented_as_live_confirmatio
         app.processEvents()
 
 
+def test_resolved_case_keeps_original_chip_difference_visible(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    data = report()
+    data["groups"][0].update(status="resolved", video_count=1, chip_count=1,
+                             initial_video_count=1, initial_chip_count=2,
+                             chip_changes=[{"kind": "withdrawn", "event_id": "extra", "bib": "020"}])
+    data["groups"].append({**data["groups"][0], "window_id": "historical", "history_only": True})
+    (tmp_path / "count_reconciliation.json").write_text(json.dumps(data), encoding="utf-8")
+    panel = CountReconciliationPanel(tmp_path)
+    try:
+        panel.set_context(tmp_path, "race", "stage")
+        panel.refresh()
+        assert panel.table.rowCount() == 2
+        assert "视频 1 · 芯片 1" in panel.summary.text()
+        assert "已处理 2" in panel.summary.text()
+        panel.table.setCurrentCell(0, 0)
+        assert "原始视频 1 / 芯片 2" in panel.hint.text()
+        assert "已撤销 020" in panel.hint.text()
+        assert "已处理" in panel.table.item(0, 6).text()
+    finally:
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()
+
+
+def test_count_review_updates_panel_and_new_observations_invalidate_it(tmp_path):
+    from realtime.count_history import observation_key
+    app = QApplication.instance() or QApplication([])
+    data = report()
+    path = tmp_path / "count_reconciliation.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    row = data["groups"][0]
+    review = {"scope": data["scope"], "window_id": row["window_id"], "verified_video_count": 1,
+              "observation_key": observation_key(data["scope"], row)}
+    (tmp_path / "count_reviews.jsonl").write_text(json.dumps(review)+"\n", encoding="utf-8")
+    panel = CountReconciliationPanel(tmp_path)
+    try:
+        panel.set_context(tmp_path, "race", "stage")
+        panel.refresh()
+        assert panel.report["groups"][0]["status"] == "resolved"
+        panel.table.setCurrentCell(0, 0)
+        assert "核片人数 1" in panel.hint.text()
+        assert panel.verify_button.isEnabled()
+        row.update(video_count=3, video_event_uids=["new"])
+        path.write_text(json.dumps(data), encoding="utf-8")
+        panel.refresh()
+        assert panel.report["groups"][0]["video_count"] == 3
+        assert panel.report["groups"][0]["status"] == "unresolved"
+        assert "manual_review_stale" in panel.report["groups"][0]["reasons"]
+    finally:
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()
+
+
 @pytest.mark.parametrize("payload", [None, [], {"schema_version": 1, "scope": None, "groups": []},
                                      {**report(), "groups": [None]}, {**report(), "clock": None}])
 def test_invalid_report_structure_clears_selection_and_recovers(tmp_path, payload):

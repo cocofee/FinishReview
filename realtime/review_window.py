@@ -2155,6 +2155,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.count_panel.scope_cleared.connect(lambda: self.set_count_event_scope(None))
         self.count_panel.locate_requested.connect(self._locate_count_group)
         self.count_panel.discovery_requested.connect(self._record_count_discovery)
+        self.count_panel.review_requested.connect(self._verify_count_group)
         self.count_panel.summary_changed.connect(self.count_status_label.setText)
         self._refresh_count_reconciliation()
 
@@ -2195,6 +2196,24 @@ class FinishReviewWindow(PassageReviewSurface):
             self.count_panel.hint.setText("计数时间待校准，暂不按时间跳转录像。")
             return
         self._set_sync_playing(False, seek_final=False)
+        locator = row.get("frame_locator")
+        if locator:
+            from .video_timeline import PassageVideoLocation
+            segment = self.timeline_store.get_segment(locator["segment_id"])
+            path = self.timeline_store.resolve_video_path(segment) if segment is not None else None
+            race_id, _stage_id = self._count_context()
+            if (segment is None or path is None or not path.is_file()
+                    or path.resolve() != Path(locator["video_path"]).resolve()
+                    or segment.camera_index != locator["camera_index"]
+                    or segment.race_id and segment.race_id != race_id):
+                self.count_panel.hint.setText("该集团的原录像缺失或不匹配，请检查录像索引；未跳转其他录像。")
+                return
+            position, frame = locator["position_ms"], locator["frame_index"]
+            location = PassageVideoLocation(segment, path, position, position, 0,
+                                            segment.timing_error_ms, "located")
+            if self._seek_retained_camera_frame(location, position, frame):
+                self.count_panel.hint.setText(f"已定位原录像第 {frame+1} 帧，请核实人数与号码。")
+            return
         self._update_filmstrip()
         panel = self.video_filmstrip.full_race
         chip_time = row.get("evidence_start_ms", row["start_ms"])
@@ -2215,6 +2234,60 @@ class FinishReviewWindow(PassageReviewSurface):
         if self._count_group_is_current(row):
             self._add_video_discovered_bib()
             self.count_panel.hint.setText(self.summary_label.toolTip())
+
+    def _verify_count_group(self, row) -> None:
+        if not row or not self._count_group_is_current(row):
+            return
+        if not self.count_panel.report.get("clock", {}).get("calibrated", False):
+            self.count_panel.hint.setText("请先完成校时并定位该集团原录像，再核实人数。")
+            return
+        pane = self._active_pane
+        location = pane.location
+        if location is None or pane._current_frame_index < 0:
+            self.count_panel.hint.setText("请先定位该集团录像，查看原帧后再核实人数。")
+            return
+        locator = row.get("frame_locator")
+        origin = location.segment.media_started_at_ms or location.segment.started_at_ms
+        timestamp = origin + pane._current_position_ms - location.clock_offset_ms
+        race_id, _stage_id = self._count_context()
+        if (location.segment.race_id and location.segment.race_id != race_id
+                or locator and (location.segment.segment_id != locator["segment_id"]
+                         or location.video_path.resolve() != Path(locator["video_path"]).resolve())
+                or not row.get("evidence_start_ms", row["start_ms"]) <= timestamp <= row.get("evidence_end_ms", row["end_ms"])):
+            self.count_panel.hint.setText("当前原帧不属于选中的集团，请重新定位该集团录像。")
+            return
+        from PyQt5.QtWidgets import QInputDialog
+        from .count_history import observation_key
+        from .durable_jsonl import append_jsonl_records
+        self._set_sync_playing(False, seek_final=False)
+        scope = dict(self.count_panel.report["scope"])
+        key = observation_key(scope, row)
+        review_dir = self.count_panel.output_dir
+        reviewed_frame, reviewed_position = pane._current_frame_index, pane._current_position_ms
+        count, accepted = QInputDialog.getInt(self, "核实集团人数", "核片确认的实际过线人数：",
+                                             row["video_count"], 0, 1000)
+        if not accepted:
+            return
+        fresh = next((r for r in (self.count_panel.report or {}).get("groups", [])
+                      if r["window_id"] == row["window_id"]), None)
+        if (not self._count_group_is_current(row) or fresh is None
+                or self.count_panel.report["scope"] != scope or self.count_panel.output_dir != review_dir
+                or observation_key(scope, fresh) != key):
+            self.count_panel.hint.setText("集团或录像观测已更新，请重新定位并核实人数。")
+            return
+        review = dict(scope=scope, window_id=row["window_id"], observation_key=key,
+                      verified_video_count=count, verified_at_ms=int(time.time()*1000),
+                      frame_index=reviewed_frame, position_ms=reviewed_position,
+                      segment_id=location.segment.segment_id, video_path=str(location.video_path))
+        import json
+        try:
+            append_jsonl_records(self.count_panel.output_dir / "count_reviews.jsonl",
+                                 [json.dumps(review, ensure_ascii=False).encode()+b"\n"],
+                                 description="count review")
+        except (OSError, RuntimeError) as error:
+            self.count_panel.hint.setText(f"人数核实记录未保存：{error}")
+            return
+        self.count_panel.refresh()
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label

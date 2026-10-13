@@ -367,6 +367,75 @@ def test_count_group_locates_existing_single_camera_filmstrip_with_native_clock_
         window.close()
 
 
+def test_count_group_opens_its_original_frame_and_rejects_a_different_recording(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    try:
+        window.passage_store.append(_event(event_id="c1"))
+        window.refresh()
+        row = _count_report(window, tmp_path, ["c1"])
+        video = tmp_path / "original.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=row["start_ms"]-1000, media_duration_ms=5000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="race-1")
+        row["frame_locator"] = dict(segment_id=segment.segment_id, video_path=str(video),
+                                    camera_index=1, frame_index=37, position_ms=1850)
+        opened = []
+        monkeypatch.setattr(window, "_seek_retained_camera_frame",
+                            lambda loc, pos, frame: opened.append((loc.video_path,pos,frame)) or True)
+        window._locate_count_group(row)
+        assert opened == [(video,1850,37)]
+        row["frame_locator"]["video_path"] = str(tmp_path / "other.mkv")
+        window._locate_count_group(row)
+        assert len(opened) == 1
+        assert "不匹配" in window.count_panel.hint.text()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("observations_change", [False, True])
+def test_count_group_number_review_persists_only_for_unchanged_observations(
+        qapp, tmp_path, monkeypatch, observations_change):
+    from PyQt5.QtWidgets import QInputDialog
+    from realtime.video_timeline import PassageVideoLocation
+    window = _window(tmp_path)
+    try:
+        window.passage_store.append(_event(event_id="c1"))
+        window.refresh()
+        row = _count_report(window, tmp_path, ["c1"])
+        window.count_panel.table.setCurrentCell(0, 0)
+        video = tmp_path / "original.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=row["start_ms"]-1000, media_duration_ms=5000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="race-1")
+        pane = window._active_pane
+        pane._location = PassageVideoLocation(segment,video,1000,1000,0,0,"located")
+        pane._current_frame_index = 20
+        pane._current_position_ms = 1000
+        def confirm_count(*_args):
+            if observations_change:
+                window.count_panel.report["groups"][0]["video_event_uids"] = ["revised-track"]
+            return 1, True
+
+        monkeypatch.setattr(QInputDialog, "getInt", confirm_count)
+        window.count_panel.verify_button.click()
+        if observations_change:
+            assert not (tmp_path / "count_reviews.jsonl").exists()
+            assert "观测已更新" in window.count_panel.hint.text()
+        else:
+            assert (tmp_path / "count_reviews.jsonl").exists()
+            assert window.count_panel.report["groups"][0]["video_count"] == 1
+            assert window.count_panel.report["groups"][0]["status"] == "resolved"
+        assert len(window.passage_store.events()) == 1
+    finally:
+        window.close()
+
+
 def test_count_group_without_chip_keeps_native_queue_empty_and_missing_video_is_explicit(qapp, tmp_path, monkeypatch):
     from types import SimpleNamespace
     window = _window(tmp_path)

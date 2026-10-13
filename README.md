@@ -29,6 +29,9 @@ CycleRace / RaceTiger 过线事件接入、奥亚特高速相机文件读取和�
 计数模型运行在外部服务，FinishReview 本身只读取报告与证据，不新增模型依赖。
 当前集成范围、截图和手动检查见 [FinishReview 对数集成](../finish_probe/research/finishreview_count_integration_2026-10-12.md)。
 
+原始多读、漏读异常现在可保留撤销和补录历史；遮挡集团支持“核实人数”，并优先按录像段与原帧定位。
+配置、处理步骤和不知道号码时的回放验收见 [计数异常与处理历史](docs/COUNT_RECONCILIATION_HISTORY.md)。
+
 ## Source baseline
 
 - Source repository: `cocofee/VideoPipe`
