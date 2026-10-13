@@ -96,3 +96,22 @@ def test_history_reader_returns_all_revisions_and_tolerates_torn_tail(tmp_path):
 def test_chip_time_formatting_uses_beijing_time():
     assert format_chip_time(DAY + 10 * 3_600_000 + 61_234) == "10:01:01.234"
     assert format_chip_time(None) == "--"
+
+
+def test_reused_passage_id_with_new_bib_is_a_separate_read():
+    t = DAY + 9 * 3_600_000
+    history = [
+        _event("p3", "903", t, revision=5, group="测试组"),
+        _event("p3", "902", t + 3_600_000, revision=6, group="测试组"),
+        _event("p3", "746", t + 3_900_000, revision=7),
+        _event("p3", "746", t + 3_900_000, revision=8, active=False),
+    ]
+
+    reads = chip_reads(history)
+
+    assert [(read.bib, read.revision, read.replaced, read.active_now) for read in reads] == [
+        ("903", 5, True, False),
+        ("902", 6, True, False),
+        ("746", 7, False, False),
+    ]
+    assert len({read.read_id for read in reads}) == 3

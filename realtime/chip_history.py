@@ -49,6 +49,13 @@ class ChipRead:
     excluded: str = ""
     latest_bib: str = ""
     latest_chip_ms: int = 0
+    replaced: bool = False
+
+    @property
+    def read_id(self) -> str:
+        """Unique per read even when CycleRace reuses the passage id."""
+
+        return f"{self.event_id}#{self.revision}"
 
     @property
     def receive_delay_ms(self) -> int:
@@ -137,39 +144,51 @@ def chip_reads(
     for event_id, revisions in by_event.items():
         ordered = sorted(revisions, key=lambda item: (item.revision, item.received_at_ms))
         latest = ordered[-1]
-        candidates = [
-            item for item in ordered
-            if item.is_active and item.timeline_timestamp_ms > 0
-            and (not race_date or local_date(item.timeline_timestamp_ms) == race_date)
-        ]
-        if not candidates:
-            continue
-        first = candidates[0]
-        chip_ms = int(first.timeline_timestamp_ms)
-        received = int(first.received_at_ms or 0)
-        excluded = group_exclusion(first.group_name)
-        reads.append(
-            ChipRead(
-                event_id=event_id,
-                bib=first.bib.strip(),
-                chip_id=first.chip_id.strip(),
-                group_id=first.group_id,
-                group_name=first.group_name,
-                athlete_name=first.athlete_name,
-                chip_ms=chip_ms,
-                passage_time_ms=int(first.passage_time_ms),
-                lap=int(first.lap),
-                received_at_ms=received,
-                revision=int(first.revision),
-                latest_revision=int(latest.revision),
-                active_now=bool(latest.is_active) and event_id not in deleted,
-                manual_entry=bool(received) and received - chip_ms > int(late_manual_ms),
-                excluded=excluded,
-                latest_bib=latest.bib.strip(),
-                latest_chip_ms=int(latest.timeline_timestamp_ms),
+        # CycleRace reuses a passage id for a different bib (e.g. test chips
+        # replaced by a real read). Each bib/chip identity is its own read.
+        versions: list[list[PassageEvent]] = []
+        for item in ordered:
+            identity = (item.bib.strip(), item.chip_id.strip())
+            if versions and (versions[-1][0].bib.strip(), versions[-1][0].chip_id.strip()) == identity:
+                versions[-1].append(item)
+            else:
+                versions.append([item])
+        latest_identity = (latest.bib.strip(), latest.chip_id.strip())
+        for version in versions:
+            candidates = [
+                item for item in version
+                if item.is_active and item.timeline_timestamp_ms > 0
+                and (not race_date or local_date(item.timeline_timestamp_ms) == race_date)
+            ]
+            if not candidates:
+                continue
+            first = candidates[0]
+            current = version[-1] is latest
+            chip_ms = int(first.timeline_timestamp_ms)
+            received = int(first.received_at_ms or 0)
+            reads.append(
+                ChipRead(
+                    event_id=event_id,
+                    bib=first.bib.strip(),
+                    chip_id=first.chip_id.strip(),
+                    group_id=first.group_id,
+                    group_name=first.group_name,
+                    athlete_name=first.athlete_name,
+                    chip_ms=chip_ms,
+                    passage_time_ms=int(first.passage_time_ms),
+                    lap=int(first.lap),
+                    received_at_ms=received,
+                    revision=int(first.revision),
+                    latest_revision=int(latest.revision),
+                    active_now=current and bool(latest.is_active) and event_id not in deleted,
+                    manual_entry=bool(received) and received - chip_ms > int(late_manual_ms),
+                    excluded=group_exclusion(first.group_name),
+                    latest_bib=latest_identity[0],
+                    latest_chip_ms=int(latest.timeline_timestamp_ms),
+                    replaced=not current,
+                )
             )
-        )
-    reads.sort(key=lambda item: (item.chip_ms, item.event_id))
+    reads.sort(key=lambda item: (item.chip_ms, item.event_id, item.revision))
     return tuple(reads)
 
 

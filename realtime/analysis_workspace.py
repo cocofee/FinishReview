@@ -89,9 +89,23 @@ def _deleted_event_ids(root: Path) -> tuple[str, ...]:
 class AnalysisWorkspace:
     """Passages, recordings and operator anchors of one race stage."""
 
-    def __init__(self, root: str | Path, *, race_id: str = "", stage_id: str = "", race_date: str = ""):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        race_id: str = "",
+        stage_id: str = "",
+        race_date: str = "",
+        as_of_ms: Optional[int] = None,
+    ):
         self.root = Path(root).expanduser().absolute()
         self.history: tuple[PassageEvent, ...] = read_passage_history(self.root / PASSAGE_JOURNAL)
+        if as_of_ms is not None:
+            # Replay: only what FinishReview had received by then.
+            self.history = tuple(
+                event for event in self.history
+                if 0 < int(event.received_at_ms) <= int(as_of_ms)
+            )
         self.race_id, self.stage_id = self._scope(race_id, stage_id)
         scoped = [
             event for event in self.history
