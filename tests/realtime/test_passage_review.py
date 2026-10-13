@@ -3273,6 +3273,47 @@ def test_first_confirmation_calibrates_in_default_review_and_survives_reopen(
         reopened.close()
 
 
+@pytest.mark.parametrize(("auto_offset", "warned"), ((-1_250, False), (56_700, True)))
+def test_first_rider_calibration_is_cross_checked_against_automatic_model(
+    qapp, tmp_path, fake_playback, auto_offset, warned,
+):
+    from realtime.clock_sync import ClockModel, ClockModelStore
+
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(event_id="first", bib="101", passage_time_ms=15_000)
+    passages.append(first)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01_session_archive_0000.mkv",
+                 source_id="camera_01_review", camera_index=1,
+                 started_at_ms=10_000, ended_at_ms=70_000)
+    calibration_path = tmp_path / "calibration.jsonl"
+    VideoClockCalibrationStore(calibration_path).record(
+        camera_index=1,
+        session_key=PassageReviewDialog._recording_session_key_from_path(
+            "camera_01_review", tmp_path / "camera_01_session_archive_0000.mkv",
+        ),
+        offset_ms=-1_300, anchor_event_id="first", anchor_bib="101", calibrated_at_ms=20_000,
+    )
+    model = ClockModel(
+        camera_index=1, intercept_ms=float(auto_offset), slope=0.0, reference_ms=15_000,
+        valid_from_ms=15_000, valid_to_ms=60_000, support=20, candidates=22,
+        residual_mad_ms=25.0, coarse_offset_ms=auto_offset, coarse_support=40,
+    )
+    ClockModelStore(tmp_path / "video_clock_models.jsonl").publish(model)
+    dialog = PassageReviewDialog(passages, timeline,
+                                 calibration_store=VideoClockCalibrationStore(calibration_path))
+    try:
+        dialog._select_event(first.event_id, locate_target=True)
+        text = dialog.batch_context_label.text()
+        assert text.startswith("机位1 已校准 -1300 ms")
+        assert ("请核对" in text) is warned
+        assert "自动校时 v1" in dialog.batch_context_label.toolTip()
+        # The manual anchor keeps driving playback; it is never overwritten.
+        assert VideoClockCalibrationStore(calibration_path).calibrations()[0].offset_ms == -1_300
+    finally:
+        dialog.close()
+
+
 def test_continuous_mode_seeds_first_saved_confirmation_for_session(
     qapp,
     tmp_path,

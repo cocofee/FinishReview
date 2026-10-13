@@ -61,6 +61,7 @@ from PyQt5.QtWidgets import (
 from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
 from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
 from .camera_judgments import CameraJudgment
+from .clock_sync import CLOCK_MODEL_FILENAME, MANUAL_ANCHOR_TOLERANCE_MS, ClockModelStore
 from .race_filmstrip import RaceFilmstripFrame, recording_sources
 from .external_clip_import import EXTERNAL_CLOCK_SOURCE
 from .passage_evidence import (
@@ -5316,12 +5317,62 @@ class PassageReviewSurface(QDialog):
                 "找到首位运动员的实际过线画面并确认，后续选手沿用该机位时间偏移。"
             )
             return f"机位{camera_index} 待首人校时"
+        auto_label, auto_tip = self._auto_clock_cross_check(
+            camera_index, offset_ms, calibration,
+        )
         self.batch_context_label.setToolTip(
             f"机位 {camera_index} 已按首人校准，时间偏移 {offset_ms:+d} ms；"
             f"后续运动员沿用此偏移定位。\n录像会话：{key[1]}"
             + (f"\n校时锚点：{calibration.anchor_bib}" if calibration is not None else "")
+            + auto_tip
         )
-        return f"机位{camera_index} 已校准 {offset_ms:+d} ms"
+        return f"机位{camera_index} 已校准 {offset_ms:+d} ms" + auto_label
+
+    def _auto_clock_model(self, camera_index: int):
+        """Latest automatic calibration published by the offline analysis."""
+
+        path = self.passage_store.journal_path.with_name(CLOCK_MODEL_FILENAME)
+        try:
+            stat = path.stat()
+            signature = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
+        cached = getattr(self, "_auto_clock_store_cache", None)
+        if cached is None or cached[0] != signature:
+            try:
+                cached = (signature, ClockModelStore(path))
+            except (OSError, RuntimeError, ValueError) as error:
+                logger.warning("automatic clock models unavailable: %s", error)
+                return None
+            self._auto_clock_store_cache = cached
+        return cached[1].latest(camera_index)
+
+    def _auto_clock_cross_check(self, camera_index, offset_ms, calibration) -> tuple[str, str]:
+        """Compare the first-rider anchor with the automatic model; never override it."""
+
+        model = self._auto_clock_model(camera_index)
+        if model is None:
+            return "", ""
+        anchor = (
+            self.passage_store.get(calibration.anchor_event_id)
+            if calibration is not None else None
+        )
+        anchor_time = (
+            int(anchor.timeline_timestamp_ms)
+            if anchor is not None else (model.valid_from_ms + model.valid_to_ms) // 2
+        )
+        auto_offset = model.offset_at(anchor_time)
+        difference = int(offset_ms) - auto_offset
+        tip = (
+            f"\n自动校时 v{model.version}：该时刻偏移 {auto_offset:+d} ms，"
+            f"漂移 {model.slope_ms_per_hour:+.0f} ms/小时；人工与自动相差 {difference:+d} ms"
+        )
+        if abs(difference) > MANUAL_ANCHOR_TOLERANCE_MS:
+            return (
+                f" · 与自动校时差 {difference:+d} ms，请核对",
+                tip + f"，超过 {MANUAL_ANCHOR_TOLERANCE_MS} ms，请核对首人校时；未自动覆盖。",
+            )
+        return "", tip
 
     def _update_batch_roster_overlays(
         self,
