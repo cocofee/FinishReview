@@ -14,6 +14,8 @@ try:
     from .passage_receiver import PassageEventStore
     from .preflight import PreflightJournal
     from .race_metadata import RaceMetadata, RaceMetadataStore
+    from .video_timeline import VideoTimelineStore
+    from .workspace_context import EventWorkspaceMetadataStore
 except ImportError:
     from passage_evidence import (
         HIGH_SPEED_SOURCE,
@@ -23,6 +25,8 @@ except ImportError:
     from passage_receiver import PassageEventStore
     from preflight import PreflightJournal
     from race_metadata import RaceMetadata, RaceMetadataStore
+    from video_timeline import VideoTimelineStore
+    from workspace_context import EventWorkspaceMetadataStore
 
 
 METADATA_FILENAME = "cyclerace_race_metadata.json"
@@ -83,14 +87,20 @@ def _workspace_modified_at_ms(path: Path) -> int:
 
 def _metadata_for_workspace(path: Path) -> RaceMetadata:
     metadata_path = path / METADATA_FILENAME
-    if not metadata_path.is_file():
+    if not metadata_path.is_file() and not (path / PASSAGE_FILENAME).is_file():
         raise EventWorkspaceError("缺少 CycleRace 赛事信息文件")
     try:
-        metadata = RaceMetadataStore(metadata_path).current()
+        if metadata_path.is_file() and not (path / "review_event_scope.json").is_file():
+            metadata = RaceMetadataStore(metadata_path).current()
+        else:
+            metadata = EventWorkspaceMetadataStore(
+                metadata_path, PassageEventStore(path / PASSAGE_FILENAME),
+                VideoTimelineStore(path / "video_timeline.jsonl"),
+            ).current()
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise EventWorkspaceError(f"赛事信息无法读取：{error}") from error
     if metadata is None:
-        raise EventWorkspaceError("CycleRace 赛事信息为空")
+        raise EventWorkspaceError("无法唯一确定赛事，请先在主界面选择赛事")
     return metadata
 
 
@@ -129,7 +139,7 @@ def discover_event_workspaces(
 
     workspaces = []
     for candidate in candidates:
-        if not (candidate / METADATA_FILENAME).is_file():
+        if not (candidate / METADATA_FILENAME).is_file() and not (candidate / PASSAGE_FILENAME).is_file():
             continue
         try:
             workspaces.append(validate_event_workspace(candidate, root))

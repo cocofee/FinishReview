@@ -125,3 +125,13 @@ def test_summary_counts_current_stage_confirmations_and_excludes_preflight(tmp_p
 
     assert summary.passage_count == 2
     assert summary.confirmed_count == 1
+
+
+def test_discovers_legacy_directory_without_fabricating_server_metadata(tmp_path):
+    passages = PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl")
+    passages.append(_event("legacy"))
+    workspaces = discover_event_workspaces(tmp_path)
+    assert len(workspaces) == 1
+    assert workspaces[0].metadata.race_id == "race-1"
+    assert summarize_event_workspace(workspaces[0]).passage_count == 1
+    assert not (tmp_path / "cyclerace_race_metadata.json").exists()

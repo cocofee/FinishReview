@@ -32,6 +32,9 @@ CycleRace / RaceTiger 过线事件接入、奥亚特高速相机文件读取和�
 原始多读、漏读异常现在可保留撤销和补录历史；遮挡集团支持“核实人数”，并优先按录像段与原帧定位。
 配置、处理步骤和不知道号码时的回放验收见 [计数异常与处理历史](docs/COUNT_RECONCILIATION_HISTORY.md)。
 
+v0.24.9 修复旧目录混入多场赛事时的名单范围和时间胶卷恢复，增加“选择赛事”，保留历史查看与生效校时显示。
+定边数据验证、启动方式及当前范围见 [旧赛事目录恢复与验收](docs/P0_WORKSPACE_VALIDATION.md)。
+
 ## Source baseline
 
 - Source repository: `cocofee/VideoPipe`

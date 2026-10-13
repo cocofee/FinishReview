@@ -3131,12 +3131,12 @@ class PassageReviewSurface(QDialog):
         self.offset_spin = QSpinBox(self)
         self.offset_spin.setRange(-600_000, 600_000)
         self.offset_spin.setSingleStep(100)
-        self.offset_spin.setPrefix("校时 ")
+        self.offset_spin.setPrefix("基础校时 ")
         self.offset_spin.setSuffix(" ms")
         self.offset_spin.setMinimumWidth(125)
         self.offset_spin.setMaximumWidth(145)
         self.offset_spin.setValue(self.clock_offset_ms)
-        self.offset_spin.setToolTip("复核系统时间 = CycleRace passage 时间 + 此偏移")
+        self.offset_spin.setToolTip("未做首人校时的录像使用此偏移；已校准录像沿用各自会话的生效偏移。")
         self.offset_spin.valueChanged.connect(self._on_offset_changed)
         filters.addWidget(self.offset_spin)
         results_layout.addWidget(self.filter_bar)
@@ -5312,9 +5312,10 @@ class PassageReviewSurface(QDialog):
             return f"机位{camera_index} 待首人校时"
         self.batch_context_label.setToolTip(
             f"机位 {camera_index} 已按首人校准，时间偏移 {offset_ms:+d} ms；"
-            "后续运动员沿用此偏移定位。"
+            f"后续运动员沿用此偏移定位。\n录像会话：{key[1]}"
+            + (f"\n校时锚点：{calibration.anchor_bib}" if calibration is not None else "")
         )
-        return f"机位{camera_index} 已校准"
+        return f"机位{camera_index} 已校准 {offset_ms:+d} ms"
 
     def _update_batch_roster_overlays(
         self,
@@ -6968,15 +6969,18 @@ class PassageReviewSurface(QDialog):
             absolute_window_end,
         )
 
+    def _filmstrip_race_id(self) -> str:
+        metadata = self._current_metadata()
+        if metadata is not None:
+            return metadata.race_id
+        race_ids = {item.race_id for item in self.passage_store.events() if item.race_id}
+        return next(iter(race_ids)) if len(race_ids) == 1 else ""
+
     def _update_filmstrip(self) -> None:
         if not hasattr(self, "video_filmstrip"):
             return
         pane = self._camera_one_pane()
-        metadata = self._current_metadata()
-        event = self.passage_store.get(self._selected_event_id)
-        race_ids = {item.race_id for item in self.passage_store.events() if item.is_active and item.race_id}
-        race_id = (metadata.race_id if metadata is not None else next(iter(race_ids))
-                   if len(race_ids) == 1 else event.race_id if event is not None else "")
+        race_id = self._filmstrip_race_id()
         workspace_key = (str(self.timeline_store.journal_path.absolute()), race_id)
         if workspace_key != getattr(self, "_race_filmstrip_workspace_key", None):
             self.video_filmstrip.full_race.clear()

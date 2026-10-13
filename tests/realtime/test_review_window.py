@@ -299,6 +299,120 @@ def _wait_until(qapp, predicate, timeout=5):
     assert predicate()
 
 
+def _legacy_mixed_workspace(path):
+    passages = PassageEventStore(path / "cyclerace_passage_events.jsonl")
+    event = _event(event_id="saved-rider", race_name="历史比赛")
+    passages.append(event)
+    passages.append(_event(event_id="foreign-rider", race_id="foreign-race"))
+    passages.append(_event(event_id="other-stage", stage_id="stage-2"))
+    video = path / "videos" / "camera_01_session_archive_0000.mkv"
+    video.parent.mkdir()
+    video.write_bytes(b"saved-video")
+    timeline = VideoTimelineStore(path / "video_timeline.jsonl")
+    segment = timeline.add_completed_segment(
+        source_id="camera_01_review", camera_index=1, video_path=video,
+        media_started_at_ms=event.timeline_timestamp_ms - 1000, media_duration_ms=4000,
+        clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+        end_reason="continuous_archive_fallback", race_id=event.race_id,
+    )
+    PassageEvidenceAssociationStore(path / "passage_evidence_associations.jsonl").confirm(
+        passage_event_id=event.event_id, bib=event.bib, confirmed_source=REGULAR_SOURCE,
+        segment_id=segment.segment_id, frame_index=12, position_ms=480,
+        marker_x_normalized=0.5, marker_y_normalized=0.5, confirmed_at_ms=2000,
+    )
+    return event, video
+
+
+def test_legacy_mixed_workspace_recovers_scope_and_filmstrip_without_rewriting_evidence(qapp, tmp_path):
+    event, video = _legacy_mixed_workspace(tmp_path)
+    preserved = {p: p.read_bytes() for p in tmp_path.glob("*.jsonl")}
+    inbox = RaceMetadataStore(tmp_path / ".finishreview" / "cyclerace_metadata_inbox.json")
+    inbox.store(RaceMetadata(race_id="foreign-race", stage_id="stage-1", revision=1, emitted_at_ms=1))
+    window = _window(tmp_path)
+    try:
+        assert window._current_metadata().race_id == event.race_id
+        assert window._current_metadata().stage_id == event.stage_id
+        assert window._workspace_mode == "archive"
+        assert [item.event_id for item in window._visible_events] == [event.event_id]
+        _wait_until(qapp, lambda: bool(window.video_filmstrip.full_race.index.sources))
+        snapshot = window._recording_catalog_snapshot
+        assert snapshot.context[1] == window._filmstrip_race_id() == event.race_id
+        assert video in {source.location.video_path for source in snapshot.sources}
+        assert window.association_store.get_for_event(event, REGULAR_SOURCE).frame_index == 12
+        assert not (tmp_path / "cyclerace_race_metadata.json").exists()
+        assert all(p.read_bytes() == content for p, content in preserved.items())
+    finally:
+        window.close()
+
+    # An unrelated live event must not replace the persisted historical view.
+    RaceMetadataStore(tmp_path / ".finishreview" / "cyclerace_metadata_inbox.json").store(
+        RaceMetadata(race_id="foreign-race", stage_id="stage-1", revision=1, emitted_at_ms=1)
+    )
+    restored = _window(tmp_path)
+    try:
+        assert restored._workspace_mode == "archive"
+        assert restored._current_metadata().race_id == event.race_id
+        restored.start_receiver()
+        receiver = _FakeReceiver.instances[-1]
+        receiver.deliver(_event(event_id="new-foreign", race_id="foreign-race"))
+        receiver.deliver_metadata(RaceMetadata(race_id="foreign-race", stage_id="stage-1",
+                                              revision=2, emitted_at_ms=2))
+        qapp.processEvents()
+        assert restored._current_metadata().race_id == event.race_id
+        assert restored.passage_store.get("new-foreign") is None
+        assert restored._receiver_passage_store.get("new-foreign") is not None
+    finally:
+        restored.close()
+
+
+def test_ambiguous_legacy_workspace_requires_selection_and_remembers_it(qapp, tmp_path):
+    passages = PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl")
+    passages.append(_event(event_id="first"))
+    passages.append(_event(event_id="second", race_id="another-race"))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for race_id in ("race-1", "another-race"):
+        video = tmp_path / f"{race_id}.mkv"
+        video.write_bytes(b"saved-video")
+        timeline.add_completed_segment(source_id="camera_01_review", camera_index=1, video_path=video,
+                                       media_started_at_ms=1000, media_duration_ms=4000,
+                                       clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+                                       end_reason="continuous_archive_fallback", race_id=race_id)
+    window = _window(tmp_path)
+    try:
+        assert window._current_metadata() is None
+        assert not window._visible_events
+        assert window._workspace_mode == "archive"
+        assert not window.video_filmstrip.full_race.index.sources
+        assert window.event_name_label.text() == "请选择赛事"
+        assert not window.select_event_button.isHidden()
+        assert window._select_workspace_event("another-race", "stage-1")
+        assert [item.event_id for item in window._visible_events] == ["second"]
+    finally:
+        window.close()
+    restored = _window(tmp_path)
+    try:
+        assert restored._current_metadata().race_id == "another-race"
+        assert restored._workspace_mode == "archive"
+        assert [item.event_id for item in restored._visible_events] == ["second"]
+    finally:
+        restored.close()
+
+
+def test_receiver_keeps_other_stage_in_inbox_before_metadata_arrives(qapp, tmp_path):
+    window = _window(tmp_path)
+    try:
+        window.start_receiver()
+        receiver = _FakeReceiver.instances[-1]
+        receiver.deliver(_event(event_id="first", group_name="备用测试"))
+        receiver.deliver(_event(event_id="other", stage_id="stage-2"))
+        qapp.processEvents()
+        assert window.passage_store.get("first") is not None
+        assert window.passage_store.get("other") is None
+        assert window._receiver_passage_store.get("other") is not None
+    finally:
+        window.close()
+
+
 def _count_report(window, tmp_path, event_ids):
     import json
     timestamp = window.passage_store.get(event_ids[0]).timeline_timestamp_ms if event_ids else int(time.time() * 1000)
@@ -3780,7 +3894,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.24.8 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.24.9 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -3794,7 +3908,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.24.8"
+    assert window.product_title_label.text() == "FinishReview v0.24.9"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()

@@ -3214,7 +3214,7 @@ def test_first_confirmation_calibrates_in_default_review_and_survives_reopen(
                          pos=pane.video_view.viewport().rect().center())
         assert dialog._confirm_pending_marker(pane)
         assert VideoClockCalibrationStore(calibration_path).calibrations()[0].offset_ms == -1_300
-        assert dialog.batch_context_label.text() == "机位1 已校准"
+        assert dialog.batch_context_label.text() == "机位1 已校准 -1300 ms"
         dialog._select_event(second.event_id, locate_target=True)
         assert pane._target_position_ms == 28_700
         assert not dialog._calibrate_continuous_session_at_position(second, pane, 30_000, 99_000)
@@ -3225,7 +3225,7 @@ def test_first_confirmation_calibrates_in_default_review_and_survives_reopen(
     try:
         reopened._select_event(second.event_id, locate_target=True)
         assert reopened.regular_pane._target_position_ms == 28_700
-        assert reopened.batch_context_label.text() == "机位1 已校准"
+        assert reopened.batch_context_label.text() == "机位1 已校准 -1300 ms"
         assert not reopened._calibrate_continuous_session_at_position(
             second, reopened.regular_pane, 30_000, 99_000,
         )
