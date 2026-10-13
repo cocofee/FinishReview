@@ -1,5 +1,7 @@
 # FinishReview
 
+后续改造以“只核对有问题的”为主线，方案、三场回放结论与逐步验收见 [终点问题清单实施方案](docs/CONTINUOUS_REVIEW_IMPLEMENTATION_PLAN.md)。
+
 独立的终点多源复核系统。该项目只保留人工复核、录像缓冲、视频回放、
 CycleRace / RaceTiger 过线事件接入、奥亚特高速相机文件读取和证据关联能力。
 
