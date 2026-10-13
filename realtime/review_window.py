@@ -815,6 +815,9 @@ class FinishReviewWindow(PassageReviewSurface):
             self._on_video_candidate_persistence_failed
         )
         self.video_review_status_changed.connect(self._persist_video_review)
+        self.record_deleted.connect(
+            lambda _event_id: self._export_review_summary(show_warning=True)
+        )
         if self._video_candidate_cache:
             self._reconcile_video_candidates(
                 tuple(self._video_candidate_cache.values())

@@ -233,6 +233,46 @@ def _add_segment(
     return segment
 
 
+def test_delete_selected_record_updates_queue_and_survives_reopen(qapp, tmp_path, monkeypatch):
+    path = tmp_path / "passages.jsonl"
+    passages = PassageEventStore(path)
+    first = _event(event_id="spare-4", bib="443", athlete_name="备用4")
+    second = _event(event_id="spare-3", bib="442", sequence=2)
+    passages.append(first)
+    passages.append(second)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    dialog = PassageReviewDialog(passages, timeline)
+    row = next(index for index, event in enumerate(dialog._visible_events)
+               if event.event_id == first.event_id)
+    dialog.table.setCurrentCell(row, 1)
+    deleted = []
+    dialog.record_deleted.connect(deleted.append)
+    monkeypatch.setattr(passage_review.QMessageBox, "question",
+                        lambda *_args: passage_review.QMessageBox.No)
+    dialog.delete_record_button.click()
+    assert dialog.table.rowCount() == 2
+    assert not deleted
+
+    monkeypatch.setattr(passage_review.QMessageBox, "question",
+                        lambda *_args: passage_review.QMessageBox.Yes)
+    dialog.delete_record_button.click()
+    assert deleted == [first.event_id]
+    assert dialog.table.rowCount() == 1
+    assert dialog.table.item(0, 1).text() == "442"
+    assert dialog._selected_event_id == second.event_id
+    assert dialog._total_event_count == 1
+    dialog.close()
+
+    reopened = PassageReviewDialog(PassageEventStore(path), timeline)
+    assert reopened.table.rowCount() == 1
+    reopened.delete_record_button.click()
+    assert reopened.table.rowCount() == 0
+    assert reopened._selected_event_id == ""
+    assert len(reopened.passage_store) == 0
+    reopened.delete_record_button.click()
+    reopened.close()
+
+
 def test_retained_image_exact_frame_seek_waits_for_metadata(qapp, tmp_path, fake_playback):
     timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
     _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01", camera_index=1,

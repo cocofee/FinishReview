@@ -105,6 +105,9 @@ v0.24.9 修复旧目录混入多场赛事时的名单范围和时间胶卷恢复
 
 ## Development
 
+通过记录列表支持选中一行后点击“删除记录”，确认后立即更新列表和复核清单。
+删除状态按本地赛事目录保存，重启或收到同一记录的新版本后也不会重新显示。
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]" -c constraints-dev.txt

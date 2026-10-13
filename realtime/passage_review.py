@@ -2689,6 +2689,7 @@ class PassageReviewSurface(QDialog):
     SINGLE_CAMERA_PREVIEW = True
 
     clock_offset_changed = pyqtSignal(int)
+    record_deleted = pyqtSignal(str)
     evidence_pane_added = pyqtSignal(object)
     video_review_updated = pyqtSignal(object)
     video_candidates_received = pyqtSignal(object)
@@ -3066,6 +3067,10 @@ class PassageReviewSurface(QDialog):
         self.identity_search.textChanged.connect(self._on_search_changed)
         self.identity_search.returnPressed.connect(self._find_identity)
         filters.addWidget(self.identity_search)
+        self.delete_record_button = QPushButton("删除记录", self)
+        self.delete_record_button.setToolTip("删除选中的通过记录")
+        self.delete_record_button.clicked.connect(self._delete_selected_record)
+        filters.addWidget(self.delete_record_button)
         self.filter_bar.width_controls = (
             (self.group_combo, 180, 110), (self.identity_search, 180, 120),
         )
@@ -5221,6 +5226,7 @@ class PassageReviewSurface(QDialog):
             self.table.selectRow(selected_row)
         self.table.blockSignals(False)
         self.table.schedule_auto_fit()
+        self.delete_record_button.setEnabled(selected_row >= 0)
         self.table.verticalScrollBar().setValue(scroll)
 
         self._render_summary()
@@ -5867,6 +5873,7 @@ class PassageReviewSurface(QDialog):
         compact_controls = (
             "group_combo",
             "identity_search",
+            "delete_record_button",
             "summary_label",
             "video_arrival_button",
             "video_review_button",
@@ -6138,6 +6145,30 @@ class PassageReviewSurface(QDialog):
             "已确认",
         })
         item.setFont(font)
+
+    def _delete_selected_record(self) -> None:
+        row = self.table.currentRow()
+        if not 0 <= row < len(self._visible_events):
+            return
+        event = self._visible_events[row]
+        store = self.passage_store
+        identity = " ".join(value for value in (event.bib, event.athlete_name) if value)
+        answer = QMessageBox.question(
+            self, "删除记录",
+            f"确定删除 {identity or event.event_id} 在 "
+            f"{format_passage_time(event.timeline_timestamp_ms)} 的通过记录吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes or self.passage_store is not store:
+            return
+        try:
+            deleted = store.delete(event.event_id)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "删除失败", f"无法删除记录：{error}")
+            return
+        self.refresh()
+        if deleted:
+            self.record_deleted.emit(event.event_id)
 
     def _on_table_selection_changed(
         self,

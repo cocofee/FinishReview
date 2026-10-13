@@ -36,6 +36,7 @@ PREFLIGHT_FILENAME = "preflight_tests.jsonl"
 _UPDATE_FILENAMES = (
     METADATA_FILENAME,
     PASSAGE_FILENAME,
+    "cyclerace_passage_events_deleted.json",
     ASSOCIATION_FILENAME,
     "video_timeline.jsonl",
     "终点复核清单.csv",

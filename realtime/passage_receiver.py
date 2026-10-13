@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import socket
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
@@ -349,6 +350,20 @@ class PassageEventStore:
         self._recovered_incomplete_tail = False
         self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
+        self.deletions_path = self.journal_path.with_name(
+            self.journal_path.stem + "_deleted.json"
+        )
+        self._deleted_event_ids: set[str] = set()
+        if self.deletions_path.exists():
+            try:
+                deleted = json.loads(self.deletions_path.read_text(encoding="utf-8"))
+                if not isinstance(deleted, list) or any(
+                    not isinstance(event_id, str) or not event_id for event_id in deleted
+                ):
+                    raise ValueError("deleted event IDs must be non-empty strings")
+                self._deleted_event_ids = set(deleted)
+            except (OSError, ValueError) as error:
+                raise PassageJournalError("failed to read passage deletions") from error
 
     def _load_existing(self) -> None:
         if not self.journal_path.exists():
@@ -489,10 +504,40 @@ class PassageEventStore:
         with self._lock:
             return self._events.get(str(event_id))
 
+    def delete(self, event_id: str) -> bool:
+        """Delete a local passage without altering upstream revision numbers.
+
+        Keep its ID separately so retries and later upstream revisions cannot
+        restore a record the operator deleted from this workspace.
+        """
+        with self._lock:
+            if event_id not in self._events or event_id in self._deleted_event_ids:
+                return False
+            deleted = self._deleted_event_ids | {event_id}
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=self.deletions_path.parent,
+                    prefix=self.deletions_path.name + ".", suffix=".tmp", delete=False,
+                ) as handle:
+                    temporary_path = Path(handle.name)
+                    json.dump(sorted(deleted), handle, ensure_ascii=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, self.deletions_path)
+            except OSError as error:
+                raise PassageJournalError("failed to save passage deletion") from error
+            finally:
+                if temporary_path is not None and temporary_path.exists():
+                    temporary_path.unlink()
+            self._deleted_event_ids = deleted
+            return True
+
     def events(self, *, include_inactive: bool = False) -> tuple[PassageEvent, ...]:
         with self._lock:
             events = tuple(
                 self._events[event_id] for event_id in self._event_order
+                if event_id not in self._deleted_event_ids
             )
             if include_inactive:
                 return events

@@ -553,6 +553,52 @@ def test_inactive_revision_is_retained_for_audit_but_hidden_from_active_events(
     assert len(store.journal_path.read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_deleted_passage_stays_deleted_after_restart_and_upstream_updates(tmp_path):
+    path = tmp_path / "passages.jsonl"
+    store = PassageEventStore(path)
+    event = PassageEvent.from_payload(passage_payload())
+    other = PassageEvent.from_payload(passage_payload(event_id="other", bib="442"))
+    store.append(event)
+    store.append(other)
+    assert store.delete(event.event_id)
+    assert not store.delete(event.event_id)
+    assert not store.delete("missing")
+    assert store.events() == (other,)
+    assert store.events(include_inactive=True) == (other,)
+    assert len(store) == 1
+
+    reopened = PassageEventStore(path)
+    reopened.append(event)
+    updated = PassageEvent.from_payload(passage_payload(revision=2, bib="443"))
+    reopened.append(updated)
+    assert reopened.events() == (other,)
+    assert reopened.get(event.event_id) == updated
+    assert PassageEventStore(path).events() == (other,)
+    independent = PassageEventStore(tmp_path / "another-race.jsonl")
+    independent.append(event)
+    assert independent.events() == (event,)
+
+
+def test_failed_deletion_keeps_record_and_previous_deletions(tmp_path, monkeypatch):
+    path = tmp_path / "passages.jsonl"
+    store = PassageEventStore(path)
+    event = PassageEvent.from_payload(passage_payload())
+    other = PassageEvent.from_payload(passage_payload(event_id="other"))
+    store.append(event)
+    store.append(other)
+    store.delete(other.event_id)
+
+    def fail_replace(*_args):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(passage_receiver_module.os, "replace", fail_replace)
+    with pytest.raises(passage_receiver_module.PassageJournalError):
+        store.delete(event.event_id)
+    assert store.events() == (event,)
+    assert PassageEventStore(path).events() == (event,)
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 @pytest.mark.parametrize(
     "payload",
     [

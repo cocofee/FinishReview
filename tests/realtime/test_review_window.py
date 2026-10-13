@@ -1421,6 +1421,27 @@ def test_opening_saved_event_is_blocked_while_recording(
     window.close()
 
 
+def test_deleting_passage_immediately_updates_review_export(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path / "events")
+    metadata = RaceMetadata(
+        race_id="race-delete", stage_id="stage-1", revision=1,
+        emitted_at_ms=1, race_name="删除测试", stage_name="终点",
+    )
+    assert window._activate_cyclerace_workspace(metadata)
+    window.passage_store.append(_event(race_id="race-delete", event_id="spare"))
+    window.refresh()
+    window._export_review_summary()
+    summary = window.output_dir / REVIEW_SUMMARY_FILENAME
+    with summary.open(encoding="utf-8-sig", newline="") as handle:
+        assert len(list(csv.reader(handle))) == 2
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.Yes)
+    window.delete_record_button.click()
+    assert window.table.rowCount() == 0
+    with summary.open(encoding="utf-8-sig", newline="") as handle:
+        assert len(list(csv.reader(handle))) == 1
+    window.close()
+
+
 def test_closing_active_event_exports_review_summary(qapp, tmp_path):
     root = tmp_path / "events"
     window = _window(root)
