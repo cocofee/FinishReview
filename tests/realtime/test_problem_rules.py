@@ -198,3 +198,28 @@ def test_line_activity_before_the_first_rider_is_excluded_not_listed():
     statuses = sorted((item.status, item.status_note) for item in outcome.items)
     assert statuses == [("excluded", "已排除：赛前活动"), ("open", "")]
     assert outcome.stats["before_race"] == 1
+
+
+def test_items_inside_bunches_and_crowded_periods_are_folded_into_the_group():
+    reads = [_read(str(index), T0 + 10_000 + index * 400) for index in range(5)]
+    matched = [(_crossing(read.chip_ms + 1_000), read, 0.0) for read in reads[:4]]
+    walker = _crossing(T0 + 103_000)
+    rider = _crossing(T0 + 104_500)
+    verdicts = {
+        walker.key: BikeVerdict(LABEL_PEDESTRIAN, 0.9, DECISION_DISPUTED, "终点线拥挤时段"),
+        rider.key: BikeVerdict(LABEL_BICYCLE, 0.9, "keep"),
+    }
+    outcome = _rules(
+        matched=matched, chip_only=[reads[4]], video_only=[walker, rider], verdicts=verdicts,
+        obstructions=[Obstruction(1, T0 + 100_000, T0 + 112_000)],
+    )
+
+    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
+    crowd = next(item for item in outcome.items if item.kind == "obstruction")
+    two = next(item for item in outcome.items if item.kind == KIND_TWO_CHIPS_ONE_CROSSING)
+    assert two.grouped == bunch.item_id and not two.pending
+    assert bunch.evidence["members"] == [two.item_id] and "组内另有 1 条" in bunch.detail
+    folded = [item for item in outcome.items if item.grouped == crowd.item_id]
+    assert [item.status for item in folded] == [STATUS_DISPUTED]
+    separate = [item for item in outcome.items if item.kind == KIND_NO_CHIP_CROSSING and not item.grouped]
+    assert len(separate) == 1 and separate[0].pending

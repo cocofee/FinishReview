@@ -154,7 +154,13 @@ class ProblemItem:
 
     @property
     def pending(self) -> bool:
-        return self.status in (STATUS_OPEN, STATUS_DISPUTED)
+        """Needs a decision at the top level (group members are handled in the group)."""
+
+        return self.status in (STATUS_OPEN, STATUS_DISPUTED) and not self.grouped
+
+    @property
+    def grouped(self) -> str:
+        return str(self.evidence.get("group", "")) if self.evidence else ""
 
     def to_payload(self) -> dict[str, Any]:
         return {

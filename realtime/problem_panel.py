@@ -89,6 +89,10 @@ class ProblemListPanel(QFrame):
         self.show_closed = QCheckBox("显示已处理和已排除", self)
         self.show_closed.toggled.connect(self._render)
         controls.addWidget(self.show_closed)
+        self.expand_groups = QCheckBox("展开集团和拥挤时段", self)
+        self.expand_groups.setToolTip("集团和拥挤时段里的问题归在一条里核对；展开后逐条显示")
+        self.expand_groups.toggled.connect(self._render)
+        controls.addWidget(self.expand_groups)
         self.analyze_button = QPushButton("分析录像", self)
         self.analyze_button.setToolTip("在单独的低优先级进程中分析整段录像，不影响录像和计时")
         self.analyze_button.clicked.connect(self._toggle_analysis)
@@ -234,7 +238,7 @@ class ProblemListPanel(QFrame):
     def summary_text(self) -> str:
         if self.payload is None:
             return "问题清单：尚未分析录像"
-        states = [self.state(item) for item in self.items]
+        states = [self.state(item) for item in self.items if not item.grouped]
         pending = sum(self.is_pending_state(state) for state in states)
         done = sum(state.startswith(STATE_RESOLVED) or state == STATE_UPSTREAM for state in states)
         summary = self.payload.get("summary", {})
@@ -246,10 +250,21 @@ class ProblemListPanel(QFrame):
     def _render(self) -> None:
         selected = self.rows[self.table.currentRow()].item_id if 0 <= self.table.currentRow() < len(self.rows) else None
         show_all = self.show_closed.isChecked()
-        self.rows = [
-            item for item in self.items
-            if show_all or self.is_pending_state(self.state(item)) or self.state(item) == STATE_INFO
-        ]
+        members: dict[str, list[ProblemItem]] = {}
+        for item in self.items:
+            if item.grouped:
+                members.setdefault(item.grouped, []).append(item)
+        self.rows = []
+        for item in self.items:
+            if item.grouped:
+                continue
+            if show_all or self.is_pending_state(self.state(item)) or self.state(item) == STATE_INFO:
+                self.rows.append(item)
+            if self.expand_groups.isChecked():
+                self.rows += [
+                    member for member in members.get(item.item_id, [])
+                    if show_all or self.is_pending_state(self.state(member))
+                ]
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.rows))
         restore = -1
@@ -257,7 +272,8 @@ class ProblemListPanel(QFrame):
             state = self.state(item)
             values = (
                 format_chip_time(item.chip_time_ms) if item.chip_time_ms is not None else "--",
-                item.title, "、".join(item.bibs[:4]) + ("…" if len(item.bibs) > 4 else ""),
+                ("└ " if item.grouped else "") + item.title,
+                "、".join(item.bibs[:4]) + ("…" if len(item.bibs) > 4 else ""),
                 state, item.detail,
             )
             for column, value in enumerate(values):

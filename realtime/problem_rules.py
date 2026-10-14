@@ -18,7 +18,7 @@ result; items only describe what the operator should look at.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Mapping, Optional, Sequence
 
 from .bike_check import (
@@ -352,11 +352,12 @@ def build_video_items(
             continue
         outcome.auto_passed.append(_auto_passed(read, crossing, int(residual), version))
 
-    outcome.items += _bunch_items(camera_index, model, matched, chip_only, rest, version)
+    bunches = _bunch_items(camera_index, model, matched, chip_only, rest, version)
     race_periods = [
         (start, end) for start, end in periods if race_start_ms is None or end >= race_start_ms
     ]
-    outcome.items += _obstruction_items(camera_index, model, race_periods, matched, chip_only, version)
+    crowds = _obstruction_items(camera_index, model, race_periods, matched, chip_only, version)
+    outcome.items = _group_members(outcome.items, bunches, crowds, expected)
     outcome.items += _no_video_items(camera_index, no_video)
     outcome.stats = {
         "candidates": len(candidates),
@@ -367,6 +368,59 @@ def build_video_items(
         "before_race": len(before_race),
     }
     return outcome
+
+
+def _item_recorder_ms(item: ProblemItem, expected: Mapping[str, int]) -> Optional[int]:
+    if "recorder_ms" in item.evidence:
+        return int(item.evidence["recorder_ms"])
+    if "expected_recorder_ms" in item.evidence:
+        return int(item.evidence["expected_recorder_ms"])
+    return None
+
+
+def _group_members(items, bunches, crowds, expected) -> list[ProblemItem]:
+    """Fold items inside a bunch or a crowded period into that group item.
+
+    Bunches (4+ riders within 2 s) need a head count anyway (plan 7.4), and a
+    crowded line period is checked as a whole (plan 7.1). Members stay in the
+    list with a link to their group, so nothing is dropped or excluded.
+    """
+
+    groups = []
+    for bunch in bunches:
+        window = (bunch.evidence["recorder_start_ms"], bunch.evidence["recorder_end_ms"])
+        groups.append((bunch, window, {KIND_TWO_CHIPS_ONE_CROSSING, KIND_CHIP_NO_CROSSING, KIND_NO_CHIP_CROSSING}))
+    for crowd in crowds:
+        window = (crowd.evidence["recorder_start_ms"] - 5_000, crowd.evidence["recorder_end_ms"] + 5_000)
+        groups.append((crowd, window, {KIND_NO_CHIP_CROSSING, KIND_STANDING}))
+    members: dict[str, list[str]] = {}
+    result = []
+    for item in items:
+        group = None
+        position = _item_recorder_ms(item, expected)
+        if item.pending and position is not None:
+            for candidate, (start, end), kinds in groups:
+                if item.kind not in kinds or not start <= position <= end:
+                    continue
+                if candidate.kind == KIND_OBSTRUCTION and item.kind == KIND_NO_CHIP_CROSSING and item.status != STATUS_DISPUTED:
+                    continue  # a likely rider in a crowd stays a separate item
+                group = candidate
+                break
+        if group is None:
+            result.append(item)
+            continue
+        members.setdefault(group.item_id, []).append(item.item_id)
+        result.append(replace(item, evidence=dict(item.evidence, group=group.item_id)))
+    for candidate, _window, _kinds in groups:
+        ids = members.get(candidate.item_id, [])
+        if ids:
+            candidate = replace(
+                candidate,
+                detail=candidate.detail + f"；组内另有 {len(ids)} 条待核对问题",
+                evidence=dict(candidate.evidence, members=ids),
+            )
+        result.append(candidate)
+    return result
 
 
 def _auto_passed(read: ChipRead, crossing: CrossingRecord, residual: int, version: int, *, late: bool = False) -> dict:
