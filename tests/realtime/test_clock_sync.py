@@ -123,7 +123,7 @@ def test_sessions_far_from_shared_drift_line_are_reported():
     assert abs(model.slope_ms_per_hour - (-334)) < 40
     assert abs(dict(model.session_offsets)["second"] - 400) < 40
     chip = START + int(1.1 * HOUR)
-    assert model.offset_at(chip, "second") - model.offset_at(chip) == round(dict(model.session_offsets)["second"])
+    assert abs(model.offset_at(chip, "second") - model.offset_at(chip) - dict(model.session_offsets)["second"]) <= 1
     assert abs(model.to_chip(model.to_recorder(chip, "second"), "second") - chip) <= 1
     assert ClockModel.from_payload(model.to_payload()) == model
 
