@@ -223,3 +223,17 @@ def test_items_inside_bunches_and_crowded_periods_are_folded_into_the_group():
     assert [item.status for item in folded] == [STATUS_DISPUTED]
     separate = [item for item in outcome.items if item.kind == KIND_NO_CHIP_CROSSING and not item.grouped]
     assert len(separate) == 1 and separate[0].pending
+
+
+def test_reads_paired_inside_a_crowded_period_are_not_auto_passed():
+    inside = _read("1", T0 + 200_000)
+    outside = _read("2", T0 + 400_000)
+    outcome = _rules(
+        matched=[(_crossing(T0 + 201_000, obstruction=True), inside, 0.0), (_crossing(T0 + 401_000), outside, 0.0)],
+        obstructions=[Obstruction(1, T0 + 195_000, T0 + 215_000)],
+    )
+
+    assert [item["bib"] for item in outcome.auto_passed] == ["2"]
+    crowd = next(item for item in outcome.items if item.kind == "obstruction")
+    assert crowd.bibs == ("1",) and crowd.pending
+    assert outcome.stats["paired_in_crowd"] == 1

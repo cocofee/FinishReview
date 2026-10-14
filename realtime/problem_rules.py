@@ -347,8 +347,14 @@ def build_video_items(
         for item in outcome.items if item.pending
         for read_id in item.event_ids
     }
+    crowd_paired = 0
     for crossing, read, residual in matched:
         if read.event_id in open_bibs:
+            continue
+        if crossing.in_obstruction or crowded(expected[read.read_id]):
+            # Paired inside a crowded period: evidence is insufficient, the
+            # read is checked with that period instead of passing silently.
+            crowd_paired += 1
             continue
         outcome.auto_passed.append(_auto_passed(read, crossing, int(residual), version))
 
@@ -366,6 +372,7 @@ def build_video_items(
         "duplicates": outcome.duplicates,
         "standing": sum(len(spot["members"]) >= STANDING_MIN for spot in spots),
         "before_race": len(before_race),
+        "paired_in_crowd": crowd_paired,
     }
     return outcome
 
