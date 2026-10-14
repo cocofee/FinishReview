@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
+from .analysis_resources import ResourceGovernor, limit_opencv_threads, lower_process_priority
 from .analysis_workspace import AnalysisWorkspace, ArchiveSegment
 from .bike_check import BikeVerdict, CropPlan, FrameReader, YoloxDetector, classify_frames
 from .chip_checks import ChipCheckContext, chip_check_items
@@ -515,6 +516,85 @@ def analyse_camera(
     result["auto_passed"] = outcome.auto_passed
     result["model"] = model
     return result
+
+
+ANALYSIS_CONFIG_FILENAME = "analysis_config.json"
+
+
+def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
+    """Settings for a GUI-started run: ``finish_problems/analysis_config.json``.
+
+    Keys (all optional): ``model_path``, ``model_input``, ``crop_modes``
+    (camera -> mode), ``finish_lines`` (list like ``finish_lines.json``),
+    ``cameras``. Results go to ``finish_problems/``; calibration versions to
+    the workspace's ``video_clock_models.jsonl`` so the main window sees them.
+    """
+
+    root = Path(workspace_dir)
+    output = root / OUTPUT_DIRNAME
+    settings: dict = {}
+    try:
+        settings = json.loads((output / ANALYSIS_CONFIG_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        settings = {}
+    lines = settings.get("finish_lines") or []
+    return AnalysisConfig(
+        workspace=root,
+        output_dir=output,
+        finish_lines={int(item["camera_index"]): dict(item) for item in lines if "camera_index" in item},
+        cameras=tuple(int(value) for value in settings.get("cameras", ())),
+        model_path=Path(settings["model_path"]) if settings.get("model_path") else None,
+        model_input=int(settings.get("model_input", 640)),
+        crop_modes={int(key): str(value) for key, value in (settings.get("crop_modes") or {}).items()},
+        clock_model_path=root / CLOCK_MODEL_FILENAME,
+    )
+
+
+def run_offline_analysis(
+    config: AnalysisConfig,
+    *,
+    stage: str = "all",
+    progress: ProgressCallback = _noop_progress,
+    cancelled: Callable[[], bool] = lambda: False,
+    lower_priority: bool = True,
+) -> dict:
+    """Whole pipeline at low priority; resumes from cached strips."""
+
+    if lower_priority:
+        lower_process_priority()
+    limit_opencv_threads(1)
+    governor = ResourceGovernor()
+    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id)
+    cameras = config.cameras or workspace.camera_indexes()
+    summary: dict = {"race_id": workspace.race_id, "cameras": {}}
+    results = []
+    for camera in cameras:
+        line = line_for_camera(config, workspace, camera)
+        segments = workspace.archive_segments(camera)
+        if line is None or not segments:
+            summary["cameras"][camera] = {"skipped": "没有终点线或整段录像"}
+            continue
+        paths = extract_strips(
+            config, segments, line, progress=progress,
+            checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
+        )
+        summary["cameras"][camera] = {"strips": len(paths)}
+        if stage == "strips" or cancelled():
+            continue
+        result = analyse_camera(
+            config, workspace, camera, paths, progress=progress,
+            checkpoint=lambda: governor.checkpoint(cancelled),
+        )
+        results.append(result)
+        summary["cameras"][camera] = {
+            key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")
+        }
+    if stage != "strips" and not cancelled():
+        path = write_problem_list(config, workspace, results, progress=progress)
+        summary["problem_list"] = str(path)
+        summary["summary"] = json.loads(path.read_text(encoding="utf-8"))["summary"]
+    summary["paused_seconds"] = round(governor.paused_seconds, 1)
+    return summary
 
 
 def summarize_items(items: list[ProblemItem], auto_passed: list[dict], unverifiable: int) -> dict:

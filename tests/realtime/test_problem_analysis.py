@@ -10,9 +10,12 @@ import pytest
 from realtime.analysis_workspace import AnalysisWorkspace
 from realtime.passage_receiver import PassageEvent
 from realtime.problem_analysis import (
+    ANALYSIS_CONFIG_FILENAME,
     AnalysisConfig,
     analyse_camera,
+    config_from_workspace,
     extract_strips,
+    run_offline_analysis,
     write_problem_list,
 )
 from realtime.problem_items import (
@@ -165,3 +168,20 @@ def test_problem_list_file_and_cards(synthetic_race):
     assert card.is_file() and strip.is_file()
     image = cv2.imdecode(np.fromfile(str(strip), dtype=np.uint8), cv2.IMREAD_COLOR)
     assert image.shape[1] == 9 * image.shape[0]
+
+
+def test_gui_started_run_uses_workspace_config_and_publishes_calibration(synthetic_race):
+    root, _workspace, _config, _strips = synthetic_race
+    (root / "finish_problems").mkdir(exist_ok=True)
+    (root / "finish_problems" / ANALYSIS_CONFIG_FILENAME).write_text(
+        json.dumps({"crop_modes": {"1": "side-right"}, "cameras": [1]}), encoding="utf-8",
+    )
+    config = config_from_workspace(root)
+    assert config.crop_modes == {1: "side-right"} and config.model_path is None
+
+    summary = run_offline_analysis(config, lower_priority=False)
+
+    assert summary["summary"]["pending"] == 0
+    assert summary["summary"]["auto_passed"] == len(CROSSINGS_S)
+    assert (root / "finish_problems" / "problem_list.json").is_file()
+    assert (root / "video_clock_models.jsonl").is_file()

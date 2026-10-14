@@ -105,6 +105,25 @@ def test_distribution_check_rejects_known_non_project_dependencies():
     assert "Distribution contains unexpected dependencies" in clean_check
 
 
+def test_distribution_check_rejects_bundled_model_weights():
+    clean_check = (
+        ROOT / "packaging" / "assert_clean_distribution.ps1"
+    ).read_text(encoding="utf-8")
+
+    for extension in (".onnx", ".pt", ".pth"):
+        assert f'"{extension}"' in clean_check
+    assert "Distribution contains model weights" in clean_check
+
+
+def test_bicycle_check_uses_opencv_dnn_and_no_model_runtime():
+    source = (ROOT / "realtime" / "bike_check.py").read_text(encoding="utf-8")
+
+    assert "cv2.dnn.readNetFromONNX" in source
+    assert "cv2.setNumThreads(1)" in source
+    for runtime in ("onnxruntime", "torch", "ultralytics", "paddle"):
+        assert f"import {runtime}" not in source
+
+
 def test_runtime_modules_use_package_relative_imports():
     modules = (
         "auyat_rgb.py",

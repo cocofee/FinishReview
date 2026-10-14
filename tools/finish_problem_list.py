@@ -16,16 +16,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from realtime.analysis_resources import ResourceGovernor, limit_opencv_threads, lower_process_priority
-from realtime.analysis_workspace import AnalysisWorkspace
-from realtime.problem_analysis import (
-    AnalysisConfig,
-    analyse_camera,
-    extract_strips,
-    line_for_camera,
-    load_line_overrides,
-    write_problem_list,
-)
+from realtime.problem_analysis import AnalysisConfig, load_line_overrides, run_offline_analysis
 
 
 def _progress(stage: str, done: int, total: int) -> None:
@@ -53,34 +44,7 @@ def build_config(arguments: argparse.Namespace) -> AnalysisConfig:
 
 
 def run(config: AnalysisConfig, stage: str) -> dict:
-    lower_process_priority()
-    limit_opencv_threads(1)
-    governor = ResourceGovernor()
-    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id)
-    cameras = config.cameras or workspace.camera_indexes()
-    summary: dict = {"race_id": workspace.race_id, "cameras": {}}
-    results = []
-    for camera in cameras:
-        line = line_for_camera(config, workspace, camera)
-        segments = workspace.archive_segments(camera)
-        if line is None or not segments:
-            summary["cameras"][camera] = {"skipped": "没有终点线或整段录像"}
-            continue
-        paths = extract_strips(config, segments, line, progress=_progress, checkpoint=governor.checkpoint)
-        summary["cameras"][camera] = {"strips": len(paths)}
-        if stage == "strips":
-            continue
-        result = analyse_camera(config, workspace, camera, paths, progress=_progress, checkpoint=governor.checkpoint)
-        results.append(result)
-        summary["cameras"][camera] = {
-            key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")
-        }
-    if stage != "strips":
-        path = write_problem_list(config, workspace, results, progress=_progress)
-        summary["problem_list"] = str(path)
-        summary["summary"] = json.loads(path.read_text(encoding="utf-8"))["summary"]
-    summary["paused_seconds"] = round(governor.paused_seconds, 1)
-    return summary
+    return run_offline_analysis(config, stage=stage, progress=_progress)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

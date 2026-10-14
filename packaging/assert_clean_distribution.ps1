@@ -48,4 +48,16 @@ if ($FoundDependencies.Count -gt 0) {
     throw "Distribution contains unexpected dependencies: $($FoundDependencies -join ', ')"
 }
 
+# Model weights are configured by the user, never shipped.
+$ForbiddenModelExtensions = @(".onnx", ".pt", ".pth", ".engine", ".tflite", ".pdparams")
+$FoundModels = @(
+    Get-ChildItem -LiteralPath $ResolvedAppDir -Recurse -Force -File |
+        Where-Object { $ForbiddenModelExtensions -contains $_.Extension.ToLowerInvariant() } |
+        ForEach-Object { $_.FullName }
+)
+
+if ($FoundModels.Count -gt 0) {
+    throw "Distribution contains model weights: $($FoundModels -join ', ')"
+}
+
 Write-Host "Distribution boundary check passed: $ResolvedAppDir"

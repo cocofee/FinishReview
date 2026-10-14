@@ -77,7 +77,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="启动后自动开始录像，日常操作默认使用界面按钮",
     )
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--analyze-problems", metavar="EVENT_DIR", help=argparse.SUPPRESS)
     return parser
+
+
+def run_problem_analysis(event_dir: str) -> int:
+    """Headless offline problem-list run, started by the console in its own process."""
+
+    import json as _json
+
+    from realtime.problem_analysis import config_from_workspace, run_offline_analysis
+
+    def report(stage: str, done: int, total: int) -> None:
+        print(_json.dumps({"stage": stage, "done": done, "total": total}, ensure_ascii=False), flush=True)
+
+    summary = run_offline_analysis(config_from_workspace(event_dir), progress=report)
+    print(_json.dumps({"stage": "done", "summary": summary.get("summary", {})}, ensure_ascii=False, default=str),
+          flush=True)
+    return 0
 
 
 def requested_source(
@@ -618,6 +635,8 @@ def main(argv: list[str] | None = None) -> int:
     app_argv = [sys.argv[0]] if argv is not None else sys.argv
     if getattr(args, "smoke_test", False):
         return run_packaged_smoke_test(app_argv)
+    if getattr(args, "analyze_problems", None):
+        return run_problem_analysis(args.analyze_problems)
     source_override = requested_source(args, parser)
     runtime_root = application_dir(module_file=__file__)
     requested_output_dir = (
