@@ -440,6 +440,7 @@ def analyse_camera(
         "residual_mad_ms": round(model.residual_mad_ms, 1),
         "coarse_offset_ms": model.coarse_offset_ms,
         "coarse_distinct": bool(calibration.coarse and calibration.coarse.distinct),
+        "session_offsets_ms": {key: value for key, value in model.session_offsets},
         "anchors": [
             {"bib": check.anchor.label, "difference_ms": check.difference_ms,
              "within_tolerance": check.within_tolerance, "message": check.message}
@@ -451,6 +452,7 @@ def analyse_camera(
     manual_entries = [read for read in reads if read.manual_entry and not read.excluded]
     by_session: dict[str, list[ChipRead]] = {}
     no_video: list[ChipRead] = []
+    expected_ms: dict[str, int] = {}
     for read in pairing_reads:
         expected = model.to_recorder(read.chip_ms)
         session = next(
@@ -462,13 +464,14 @@ def analyse_camera(
             no_video.append(read)
         else:
             by_session.setdefault(session, []).append(read)
+            expected_ms[read.read_id] = int(model.to_recorder(read.chip_ms, session))
     matched, video_only, chip_only = [], [], []
     for session in {item[2] for item in coverage}:
         session_crossings = [item for item in crossings if item.session_id == session]
         session_reads = by_session.get(session, [])
         pairing = pair_crossings(
             session_crossings, [item.recorder_ms for item in session_crossings],
-            session_reads, [model.to_recorder(read.chip_ms) for read in session_reads],
+            session_reads, [expected_ms[read.read_id] for read in session_reads],
         )
         matched += pairing.matched
         video_only += pairing.video_only
@@ -510,6 +513,7 @@ def analyse_camera(
         camera_index=camera, model=model, matched=matched, video_only=video_only,
         chip_only=chip_only, no_video=no_video, obstructions=obstructions, verdicts=verdicts,
         manual_entries=manual_entries, chip_locator=_chip_locator(files, model.version),
+        expected_ms=expected_ms,
     )
     result["rules"] = dict(outcome.stats, late_pairs=outcome.late_pairs)
     result["items"] = outcome.items

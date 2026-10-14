@@ -87,6 +87,7 @@ class ClockModel:
     source: str = "auto"
     session_ids: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    session_offsets: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         if int(self.camera_index) <= 0:
@@ -104,24 +105,30 @@ class ClockModel:
     def slope_ms_per_hour(self) -> float:
         return float(self.slope) * _MS_PER_HOUR
 
-    def offset_at(self, chip_ms: int) -> int:
-        """Recorder minus chip at a chip-domain time."""
+    def offset_at(self, chip_ms: int, session_id: str = "") -> int:
+        """Recorder minus chip at a chip-domain time (optionally per session)."""
 
-        return int(round(self.intercept_ms + self.slope * (int(chip_ms) - self.reference_ms)))
+        shift = float(dict(self.session_offsets).get(session_id, 0.0)) if session_id else 0.0
+        return int(round(self.intercept_ms + shift + self.slope * (int(chip_ms) - self.reference_ms)))
 
-    def to_recorder(self, chip_ms: int) -> RecorderClockMs:
-        return RecorderClockMs(int(chip_ms) + self.offset_at(chip_ms))
+    def to_recorder(self, chip_ms: int, session_id: str = "") -> RecorderClockMs:
+        return RecorderClockMs(int(chip_ms) + self.offset_at(chip_ms, session_id))
 
-    def to_chip(self, recorder_ms: int) -> ChipClockMs:
+    def to_chip(self, recorder_ms: int, session_id: str = "") -> ChipClockMs:
         """Invert the model; the offset is removed exactly once."""
 
+        shift = float(dict(self.session_offsets).get(session_id, 0.0)) if session_id else 0.0
         value = (
-            float(recorder_ms) - self.intercept_ms + self.slope * self.reference_ms
+            float(recorder_ms) - self.intercept_ms - shift + self.slope * self.reference_ms
         ) / (1.0 + self.slope)
         return ChipClockMs(int(round(value)))
 
     def same_fit(self, other: "ClockModel", *, tolerance_ms: int = 5) -> bool:
         if other.camera_index != self.camera_index:
+            return False
+        if {key: round(value) for key, value in dict(self.session_offsets).items()} != {
+            key: round(value) for key, value in dict(other.session_offsets).items()
+        }:
             return False
         start = min(self.valid_from_ms, other.valid_from_ms)
         end = max(self.valid_to_ms, other.valid_to_ms)
@@ -134,6 +141,7 @@ class ClockModel:
         payload = asdict(self)
         payload["session_ids"] = list(self.session_ids)
         payload["notes"] = list(self.notes)
+        payload["session_offsets"] = {str(key): float(value) for key, value in dict(self.session_offsets).items()}
         payload["schema_version"] = SCHEMA_VERSION
         payload["record_type"] = "clock_model"
         return payload
@@ -163,6 +171,9 @@ class ClockModel:
             source=str(payload.get("source", "auto")),
             session_ids=tuple(str(item) for item in payload.get("session_ids", ())),
             notes=tuple(str(item) for item in payload.get("notes", ())),
+            session_offsets=tuple(
+                (str(key), float(value)) for key, value in (payload.get("session_offsets") or {}).items()
+            ),
         )
 
 
@@ -360,6 +371,9 @@ def calibrate_camera(
             f"自动粗校峰值不明显（峰 {coarse.support}，背景 {coarse.background:.1f}，次峰 {coarse.second_support}），请人工核对"
         )
 
+    session_of = {}
+    for item in items:
+        session_of.setdefault(int(item.recorder_ms), item.session_id)
     expected = float(coarse.offset_ms)
     pairs: list[tuple[int, int, int, int]] = []
     fit = None
@@ -370,10 +384,23 @@ def calibrate_camera(
         )
         if not pairs:
             break
-        times = [pair[1] for pair in pairs]
-        values = [pair[2] for pair in pairs]
-        fit = robust_line_fit(times, values, fit_slope=len(pairs) >= min_drift_support)
-        a, b, mean = fit[0], fit[1], fit[2]
+        # Short extra sessions (a recorder restart may change the camera
+        # latency) must not tilt the shared drift line: fit on sessions with
+        # enough isolated riders and only report the others.
+        sessions = [session_of.get(pair[3], "") for pair in pairs]
+        counts = {name: sessions.count(name) for name in set(sessions)}
+        main = {name for name, count in counts.items() if count >= min_drift_support}
+        chosen = [index for index, name in enumerate(sessions) if name in main] if main else list(range(len(pairs)))
+        times = [pairs[index][1] for index in chosen]
+        values = [pairs[index][2] for index in chosen]
+        a, b, mean, keep_chosen, _residuals = robust_line_fit(
+            times, values, fit_slope=len(chosen) >= min_drift_support,
+        )
+        all_times = np.asarray([pair[1] for pair in pairs], dtype=np.float64)
+        residuals = np.asarray([pair[2] for pair in pairs], dtype=np.float64) - (a + b * (all_times - mean))
+        keep = np.zeros(len(pairs), dtype=bool)
+        keep[chosen] = keep_chosen
+        fit = (a, b, mean, keep, residuals)
         expected = (lambda chip, a=a, b=b, mean=mean: a + b * (chip - mean))
     if fit is None or not pairs:
         return CalibrationResult(
@@ -404,10 +431,15 @@ def calibrate_camera(
         session = crossing_sessions.get(pair[3], "")
         by_session.setdefault(session, []).append(float(residual))
     session_medians = {key: float(np.median(values)) for key, values in by_session.items()}
+    session_offsets = []
     for key, values in by_session.items():
         median = session_medians[key]
-        if len(values) >= 5 and abs(median) > SESSION_DEVIATION_MS:
-            warnings.append(f"录像会话 {key or '-'} 与漂移线相差 {median:+.0f} ms，请核对该会话校时")
+        if len(values) >= 3 and abs(median) > SESSION_DEVIATION_MS and key:
+            session_offsets.append((key, round(median, 1)))
+            warnings.append(
+                f"录像会话 {key} 与共用漂移线相差 {median:+.0f} ms（可能重启录像后延迟变化），"
+                "已对该会话单独修正，请核对"
+            )
 
     sessions = tuple(sorted({item.session_id for item in items if item.session_id}))
     model = ClockModel(
@@ -424,6 +456,7 @@ def calibrate_camera(
         coarse_support=int(coarse.support),
         session_ids=sessions,
         notes=tuple(warnings),
+        session_offsets=tuple(session_offsets),
     )
     return CalibrationResult(
         model,

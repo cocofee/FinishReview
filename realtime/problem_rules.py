@@ -156,12 +156,16 @@ def build_video_items(
     verdicts: Mapping[str, BikeVerdict] = {},
     manual_entries: Sequence[ChipRead] = (),
     chip_locator=None,
+    expected_ms: Optional[Mapping[str, int]] = None,
 ) -> RuleOutcome:
     """Apply the merge rules; ``chip_locator(read)`` pins a chip to a frame."""
 
     version = int(model.version)
     outcome = RuleOutcome()
-    expected = {read.read_id: model.to_recorder(read.chip_ms) for read in [*chip_only, *(m[1] for m in matched)]}
+    expected = {
+        read.read_id: (expected_ms or {}).get(read.read_id, model.to_recorder(read.chip_ms))
+        for read in [*chip_only, *(m[1] for m in matched)]
+    }
     all_chip_times = sorted(read.chip_ms for read in [*chip_only, *(m[1] for m in matched)])
     crossing_times = sorted([m[0].recorder_ms for m in matched] + [c.recorder_ms for c in video_only])
     periods = _merge_obstructions(obstructions)
@@ -225,14 +229,14 @@ def build_video_items(
     for spot in spots:
         members = spot["members"]
         first = members[0][0]
-        chip_time = model.to_chip(first.recorder_ms)
+        chip_time = model.to_chip(first.recorder_ms, first.session_id)
         if len(members) >= STANDING_MIN:
             last = members[-1][0]
             outcome.items.append(ProblemItem(
                 item_id=stable_item_id(KIND_STANDING, camera_index, first.key),
                 kind=KIND_STANDING, category=CATEGORY_VIDEO,
                 detail=(
-                    f"线上同一位置 {format_chip_time(chip_time)}–{format_chip_time(model.to_chip(last.recorder_ms))} "
+                    f"线上同一位置 {format_chip_time(chip_time)}–{format_chip_time(model.to_chip(last.recorder_ms, last.session_id))} "
                     f"反复出现 {len(members)} 次活动，可能有人停留"
                 ),
                 chip_time_ms=chip_time, status=STATUS_OPEN, priority=40,
@@ -241,7 +245,7 @@ def build_video_items(
             ))
             continue
         for crossing, verdict in members:
-            chip_time = model.to_chip(crossing.recorder_ms)
+            chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
             label = verdict.label if verdict is not None else LABEL_UNCHECKED
             status, note = STATUS_OPEN, ""
             if verdict is not None and verdict.decision == DECISION_DISPUTED:
@@ -310,7 +314,7 @@ def build_video_items(
         ))
 
     for crossing, verdict in excluded:
-        chip_time = model.to_chip(crossing.recorder_ms)
+        chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
         outcome.items.append(ProblemItem(
             item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
             kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,

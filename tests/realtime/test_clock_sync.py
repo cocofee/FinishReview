@@ -117,6 +117,15 @@ def test_sessions_far_from_shared_drift_line_are_reported():
     assert abs(result.session_medians_ms["main"]) < 30
     assert any("second" in warning for warning in result.warnings)
     assert not any("main" in warning for warning in result.warnings)
+    # The shared drift line is fitted on the main session; the short session
+    # keeps it and only gets its own measured shift.
+    model = result.model
+    assert abs(model.slope_ms_per_hour - (-334)) < 40
+    assert abs(dict(model.session_offsets)["second"] - 400) < 40
+    chip = START + int(1.1 * HOUR)
+    assert model.offset_at(chip, "second") - model.offset_at(chip) == round(dict(model.session_offsets)["second"])
+    assert abs(model.to_chip(model.to_recorder(chip, "second"), "second") - chip) <= 1
+    assert ClockModel.from_payload(model.to_payload()) == model
 
 
 def test_manual_anchor_is_only_checked_against_automatic_model():
