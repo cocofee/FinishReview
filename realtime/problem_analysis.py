@@ -611,7 +611,8 @@ def summarize_items(items: list[ProblemItem], auto_passed: list[dict], unverifia
     return {
         "auto_passed": sum(1 for item in auto_passed if item.get("active_now", True)),
         "pending": sum(1 for item in items if item.pending),
-        "disputed": sum(1 for item in items if item.status == STATUS_DISPUTED),
+        "disputed": sum(1 for item in items if item.status == STATUS_DISPUTED and item.pending),
+        "grouped": sum(1 for item in items if item.grouped and item.status in ("open", "disputed")),
         "closed_upstream": sum(1 for item in items if item.status == STATUS_CLOSED_UPSTREAM),
         "excluded": sum(1 for item in items if item.status == STATUS_EXCLUDED),
         "unverifiable": unverifiable,
