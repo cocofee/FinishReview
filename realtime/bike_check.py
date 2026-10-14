@@ -31,6 +31,7 @@ DETECTION_THRESHOLD = 0.2
 EXCLUDE_THRESHOLD = 0.5
 NMS_THRESHOLD = 0.45
 SEEK_LEAD_MS = 4_000
+FORWARD_READ_MS = 6_000
 
 LABEL_BICYCLE = "bicycle"
 LABEL_PEDESTRIAN = "pedestrian"
@@ -156,6 +157,10 @@ class FrameReader:
         targets = sorted(float(value) for value in targets_ms)
         if not targets:
             return []
+        last = getattr(self, "_last", None)
+        if last is not None and last[1] <= targets[0] - tolerance_ms <= last[1] + FORWARD_READ_MS:
+            # Close ahead of the last decoded frame: keep reading, no seek.
+            return self._read_forward(self._capture, last[0], last[1], targets, tolerance_ms)
         for lead in (SEEK_LEAD_MS, 2 * SEEK_LEAD_MS):
             capture = self._open()
             if not capture.isOpened():
@@ -167,21 +172,27 @@ class FrameReader:
             pts = float(capture.get(cv2.CAP_PROP_POS_MSEC))
             if pts > targets[0] + tolerance_ms and targets[0] - lead > 0:
                 continue  # overshoot: retry from further back
-            found = []
-            pending = list(targets)
-            while pending:
-                if pts >= pending[0] - tolerance_ms:
-                    found.append((frame, pts))
-                    pending.pop(0)
-                    continue
-                ok, frame = capture.read()
-                if not ok:
-                    break
-                pts = float(capture.get(cv2.CAP_PROP_POS_MSEC))
-            return found
+            return self._read_forward(capture, frame, pts, targets, tolerance_ms)
         return []
 
+    def _read_forward(self, capture, frame, pts, targets, tolerance_ms):
+        found = []
+        pending = list(targets)
+        while pending:
+            if pts >= pending[0] - tolerance_ms:
+                found.append((frame, pts))
+                pending.pop(0)
+                continue
+            ok, frame = capture.read()
+            if not ok:
+                self._last = None
+                return found
+            pts = float(capture.get(cv2.CAP_PROP_POS_MSEC))
+        self._last = (frame, pts)
+        return found
+
     def close(self) -> None:
+        self._last = None
         if self._capture is not None:
             self._capture.release()
             self._capture = None

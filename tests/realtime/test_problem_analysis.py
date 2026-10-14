@@ -170,6 +170,23 @@ def test_problem_list_file_and_cards(synthetic_race):
     assert image.shape[1] == 9 * image.shape[0]
 
 
+def test_frame_reader_reads_forward_and_seeks_back_by_real_frame_times(synthetic_race):
+    from realtime.bike_check import FrameReader
+
+    root, _workspace, _config, _strips = synthetic_race
+    reader = FrameReader(root / "videos" / "camera_01_20260919_100000_000000_archive_0000.avi")
+    try:
+        first = [pts for _frame, pts in reader.frames_at([10_000, 10_250])]
+        ahead = [pts for _frame, pts in reader.frames_at([13_000])]
+        back = [pts for _frame, pts in reader.frames_at([2_000])]
+    finally:
+        reader.close()
+
+    assert first == [10_000.0, 10_250.0]
+    assert ahead == [13_000.0]
+    assert back == [2_000.0]
+
+
 def test_gui_started_run_uses_workspace_config_and_publishes_calibration(synthetic_race):
     root, _workspace, _config, _strips = synthetic_race
     (root / "finish_problems").mkdir(exist_ok=True)
