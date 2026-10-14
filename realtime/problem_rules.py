@@ -347,14 +347,14 @@ def build_video_items(
         for item in outcome.items if item.pending
         for read_id in item.event_ids
     }
-    crowd_paired = 0
+    unverified: set[str] = set()
     for crossing, read, residual in matched:
         if read.event_id in open_bibs:
             continue
-        if crossing.in_obstruction or crowded(expected[read.read_id]):
-            # Paired inside a crowded period: evidence is insufficient, the
-            # read is checked with that period instead of passing silently.
-            crowd_paired += 1
+        if crossing.in_obstruction and crowded(expected[read.read_id]):
+            # Only motion inside a blocked, crowded stretch matches this chip;
+            # no rider is seen, so it is checked with that period instead.
+            unverified.add(read.read_id)
             continue
         outcome.auto_passed.append(_auto_passed(read, crossing, int(residual), version))
 
@@ -362,7 +362,7 @@ def build_video_items(
     race_periods = [
         (start, end) for start, end in periods if race_start_ms is None or end >= race_start_ms
     ]
-    crowds = _obstruction_items(camera_index, model, race_periods, matched, chip_only, version)
+    crowds = _obstruction_items(camera_index, model, race_periods, matched, chip_only, version, unverified)
     outcome.items = _group_members(outcome.items, bunches, crowds, expected)
     outcome.items += _no_video_items(camera_index, no_video)
     outcome.stats = {
@@ -372,7 +372,7 @@ def build_video_items(
         "duplicates": outcome.duplicates,
         "standing": sum(len(spot["members"]) >= STANDING_MIN for spot in spots),
         "before_race": len(before_race),
-        "paired_in_crowd": crowd_paired,
+        "paired_in_crowd": len(unverified),
     }
     return outcome
 
@@ -487,23 +487,28 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
     return items
 
 
-def _obstruction_items(camera_index, model, periods, matched, chip_only, version) -> list[ProblemItem]:
+def _obstruction_items(
+    camera_index, model, periods, matched, chip_only, version, unverified=frozenset(),
+) -> list[ProblemItem]:
     items = []
+    reads = [m[1] for m in matched] + list(chip_only)
     for start, end in periods:
-        inside = [
-            read for read in [m[1] for m in matched] + list(chip_only)
-            if start <= model.to_recorder(read.chip_ms) <= end
-        ]
+        inside = [read for read in reads if start - 5_000 <= model.to_recorder(read.chip_ms) <= end + 5_000]
+        weak = [read.bib for read in inside if read.read_id in unverified]
+        detail = (
+            f"{format_chip_time(model.to_chip(start))}–{format_chip_time(model.to_chip(end))} 终点线被挡或拥挤"
+            f"（{(end - start) / 1000:.0f} 秒），期间芯片 {len(inside)} 个"
+        )
+        if weak:
+            detail += f"，其中 {len(weak)} 个只对上遮挡中的晃动、未自动通过：" + "、".join(weak[:30])
+            detail += "……" if len(weak) > 30 else ""
         items.append(ProblemItem(
             item_id=stable_item_id(KIND_OBSTRUCTION, camera_index, start),
             kind=KIND_OBSTRUCTION, category=CATEGORY_VIDEO,
-            detail=(
-                f"{format_chip_time(model.to_chip(start))}–{format_chip_time(model.to_chip(end))} 终点线被挡或拥挤"
-                f"（{(end - start) / 1000:.0f} 秒），期间芯片 {len(inside)} 个；证据不足，请核对该时段"
-            ),
+            detail=detail + "；证据不足，请核对该时段",
             chip_time_ms=model.to_chip(start), bibs=tuple(read.bib for read in inside),
             event_ids=tuple(read.event_id for read in inside), status=STATUS_OPEN, priority=60,
-            evidence={"recorder_start_ms": int(start), "recorder_end_ms": int(end)},
+            evidence={"recorder_start_ms": int(start), "recorder_end_ms": int(end), "unverified": weak},
             calibration_version=version,
         ))
     return items

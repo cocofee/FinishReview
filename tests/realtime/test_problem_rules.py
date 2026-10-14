@@ -225,17 +225,25 @@ def test_items_inside_bunches_and_crowded_periods_are_folded_into_the_group():
     assert len(separate) == 1 and separate[0].pending
 
 
-def test_reads_paired_inside_a_crowded_period_are_not_auto_passed():
-    inside = _read("1", T0 + 200_000)
+def test_reads_paired_only_to_motion_in_a_crowded_period_are_not_auto_passed():
+    burst = _read("1", T0 + 200_000)
+    rider = _read("3", T0 + 205_000)
     outside = _read("2", T0 + 400_000)
     outcome = _rules(
-        matched=[(_crossing(T0 + 201_000, obstruction=True), inside, 0.0), (_crossing(T0 + 401_000), outside, 0.0)],
+        matched=[
+            (_crossing(T0 + 201_000, obstruction=True), burst, 0.0),
+            (_crossing(T0 + 206_000), rider, 0.0),
+            (_crossing(T0 + 401_000), outside, 0.0),
+        ],
         obstructions=[Obstruction(1, T0 + 195_000, T0 + 215_000)],
     )
 
-    assert [item["bib"] for item in outcome.auto_passed] == ["2"]
+    # A rider-like crossing in the crowded period still matches its chip; a
+    # chip that only lines up with motion inside the blockage does not pass.
+    assert sorted(item["bib"] for item in outcome.auto_passed) == ["2", "3"]
     crowd = next(item for item in outcome.items if item.kind == "obstruction")
-    assert crowd.bibs == ("1",) and crowd.pending
+    assert crowd.bibs == ("1", "3") and crowd.pending
+    assert crowd.evidence["unverified"] == ["1"] and "未自动通过：1" in crowd.detail
     assert outcome.stats["paired_in_crowd"] == 1
 
 
