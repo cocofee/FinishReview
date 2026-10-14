@@ -113,7 +113,7 @@ class CpuMonitor:
         return max(0.0, min(1.0, 1.0 - idle / total))
 
 
-MIN_AVAILABLE_MEMORY_MB = 4096
+MIN_AVAILABLE_MEMORY_MB = 1536
 
 
 def available_memory_mb() -> Optional[int]:

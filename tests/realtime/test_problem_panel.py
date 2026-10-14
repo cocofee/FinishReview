@@ -131,3 +131,30 @@ def test_upstream_voids_and_changes_reopen_or_close_items(qapp, tmp_path):
     panel.set_events_provider(lambda: events)
     assert panel.state(changed) == "CycleRace 已处理"
     assert panel.analysis_command()[1][-2:] == ["--analyze-problems", str(tmp_path)]
+
+
+def test_progress_preserves_split_chinese_json_and_final_memory_message(qapp):
+    panel = ProblemListPanel()
+    message = (json.dumps({"stage": "提取线", "done": 2, "total": 21}, ensure_ascii=False) + "\n").encode("utf-8")
+    split = message.index("提".encode("utf-8")) + 1
+    panel._consume_progress(message[:split])
+    assert not panel.hint.text()
+    panel._consume_progress(message[split:])
+    assert panel.hint.text() == "后台分析：提取线 2/21"
+    panel._consume_progress(json.dumps({"stage": "skipped", "message": "可用内存不足 1536 MB"},
+                                      ensure_ascii=False).encode("utf-8"))
+    panel._analysis_done()
+    assert panel.hint.text() == "可用内存不足 1536 MB"
+
+
+def test_gui_analysis_sets_utf8_unbuffered_worker_environment(qapp, tmp_path, monkeypatch):
+    from PyQt5.QtCore import QProcess
+
+    monkeypatch.setattr(QProcess, "start", lambda self: None)
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel._toggle_analysis()
+    environment = panel._process.processEnvironment()
+    assert environment.value("PYTHONIOENCODING") == "utf-8"
+    assert environment.value("PYTHONUNBUFFERED") == "1"
+    panel._process = None

@@ -567,7 +567,8 @@ def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
 
     Keys (all optional): ``model_path``, ``model_input``, ``crop_modes``
     (camera -> mode), ``finish_lines`` (list like ``finish_lines.json``),
-    ``cameras``. Results go to ``finish_problems/``; calibration versions to
+    ``cameras``, ``min_available_mb`` (default 1536 MB). Results go to
+    ``finish_problems/``; calibration versions to
     the workspace's ``video_clock_models.jsonl`` so the main window sees them.
     """
 

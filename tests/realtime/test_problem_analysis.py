@@ -218,6 +218,44 @@ def test_analysis_does_not_start_when_memory_is_short(synthetic_race, monkeypatc
     assert not (tmp_path / "out").exists()
 
 
+@pytest.mark.parametrize("available,starts", [(1535, False), (1536, True), (2048, True)])
+def test_default_memory_gate_boundary(synthetic_race, monkeypatch, tmp_path, available, starts):
+    root, _workspace, _config, _strips = synthetic_race
+    monkeypatch.setattr(problem_analysis, "available_memory_mb", lambda: available)
+    extracted = []
+    monkeypatch.setattr(problem_analysis, "extract_strips", lambda *args, **kwargs: extracted.append(True) or [])
+    config = AnalysisConfig(workspace=root, output_dir=tmp_path / "out")
+
+    summary = run_offline_analysis(config, stage="strips", lower_priority=False)
+
+    assert config.min_available_mb == 1536
+    assert bool(extracted) == starts
+    assert ("skipped" not in summary) == starts
+    if not starts:
+        assert "1536 MB" in summary["skipped"]
+        assert not config.resolved_output().exists()
+
+
+def test_workspace_memory_threshold_default_and_override(tmp_path):
+    assert config_from_workspace(tmp_path).min_available_mb == 1536
+    output = tmp_path / "finish_problems"
+    output.mkdir()
+    (output / ANALYSIS_CONFIG_FILENAME).write_text(
+        json.dumps({"min_available_mb": 4096}), encoding="utf-8",
+    )
+    assert config_from_workspace(tmp_path).min_available_mb == 4096
+
+
+@pytest.mark.parametrize("options,expected", [([], 1536), (["--min-free-mb", "2048"], 2048)])
+def test_cli_memory_threshold_default_and_override(tmp_path, monkeypatch, options, expected):
+    from tools import finish_problem_list
+
+    seen = []
+    monkeypatch.setattr(finish_problem_list, "run", lambda config, stage: seen.append(config) or {})
+    assert finish_problem_list.main(["--workspace", str(tmp_path), *options]) == 0
+    assert seen[0].min_available_mb == expected
+
+
 def test_bike_check_keeps_one_decoder_open_at_a_time(monkeypatch, tmp_path):
     from realtime.bike_check import BikeVerdict
     from realtime.problem_rules import CrossingRecord

@@ -42,6 +42,24 @@ def _unprotect_for_test(value: str) -> str:
     return bytes.fromhex(value.removeprefix(prefix)).decode("utf-8")
 
 
+def test_problem_worker_progress_is_ascii_json(monkeypatch, capsys):
+    from realtime import problem_analysis
+
+    monkeypatch.setattr(problem_analysis, "config_from_workspace", lambda path: path)
+    def run(config, progress):
+        progress("提取线", 2, 21)
+        return {"skipped": "可用内存只有 1000 MB，少于 1536 MB"}
+    monkeypatch.setattr(problem_analysis, "run_offline_analysis", run)
+
+    assert review_main.run_problem_analysis("synthetic-workspace") == 1
+
+    output = capsys.readouterr().out
+    assert output.isascii()
+    messages = [json.loads(line) for line in output.splitlines()]
+    assert messages[0] == {"stage": "提取线", "done": 2, "total": 21}
+    assert messages[1] == {"stage": "skipped", "message": "可用内存只有 1000 MB，少于 1536 MB"}
+
+
 def test_main_shows_real_window_before_entering_event_loop(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     captured_windows = []

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt5.QtCore import QProcess, Qt, pyqtSignal
+from PyQt5.QtCore import QProcess, QProcessEnvironment, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -79,6 +79,7 @@ class ProblemListPanel(QFrame):
         self._signature = None
         self._events_provider: Callable[[], object] = lambda: ()
         self._process: Optional[QProcess] = None
+        self._progress_buffer = b""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(4)
@@ -427,12 +428,17 @@ class ProblemListPanel(QFrame):
         if self.workspace_dir is None:
             return
         process = QProcess(self)
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("PYTHONIOENCODING", "utf-8")
+        environment.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(environment)
         program, arguments = self.analysis_command()
         process.setProgram(program)
         process.setArguments(arguments)
         process.readyReadStandardOutput.connect(self._read_progress)
         process.finished.connect(self._analysis_done)
         self._process = process
+        self._progress_buffer = b""
         self.analyze_button.setText("停止分析")
         self.hint.setText("正在后台分析录像（低优先级，可随时停止，下次从已完成的部分继续）……")
         process.start()
@@ -440,9 +446,18 @@ class ProblemListPanel(QFrame):
     def _read_progress(self) -> None:
         if self._process is None:
             return
-        for raw in bytes(self._process.readAllStandardOutput()).decode("utf-8", "replace").splitlines():
+        self._consume_progress(bytes(self._process.readAllStandardOutput()))
+
+    def _consume_progress(self, data: bytes, *, final: bool = False) -> None:
+        self._progress_buffer += data
+        lines = self._progress_buffer.split(b"\n")
+        self._progress_buffer = lines.pop()
+        if final and self._progress_buffer:
+            lines.append(self._progress_buffer)
+            self._progress_buffer = b""
+        for raw in lines:
             try:
-                message = json.loads(raw)
+                message = json.loads(raw.decode("utf-8"))
             except ValueError:
                 continue
             if message.get("stage") == "done":
@@ -454,6 +469,8 @@ class ProblemListPanel(QFrame):
             self.hint.setText(f"后台分析：{message.get('stage')} {message.get('done')}/{total}")
 
     def _analysis_done(self, *_args) -> None:
+        self._read_progress()
+        self._consume_progress(b"", final=True)
         self._process = None
         self.analyze_button.setText("分析录像")
         self._signature = None

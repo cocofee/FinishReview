@@ -20,7 +20,7 @@ D:\orca\FinishReview\.venv\Scripts\python.exe -m realtime.review_main --output D
 
 - 有问题清单时，主界面会自动打开“问题清单”窗口；关掉后点工具栏“问题清单”再打开。
 - 不要点“开始录像”，也不用连接 CycleRace。
-- 清单已经生成，不用点“分析录像”。点了会在后台用缓存重算（可用内存不足 4 GB 时不会开始），只写演练目录，不写原目录。
+- 清单已经生成，不用点“分析录像”。点了会在后台用缓存重算（默认可用内存不足 1536 MB 时不会开始），只写演练目录，不写原目录。可在 `finish_problems/analysis_config.json` 中通过 `min_available_mb` 调整门槛。
 
 ## 清单里有什么
 

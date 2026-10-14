@@ -49,6 +49,12 @@ FinishReview 通过 OpenCV 自带的 `cv2.dnn` 单线程运行，只看配不上
 v0.24.9 修复旧目录混入多场赛事时的名单范围和时间胶卷恢复，增加“选择赛事”，保留历史查看与生效校时显示。
 定边数据验证、启动方式及当前范围见 [旧赛事目录恢复与验收](docs/P0_WORKSPACE_VALIDATION.md)。
 
+v0.25.0 测试版使用“问题清单”处理过线卡片、芯片自检和导出建议；操作流程见
+[定边演练](docs/FINISH_PROBLEM_LIST_WALKTHROUGH.md)。分析启动时默认要求至少 1536 MB
+可用物理内存。可在赛事目录 `finish_problems/analysis_config.json` 中配置
+`"min_available_mb": 2048` 等数值；赛后命令行工具可用 `--min-free-mb 2048` 覆盖。
+该门槛只决定是否开始分析，分析仍使用低优先级、受限解码线程和单线程认车。
+
 ## Source baseline
 
 - Source repository: `cocofee/VideoPipe`

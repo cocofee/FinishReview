@@ -89,13 +89,15 @@ def run_problem_analysis(event_dir: str) -> int:
     from realtime.problem_analysis import config_from_workspace, run_offline_analysis
 
     def report(stage: str, done: int, total: int) -> None:
-        print(_json.dumps({"stage": stage, "done": done, "total": total}, ensure_ascii=False), flush=True)
+        # Frozen Windows executables may ignore PYTHONIOENCODING. ASCII JSON
+        # keeps the pipe protocol independent of the system code page.
+        print(_json.dumps({"stage": stage, "done": done, "total": total}, ensure_ascii=True), flush=True)
 
     summary = run_offline_analysis(config_from_workspace(event_dir), progress=report)
     if summary.get("skipped"):
-        print(_json.dumps({"stage": "skipped", "message": summary["skipped"]}, ensure_ascii=False), flush=True)
+        print(_json.dumps({"stage": "skipped", "message": summary["skipped"]}, ensure_ascii=True), flush=True)
         return 1
-    print(_json.dumps({"stage": "done", "summary": summary.get("summary", {})}, ensure_ascii=False, default=str),
+    print(_json.dumps({"stage": "done", "summary": summary.get("summary", {})}, ensure_ascii=True, default=str),
           flush=True)
     return 0
 
