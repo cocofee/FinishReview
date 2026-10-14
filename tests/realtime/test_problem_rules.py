@@ -237,3 +237,10 @@ def test_reads_paired_inside_a_crowded_period_are_not_auto_passed():
     crowd = next(item for item in outcome.items if item.kind == "obstruction")
     assert crowd.bibs == ("1",) and crowd.pending
     assert outcome.stats["paired_in_crowd"] == 1
+
+
+def test_memory_readings_are_positive_or_unavailable():
+    from realtime.analysis_resources import available_memory_mb, peak_memory_mb
+
+    for value in (available_memory_mb(), peak_memory_mb()):
+        assert value is None or value > 0

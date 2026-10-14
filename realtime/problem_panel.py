@@ -447,6 +447,9 @@ class ProblemListPanel(QFrame):
                 continue
             if message.get("stage") == "done":
                 continue
+            if message.get("stage") == "skipped":
+                self._skip_message = str(message.get("message", ""))
+                continue
             total = message.get("total") or 0
             self.hint.setText(f"后台分析：{message.get('stage')} {message.get('done')}/{total}")
 
@@ -455,7 +458,11 @@ class ProblemListPanel(QFrame):
         self.analyze_button.setText("分析录像")
         self._signature = None
         self.refresh()
-        self.hint.setText("录像分析结束。" if self.payload else "录像分析未完成，请查看日志。")
+        skipped, self._skip_message = getattr(self, "_skip_message", ""), ""
+        if skipped:
+            self.hint.setText(skipped)
+        else:
+            self.hint.setText("录像分析结束。" if self.payload else "录像分析未完成，请查看日志。")
         self.analysis_finished.emit()
 
 

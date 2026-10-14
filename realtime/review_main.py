@@ -92,6 +92,9 @@ def run_problem_analysis(event_dir: str) -> int:
         print(_json.dumps({"stage": stage, "done": done, "total": total}, ensure_ascii=False), flush=True)
 
     summary = run_offline_analysis(config_from_workspace(event_dir), progress=report)
+    if summary.get("skipped"):
+        print(_json.dumps({"stage": "skipped", "message": summary["skipped"]}, ensure_ascii=False), flush=True)
+        return 1
     print(_json.dumps({"stage": "done", "summary": summary.get("summary", {})}, ensure_ascii=False, default=str),
           flush=True)
     return 0

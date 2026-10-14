@@ -113,6 +113,73 @@ class CpuMonitor:
         return max(0.0, min(1.0, 1.0 - idle / total))
 
 
+MIN_AVAILABLE_MEMORY_MB = 4096
+
+
+def available_memory_mb() -> Optional[int]:
+    """Free physical memory of the whole computer in MB, or ``None``."""
+
+    if sys.platform != "win32":
+        try:
+            with open("/proc/meminfo", encoding="ascii") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        except (OSError, ValueError, IndexError):
+            return None
+        return None
+    try:
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(_MemoryStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullAvailPhys // (1024 * 1024))
+    except (AttributeError, OSError):  # pragma: no cover - platform specific
+        return None
+
+
+def peak_memory_mb() -> Optional[int]:
+    """Peak working set of this process in MB, or ``None``."""
+
+    if sys.platform != "win32":
+        try:
+            import resource
+
+            return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)
+        except (ImportError, OSError, ValueError):
+            return None
+    try:
+        class _Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = _Counters()
+        counters.cb = ctypes.sizeof(_Counters)
+        function = ctypes.WinDLL("psapi").GetProcessMemoryInfo
+        function.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Counters), ctypes.c_ulong]
+        function.restype = ctypes.c_int
+        # -1 is the pseudo handle of the current process.
+        if not function(ctypes.c_void_p(-1), ctypes.byref(counters), counters.cb):
+            return None
+        return int(counters.PeakWorkingSetSize // (1024 * 1024))
+    except (AttributeError, OSError):  # pragma: no cover - platform specific
+        return None
+
+
 @dataclass
 class ResourceGovernor:
     """Pause analysis while the computer is busy; resume when it calms down."""
@@ -152,8 +219,11 @@ class ResourceGovernor:
 
 
 __all__ = [
+    "MIN_AVAILABLE_MEMORY_MB",
     "CpuMonitor",
     "ResourceGovernor",
+    "available_memory_mb",
+    "peak_memory_mb",
     "limit_opencv_threads",
     "lower_process_priority",
 ]

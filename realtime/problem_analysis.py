@@ -24,7 +24,14 @@ from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from .analysis_resources import ResourceGovernor, limit_opencv_threads, lower_process_priority
+from .analysis_resources import (
+    MIN_AVAILABLE_MEMORY_MB,
+    ResourceGovernor,
+    available_memory_mb,
+    limit_opencv_threads,
+    lower_process_priority,
+    peak_memory_mb,
+)
 from .analysis_workspace import AnalysisWorkspace, ArchiveSegment
 from .bike_check import BikeVerdict, CropPlan, FrameReader, YoloxDetector, classify_frames
 from .chip_checks import ChipCheckContext, chip_check_items
@@ -75,6 +82,7 @@ class AnalysisConfig:
     clock_model_path: Optional[Path] = None
     render_cards: bool = True
     check_paired_bikes: bool = False
+    min_available_mb: int = MIN_AVAILABLE_MEMORY_MB
 
     def resolved_output(self) -> Path:
         return Path(self.output_dir) if self.output_dir else Path(self.workspace) / OUTPUT_DIRNAME
@@ -337,10 +345,14 @@ def _bike_verdicts(
             cache = {}
     plan = CropPlan.for_mode(config.crop_modes.get(camera, "up"))
     detector = None
-    readers: dict[str, FrameReader] = {}
+    reader: Optional[FrameReader] = None
     verdicts: dict[str, BikeVerdict] = {}
+    # One decoder at a time, files in order: an open decoder per file would
+    # keep every file's frame buffers in memory for the whole race.
+    ordered = sorted(crossings, key=lambda item: (item.video_path, item.position_ms))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        for index, crossing in enumerate(crossings):
+        for index, crossing in enumerate(ordered):
             key = f"{model_key}|{plan.mode}|{crossing.key}|{int(crowded(crossing.recorder_ms))}"
             if key in cache:
                 verdicts[crossing.key] = BikeVerdict(**{
@@ -351,7 +363,10 @@ def _bike_verdicts(
             if detector is None:
                 detector = YoloxDetector(config.model_path, config.model_input)
             progress("认车", index, len(crossings))
-            reader = readers.setdefault(crossing.video_path, FrameReader(crossing.video_path, config.decode_threads))
+            if reader is None or str(reader.path) != str(Path(crossing.video_path)):
+                if reader is not None:
+                    reader.close()
+                reader = FrameReader(crossing.video_path, config.decode_threads)
             frames = [
                 frame for frame, _pts in reader.frames_at(
                     [crossing.position_ms + offset for offset in plan.offsets_ms]
@@ -372,9 +387,8 @@ def _bike_verdicts(
             if index % 20 == 0:
                 cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
     finally:
-        for reader in readers.values():
+        if reader is not None:
             reader.close()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
     return verdicts
 
@@ -557,6 +571,7 @@ def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
         model_input=int(settings.get("model_input", 640)),
         crop_modes={int(key): str(value) for key, value in (settings.get("crop_modes") or {}).items()},
         clock_model_path=root / CLOCK_MODEL_FILENAME,
+        min_available_mb=int(settings.get("min_available_mb", MIN_AVAILABLE_MEMORY_MB)),
     )
 
 
@@ -568,15 +583,36 @@ def run_offline_analysis(
     cancelled: Callable[[], bool] = lambda: False,
     lower_priority: bool = True,
 ) -> dict:
-    """Whole pipeline at low priority; resumes from cached strips."""
+    """Whole pipeline at low priority; resumes from cached strips.
 
+    It does not start while free memory is below ``config.min_available_mb``
+    (the recorder and CycleRace come first) and records the peak working set
+    per stage in ``summary["memory"]``.
+    """
+
+    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id)
+    summary: dict = {"race_id": workspace.race_id, "cameras": {}}
+    free = available_memory_mb()
+    memory: dict = {"available_at_start_mb": free, "stage_peaks_mb": {}}
+    summary["memory"] = memory
+    if free is not None and free < int(config.min_available_mb):
+        summary["skipped"] = (
+            f"可用内存只有 {free} MB，少于 {int(config.min_available_mb)} MB；"
+            "为保护 CycleRace 和录像，暂不分析，请关闭其他程序后再试。"
+        )
+        return summary
     if lower_priority:
         lower_process_priority()
     limit_opencv_threads(1)
     governor = ResourceGovernor()
-    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id)
     cameras = config.cameras or workspace.camera_indexes()
-    summary: dict = {"race_id": workspace.race_id, "cameras": {}}
+    outer_progress = progress
+
+    def progress(stage_name: str, done: int, total: int) -> None:
+        peak = peak_memory_mb()
+        if peak is not None:
+            memory["stage_peaks_mb"][stage_name] = peak
+        outer_progress(stage_name, done, total)
     results = []
     for camera in cameras:
         line = line_for_camera(config, workspace, camera)
@@ -604,6 +640,7 @@ def run_offline_analysis(
         summary["problem_list"] = str(path)
         summary["summary"] = json.loads(path.read_text(encoding="utf-8"))["summary"]
     summary["paused_seconds"] = round(governor.paused_seconds, 1)
+    memory["peak_mb"] = peak_memory_mb()
     return summary
 
 

@@ -16,11 +16,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from realtime.analysis_resources import MIN_AVAILABLE_MEMORY_MB, peak_memory_mb
 from realtime.problem_analysis import AnalysisConfig, load_line_overrides, run_offline_analysis
 
 
 def _progress(stage: str, done: int, total: int) -> None:
-    print(f"[{stage}] {done}/{total}", flush=True)
+    print(f"[{stage}] {done}/{total} peak {peak_memory_mb()} MB", flush=True)
 
 
 def build_config(arguments: argparse.Namespace) -> AnalysisConfig:
@@ -40,6 +41,7 @@ def build_config(arguments: argparse.Namespace) -> AnalysisConfig:
         race_id=arguments.race_id,
         render_cards=not arguments.no_cards,
         check_paired_bikes=arguments.check_paired_bikes,
+        min_available_mb=arguments.min_free_mb,
     )
 
 
@@ -61,9 +63,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--stage", choices=("strips", "all"), default="all")
     parser.add_argument("--no-cards", action="store_true")
     parser.add_argument("--check-paired-bikes", action="store_true", help="同时对已配对骑手认车（只用于验收）")
+    parser.add_argument(
+        "--min-free-mb", type=int, default=MIN_AVAILABLE_MEMORY_MB, help="可用内存低于此值时不开始分析",
+    )
     arguments = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(message)s")
     summary = run(build_config(arguments), arguments.stage)
+    print("memory:", json.dumps(summary.get("memory", {}), ensure_ascii=False), flush=True)
+    if summary.get("skipped"):
+        print(summary["skipped"], flush=True)
+        return 1
     print(json.dumps(summary, ensure_ascii=False, default=str)[:2000])
     return 0
 

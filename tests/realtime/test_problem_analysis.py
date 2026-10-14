@@ -9,6 +9,7 @@ import pytest
 
 from realtime.analysis_workspace import AnalysisWorkspace
 from realtime.passage_receiver import PassageEvent
+from realtime import problem_analysis
 from realtime.problem_analysis import (
     ANALYSIS_CONFIG_FILENAME,
     AnalysisConfig,
@@ -187,7 +188,7 @@ def test_frame_reader_reads_forward_and_seeks_back_by_real_frame_times(synthetic
     assert back == [2_000.0]
 
 
-def test_gui_started_run_uses_workspace_config_and_publishes_calibration(synthetic_race):
+def test_gui_started_run_uses_workspace_config_and_publishes_calibration(synthetic_race, monkeypatch):
     root, _workspace, _config, _strips = synthetic_race
     (root / "finish_problems").mkdir(exist_ok=True)
     (root / "finish_problems" / ANALYSIS_CONFIG_FILENAME).write_text(
@@ -195,6 +196,7 @@ def test_gui_started_run_uses_workspace_config_and_publishes_calibration(synthet
     )
     config = config_from_workspace(root)
     assert config.crop_modes == {1: "side-right"} and config.model_path is None
+    monkeypatch.setattr(problem_analysis, "available_memory_mb", lambda: 6_000)
 
     summary = run_offline_analysis(config, lower_priority=False)
 
@@ -202,3 +204,55 @@ def test_gui_started_run_uses_workspace_config_and_publishes_calibration(synthet
     assert summary["summary"]["auto_passed"] == len(CROSSINGS_S)
     assert (root / "finish_problems" / "problem_list.json").is_file()
     assert (root / "video_clock_models.jsonl").is_file()
+
+
+def test_analysis_does_not_start_when_memory_is_short(synthetic_race, monkeypatch, tmp_path):
+    root, _workspace, _config, _strips = synthetic_race
+    monkeypatch.setattr(problem_analysis, "available_memory_mb", lambda: 1_500)
+    config = AnalysisConfig(workspace=root, output_dir=tmp_path / "out", min_available_mb=4_096)
+
+    summary = run_offline_analysis(config, lower_priority=False)
+
+    assert "1500 MB" in summary["skipped"] and "4096 MB" in summary["skipped"]
+    assert summary["memory"]["available_at_start_mb"] == 1_500
+    assert not (tmp_path / "out").exists()
+
+
+def test_bike_check_keeps_one_decoder_open_at_a_time(monkeypatch, tmp_path):
+    from realtime.bike_check import BikeVerdict
+    from realtime.problem_rules import CrossingRecord
+
+    opened, state = [], {"open": 0, "max": 0}
+
+    class FakeReader:
+        def __init__(self, path, threads=2):
+            self.path = path
+            opened.append(str(path))
+            state["open"] += 1
+            state["max"] = max(state["max"], state["open"])
+
+        def frames_at(self, targets, tolerance_ms=20.0):
+            return []
+
+        def close(self):
+            state["open"] -= 1
+
+    monkeypatch.setattr(problem_analysis, "FrameReader", FakeReader)
+    monkeypatch.setattr(problem_analysis, "YoloxDetector", lambda *args: object())
+    monkeypatch.setattr(
+        problem_analysis, "classify_frames",
+        lambda *args, **kwargs: BikeVerdict("bicycle", 0.9, "keep"),
+    )
+    crossings = [
+        CrossingRecord(1, "s", "seg", f"video_{index % 3}.mkv", 1_000 * index, index, 1_000 * index, 0, 0, 1)
+        for index in range(9)
+    ]
+    config = AnalysisConfig(workspace=tmp_path, output_dir=tmp_path / "out", model_path=tmp_path / "m.onnx")
+
+    verdicts = problem_analysis._bike_verdicts(
+        config, 1, crossings, lambda _ms: False, progress=lambda *args: None, checkpoint=None,
+    )
+
+    assert len(verdicts) == 9
+    assert state["max"] == 1 and state["open"] == 0
+    assert opened == ["video_0.mkv", "video_1.mkv", "video_2.mkv"]
