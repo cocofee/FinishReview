@@ -66,7 +66,7 @@ from .problem_items import (
     ProblemItem,
     sort_items,
 )
-from .problem_rules import CrossingRecord, Obstruction, build_video_items
+from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
 
 
 logger = logging.getLogger("FinishReview.ProblemAnalysis")
@@ -362,9 +362,11 @@ def _bike_verdicts(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         for index, crossing in enumerate(ordered):
-            key = f"{model_key}|{plan.mode}|{crossing.key}|{int(crowded(crossing.recorder_ms))}"
-            if key in cache:
-                entry = cache[key]
+            key = f"{model_key}|{plan.mode}|{crossing.key}"
+            # Older caches added the crowded flag to the key; detections do not
+            # depend on it, the decision is re-made below.
+            entry = cache.get(key) or cache.get(key + "|0") or cache.get(key + "|1")
+            if entry is not None:
                 verdict = BikeVerdict(**{
                     name: tuple(value) if name == "details" else value
                     for name, value in entry.items()
@@ -521,12 +523,9 @@ def analyse_camera(
         "residual_p90_abs_ms": round(float(np.percentile(np.abs(residuals), 90)), 1) if residuals.size else None,
     }
 
-    periods = []
-    for item in sorted(obstructions, key=lambda value: value.start_ms):
-        if periods and item.start_ms - periods[-1][1] <= 30_000:
-            periods[-1][1] = max(periods[-1][1], item.end_ms)
-        else:
-            periods.append([item.start_ms, item.end_ms])
+    # The same crowded periods the list reports, so a disputed crossing and
+    # its period item agree.
+    periods = merge_obstructions(obstructions)
 
     def crowded(recorder_ms: int) -> bool:
         return any(start - 5_000 <= recorder_ms <= end + 5_000 for start, end in periods)

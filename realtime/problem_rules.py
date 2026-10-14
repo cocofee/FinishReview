@@ -171,7 +171,7 @@ def build_video_items(
     }
     all_chip_times = sorted(read.chip_ms for read in [*chip_only, *(m[1] for m in matched)])
     crossing_times = sorted([m[0].recorder_ms for m in matched] + [c.recorder_ms for c in video_only])
-    periods = _merge_obstructions(obstructions)
+    periods = merge_obstructions(obstructions)
 
     def crowded(recorder_ms: int) -> bool:
         return any(start - 5_000 <= recorder_ms <= end + 5_000 for start, end in periods)
@@ -447,7 +447,7 @@ def _group_members(items, bunches, crowds, expected) -> list[ProblemItem]:
     return result
 
 
-def _evidence_rank(member: tuple[CrossingRecord, Optional[BikeVerdict]]) -> tuple[int, int]:
+def _evidence_rank(member: tuple[CrossingRecord, Optional[BikeVerdict]]) -> tuple[int, float, int]:
     crossing, verdict = member
     if verdict is not None and verdict.label == LABEL_BICYCLE:
         rank = 0
@@ -455,7 +455,7 @@ def _evidence_rank(member: tuple[CrossingRecord, Optional[BikeVerdict]]) -> tupl
         rank = 1
     else:
         rank = 2
-    return rank, crossing.recorder_ms
+    return rank, -(verdict.score if verdict is not None else 0.0), crossing.recorder_ms
 
 
 def _auto_passed(read: ChipRead, crossing: CrossingRecord, residual: int, version: int, *, late: bool = False) -> dict:
@@ -472,7 +472,9 @@ def _auto_passed(read: ChipRead, crossing: CrossingRecord, residual: int, versio
     }
 
 
-def _merge_obstructions(obstructions: Sequence[Obstruction]) -> list[tuple[int, int]]:
+def merge_obstructions(obstructions: Sequence[Obstruction]) -> list[tuple[int, int]]:
+    """Crowded line periods: blockages less than 30 s apart, at least 10 s in total."""
+
     periods: list[list[int]] = []
     for item in sorted(obstructions, key=lambda value: value.start_ms):
         if periods and item.start_ms - periods[-1][1] <= OBSTRUCTION_MERGE_MS:
@@ -573,4 +575,5 @@ __all__ = [
     "Obstruction",
     "RuleOutcome",
     "build_video_items",
+    "merge_obstructions",
 ]
