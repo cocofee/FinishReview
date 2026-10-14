@@ -1,0 +1,323 @@
+"""Operator decisions on problem items, and the three CycleRace hand-off lists.
+
+Every decision records the action, reason, evidence frame and calibration
+version, bound to the bibs, chip reads and time it was made for. When the
+item changes upstream (another bib, another read, a new time) the decision
+is stale and the item asks again. Decisions never change CycleRace results;
+the exports are suggestions for CycleRace to apply.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Optional, Sequence
+
+from .chip_history import format_chip_time
+from .durable_jsonl import append_jsonl_records
+from .problem_items import (
+    ACTION_CHANGE,
+    ACTION_DELETE_CHIP,
+    ACTION_DELETE_EXTRA_CHIP,
+    ACTION_LABELS,
+    ACTION_RECORD_BIB,
+    KIND_TITLES,
+    ProblemItem,
+)
+
+
+SCHEMA_VERSION = 1
+RESOLUTIONS_FILENAME = "problem_resolutions.jsonl"
+EXPORT_MANUAL_ENTRIES = "补录清单.csv"
+EXPORT_DELETIONS = "建议删除清单.csv"
+EXPORT_CHANGES = "建议改号改圈清单.csv"
+SAME_FRAME_DISTANCE = 0.03
+
+
+class ProblemResolutionError(RuntimeError):
+    """Raised when the decision journal cannot be read or written."""
+
+
+@dataclass(frozen=True)
+class ProblemBinding:
+    """What the decision was made for."""
+
+    bibs: tuple[str, ...]
+    event_ids: tuple[str, ...]
+    chip_time_ms: Optional[int]
+
+    @classmethod
+    def of(cls, item: ProblemItem) -> "ProblemBinding":
+        return cls(tuple(item.bibs), tuple(item.event_ids), item.chip_time_ms)
+
+
+@dataclass(frozen=True)
+class ProblemResolution:
+    item_id: str
+    kind: str
+    action: str
+    binding: ProblemBinding
+    bib: str = ""
+    target_bib: str = ""
+    reason: str = ""
+    frame: Mapping[str, Any] = field(default_factory=dict)
+    position: tuple[float, float] = ()
+    chip_time_ms: Optional[int] = None
+    calibration_version: int = 0
+    resolved_at_ms: int = 0
+    revision: int = 1
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["binding"] = {
+            "bibs": list(self.binding.bibs),
+            "event_ids": list(self.binding.event_ids),
+            "chip_time_ms": self.binding.chip_time_ms,
+        }
+        payload["position"] = list(self.position)
+        payload["frame"] = dict(self.frame)
+        payload["schema_version"] = SCHEMA_VERSION
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ProblemResolution":
+        if payload.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("unsupported problem resolution schema_version")
+        binding = payload.get("binding") or {}
+        return cls(
+            item_id=str(payload["item_id"]),
+            kind=str(payload.get("kind", "")),
+            action=str(payload["action"]),
+            binding=ProblemBinding(
+                tuple(str(value) for value in binding.get("bibs", ())),
+                tuple(str(value) for value in binding.get("event_ids", ())),
+                None if binding.get("chip_time_ms") is None else int(binding["chip_time_ms"]),
+            ),
+            bib=str(payload.get("bib", "")),
+            target_bib=str(payload.get("target_bib", "")),
+            reason=str(payload.get("reason", "")),
+            frame=dict(payload.get("frame", {})),
+            position=tuple(float(value) for value in payload.get("position", ())),
+            chip_time_ms=None if payload.get("chip_time_ms") is None else int(payload["chip_time_ms"]),
+            calibration_version=int(payload.get("calibration_version", 0)),
+            resolved_at_ms=int(payload.get("resolved_at_ms", 0)),
+            revision=int(payload.get("revision", 1)),
+        )
+
+    @property
+    def label(self) -> str:
+        return ACTION_LABELS.get(self.action, self.action)
+
+
+class ProblemResolutionStore:
+    """Append-only journal; the latest revision per item wins."""
+
+    def __init__(self, journal_path: str | Path):
+        self.journal_path = Path(journal_path).expanduser().absolute()
+        self._lock = threading.RLock()
+        self._latest: dict[str, ProblemResolution] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.journal_path.exists():
+            return
+        try:
+            lines = self.journal_path.read_bytes().splitlines(keepends=True)
+        except OSError as error:
+            raise ProblemResolutionError(f"failed to read {self.journal_path}") from error
+        for number, raw in enumerate(lines, start=1):
+            stripped = raw.rstrip(b"\r\n")
+            if not stripped:
+                continue
+            try:
+                resolution = ProblemResolution.from_payload(json.loads(stripped.decode("utf-8")))
+            except (UnicodeDecodeError, ValueError, KeyError, TypeError) as error:
+                if number == len(lines) and not raw.endswith((b"\n", b"\r")):
+                    break
+                raise ProblemResolutionError(f"invalid problem resolution line {number}: {error}") from error
+            current = self._latest.get(resolution.item_id)
+            if current is None or resolution.revision >= current.revision:
+                self._latest[resolution.item_id] = resolution
+
+    def get(self, item_id: str) -> Optional[ProblemResolution]:
+        with self._lock:
+            return self._latest.get(item_id)
+
+    def resolutions(self) -> tuple[ProblemResolution, ...]:
+        with self._lock:
+            return tuple(self._latest.values())
+
+    def resolve(
+        self,
+        item: ProblemItem,
+        action: str,
+        *,
+        bib: str = "",
+        target_bib: str = "",
+        reason: str = "",
+        position: Sequence[float] = (),
+        chip_time_ms: Optional[int] = None,
+    ) -> ProblemResolution:
+        if action not in item.actions and action != "reopen":
+            raise ValueError(f"action {action} is not available for {item.kind}")
+        if action == ACTION_RECORD_BIB and not bib.strip():
+            raise ValueError("认号补录需要号码")
+        if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP) and not reason.strip():
+            raise ValueError("删除需要填写原因")
+        with self._lock:
+            current = self._latest.get(item.item_id)
+            resolution = ProblemResolution(
+                item_id=item.item_id,
+                kind=item.kind,
+                action=action,
+                binding=ProblemBinding.of(item),
+                bib=bib.strip(),
+                target_bib=target_bib.strip(),
+                reason=reason.strip(),
+                frame=dict(item.evidence.get("frame") or {}),
+                position=tuple(float(value) for value in position),
+                chip_time_ms=item.chip_time_ms if chip_time_ms is None else int(chip_time_ms),
+                calibration_version=int(item.calibration_version),
+                resolved_at_ms=int(time.time() * 1000),
+                revision=(current.revision + 1) if current is not None else 1,
+            )
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            append_jsonl_records(
+                self.journal_path,
+                [json.dumps(resolution.to_payload(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")],
+                description="problem resolution journal",
+            )
+            self._latest[item.item_id] = resolution
+            return resolution
+
+    def state(self, item: ProblemItem) -> tuple[Optional[ProblemResolution], bool]:
+        """Return (decision, stale). A stale decision no longer matches the item."""
+
+        resolution = self.get(item.item_id)
+        if resolution is None or resolution.action == "reopen":
+            return None, False
+        return resolution, resolution.binding != ProblemBinding.of(item)
+
+
+def same_frame_conflicts(
+    frame: Mapping[str, Any],
+    position: Sequence[float],
+    bib: str,
+    claims: Iterable[tuple[str, Mapping[str, Any], Sequence[float]]],
+    *,
+    distance: float = SAME_FRAME_DISTANCE,
+) -> list[str]:
+    """Other bibs already confirmed on the same frame and position.
+
+    ``claims`` are (bib, frame, normalized position). The Dingbian errors
+    (067 confirmed on 057, 051 on 029) were second bibs on one frame.
+    """
+
+    conflicts = []
+    for other_bib, other_frame, other_position in claims:
+        if not other_bib or other_bib == bib:
+            continue
+        same_frame = (
+            str(other_frame.get("video_path", "")) == str(frame.get("video_path", ""))
+            and int(other_frame.get("frame_index", -1)) == int(frame.get("frame_index", -2))
+        ) or (
+            other_frame.get("segment_id") and other_frame.get("segment_id") == frame.get("segment_id")
+            and int(other_frame.get("frame_index", -1)) == int(frame.get("frame_index", -2))
+        )
+        if not same_frame:
+            continue
+        if position and other_position:
+            dx = float(position[0]) - float(other_position[0])
+            dy = float(position[1]) - float(other_position[1])
+            if (dx * dx + dy * dy) ** 0.5 > distance:
+                continue
+        conflicts.append(other_bib)
+    return conflicts
+
+
+def _frame_text(frame: Mapping[str, Any]) -> str:
+    if not frame:
+        return ""
+    name = Path(str(frame.get("video_path", ""))).name
+    return f"{name} 第 {int(frame.get('frame_index', 0)) + 1} 帧（片内 {int(frame.get('position_ms', 0))} ms）"
+
+
+def _passage_number(event_id: str) -> str:
+    return event_id.rsplit("-passage-", 1)[-1] if "-passage-" in event_id else event_id
+
+
+def export_lists(
+    items: Sequence[ProblemItem],
+    store: ProblemResolutionStore,
+    output_dir: str | Path,
+) -> dict[str, int]:
+    """Write 补录 / 建议删除 / 建议改号改圈 CSV lists for CycleRace."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    by_id = {item.item_id: item for item in items}
+    manual, deletions, changes = [], [], []
+    for resolution in sorted(store.resolutions(), key=lambda value: value.chip_time_ms or 0):
+        item = by_id.get(resolution.item_id)
+        if item is None:
+            continue
+        _decision, stale = store.state(item)
+        if stale:
+            continue
+        title = KIND_TITLES.get(item.kind, item.kind)
+        if resolution.action == ACTION_RECORD_BIB:
+            manual.append((
+                resolution.bib, format_chip_time(resolution.chip_time_ms), _frame_text(resolution.frame),
+                resolution.frame.get("camera_index", ""), resolution.calibration_version,
+                f"{title}；{resolution.reason}".rstrip("；"),
+            ))
+        elif resolution.action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP):
+            target = resolution.target_bib or (item.bibs[0] if item.bibs else "")
+            event_ids = [
+                event_id for bib, event_id in zip(item.bibs, item.event_ids) if bib == target
+            ] or list(item.event_ids[:1])
+            for event_id in event_ids:
+                deletions.append((
+                    target, format_chip_time(item.chip_time_ms), _passage_number(event_id),
+                    title, resolution.reason,
+                ))
+        elif resolution.action == ACTION_CHANGE:
+            changes.append((
+                item.bibs[0] if item.bibs else "", resolution.target_bib, format_chip_time(item.chip_time_ms),
+                "、".join(_passage_number(event_id) for event_id in item.event_ids), title, resolution.reason,
+            ))
+    tables = (
+        (EXPORT_MANUAL_ENTRIES, ("号码", "芯片域时间", "证据帧", "机位", "校时版本", "说明"), manual),
+        (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因"), deletions),
+        (EXPORT_CHANGES, ("原号码", "建议号码或圈数", "通过时间", "CycleRace 记录编号", "问题类型", "原因"), changes),
+    )
+    counts = {}
+    for name, header, rows in tables:
+        path = output_dir / name
+        temporary = path.with_name(path.name + ".tmp")
+        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(rows)
+        os.replace(temporary, path)
+        counts[name] = len(rows)
+    return counts
+
+
+__all__ = [
+    "EXPORT_CHANGES",
+    "EXPORT_DELETIONS",
+    "EXPORT_MANUAL_ENTRIES",
+    "ProblemBinding",
+    "ProblemResolution",
+    "ProblemResolutionError",
+    "ProblemResolutionStore",
+    "RESOLUTIONS_FILENAME",
+    "export_lists",
+    "same_frame_conflicts",
+]

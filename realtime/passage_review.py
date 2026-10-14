@@ -6204,16 +6204,19 @@ class PassageReviewSurface(QDialog):
         event = self._visible_events[row]
         store = self.passage_store
         identity = " ".join(value for value in (event.bib, event.athlete_name) if value)
-        answer = QMessageBox.question(
+        reason, accepted = QInputDialog.getText(
             self, "删除记录",
-            f"确定删除 {identity or event.event_id} 在 "
-            f"{format_passage_time(event.timeline_timestamp_ms)} 的通过记录吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            f"删除 {identity or event.event_id} 在 "
+            f"{format_passage_time(event.timeline_timestamp_ms)} 的通过记录。\n"
+            "请填写原因（只在本机隐藏；CycleRace 改了号码、芯片或时间会重新显示）：",
         )
-        if answer != QMessageBox.Yes or self.passage_store is not store:
+        if not accepted or self.passage_store is not store:
+            return
+        if not str(reason).strip():
+            QMessageBox.information(self, "删除记录", "请填写删除原因。")
             return
         try:
-            deleted = store.delete(event.event_id)
+            deleted = store.delete(event.event_id, reason=str(reason).strip())
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "删除失败", f"无法删除记录：{error}")
             return

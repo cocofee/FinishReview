@@ -353,17 +353,46 @@ class PassageEventStore:
         self.deletions_path = self.journal_path.with_name(
             self.journal_path.stem + "_deleted.json"
         )
-        self._deleted_event_ids: set[str] = set()
+        # A deletion is a reasoned local mark bound to the record's bib, chip
+        # and time. CycleRace reuses record ids, so a changed record shows again.
+        self._deletions: dict[str, dict[str, Any]] = {}
         if self.deletions_path.exists():
             try:
-                deleted = json.loads(self.deletions_path.read_text(encoding="utf-8"))
-                if not isinstance(deleted, list) or any(
-                    not isinstance(event_id, str) or not event_id for event_id in deleted
-                ):
-                    raise ValueError("deleted event IDs must be non-empty strings")
-                self._deleted_event_ids = set(deleted)
+                payload = json.loads(self.deletions_path.read_text(encoding="utf-8"))
+                if isinstance(payload, list):
+                    if any(not isinstance(event_id, str) or not event_id for event_id in payload):
+                        raise ValueError("deleted event IDs must be non-empty strings")
+                    # Legacy id-only list: bind to the record as it is now.
+                    for event_id in payload:
+                        event = self._events.get(event_id)
+                        self._deletions[event_id] = dict(
+                            self._deletion_identity(event) if event is not None else {},
+                            event_id=event_id, reason="", deleted_at_ms=0, legacy=True,
+                        )
+                elif isinstance(payload, dict) and isinstance(payload.get("deletions"), list):
+                    for mark in payload["deletions"]:
+                        if not isinstance(mark, dict) or not str(mark.get("event_id", "")).strip():
+                            raise ValueError("deletion marks need an event_id")
+                        self._deletions[str(mark["event_id"])] = dict(mark)
+                else:
+                    raise ValueError("unsupported passage deletion file")
             except (OSError, ValueError) as error:
                 raise PassageJournalError("failed to read passage deletions") from error
+
+    @staticmethod
+    def _deletion_identity(event: PassageEvent) -> dict[str, Any]:
+        return {
+            "bib": event.bib.strip(),
+            "chip_id": event.chip_id.strip(),
+            "passage_timestamp_ms": int(event.timeline_timestamp_ms),
+        }
+
+    def _deletion_applies(self, event: PassageEvent) -> bool:
+        mark = self._deletions.get(event.event_id)
+        if mark is None:
+            return False
+        identity = self._deletion_identity(event)
+        return all(mark.get(key, identity[key]) == identity[key] for key in identity)
 
     def _load_existing(self) -> None:
         if not self.journal_path.exists():
@@ -504,16 +533,24 @@ class PassageEventStore:
         with self._lock:
             return self._events.get(str(event_id))
 
-    def delete(self, event_id: str) -> bool:
-        """Delete a local passage without altering upstream revision numbers.
+    def delete(self, event_id: str, *, reason: str = "") -> bool:
+        """Mark a local passage deleted without altering upstream revisions.
 
-        Keep its ID separately so retries and later upstream revisions cannot
-        restore a record the operator deleted from this workspace.
+        The mark keeps the reason and is bound to the record's bib, chip and
+        time: retries of the same record stay hidden, but an upstream change
+        (another bib, chip or time under a reused id) shows the record again.
         """
         with self._lock:
-            if event_id not in self._events or event_id in self._deleted_event_ids:
+            event = self._events.get(event_id)
+            if event is None or self._deletion_applies(event):
                 return False
-            deleted = self._deleted_event_ids | {event_id}
+            deletions = dict(self._deletions)
+            deletions[event_id] = dict(
+                self._deletion_identity(event),
+                event_id=event_id,
+                reason=str(reason).strip(),
+                deleted_at_ms=int(time.time() * 1000),
+            )
             temporary_path = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -521,7 +558,10 @@ class PassageEventStore:
                     prefix=self.deletions_path.name + ".", suffix=".tmp", delete=False,
                 ) as handle:
                     temporary_path = Path(handle.name)
-                    json.dump(sorted(deleted), handle, ensure_ascii=False)
+                    json.dump(
+                        {"schema_version": 2, "deletions": [deletions[key] for key in sorted(deletions)]},
+                        handle, ensure_ascii=False,
+                    )
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary_path, self.deletions_path)
@@ -530,14 +570,30 @@ class PassageEventStore:
             finally:
                 if temporary_path is not None and temporary_path.exists():
                     temporary_path.unlink()
-            self._deleted_event_ids = deleted
+            self._deletions = deletions
             return True
+
+    def deletion(self, event_id: str) -> Optional[dict[str, Any]]:
+        """The local deletion mark of a record, if any (also when no longer applied)."""
+
+        with self._lock:
+            mark = self._deletions.get(str(event_id))
+            return dict(mark) if mark is not None else None
+
+    def changed_deletions(self) -> tuple[PassageEvent, ...]:
+        """Deleted records that CycleRace has changed since; they need a new look."""
+
+        with self._lock:
+            return tuple(
+                self._events[event_id] for event_id in self._event_order
+                if event_id in self._deletions and not self._deletion_applies(self._events[event_id])
+            )
 
     def events(self, *, include_inactive: bool = False) -> tuple[PassageEvent, ...]:
         with self._lock:
             events = tuple(
                 self._events[event_id] for event_id in self._event_order
-                if event_id not in self._deleted_event_ids
+                if not self._deletion_applies(self._events[event_id])
             )
             if include_inactive:
                 return events

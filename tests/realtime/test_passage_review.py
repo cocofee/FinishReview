@@ -247,16 +247,24 @@ def test_delete_selected_record_updates_queue_and_survives_reopen(qapp, tmp_path
     dialog.table.setCurrentCell(row, 1)
     deleted = []
     dialog.record_deleted.connect(deleted.append)
-    monkeypatch.setattr(passage_review.QMessageBox, "question",
-                        lambda *_args: passage_review.QMessageBox.No)
+    monkeypatch.setattr(passage_review.QInputDialog, "getText",
+                        lambda *_args, **_kwargs: ("", False))
     dialog.delete_record_button.click()
     assert dialog.table.rowCount() == 2
     assert not deleted
+    notices = []
+    monkeypatch.setattr(passage_review.QMessageBox, "information",
+                        lambda *args: notices.append(args[2]))
+    monkeypatch.setattr(passage_review.QInputDialog, "getText",
+                        lambda *_args, **_kwargs: ("  ", True))
+    dialog.delete_record_button.click()
+    assert dialog.table.rowCount() == 2 and notices == ["请填写删除原因。"]
 
-    monkeypatch.setattr(passage_review.QMessageBox, "question",
-                        lambda *_args: passage_review.QMessageBox.Yes)
+    monkeypatch.setattr(passage_review.QInputDialog, "getText",
+                        lambda *_args, **_kwargs: ("备用芯片经过天线", True))
     dialog.delete_record_button.click()
     assert deleted == [first.event_id]
+    assert passages.deletion(first.event_id)["reason"] == "备用芯片经过天线"
     assert dialog.table.rowCount() == 1
     assert dialog.table.item(0, 1).text() == "442"
     assert dialog._selected_event_id == second.event_id

@@ -569,14 +569,36 @@ def test_deleted_passage_stays_deleted_after_restart_and_upstream_updates(tmp_pa
 
     reopened = PassageEventStore(path)
     reopened.append(event)
-    updated = PassageEvent.from_payload(passage_payload(revision=2, bib="443"))
-    reopened.append(updated)
     assert reopened.events() == (other,)
+    same_record = PassageEvent.from_payload(passage_payload(revision=2))
+    reopened.append(same_record)
+    assert reopened.events() == (other,)
+    # CycleRace reuses record ids: a changed bib is a new record to look at.
+    updated = PassageEvent.from_payload(passage_payload(revision=3, bib="443"))
+    reopened.append(updated)
+    assert reopened.events() == (updated, other)
+    assert reopened.changed_deletions() == (updated,)
     assert reopened.get(event.event_id) == updated
-    assert PassageEventStore(path).events() == (other,)
+    assert PassageEventStore(path).events() == (updated, other)
     independent = PassageEventStore(tmp_path / "another-race.jsonl")
     independent.append(event)
     assert independent.events() == (event,)
+
+
+def test_deletion_keeps_reason_and_reads_legacy_id_lists(tmp_path):
+    path = tmp_path / "passages.jsonl"
+    store = PassageEventStore(path)
+    event = PassageEvent.from_payload(passage_payload())
+    store.append(event)
+    assert store.delete(event.event_id, reason="测试芯片经过天线")
+    mark = PassageEventStore(path).deletion(event.event_id)
+    assert mark["reason"] == "测试芯片经过天线" and mark["bib"] == event.bib
+
+    legacy = tmp_path / "legacy.jsonl"
+    old_store = PassageEventStore(legacy)
+    old_store.append(event)
+    legacy.with_name("legacy_deleted.json").write_text(json.dumps([event.event_id]), encoding="utf-8")
+    assert PassageEventStore(legacy).events() == ()
 
 
 def test_failed_deletion_keeps_record_and_previous_deletions(tmp_path, monkeypatch):

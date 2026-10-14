@@ -76,14 +76,32 @@ def _read_json(path: Path):
         return None
 
 
-def _deleted_event_ids(root: Path) -> tuple[str, ...]:
+def _deletion_marks(root: Path) -> tuple[dict, ...]:
     payload = _read_json(root / DELETIONS_FILE)
     if isinstance(payload, list):
-        return tuple(str(item) for item in payload if isinstance(item, str))
+        return tuple({"event_id": str(item)} for item in payload if isinstance(item, str))
     if isinstance(payload, dict):
         records = payload.get("deletions", [])
-        return tuple(str(item.get("event_id")) for item in records if isinstance(item, dict) and item.get("event_id"))
+        return tuple(dict(item) for item in records if isinstance(item, dict) and item.get("event_id"))
     return ()
+
+
+def _applied_deletions(marks, latest: dict) -> tuple[str, ...]:
+    """Deletions bound to bib/chip/time apply only while the record is unchanged."""
+
+    applied = []
+    for mark in marks:
+        event = latest.get(mark["event_id"])
+        if event is None:
+            continue
+        identity = {
+            "bib": event.bib.strip(),
+            "chip_id": event.chip_id.strip(),
+            "passage_timestamp_ms": int(event.timeline_timestamp_ms),
+        }
+        if all(mark.get(key, value) == value for key, value in identity.items()):
+            applied.append(mark["event_id"])
+    return tuple(applied)
 
 
 class AnalysisWorkspace:
@@ -116,14 +134,14 @@ class AnalysisWorkspace:
             metadata.stage_date if metadata is not None and metadata.race_id == self.race_id
             and metadata.stage_date else dominant_race_date(scoped)
         )
-        self.deleted_event_ids = _deleted_event_ids(self.root)
+        self._latest = {
+            event_id: event for event_id, event in latest_events(scoped).items()
+        }
+        self.deleted_event_ids = _applied_deletions(_deletion_marks(self.root), self._latest)
         self.reads: tuple[ChipRead, ...] = chip_reads(
             scoped, race_id=self.race_id, stage_id=self.stage_id,
             race_date=self.race_date, deleted_event_ids=self.deleted_event_ids,
         )
-        self._latest = {
-            event_id: event for event_id, event in latest_events(scoped).items()
-        }
         self._timeline: Optional[VideoTimelineStore] = None
 
     def _scope(self, race_id: str, stage_id: str) -> tuple[str, str]:
