@@ -294,17 +294,20 @@ def decide_verdict(
 ) -> BikeVerdict:
     """Exclude or dispute a pedestrian/vehicle verdict from per-frame scores.
 
-    ``details`` holds (bicycle, person, vehicle) scores per frame. A frame
-    that sees nothing, or the same thing less clearly, does not contradict
-    the others; a bicycle in any frame does. With several frames, at least
-    two must agree clearly. Cached verdicts are re-decided with this, so a
-    rule change does not need the detector again.
+    ``details`` holds (bicycle, person, vehicle) scores per frame; a bicycle
+    in any frame contradicts the verdict. Vehicles are fast, so one frame
+    without them is normal and two clear frames are enough. A walking person
+    stays in view in every frame; a person who shows up only in later frames
+    moved fast, which looks more like a rider whose bicycle was missed
+    (Tongxin 14:57:03), so pedestrians need every frame clear. Cached
+    verdicts are re-decided with this, without running the detector again.
     """
 
     column = 2 if label == LABEL_VEHICLE else 1
     support = sum(1 for item in details if item[column] >= EXCLUDE_THRESHOLD)
     bicycle_seen = any(item[0] > 0 for item in details)
-    consistent = not bicycle_seen and support >= min(2, len(details))
+    needed = min(2, len(details)) if label == LABEL_VEHICLE else len(details)
+    consistent = not bicycle_seen and support >= needed
     reasons = []
     if score < EXCLUDE_THRESHOLD or not consistent:
         reasons.append("把握不高或几帧不一致")

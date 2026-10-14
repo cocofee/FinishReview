@@ -166,7 +166,7 @@ def test_classify_keeps_bicycles_and_only_excludes_confident_consistent_people()
     assert vehicle.label == LABEL_VEHICLE and vehicle.vehicle == "摩托车"
 
 
-def test_frames_that_see_nothing_do_not_make_a_verdict_inconsistent():
+def test_vehicles_may_miss_a_frame_but_pedestrians_must_be_clear_in_every_frame():
     points = [(700.0, 700.0 + offset) for offset in range(0, 90, 10)]
     person = Detection(PERSON, 0.9, 400.0, 300.0, 250.0, 500.0)
     weak = Detection(PERSON, 0.3, 400.0, 300.0, 250.0, 500.0)
@@ -179,11 +179,13 @@ def test_frames_that_see_nothing_do_not_make_a_verdict_inconsistent():
 
     # A fast motorcycle is out of view in one of three frames: still excluded.
     assert verdict([], [car], [car]).decision == DECISION_EXCLUDE
-    # The same person, once less clearly: still excluded.
-    assert verdict([weak], [person], [person]).decision == DECISION_EXCLUDE
-    # Only one clear frame out of three, or a bicycle anywhere: disputed.
-    assert verdict([], [], [person]).decision == DECISION_DISPUTED
+    assert verdict([], [], [car]).decision == DECISION_DISPUTED
     assert verdict([bike, car], [car], [car]).decision == DECISION_DISPUTED
+    # A person who appears late moved fast, maybe a rider whose bicycle was
+    # missed: disputed. A walking person is clear in every frame.
+    assert verdict([], [person], [person]).decision == DECISION_DISPUTED
+    assert verdict([weak], [person], [person]).decision == DECISION_DISPUTED
+    assert verdict([person], [person], [person]).decision == DECISION_EXCLUDE
 
 
 def test_side_mode_uses_earlier_frames_and_stops_at_first_bicycle():
