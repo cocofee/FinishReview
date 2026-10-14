@@ -256,3 +256,21 @@ def test_bike_check_keeps_one_decoder_open_at_a_time(monkeypatch, tmp_path):
     assert len(verdicts) == 9
     assert state["max"] == 1 and state["open"] == 0
     assert opened == ["video_0.mkv", "video_1.mkv", "video_2.mkv"]
+
+
+def test_cached_bike_verdicts_are_re_decided_with_current_rules(tmp_path):
+    from realtime.problem_rules import CrossingRecord
+
+    crossing = CrossingRecord(1, "s", "seg", "video.mkv", 5_000, 100, 5_000, 0, 0, 1)
+    config = AnalysisConfig(workspace=tmp_path, output_dir=tmp_path, model_path=tmp_path / "m.onnx")
+    key = f"m.onnx@640|up|{crossing.key}|0"
+    (tmp_path / "bike_camera1.json").write_text(json.dumps({key: {
+        "label": "vehicle", "score": 0.9, "decision": "disputed", "reason": "把握不高或几帧不一致",
+        "frames": 3, "vehicle": "摩托车", "details": [[0, 0, 0], [0, 0, 0.9], [0, 0, 0.85]],
+    }}), encoding="utf-8")
+
+    verdicts = problem_analysis._bike_verdicts(
+        config, 1, [crossing], lambda _ms: False, progress=lambda *args: None, checkpoint=None,
+    )
+
+    assert verdicts[crossing.key].decision == "exclude"

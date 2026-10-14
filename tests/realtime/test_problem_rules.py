@@ -166,6 +166,26 @@ def test_classify_keeps_bicycles_and_only_excludes_confident_consistent_people()
     assert vehicle.label == LABEL_VEHICLE and vehicle.vehicle == "摩托车"
 
 
+def test_frames_that_see_nothing_do_not_make_a_verdict_inconsistent():
+    points = [(700.0, 700.0 + offset) for offset in range(0, 90, 10)]
+    person = Detection(PERSON, 0.9, 400.0, 300.0, 250.0, 500.0)
+    weak = Detection(PERSON, 0.3, 400.0, 300.0, 250.0, 500.0)
+    car = Detection(MOTORCYCLE, 0.9, 400.0, 300.0, 250.0, 500.0)
+    bike = Detection(BICYCLE, 0.4, 400.0, 300.0, 250.0, 500.0)
+    plan = CropPlan.for_mode("up")
+
+    def verdict(*frames):
+        return classify_frames(_FakeDetector(list(frames)), _frames(len(frames)), points, plan)
+
+    # A fast motorcycle is out of view in one of three frames: still excluded.
+    assert verdict([], [car], [car]).decision == DECISION_EXCLUDE
+    # The same person, once less clearly: still excluded.
+    assert verdict([weak], [person], [person]).decision == DECISION_EXCLUDE
+    # Only one clear frame out of three, or a bicycle anywhere: disputed.
+    assert verdict([], [], [person]).decision == DECISION_DISPUTED
+    assert verdict([bike, car], [car], [car]).decision == DECISION_DISPUTED
+
+
 def test_side_mode_uses_earlier_frames_and_stops_at_first_bicycle():
     points = [(400.0, 500.0 + offset) for offset in range(0, 90, 10)]
     plan = CropPlan.for_mode("side-right")
@@ -252,3 +272,13 @@ def test_memory_readings_are_positive_or_unavailable():
 
     for value in (available_memory_mb(), peak_memory_mb()):
         assert value is None or value > 0
+
+
+def test_changes_at_two_places_in_the_same_moment_are_one_item():
+    outcome = _rules(video_only=[
+        _crossing(T0 + 50_000, row=100), _crossing(T0 + 50_000, row=400), _crossing(T0 + 90_000, row=250),
+    ])
+
+    items = sorted((item for item in outcome.items if item.kind == "no_chip_crossing"), key=lambda i: i.chip_time_ms)
+    assert len(items) == 2
+    assert "另有 1 处变化" in items[0].detail and "另有" not in items[1].detail

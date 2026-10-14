@@ -73,6 +73,7 @@ class BikeVerdict:
     frames: int = 0
     vehicle: str = ""
     details: tuple = field(default_factory=tuple)
+    edge_cut: bool = False
 
 
 @dataclass(frozen=True)
@@ -272,12 +273,38 @@ def classify_frames(
         return BikeVerdict(LABEL_BICYCLE, bike, DECISION_KEEP, "", len(per_frame), details=details)
     if vehicle is not None:
         label, score = LABEL_VEHICLE, vehicle.score
-        consistent = all(item[2] is not None and item[2].score >= EXCLUDE_THRESHOLD for item in per_frame)
     elif person > 0:
         label, score = LABEL_PEDESTRIAN, person
-        consistent = all(item[1] >= EXCLUDE_THRESHOLD for item in per_frame)
     else:
         return BikeVerdict(LABEL_NOTHING, 0.0, DECISION_KEEP, "", len(per_frame), details=details)
+    return decide_verdict(
+        label, score, details, edge_cut=edge_cut, crowded=crowded,
+        vehicle=VEHICLES.get(vehicle.cls, "") if vehicle is not None else "",
+    )
+
+
+def decide_verdict(
+    label: str,
+    score: float,
+    details: Sequence[Sequence[float]],
+    *,
+    edge_cut: bool,
+    crowded: bool,
+    vehicle: str = "",
+) -> BikeVerdict:
+    """Exclude or dispute a pedestrian/vehicle verdict from per-frame scores.
+
+    ``details`` holds (bicycle, person, vehicle) scores per frame. A frame
+    that sees nothing, or the same thing less clearly, does not contradict
+    the others; a bicycle in any frame does. With several frames, at least
+    two must agree clearly. Cached verdicts are re-decided with this, so a
+    rule change does not need the detector again.
+    """
+
+    column = 2 if label == LABEL_VEHICLE else 1
+    support = sum(1 for item in details if item[column] >= EXCLUDE_THRESHOLD)
+    bicycle_seen = any(item[0] > 0 for item in details)
+    consistent = not bicycle_seen and support >= min(2, len(details))
     reasons = []
     if score < EXCLUDE_THRESHOLD or not consistent:
         reasons.append("把握不高或几帧不一致")
@@ -287,8 +314,8 @@ def classify_frames(
         reasons.append("终点线拥挤时段")
     decision = DECISION_DISPUTED if reasons else DECISION_EXCLUDE
     return BikeVerdict(
-        label, score, decision, "；".join(reasons), len(per_frame),
-        VEHICLES.get(vehicle.cls, "") if vehicle is not None else "", details,
+        label, score, decision, "；".join(reasons), len(details), vehicle,
+        tuple(tuple(item) for item in details), edge_cut,
     )
 
 
@@ -299,6 +326,7 @@ __all__ = [
     "DECISION_EXCLUDE",
     "DECISION_KEEP",
     "FrameReader",
+    "decide_verdict",
     "LABEL_BICYCLE",
     "LABEL_NOTHING",
     "LABEL_PEDESTRIAN",

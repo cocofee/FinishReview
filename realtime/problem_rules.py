@@ -24,6 +24,7 @@ from typing import Mapping, Optional, Sequence
 from .bike_check import (
     DECISION_DISPUTED,
     DECISION_EXCLUDE,
+    LABEL_BICYCLE,
     LABEL_TEXT,
     LABEL_UNCHECKED,
     BikeVerdict,
@@ -59,6 +60,7 @@ TWO_CHIP_MS = 600
 STANDING_ROWS = 50
 STANDING_WINDOW_MS = 90_000
 STANDING_MIN = 3
+SIMULTANEOUS_MS = 300
 BUNCH_GAP_MS = 2_000
 BUNCH_MIN = 4
 BUNCH_MARGIN_MS = 700
@@ -231,6 +233,7 @@ def build_video_items(
         else:
             spots.append({"row": crossing.row, "last": crossing.recorder_ms, "members": [(crossing, verdict)]})
 
+    singles: list[tuple[CrossingRecord, Optional[BikeVerdict]]] = []
     for spot in spots:
         members = spot["members"]
         first = members[0][0]
@@ -249,31 +252,45 @@ def build_video_items(
                 calibration_version=version,
             ))
             continue
-        for crossing, verdict in members:
-            chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
-            label = verdict.label if verdict is not None else LABEL_UNCHECKED
-            status, note = STATUS_OPEN, ""
-            if verdict is not None and verdict.decision == DECISION_DISPUTED:
-                status, note = STATUS_DISPUTED, f"有争议：{LABEL_TEXT.get(label, label)}，{verdict.reason}"
-            elif verdict is not None and verdict.decision != DECISION_EXCLUDE and crowded(crossing.recorder_ms):
-                note = "终点线拥挤时段"
-            manual = [
-                read for read in manual_entries
-                if read.active_now and abs(read.chip_ms - chip_time) <= MANUAL_MATCH_MS
-            ]
-            if manual:
-                status = STATUS_CLOSED_UPSTREAM
-                note = "CycleRace 已补录 " + "、".join(_chip_text(read) for read in manual)
-            outcome.items.append(ProblemItem(
-                item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
-                kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
-                detail=f"{format_chip_time(chip_time)} 有人过线，附近没有芯片读数（认车：{LABEL_TEXT.get(label, label)}）",
-                chip_time_ms=chip_time, bibs=tuple(read.bib for read in manual),
-                event_ids=tuple(read.event_id for read in manual),
-                status=status, status_note=note, priority=10,
-                evidence=_crossing_evidence(crossing, version, verdict),
-                calibration_version=version,
-            ))
+        singles.extend(members)
+
+    # Changes at several places on the line in the same moment are one item:
+    # a rider can split into two parts on the line, and one card shows all.
+    clusters: list[list[tuple[CrossingRecord, Optional[BikeVerdict]]]] = []
+    for member in sorted(singles, key=lambda item: item[0].recorder_ms):
+        if clusters and member[0].recorder_ms - clusters[-1][-1][0].recorder_ms <= SIMULTANEOUS_MS:
+            clusters[-1].append(member)
+        else:
+            clusters.append([member])
+    for cluster in clusters:
+        crossing, verdict = min(cluster, key=_evidence_rank)
+        chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
+        label = verdict.label if verdict is not None else LABEL_UNCHECKED
+        status, note = STATUS_OPEN, ""
+        if verdict is not None and verdict.decision == DECISION_DISPUTED:
+            status, note = STATUS_DISPUTED, f"有争议：{LABEL_TEXT.get(label, label)}，{verdict.reason}"
+        elif verdict is not None and verdict.decision != DECISION_EXCLUDE and crowded(crossing.recorder_ms):
+            note = "终点线拥挤时段"
+        manual = [
+            read for read in manual_entries
+            if read.active_now and abs(read.chip_ms - chip_time) <= MANUAL_MATCH_MS
+        ]
+        if manual:
+            status = STATUS_CLOSED_UPSTREAM
+            note = "CycleRace 已补录 " + "、".join(_chip_text(read) for read in manual)
+        outcome.items.append(ProblemItem(
+            item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
+            kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
+            detail=(
+                f"{format_chip_time(chip_time)} 有人过线，附近没有芯片读数（认车：{LABEL_TEXT.get(label, label)}）"
+                + (f"；同一时刻线上另有 {len(cluster) - 1} 处变化" if len(cluster) > 1 else "")
+            ),
+            chip_time_ms=chip_time, bibs=tuple(read.bib for read in manual),
+            event_ids=tuple(read.event_id for read in manual),
+            status=status, status_note=note, priority=10,
+            evidence=_crossing_evidence(crossing, version, verdict),
+            calibration_version=version,
+        ))
 
     paired_crossings = [m[0] for m in matched]
     for read in chip_only:
@@ -428,6 +445,17 @@ def _group_members(items, bunches, crowds, expected) -> list[ProblemItem]:
             )
         result.append(candidate)
     return result
+
+
+def _evidence_rank(member: tuple[CrossingRecord, Optional[BikeVerdict]]) -> tuple[int, int]:
+    crossing, verdict = member
+    if verdict is not None and verdict.label == LABEL_BICYCLE:
+        rank = 0
+    elif verdict is None or verdict.decision != DECISION_DISPUTED:
+        rank = 1
+    else:
+        rank = 2
+    return rank, crossing.recorder_ms
 
 
 def _auto_passed(read: ChipRead, crossing: CrossingRecord, residual: int, version: int, *, late: bool = False) -> dict:

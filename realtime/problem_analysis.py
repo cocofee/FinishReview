@@ -33,7 +33,16 @@ from .analysis_resources import (
     peak_memory_mb,
 )
 from .analysis_workspace import AnalysisWorkspace, ArchiveSegment
-from .bike_check import BikeVerdict, CropPlan, FrameReader, YoloxDetector, classify_frames
+from .bike_check import (
+    LABEL_PEDESTRIAN,
+    LABEL_VEHICLE,
+    BikeVerdict,
+    CropPlan,
+    FrameReader,
+    YoloxDetector,
+    classify_frames,
+    decide_verdict,
+)
 from .chip_checks import ChipCheckContext, chip_check_items
 from .chip_history import ChipRead, calibration_chip_times, format_chip_time
 from .clock_sync import CLOCK_MODEL_FILENAME, ClockCrossing, ClockModelStore, calibrate_camera, check_anchors
@@ -355,10 +364,19 @@ def _bike_verdicts(
         for index, crossing in enumerate(ordered):
             key = f"{model_key}|{plan.mode}|{crossing.key}|{int(crowded(crossing.recorder_ms))}"
             if key in cache:
-                verdicts[crossing.key] = BikeVerdict(**{
+                entry = cache[key]
+                verdict = BikeVerdict(**{
                     name: tuple(value) if name == "details" else value
-                    for name, value in cache[key].items()
+                    for name, value in entry.items()
                 })
+                if verdict.label in (LABEL_PEDESTRIAN, LABEL_VEHICLE) and verdict.details:
+                    # Re-decide from the cached per-frame scores (rules may change).
+                    verdict = decide_verdict(
+                        verdict.label, verdict.score, verdict.details,
+                        edge_cut=bool(entry.get("edge_cut", "人被画面边缘切掉" in verdict.reason)),
+                        crowded=bool(crowded(crossing.recorder_ms)), vehicle=verdict.vehicle,
+                    )
+                verdicts[crossing.key] = verdict
                 continue
             if detector is None:
                 detector = YoloxDetector(config.model_path, config.model_input)
@@ -380,7 +398,7 @@ def _bike_verdicts(
             cache[key] = {
                 "label": verdict.label, "score": verdict.score, "decision": verdict.decision,
                 "reason": verdict.reason, "frames": verdict.frames, "vehicle": verdict.vehicle,
-                "details": [list(item) for item in verdict.details],
+                "details": [list(item) for item in verdict.details], "edge_cut": verdict.edge_cut,
             }
             if checkpoint is not None:
                 checkpoint()
