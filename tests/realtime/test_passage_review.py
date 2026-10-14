@@ -3281,6 +3281,46 @@ def test_first_confirmation_calibrates_in_default_review_and_survives_reopen(
         reopened.close()
 
 
+def test_second_bib_on_same_frame_and_position_requires_confirmation(qapp, tmp_path, fake_playback, monkeypatch):
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    first = _event(event_id="first", bib="029", passage_time_ms=15_000)
+    second = _event(event_id="second", bib="051", sequence=2, passage_time_ms=15_400)
+    passages.append(first)
+    passages.append(second)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01_session_archive_0000.mkv",
+                 source_id="camera_01_review", camera_index=1,
+                 started_at_ms=10_000, ended_at_ms=70_000)
+    dialog = PassageReviewDialog(passages, timeline)
+    asked = []
+    try:
+        dialog.show()
+        qapp.processEvents()
+        pane = dialog.regular_pane
+        frame = QImage(1280, 720, QImage.Format_RGB888)
+        frame.fill(0)
+
+        def mark_and_confirm():
+            pane._worker.frame_ready.emit(frame, 3_700, 185)
+            QTest.mouseClick(pane.video_view.viewport(), Qt.LeftButton,
+                             pos=pane.video_view.viewport().rect().center())
+            return dialog._confirm_pending_marker(pane)
+
+        dialog._select_event(first.event_id, locate_target=True)
+        assert mark_and_confirm()
+        dialog._select_event(second.event_id, locate_target=True)
+        monkeypatch.setattr(passage_review.QMessageBox, "question",
+                            lambda *args: asked.append(args[2]) or passage_review.QMessageBox.No)
+        assert not mark_and_confirm()
+        assert asked and "029" in asked[0]
+        assert dialog.association_store.get(second.event_id, "regular") is None
+        monkeypatch.setattr(passage_review.QMessageBox, "question",
+                            lambda *args: passage_review.QMessageBox.Yes)
+        assert mark_and_confirm()
+    finally:
+        dialog.close()
+
+
 @pytest.mark.parametrize(("auto_offset", "warned"), ((-1_250, False), (56_700, True)))
 def test_first_rider_calibration_is_cross_checked_against_automatic_model(
     qapp, tmp_path, fake_playback, auto_offset, warned,

@@ -8195,6 +8195,37 @@ class PassageReviewSurface(QDialog):
         )
         return True
 
+    SAME_FRAME_MARKER_DISTANCE = 0.03
+
+    def _same_frame_confirmations(self, event, source_kind, location, pending) -> list[str]:
+        """Other bibs already confirmed on this frame at nearly the same spot.
+
+        Frames are compared by recorder time (segment start + position) so a
+        short clip and the archive of the same moment count as one frame.
+        """
+
+        segment = location.segment
+        if segment.media_started_at_ms is None:
+            return []
+        frame_time = int(segment.media_started_at_ms) + int(pending["position_ms"])
+        x, y = float(pending["marker_x_normalized"]), float(pending["marker_y_normalized"])
+        conflicts = []
+        for association in self.association_store.associations():
+            if (
+                association.passage_event_id == event.event_id
+                or association.confirmed_source != source_kind
+                or association.confirmation_status != "confirmed"
+            ):
+                continue
+            other = self.timeline_store.get_segment(association.segment_id)
+            if other is None or other.media_started_at_ms is None:
+                continue
+            other_time = int(other.media_started_at_ms) + int(association.position_ms)
+            distance = ((association.marker_x_normalized - x) ** 2 + (association.marker_y_normalized - y) ** 2) ** 0.5
+            if abs(other_time - frame_time) <= 25 and distance <= self.SAME_FRAME_MARKER_DISTANCE:
+                conflicts.append(association.bib)
+        return conflicts
+
     def _confirm_pending_marker(self, pane: PassageEvidencePane) -> bool:
         event = self.passage_store.get(self._selected_event_id)
         pending = pane.pending_confirmation()
@@ -8250,6 +8281,18 @@ class PassageReviewSurface(QDialog):
                 return False
             pane._location = location
             pending["segment_id"] = location.segment.segment_id
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            QMessageBox.critical(self, "保存失败", f"无法保存证据标记：{error}")
+            return False
+        conflicts = self._same_frame_confirmations(event, pane.source_kind, location, pending)
+        if conflicts and QMessageBox.question(
+            self, "同一帧已确认其他号码",
+            f"该帧同一位置已确认 {'、'.join(conflicts)}。\n"
+            f"再确认 {identity} 前请核对号码牌，是否仍要确认？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return False
+        try:
             association = self.association_store.confirm(
                 passage_event_id=event.event_id,
                 bib=identity,
