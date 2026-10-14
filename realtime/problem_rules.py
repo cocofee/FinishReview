@@ -157,6 +157,7 @@ def build_video_items(
     manual_entries: Sequence[ChipRead] = (),
     chip_locator=None,
     expected_ms: Optional[Mapping[str, int]] = None,
+    race_start_ms: Optional[int] = None,
 ) -> RuleOutcome:
     """Apply the merge rules; ``chip_locator(read)`` pins a chip to a frame."""
 
@@ -181,8 +182,12 @@ def build_video_items(
 
     candidates: list[tuple[CrossingRecord, Optional[BikeVerdict]]] = []
     excluded = []
+    before_race = []
     for crossing in video_only:
         if crossing.in_obstruction:
+            continue
+        if race_start_ms is not None and crossing.recorder_ms < race_start_ms:
+            before_race.append(crossing)
             continue
         verdict = verdicts.get(crossing.key)
         if verdict is not None and verdict.decision == DECISION_EXCLUDE:
@@ -326,6 +331,17 @@ def build_video_items(
             calibration_version=version,
         ))
 
+    for crossing in before_race:
+        chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
+        outcome.items.append(ProblemItem(
+            item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
+            kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
+            detail=f"{format_chip_time(chip_time)} 首位选手到达前的线上活动",
+            chip_time_ms=chip_time, status=STATUS_EXCLUDED, status_note="已排除：赛前活动",
+            priority=95, evidence=_crossing_evidence(crossing, version),
+            calibration_version=version,
+        ))
+
     open_bibs = {
         read_id
         for item in outcome.items if item.pending
@@ -337,7 +353,10 @@ def build_video_items(
         outcome.auto_passed.append(_auto_passed(read, crossing, int(residual), version))
 
     outcome.items += _bunch_items(camera_index, model, matched, chip_only, rest, version)
-    outcome.items += _obstruction_items(camera_index, model, periods, matched, chip_only, version)
+    race_periods = [
+        (start, end) for start, end in periods if race_start_ms is None or end >= race_start_ms
+    ]
+    outcome.items += _obstruction_items(camera_index, model, race_periods, matched, chip_only, version)
     outcome.items += _no_video_items(camera_index, no_video)
     outcome.stats = {
         "candidates": len(candidates),
@@ -345,6 +364,7 @@ def build_video_items(
         "late_pairs": len(outcome.late_pairs),
         "duplicates": outcome.duplicates,
         "standing": sum(len(spot["members"]) >= STANDING_MIN for spot in spots),
+        "before_race": len(before_race),
     }
     return outcome
 

@@ -74,10 +74,25 @@ def _item_geometry(item: ProblemItem) -> tuple[Optional[tuple[float, float]], li
     return None, []
 
 
+def _attach(item: ProblemItem, name: str, pts=None) -> None:
+    evidence = item.evidence
+    if isinstance(evidence, dict):
+        evidence["card"] = f"cards/{name}.jpg"
+        evidence["filmstrip"] = f"cards/{name}_strip.jpg"
+        evidence["filmstrip_offsets_ms"] = list(FILMSTRIP_OFFSETS_MS)
+        if pts is not None:
+            evidence["filmstrip_pts_ms"] = pts
+
+
 def render_item(item: ProblemItem, reader: FrameReader, output_dir: Path) -> bool:
     frame_ref = item.evidence.get("frame")
     if not frame_ref:
         return False
+    name = safe_name(item.item_id)
+    if (output_dir / "cards" / f"{name}.jpg").is_file() and (output_dir / "cards" / f"{name}_strip.jpg").is_file():
+        # Item ids follow their source frame, so an existing card is current.
+        _attach(item, name)
+        return True
     position = float(frame_ref["position_ms"])
     targets = [position + offset for offset in FILMSTRIP_OFFSETS_MS]
     frames = reader.frames_at(targets, tolerance_ms=30.0)
@@ -112,15 +127,9 @@ def render_item(item: ProblemItem, reader: FrameReader, output_dir: Path) -> boo
         tiles.append(tile)
     while len(tiles) < len(FILMSTRIP_OFFSETS_MS):
         tiles.append(np.full((FILMSTRIP_TILE, FILMSTRIP_TILE, 3), 245, np.uint8))
-    name = safe_name(item.item_id)
     write_jpeg(output_dir / "cards" / f"{name}.jpg", card)
     write_jpeg(output_dir / "cards" / f"{name}_strip.jpg", np.hstack(tiles), quality=80)
-    evidence = item.evidence
-    if isinstance(evidence, dict):
-        evidence["card"] = f"cards/{name}.jpg"
-        evidence["filmstrip"] = f"cards/{name}_strip.jpg"
-        evidence["filmstrip_offsets_ms"] = list(FILMSTRIP_OFFSETS_MS)
-        evidence["filmstrip_pts_ms"] = [round(pts, 1) for _frame, pts in frames]
+    _attach(item, name, [round(pts, 1) for _frame, pts in frames])
     return True
 
 

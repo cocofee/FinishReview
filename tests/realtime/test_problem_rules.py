@@ -190,3 +190,11 @@ def test_governor_pauses_while_cpu_is_busy():
     governor.checkpoint()
 
     assert governor.pauses == 1 and len(sleeps) == 2
+
+
+def test_line_activity_before_the_first_rider_is_excluded_not_listed():
+    outcome = _rules(video_only=[_crossing(T0 + 5_000), _crossing(T0 + 600_000)], race_start_ms=T0 + 300_000)
+
+    statuses = sorted((item.status, item.status_note) for item in outcome.items)
+    assert statuses == [("excluded", "已排除：赛前活动"), ("open", "")]
+    assert outcome.stats["before_race"] == 1

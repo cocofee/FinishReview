@@ -185,6 +185,7 @@ class _FileStrip:
 CONTEXT_MS = 5_000
 CONTIGUOUS_MS = 1_500
 COVERAGE_MARGIN_MS = 2_000
+PRE_RACE_MARGIN_MS = 120_000
 
 
 def _load_file_strips(paths: list[Path]) -> list[_FileStrip]:
@@ -514,8 +515,13 @@ def analyse_camera(
         chip_only=chip_only, no_video=no_video, obstructions=obstructions, verdicts=verdicts,
         manual_entries=manual_entries, chip_locator=_chip_locator(files, model.version),
         expected_ms=expected_ms,
+        race_start_ms=(
+            model.to_recorder(min(read.chip_ms for read in pairing_reads)) - PRE_RACE_MARGIN_MS
+            if pairing_reads else None
+        ),
     )
     result["rules"] = dict(outcome.stats, late_pairs=outcome.late_pairs)
+    result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
     result["items"] = outcome.items
     result["auto_passed"] = outcome.auto_passed
     result["model"] = model
