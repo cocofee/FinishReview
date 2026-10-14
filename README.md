@@ -14,6 +14,12 @@ FinishReview 通过 OpenCV 自带的 `cv2.dnn` 单线程运行，只看配不上
 视频只用于发现问题和为漏读者提供证据与补录时间；自动配对通过的选手单独记录，
 不会当作人工确认。
 
+主界面“问题清单”列出待处理的问题，每条带卡片、前后约 1 秒的小胶片和“跳到原帧”；
+处理记录写入比赛目录 `finish_problems/`，“导出清单”生成补录、建议删除、建议改号改圈
+三张 CSV，交给 CycleRace 处理。“分析录像”在单独的低优先级进程中运行，可用内存低于
+4 GB 时不开始。实施记录与三场验收见 [FINISH_PROBLEM_LIST_VALIDATION.md](docs/FINISH_PROBLEM_LIST_VALIDATION.md)，
+定边演练步骤见 [FINISH_PROBLEM_LIST_WALKTHROUGH.md](docs/FINISH_PROBLEM_LIST_WALKTHROUGH.md)。
+
 ## 独立计数对账入口
 
 主界面顶部显示视频次数、芯片次数、差额和待核数量。“对数”按钮在原有通过记录区
