@@ -132,6 +132,8 @@ def test_bunches_and_obstructions_get_manual_check_items():
 
     bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
     assert bunch.evidence["chip_count"] == 5 and bunch.evidence["video_count"] == 4
+    # The bunch opens at its first crossing's source frame (card and jump).
+    assert bunch.evidence["frame"]["position_ms"] == reads[0].chip_ms + 1_000 - T0
     assert any("不一致" in item.detail for item in outcome.items if item.kind == KIND_BUNCH)
     assert sum(item.kind == "obstruction" for item in outcome.items) == 1
 
@@ -266,6 +268,7 @@ def test_reads_paired_only_to_motion_in_a_crowded_period_are_not_auto_passed():
     crowd = next(item for item in outcome.items if item.kind == "obstruction")
     assert crowd.bibs == ("1", "3") and crowd.pending
     assert crowd.evidence["unverified"] == ["1"] and "未自动通过：1" in crowd.detail
+    assert crowd.evidence["frame"]["position_ms"] == 201_000
     assert outcome.stats["paired_in_crowd"] == 1
 
 

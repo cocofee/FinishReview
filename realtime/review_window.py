@@ -2275,7 +2275,7 @@ class FinishReviewWindow(PassageReviewSurface):
             panel.refresh()
 
     def _open_problem_frame(self, frame) -> None:
-        """Open the item's original frame in camera 1, without changing identity."""
+        """Open the item's original frame in its camera's pane, without changing identity."""
 
         from .video_timeline import PassageVideoLocation
 
@@ -2290,7 +2290,7 @@ class FinishReviewWindow(PassageReviewSurface):
         location = PassageVideoLocation(segment, path, position, position, 0,
                                         segment.timing_error_ms, "located")
         self._set_sync_playing(False, seek_final=False)
-        if self._seek_retained_camera_frame(location, position, index):
+        if self._seek_retained_camera_frame(location, position, index, int(frame.get("camera_index", 1) or 1)):
             self.problem_panel.hint.setText(f"已定位原录像第 {index + 1} 帧，请逐帧核对号码后在清单中处理。")
 
     def _count_context(self):

@@ -379,7 +379,10 @@ def build_video_items(
     race_periods = [
         (start, end) for start, end in periods if race_start_ms is None or end >= race_start_ms
     ]
-    crowds = _obstruction_items(camera_index, model, race_periods, matched, chip_only, version, unverified)
+    records = sorted([m[0] for m in matched] + list(video_only), key=lambda crossing: crossing.recorder_ms)
+    crowds = _obstruction_items(
+        camera_index, model, race_periods, matched, chip_only, version, unverified, records,
+    )
     outcome.items = _group_members(outcome.items, bunches, crowds, expected)
     outcome.items += _no_video_items(camera_index, no_video)
     outcome.stats = {
@@ -493,7 +496,8 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
             groups[-1].append(read)
         else:
             groups.append([read])
-    crossings = [m[0].recorder_ms for m in matched] + [crossing.recorder_ms for crossing, _verdict in rest]
+    records = sorted([m[0] for m in matched] + [crossing for crossing, _verdict in rest], key=lambda c: c.recorder_ms)
+    crossings = [record.recorder_ms for record in records]
     items = []
     for group in groups:
         if len(group) < BUNCH_MIN:
@@ -501,6 +505,9 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
         start = model.to_recorder(group[0].chip_ms) - BUNCH_MARGIN_MS
         end = model.to_recorder(group[-1].chip_ms) + BUNCH_MARGIN_MS
         video = sum(start <= value <= end for value in crossings)
+        evidence = {"recorder_start_ms": int(start), "recorder_end_ms": int(end), "video_count": video,
+                    "chip_count": len(group)}
+        evidence.update(_period_anchor(records, start, end, version))
         items.append(ProblemItem(
             item_id=stable_item_id(KIND_BUNCH, camera_index, *(read.read_id for read in group)),
             kind=KIND_BUNCH, category=CATEGORY_VIDEO,
@@ -510,15 +517,20 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
             ),
             chip_time_ms=group[0].chip_ms, bibs=tuple(read.bib for read in group),
             event_ids=tuple(read.event_id for read in group), status=STATUS_OPEN, priority=50,
-            evidence={"recorder_start_ms": int(start), "recorder_end_ms": int(end), "video_count": video,
-                      "chip_count": len(group)},
-            calibration_version=version,
+            evidence=evidence, calibration_version=version,
         ))
     return items
 
 
+def _period_anchor(records: Sequence[CrossingRecord], start: int, end: int, version: int) -> dict:
+    """Source frame of the first crossing in a bunch or crowded period, for its card and jump."""
+
+    first = next((record for record in records if start <= record.recorder_ms <= end), None)
+    return {"frame": first.frame_payload(version), "recorder_ms": first.recorder_ms} if first is not None else {}
+
+
 def _obstruction_items(
-    camera_index, model, periods, matched, chip_only, version, unverified=frozenset(),
+    camera_index, model, periods, matched, chip_only, version, unverified=frozenset(), records=(),
 ) -> list[ProblemItem]:
     items = []
     reads = [m[1] for m in matched] + list(chip_only)
@@ -538,7 +550,10 @@ def _obstruction_items(
             detail=detail + "；证据不足，请核对该时段",
             chip_time_ms=model.to_chip(start), bibs=tuple(read.bib for read in inside),
             event_ids=tuple(read.event_id for read in inside), status=STATUS_OPEN, priority=60,
-            evidence={"recorder_start_ms": int(start), "recorder_end_ms": int(end), "unverified": weak},
+            evidence={
+                "recorder_start_ms": int(start), "recorder_end_ms": int(end), "unverified": weak,
+                **_period_anchor(records, start, end, version),
+            },
             calibration_version=version,
         ))
     return items

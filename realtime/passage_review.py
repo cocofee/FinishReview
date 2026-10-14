@@ -7298,7 +7298,9 @@ class PassageReviewSurface(QDialog):
             item.key,
         )))
 
-    def _seek_retained_camera_frame(self, location: PassageVideoLocation, position_ms: int, frame_index: int) -> bool:
+    def _seek_retained_camera_frame(
+        self, location: PassageVideoLocation, position_ms: int, frame_index: int, camera_index: int = 1,
+    ) -> bool:
         """Open a pinned image's source independently of the overview window."""
         try:
             location = self._persist_filmstrip_location(location)
@@ -7307,7 +7309,7 @@ class PassageReviewSurface(QDialog):
                 f"原帧保留失败，未进入判读：{error}"
             )
             return False
-        pane = self._camera_one_pane()
+        pane = self._camera_one_pane() if int(camera_index) <= 1 else self._pane_for_camera(camera_index)
         offset = self._continuous_offset_for_location(location)
         origin = location.segment.media_started_at_ms
         event = self.passage_store.get(self._selected_event_id)

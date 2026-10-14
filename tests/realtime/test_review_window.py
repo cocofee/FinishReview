@@ -509,6 +509,30 @@ def test_count_group_opens_its_original_frame_and_rejects_a_different_recording(
         window.close()
 
 
+def test_problem_item_opens_its_original_frame_in_its_own_camera(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    try:
+        video = tmp_path / "camera_02.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_02", camera_index=2, video_path=video,
+            media_started_at_ms=1_789_000_000_000, media_duration_ms=5000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="race-1")
+        opened = []
+        monkeypatch.setattr(window, "_seek_retained_camera_frame",
+                            lambda loc, pos, frame, camera=1: opened.append((loc.video_path, pos, frame, camera)) or True)
+        frame = dict(segment_id=segment.segment_id, video_path=str(video), camera_index=2,
+                     frame_index=37, position_ms=1850)
+        window._open_problem_frame(frame)
+        assert opened == [(video, 1850, 37, 2)]
+        window._open_problem_frame(dict(frame, video_path=str(tmp_path / "missing.mkv")))
+        assert len(opened) == 1
+        assert "原录像缺失" in window.problem_panel.hint.text()
+    finally:
+        window.close()
+
+
 @pytest.mark.parametrize("observations_change", [False, True])
 def test_count_group_number_review_persists_only_for_unchanged_observations(
         qapp, tmp_path, monkeypatch, observations_change):
