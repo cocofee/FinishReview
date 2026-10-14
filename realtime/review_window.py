@@ -801,6 +801,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._clock_timer.timeout.connect(self._on_clock_tick)
         self._init_runtime_status()
         self._init_count_reconciliation()
+        self._init_problem_list()
         self._init_operator_controls()
         self._high_speed_scan_worker = AuyatRgbScanWorker(
             self._high_speed_catalog,
@@ -1904,6 +1905,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._capture_error = ""
             self.refresh()
             self._refresh_count_reconciliation()
+            self._refresh_problem_list()
             if self._video_candidate_cache:
                 self._reconcile_video_candidates(
                     tuple(self._video_candidate_cache.values())
@@ -2079,6 +2081,13 @@ class FinishReviewWindow(PassageReviewSurface):
         self.count_review_button.setToolTip("在通过记录中展开集团数量对账")
         self.count_review_button.clicked.connect(self._open_count_review)
         top_layout.addWidget(self.count_review_button)
+        self.problem_list_button = QPushButton("问题清单", panel)
+        self.problem_list_button.setObjectName("finishProblemListButton")
+        self.problem_list_button.setFixedHeight(32)
+        self.problem_list_button.setCheckable(True)
+        self.problem_list_button.setToolTip("只处理有问题的：自动通过、待处理和无法核实")
+        self.problem_list_button.clicked.connect(self._open_problem_list)
+        top_layout.addWidget(self.problem_list_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2089,6 +2098,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.count_review_button.setStyleSheet(tool_button_style)
+        self.problem_list_button.setStyleSheet(tool_button_style)
         self.select_event_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
@@ -2232,6 +2242,56 @@ class FinishReviewWindow(PassageReviewSurface):
         self.count_panel.review_requested.connect(self._verify_count_group)
         self.count_panel.summary_changed.connect(self.count_status_label.setText)
         self._refresh_count_reconciliation()
+
+    def _init_problem_list(self) -> None:
+        from .problem_panel import ProblemListPanel
+
+        self.problem_panel = ProblemListPanel(self.results_panel)
+        self.results_panel.layout().insertWidget(1, self.problem_panel)
+        self.problem_panel.hide()
+        self.problem_panel.set_events_provider(
+            lambda: self.passage_store.events(include_inactive=True)
+        )
+        self.problem_panel.jump_requested.connect(self._open_problem_frame)
+        self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
+        self.problem_panel.set_workspace(self.output_dir)
+        if self.problem_panel.payload is not None:
+            # A finished analysis makes the problem list the main entry.
+            self.problem_list_button.setChecked(True)
+            self._open_problem_list()
+
+    def _open_problem_list(self) -> None:
+        expanded = self.problem_list_button.isChecked()
+        self.problem_panel.setVisible(expanded)
+        self._set_count_layout(expanded or self.count_review_button.isChecked())
+        self._refresh_problem_list()
+
+    def _refresh_problem_list(self) -> None:
+        panel = getattr(self, "problem_panel", None)
+        if panel is None:
+            return
+        panel.set_workspace(self.output_dir)
+        if panel.isVisible():
+            panel.refresh()
+
+    def _open_problem_frame(self, frame) -> None:
+        """Open the item's original frame in camera 1, without changing identity."""
+
+        from .video_timeline import PassageVideoLocation
+
+        segment = self.timeline_store.get_segment(str(frame.get("segment_id", "")))
+        path = Path(str(frame.get("video_path", "")))
+        if not path.is_absolute():
+            path = self.output_dir / path
+        if segment is None or not path.is_file():
+            self.problem_panel.hint.setText("原录像缺失或不在本赛事的录像索引中，未跳转其他录像。")
+            return
+        position, index = int(frame.get("position_ms", 0)), int(frame.get("frame_index", 0))
+        location = PassageVideoLocation(segment, path, position, position, 0,
+                                        segment.timing_error_ms, "located")
+        self._set_sync_playing(False, seek_final=False)
+        if self._seek_retained_camera_frame(location, position, index):
+            self.problem_panel.hint.setText(f"已定位原录像第 {index + 1} 帧，请逐帧核对号码后在清单中处理。")
 
     def _count_context(self):
         metadata = self._current_metadata()
@@ -3103,6 +3163,7 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _on_clock_tick(self) -> None:
         self._refresh_count_reconciliation()
+        self._refresh_problem_list()
         self._poll_recording_health()
         self._update_runtime_status()
 
