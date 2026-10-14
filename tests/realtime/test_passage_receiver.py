@@ -553,7 +553,7 @@ def test_inactive_revision_is_retained_for_audit_but_hidden_from_active_events(
     assert len(store.journal_path.read_text(encoding="utf-8").splitlines()) == 2
 
 
-def test_deleted_passage_stays_deleted_after_restart_and_upstream_updates(tmp_path):
+def test_deleted_passage_reappears_after_upstream_revision(tmp_path):
     path = tmp_path / "passages.jsonl"
     store = PassageEventStore(path)
     event = PassageEvent.from_payload(passage_payload())
@@ -571,12 +571,42 @@ def test_deleted_passage_stays_deleted_after_restart_and_upstream_updates(tmp_pa
     reopened.append(event)
     updated = PassageEvent.from_payload(passage_payload(revision=2, bib="443"))
     reopened.append(updated)
-    assert reopened.events() == (other,)
+    assert reopened.events() == (updated, other)
     assert reopened.get(event.event_id) == updated
-    assert PassageEventStore(path).events() == (other,)
+    assert PassageEventStore(path).events() == (updated, other)
     independent = PassageEventStore(tmp_path / "another-race.jsonl")
     independent.append(event)
     assert independent.events() == (event,)
+
+
+def test_legacy_deletion_is_persisted_before_revision_and_reopen(tmp_path):
+    path = tmp_path / "passages.jsonl"
+    store = PassageEventStore(path)
+    event = PassageEvent.from_payload(passage_payload())
+    store.append(event)
+    store.deletions_path.write_text(json.dumps([event.event_id]), encoding="utf-8")
+    reopened = PassageEventStore(path)
+    assert reopened.events() == ()
+    assert json.loads(store.deletions_path.read_text(encoding="utf-8"))["schema_version"] == 2
+    updated = PassageEvent.from_payload(passage_payload(revision=2, bib="443"))
+    reopened.append(updated)
+    assert PassageEventStore(path).events() == (updated,)
+    reopened.delete(updated.event_id, reason="corrected spare read")
+    records = json.loads(store.deletions_path.read_text(encoding="utf-8"))["records"]
+    assert len(records) == 2
+    assert records[-1]["reason"] == "corrected spare read"
+    assert records[-1]["basis"]["revision"] == 2
+    assert PassageEventStore(path).events() == ()
+
+
+def test_blank_deletion_reason_leaves_event_visible(tmp_path):
+    store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = PassageEvent.from_payload(passage_payload())
+    store.append(event)
+    with pytest.raises(ValueError):
+        store.delete(event.event_id, reason=" ")
+    assert store.events() == (event,)
+    assert not store.deletions_path.exists()
 
 
 def test_failed_deletion_keeps_record_and_previous_deletions(tmp_path, monkeypatch):

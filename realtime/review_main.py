@@ -20,6 +20,7 @@ from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from realtime.auyat_rgb import discover_auyat_root
+from realtime.qt_runtime import configure_qt_plugins
 from realtime.passage_review import UI_BASE_FONT_POINT_SIZE, UI_FONT_FAMILY
 from realtime.passage_receiver import DEFAULT_HOST, DEFAULT_PORT
 from realtime.review_recorder import (
@@ -605,6 +606,11 @@ def run_packaged_smoke_test(app_argv: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     multiprocessing.freeze_support()
+    configure_qt_plugins()
+    worker_args = sys.argv[1:] if argv is None else argv
+    if worker_args and worker_args[0] == "--offline-finish-worker":
+        from realtime.offline_finish import main as offline_main
+        return offline_main(worker_args[1:])
     logging_error = ""
     try:
         log_path = configure_runtime_logging()

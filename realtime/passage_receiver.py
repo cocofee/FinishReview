@@ -353,15 +353,31 @@ class PassageEventStore:
         self.deletions_path = self.journal_path.with_name(
             self.journal_path.stem + "_deleted.json"
         )
-        self._deleted_event_ids: set[str] = set()
+        self._deletion_records: list[dict] = []
+        self._deletions_by_id: dict[str, dict] = {}
         if self.deletions_path.exists():
             try:
                 deleted = json.loads(self.deletions_path.read_text(encoding="utf-8"))
-                if not isinstance(deleted, list) or any(
-                    not isinstance(event_id, str) or not event_id for event_id in deleted
-                ):
-                    raise ValueError("deleted event IDs must be non-empty strings")
-                self._deleted_event_ids = set(deleted)
+                if isinstance(deleted, list) and all(isinstance(e, str) and e for e in deleted):
+                    # Legacy files have no original fingerprint. Bind to the
+                    # currently known revision; never hide a future reused ID.
+                    deleted = dict(schema_version=2, records=[
+                        dict(event_id=e, basis=self._deletion_basis(self._events[e]),
+                             reason="旧版删除记录，原始原因未保存", deleted_at_ms=0)
+                        for e in deleted if e in self._events])
+                    # Persist the binding before any upstream revision can be
+                    # received, otherwise each reopen would rebind the legacy ID.
+                    from .finish_problems import atomic_json
+                    atomic_json(self.deletions_path, deleted)
+                if not isinstance(deleted, dict) or deleted.get("schema_version") != 2 or not isinstance(deleted.get("records"), list):
+                    raise ValueError("unsupported passage deletion schema")
+                for record in deleted["records"]:
+                    if (not isinstance(record, dict) or not isinstance(record.get("event_id"), str)
+                            or not record["event_id"] or not isinstance(record.get("basis"), dict)
+                            or not isinstance(record.get("reason"), str) or not record["reason"].strip()):
+                        raise ValueError("invalid passage deletion record")
+                    self._deletion_records.append(record)
+                    self._deletions_by_id[record["event_id"]] = record
             except (OSError, ValueError) as error:
                 raise PassageJournalError("failed to read passage deletions") from error
 
@@ -504,16 +520,31 @@ class PassageEventStore:
         with self._lock:
             return self._events.get(str(event_id))
 
-    def delete(self, event_id: str) -> bool:
+    @staticmethod
+    def _deletion_basis(event: PassageEvent) -> dict:
+        return {name: getattr(event, name) for name in (
+            "race_id", "stage_id", "group_id", "bib", "chip_id", "lap", "revision",
+            "timeline_timestamp_ms", "is_active")}
+
+    def _is_deleted(self, event: PassageEvent) -> bool:
+        record = self._deletions_by_id.get(event.event_id)
+        return bool(record and record["basis"] == self._deletion_basis(event))
+
+    def delete(self, event_id: str, *, reason: str = "操作员本地删除") -> bool:
         """Delete a local passage without altering upstream revision numbers.
 
-        Keep its ID separately so retries and later upstream revisions cannot
-        restore a record the operator deleted from this workspace.
+        Keep the identity, revision, time and reason. Retries remain hidden;
+        upstream revisions reappear for review. Original journals are retained.
         """
         with self._lock:
-            if event_id not in self._events or event_id in self._deleted_event_ids:
+            event = self._events.get(event_id)
+            if event is None or self._is_deleted(event):
                 return False
-            deleted = self._deleted_event_ids | {event_id}
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("删除记录必须填写原因")
+            record = dict(event_id=event_id, basis=self._deletion_basis(event),
+                          reason=reason.strip(), deleted_at_ms=int(time.time() * 1000))
+            deleted = dict(schema_version=2, records=[*self._deletion_records, record])
             temporary_path = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -521,7 +552,7 @@ class PassageEventStore:
                     prefix=self.deletions_path.name + ".", suffix=".tmp", delete=False,
                 ) as handle:
                     temporary_path = Path(handle.name)
-                    json.dump(sorted(deleted), handle, ensure_ascii=False)
+                    json.dump(deleted, handle, ensure_ascii=False)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary_path, self.deletions_path)
@@ -530,14 +561,15 @@ class PassageEventStore:
             finally:
                 if temporary_path is not None and temporary_path.exists():
                     temporary_path.unlink()
-            self._deleted_event_ids = deleted
+            self._deletion_records.append(record)
+            self._deletions_by_id[event_id] = record
             return True
 
     def events(self, *, include_inactive: bool = False) -> tuple[PassageEvent, ...]:
         with self._lock:
             events = tuple(
                 self._events[event_id] for event_id in self._event_order
-                if event_id not in self._deleted_event_ids
+                if not self._is_deleted(self._events[event_id])
             )
             if include_inactive:
                 return events

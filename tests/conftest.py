@@ -11,6 +11,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QCoreApplication, QEvent, QThread  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
+from realtime.qt_runtime import configure_qt_plugins  # noqa: E402
+
+configure_qt_plugins()
 
 
 @pytest.fixture(autouse=True)

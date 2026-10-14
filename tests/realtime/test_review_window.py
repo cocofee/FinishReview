@@ -323,6 +323,54 @@ def _legacy_mixed_workspace(path):
     return event, video
 
 
+def test_finish_problem_request_binds_scope_line_and_original_file(qapp, tmp_path):
+    from dataclasses import asdict
+    from realtime.finish_line import FinishLine
+    event, video = _legacy_mixed_workspace(tmp_path)
+    window = _window(tmp_path)
+    try:
+        _wait_until(qapp, lambda: bool(window.video_filmstrip.full_race.index.sources))
+        request = window._finish_problem_request(1, asdict(FinishLine(1, .2, .5, .8, .5)))
+        assert request["scope"] == dict(race_id=event.race_id, stage_id=event.stage_id, camera_index=1)
+        assert [c["event_id"] for c in request["chips"]] == [event.event_id]
+        assert str(video) in {s["video_path"] for s in request["sources"]}
+        assert request["input_signature"] == window._finish_problem_signature()[3]
+        signature = window._finish_problem_signature()
+        video.write_bytes(video.read_bytes() + b"changed")
+        assert window._finish_problem_signature() != signature
+    finally:
+        window.close()
+
+
+def test_finish_problem_locates_pinned_source_and_rejects_changed_video(qapp, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    event, video = _legacy_mixed_workspace(tmp_path)
+    window = _window(tmp_path)
+    try:
+        _wait_until(qapp, lambda: bool(window.video_filmstrip.full_race.index.sources))
+        request = window._finish_problem_request()
+        segment_id = next(s["segment_id"] for s in request["sources"] if s["video_path"] == str(video))
+        loc = dict(segment_id=segment_id, video_path=str(video), camera_index=1,
+                   frame_index=12, position_ms=480, recorder_ms=10_480,
+                   source_signature=[video.stat().st_size, video.stat().st_mtime_ns])
+        window._finish_problem_dialog = SimpleNamespace(_current=lambda: True,
+                                                       report={"clock": None}, hint=QLabel(), close=lambda: None)
+        sought = []
+        monkeypatch.setattr(window, "_seek_retained_camera_frame",
+                            lambda *args, **kwargs: sought.append((args, kwargs)) or True)
+        monkeypatch.setattr(window, "_uses_popup_judging", lambda: False)
+        window._locate_finish_problem(dict(locator=loc, chips=[]))
+        assert sought[0][0][1:] == (480, 12)
+        assert sought[0][0][0].video_path == video
+        assert not window._selected_event_id
+        video.write_bytes(b"replaced")
+        window._locate_finish_problem(dict(locator=loc, chips=[]))
+        assert len(sought) == 1
+        assert "重新分析" in window._finish_problem_dialog.hint.text()
+    finally:
+        window.close()
+
+
 def test_legacy_mixed_workspace_recovers_scope_and_filmstrip_without_rewriting_evidence(qapp, tmp_path):
     event, video = _legacy_mixed_workspace(tmp_path)
     preserved = {p: p.read_bytes() for p in tmp_path.glob("*.jsonl")}
@@ -1422,6 +1470,7 @@ def test_opening_saved_event_is_blocked_while_recording(
 
 
 def test_deleting_passage_immediately_updates_review_export(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(passage_review.QInputDialog, "getText", lambda *_args: ("spare chip", True))
     window = _window(tmp_path / "events")
     metadata = RaceMetadata(
         race_id="race-delete", stage_id="stage-1", revision=1,

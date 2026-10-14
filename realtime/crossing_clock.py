@@ -118,39 +118,46 @@ def align_crossings(chip_times, video_times, clock: CrossingClock):
 
     Return input indices and residuals. A Fenwick tree stores the best preceding
     match, bounding memory to candidate pairs rather than a whole-race matrix.
+    Maximize match count, then minimize squared residual. All candidates inside
+    700 ms are eligible; 1500 ms is allowed only when both arrivals are isolated.
     """
     chips = sorted(enumerate(chip_times), key=lambda p: p[1])
     videos = sorted(enumerate(video_times), key=lambda p: p[1])
     times = [p[1] for p in videos]
-    tree = [(0., -1)] * (len(videos) + 1)
+    tree = [(0, 0., -1)] * (len(videos) + 1)
     nodes = []
 
     def query(end):
-        best = (0., -1)
+        best = (0, 0., -1)
         while end:
-            if tree[end][0] > best[0]:
+            if tree[end][:2] > best[:2]:
                 best = tree[end]
             end -= end & -end
         return best
 
-    for ci, ct in chips:
+    def isolated(items, index):
+        t = items[index][1]
+        return (index == 0 or t - items[index - 1][1] >= 5_000) and (
+            index + 1 == len(items) or items[index + 1][1] - t >= 5_000)
+
+    for index, (ci, ct) in enumerate(chips):
         expected = clock.to_video(ct)
+        window = 1500 if isolated(chips, index) else 700
         updates = []
-        for j in range(bisect_left(times, expected - 700), bisect_right(times, expected + 700)):
+        for j in range(bisect_left(times, expected - window), bisect_right(times, expected + window)):
             residual = times[j] - expected
-            gain = 3.2 - .5 * (residual / 150.) ** 2
-            if gain <= 0:
+            if abs(residual) > 700 and not isolated(videos, j):
                 continue
-            score, previous = query(j)
+            count, score, previous = query(j)
             nodes.append((previous, ci, videos[j][0], float(residual)))
-            updates.append((j + 1, (score + gain, len(nodes) - 1)))
+            updates.append((j + 1, (count + 1, score - residual ** 2, len(nodes) - 1)))
         # Apply after the chip's candidates so one chip can never match twice.
         for j, value in updates:
             while j < len(tree):
-                if value[0] > tree[j][0]:
+                if value[:2] > tree[j][:2]:
                     tree[j] = value
                 j += j & -j
-    _, node = query(len(videos))
+    _, _, node = query(len(videos))
     result = []
     while node >= 0:
         previous, ci, vi, residual = nodes[node]

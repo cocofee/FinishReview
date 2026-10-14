@@ -50,3 +50,24 @@ def test_alignment_is_one_to_one_ordered_and_handles_extra_reads():
 def test_alignment_indices_refer_to_unsorted_inputs():
     clock = CrossingClock(0, 0, 0, 0, 100000, 5, 0, 0, "test")
     assert [(c, v) for c, v, _ in align_crossings([20000, 10000], [10000, 20000], clock)] == [(1, 0), (0, 1)]
+
+
+@pytest.mark.parametrize("residual", [-700, -600, 600, 700])
+def test_full_normal_window_is_eligible(residual):
+    clock = CrossingClock(0, 0, 0, 0, 100000, 5, 0, 0, "test")
+    pairs = align_crossings([10000, 12000], [10000 + residual, 12000 + residual], clock)
+    assert len(pairs) == 2
+    assert [r for _, _, r in pairs] == [residual, residual]
+
+
+@pytest.mark.parametrize("residual", [-1500, -1400, 1400, 1500])
+def test_isolated_delayed_reads_can_pair(residual):
+    clock = CrossingClock(0, 0, 0, 0, 100000, 5, 0, 0, "test")
+    assert len(align_crossings([10000, 20000], [10000 + residual, 20000], clock)) == 2
+
+
+def test_cluster_or_ambiguous_video_does_not_get_wider_window():
+    clock = CrossingClock(0, 0, 0, 0, 100000, 5, 0, 0, "test")
+    assert align_crossings([10000, 11000], [8500], clock) == []
+    assert align_crossings([10000], [8500, 8600], clock) == []
+    assert align_crossings([10000], [8499], clock) == []

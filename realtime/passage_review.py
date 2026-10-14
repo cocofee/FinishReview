@@ -6161,8 +6161,11 @@ class PassageReviewSurface(QDialog):
         )
         if answer != QMessageBox.Yes or self.passage_store is not store:
             return
+        reason, accepted = QInputDialog.getText(self, "删除原因", "请填写删除原因（保留原始记录，上游修订后重新提示）：")
+        if not accepted or not reason.strip() or self.passage_store is not store:
+            return
         try:
-            deleted = store.delete(event.event_id)
+            deleted = store.delete(event.event_id, reason=reason)
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "删除失败", f"无法删除记录：{error}")
             return
@@ -7244,7 +7247,8 @@ class PassageReviewSurface(QDialog):
             item.key,
         )))
 
-    def _seek_retained_camera_frame(self, location: PassageVideoLocation, position_ms: int, frame_index: int) -> bool:
+    def _seek_retained_camera_frame(self, location: PassageVideoLocation, position_ms: int, frame_index: int,
+                                    *, clock_offset_override: Optional[int] = None) -> bool:
         """Open a pinned image's source independently of the overview window."""
         try:
             location = self._persist_filmstrip_location(location)
@@ -7254,7 +7258,8 @@ class PassageReviewSurface(QDialog):
             )
             return False
         pane = self._camera_one_pane()
-        offset = self._continuous_offset_for_location(location)
+        offset = (self._continuous_offset_for_location(location) if clock_offset_override is None
+                  else int(clock_offset_override))
         origin = location.segment.media_started_at_ms
         event = self.passage_store.get(self._selected_event_id)
         if event is None:

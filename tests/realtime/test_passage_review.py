@@ -234,6 +234,7 @@ def _add_segment(
 
 
 def test_delete_selected_record_updates_queue_and_survives_reopen(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(passage_review.QInputDialog, "getText", lambda *_args: ("spare chip", True))
     path = tmp_path / "passages.jsonl"
     passages = PassageEventStore(path)
     first = _event(event_id="spare-4", bib="443", athlete_name="备用4")

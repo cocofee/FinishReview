@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -2079,6 +2079,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self.count_review_button.setToolTip("在通过记录中展开集团数量对账")
         self.count_review_button.clicked.connect(self._open_count_review)
         top_layout.addWidget(self.count_review_button)
+        self.finish_problems_button = QPushButton("问题清单", panel)
+        self.finish_problems_button.setObjectName("finishProblemsButton")
+        self.finish_problems_button.setFixedHeight(32)
+        self.finish_problems_button.setToolTip("分析封口归档录像，核对异常并导出修改建议")
+        self.finish_problems_button.clicked.connect(self._open_finish_problems)
+        top_layout.addWidget(self.finish_problems_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2089,6 +2095,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.count_review_button.setStyleSheet(tool_button_style)
+        self.finish_problems_button.setStyleSheet(tool_button_style)
         self.select_event_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
@@ -2219,6 +2226,127 @@ class FinishReviewWindow(PassageReviewSurface):
             if sum(sizes):
                 self.review_content_splitter.setSizes(sizes)
             self._count_layout_before = None
+
+    def _finish_problem_chips(self):
+        race_id, stage_id = self._count_context()
+        return [dict(event.to_payload(), timestamp_ms=int(event.timeline_timestamp_ms))
+                for event in self.passage_store.events(include_inactive=True)
+                if event.race_id == race_id and event.stage_id == stage_id]
+
+    def _finish_problem_signature(self):
+        from .finish_problems import chip_basis, digest, scoped_chips
+        race_id, stage_id = self._count_context()
+        scope = dict(race_id=race_id, stage_id=stage_id, camera_index=1)
+        chips = scoped_chips(self._finish_problem_chips(), scope)
+        line = self._finish_line_store.get(1)
+        sources, _pending = self._recording_sources_for_filmstrip(self._camera_one_pane(), race_id)
+        source_basis = []
+        for source in sources:
+            if source.priority != 0 or source.location.segment.ended_at_ms is None:
+                continue
+            path = source.location.video_path.absolute()
+            try:
+                stat = path.stat()
+                signature = [stat.st_size, stat.st_mtime_ns]
+            except OSError:
+                signature = None
+            source_basis.append([source.location.segment.segment_id, str(path), signature])
+        basis = dict(timeline_revision=self.timeline_store.revision,
+                     sources=sorted(source_basis),
+                     line=asdict(line) if line else None,
+                     manual=[c.to_payload() for c in self.calibration_store.calibrations()])
+        return str(self.output_dir.absolute()), scope, digest([chip_basis(c) for c in chips]), digest(basis)
+
+    def _finish_problem_request(self, final_lap=0, line=None):
+        from .finish_line import FinishLine
+        output, scope, _chip_signature, _input_signature = self._finish_problem_signature()
+        if not scope["race_id"] or not scope["stage_id"]:
+            raise ValueError("请先选择赛事和赛段，再打开问题清单")
+        if line is not None:
+            value = FinishLine(**line)
+            if self._finish_line_store.get(1) != value:
+                self._finish_line_store.set(value)
+        line_value = self._finish_line_store.get(1)
+        sources, _pending = self._recording_sources_for_filmstrip(self._camera_one_pane(), scope["race_id"])
+        archives = []
+        seen_paths = set()
+        session_keys = set()
+        for source in sources:
+            segment = source.location.segment
+            path = source.location.video_path.absolute()
+            if (not source.available or source.priority != 0 or segment.ended_at_ms is None
+                    or path.suffix.lower() not in {".mkv", ".mp4", ".avi", ".mov"}
+                    or str(path) in seen_paths):
+                continue
+            seen_paths.add(str(path))
+            session_keys.add(self._recording_session_key(source.location))
+            archives.append(dict(segment_id=segment.segment_id, video_path=str(path),
+                                 origin_ms=int(source.start_ms), camera_index=1, race_id=segment.race_id))
+        chips = self._finish_problem_chips()
+        by_id = {c["event_id"]: c for c in chips}
+        anchors = []
+        for calibration in self.calibration_store.calibrations():
+            chip = by_id.get(calibration.anchor_event_id)
+            if chip and calibration.camera_index == 1 and calibration.session_key in session_keys:
+                anchors.append(dict(chip_ms=chip["timestamp_ms"], offset_ms=calibration.offset_ms,
+                                    anchor_bib=calibration.anchor_bib, revision=calibration.revision))
+        return dict(schema_version=1, scope=scope, output_dir=output, chips=chips,
+                    sources=archives, finish_line=asdict(line_value) if line_value else None,
+                    final_lap=final_lap, manual_anchors=anchors,
+                    input_signature=self._finish_problem_signature()[3])
+
+    def _open_finish_problems(self):
+        from .finish_problem_panel import FinishProblemDialog
+        dialog = getattr(self, "_finish_problem_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        try:
+            dialog = FinishProblemDialog(self._finish_problem_request, self._finish_problem_signature, self)
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.information(self, "问题清单", str(error))
+            return
+        self._finish_problem_dialog = dialog
+        dialog.locate_requested.connect(self._locate_finish_problem)
+        dialog.show()
+
+    def _locate_finish_problem(self, row):
+        from .crossing_clock import CrossingClock
+        dialog = getattr(self, "_finish_problem_dialog", None)
+        if dialog is None or not dialog._current():
+            return
+        locator = row.get("locator")
+        if not locator:
+            return
+        segment = self.timeline_store.get_segment(locator["segment_id"])
+        path = self.timeline_store.resolve_video_path(segment) if segment else None
+        try:
+            if (segment is None or path is None or not path.is_file() or segment.camera_index != 1
+                    or path.resolve() != Path(locator["video_path"]).resolve()
+                    or [path.stat().st_size, path.stat().st_mtime_ns] != locator["source_signature"]):
+                raise ValueError("原录像缺失、已改变或不匹配，请重新分析")
+            offset = 0
+            if dialog.report["clock"]:
+                clock = CrossingClock(**dialog.report["clock"])
+                offset = round(locator["recorder_ms"] - clock.to_chip(locator["recorder_ms"]))
+            event_id = row["chips"][0]["event_id"] if row["chips"] else None
+            if event_id:
+                self._select_event(event_id)
+            else:
+                self._selected_event_id = ""
+                self._clear_selection_details()
+            position = locator["position_ms"]
+            location = PassageVideoLocation(segment, path, position, position, offset,
+                                            segment.timing_error_ms, "located")
+            if self._seek_retained_camera_frame(location, position, locator["frame_index"],
+                                                clock_offset_override=offset):
+                pane = self._camera_one_pane()
+                if self._uses_popup_judging() and self._maximized_window is None:
+                    self._toggle_maximized_pane(pane)
+                dialog.hint.setText("已打开保存的原帧；可逐帧核对，再回问题清单保存处理。")
+        except (OSError, ValueError) as error:
+            dialog.hint.setText(str(error))
 
     def _init_count_reconciliation(self) -> None:
         from .count_panel import CountReconciliationPanel
@@ -4466,6 +4594,9 @@ class FinishReviewWindow(PassageReviewSurface):
             event.ignore()
             return
         self._clock_timer.stop()
+        problem_dialog = getattr(self, "_finish_problem_dialog", None)
+        if problem_dialog is not None:
+            problem_dialog.close()
         if hasattr(self, "_ui_latency_probe"):
             self._ui_latency_probe.stop()
         if not self.stop():
