@@ -1435,6 +1435,8 @@ def test_deleting_passage_immediately_updates_review_export(qapp, tmp_path, monk
     with summary.open(encoding="utf-8-sig", newline="") as handle:
         assert len(list(csv.reader(handle))) == 2
     monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.Yes)
+    from PyQt5.QtWidgets import QInputDialog
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("备用芯片", True))
     window.delete_record_button.click()
     assert window.table.rowCount() == 0
     with summary.open(encoding="utf-8-sig", newline="") as handle:
