@@ -26,6 +26,7 @@ from .passage_evidence import (
     VideoClockCalibrationStore,
 )
 from .passage_receiver import PassageEvent
+from .passage_deletions import decode_deletions
 from .race_metadata import RaceMetadata
 from .sync_check import latest_events
 from .video_timeline import DEFAULT_CLOCK_SOURCE, RecordingSegment, VideoTimelineStore
@@ -77,13 +78,13 @@ def _read_json(path: Path):
 
 
 def _deletion_marks(root: Path) -> tuple[dict, ...]:
-    payload = _read_json(root / DELETIONS_FILE)
-    if isinstance(payload, list):
-        return tuple({"event_id": str(item)} for item in payload if isinstance(item, str))
-    if isinstance(payload, dict):
-        records = payload.get("deletions", [])
-        return tuple(dict(item) for item in records if isinstance(item, dict) and item.get("event_id"))
-    return ()
+    path = root / DELETIONS_FILE
+    if not path.exists():
+        return ()
+    try:
+        return decode_deletions(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"无法读取通过记录删除标记：{path}\n{error}") from error
 
 
 def _applied_deletions(marks, latest: dict) -> tuple[str, ...]:

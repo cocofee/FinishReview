@@ -359,25 +359,20 @@ class PassageEventStore:
         if self.deletions_path.exists():
             try:
                 payload = json.loads(self.deletions_path.read_text(encoding="utf-8"))
-                if isinstance(payload, list):
-                    if any(not isinstance(event_id, str) or not event_id for event_id in payload):
-                        raise ValueError("deleted event IDs must be non-empty strings")
-                    # Legacy id-only list: bind to the record as it is now.
-                    for event_id in payload:
+                from .passage_deletions import decode_deletions
+
+                for mark in decode_deletions(payload):
+                    event_id = mark["event_id"]
+                    if isinstance(payload, list):
+                        # Bind legacy ID-only marks to the currently stored record.
                         event = self._events.get(event_id)
-                        self._deletions[event_id] = dict(
-                            self._deletion_identity(event) if event is not None else {},
-                            event_id=event_id, reason="", deleted_at_ms=0, legacy=True,
-                        )
-                elif isinstance(payload, dict) and isinstance(payload.get("deletions"), list):
-                    for mark in payload["deletions"]:
-                        if not isinstance(mark, dict) or not str(mark.get("event_id", "")).strip():
-                            raise ValueError("deletion marks need an event_id")
-                        self._deletions[str(mark["event_id"])] = dict(mark)
-                else:
-                    raise ValueError("unsupported passage deletion file")
+                        if event is not None:
+                            mark.update(self._deletion_identity(event))
+                    self._deletions[event_id] = mark
             except (OSError, ValueError) as error:
-                raise PassageJournalError("failed to read passage deletions") from error
+                raise PassageJournalError(
+                    f"无法读取通过记录删除标记：{self.deletions_path}\n{error}"
+                ) from error
 
     @staticmethod
     def _deletion_identity(event: PassageEvent) -> dict[str, Any]:
