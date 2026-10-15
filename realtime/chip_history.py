@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from .passage_receiver import PassageEvent, PassageEventError
+from .evidence_clock import align_evidence_timestamp
 
 
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
@@ -30,7 +31,7 @@ EXCLUDED_OTHER_DAY = "other_day"
 
 @dataclass(frozen=True, slots=True)
 class ChipRead:
-    """One CycleRace passage, using its first active revision on race day."""
+    """One CycleRace passage, preserving its official timestamp."""
 
     event_id: str
     bib: str
@@ -59,7 +60,8 @@ class ChipRead:
 
     @property
     def receive_delay_ms(self) -> int:
-        return int(self.received_at_ms) - int(self.chip_ms) if self.received_at_ms else 0
+        return (int(self.received_at_ms) - align_evidence_timestamp(self.chip_ms, self.received_at_ms)
+                if self.received_at_ms else 0)
 
     @property
     def changed_upstream(self) -> bool:
@@ -122,11 +124,12 @@ def chip_reads(
 ) -> tuple[ChipRead, ...]:
     """Rebuild chip reads from all journal revisions.
 
-    A read uses the first revision that was active on race day, i.e. what the
+    A read uses the first revision that was active, i.e. what the
     finish saw when the read arrived. ``active_now`` reflects the latest
     revision and local deletions. CycleRace does not send a manual-entry flag,
-    so a passage received more than ``late_manual_ms`` after its own time is
-    treated as a manual entry (补录), not as a chip read.
+    so a passage received more than ``late_manual_ms`` after its evidence time
+    is treated as a manual entry (补录), not as a chip read. Only an explicit
+    ``race_date`` restricts dates; metadata dates never imply a filter.
     """
 
     scoped = [
@@ -134,8 +137,6 @@ def chip_reads(
         if (not race_id or event.race_id == race_id)
         and (not stage_id or event.stage_id == stage_id)
     ]
-    if not race_date:
-        race_date = dominant_race_date(scoped)
     deleted = set(deleted_event_ids)
     by_event: dict[str, list[PassageEvent]] = {}
     for event in scoped:
@@ -149,7 +150,8 @@ def chip_reads(
         versions: list[list[PassageEvent]] = []
         for item in ordered:
             identity = (item.bib.strip(), item.chip_id.strip())
-            if versions and (versions[-1][0].bib.strip(), versions[-1][0].chip_id.strip()) == identity:
+            if (versions and (versions[-1][0].bib.strip(), versions[-1][0].chip_id.strip()) == identity
+                    and local_date(versions[-1][0].timeline_timestamp_ms) == local_date(item.timeline_timestamp_ms)):
                 versions[-1].append(item)
             else:
                 versions.append([item])
@@ -181,7 +183,9 @@ def chip_reads(
                     revision=int(first.revision),
                     latest_revision=int(latest.revision),
                     active_now=current and bool(latest.is_active) and event_id not in deleted,
-                    manual_entry=bool(received) and received - chip_ms > int(late_manual_ms),
+                    manual_entry=bool(received) and (
+                        received - align_evidence_timestamp(chip_ms, received) > int(late_manual_ms)
+                    ),
                     excluded=group_exclusion(first.group_name),
                     latest_bib=latest_identity[0],
                     latest_chip_ms=int(latest.timeline_timestamp_ms),

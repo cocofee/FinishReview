@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -32,6 +33,22 @@ def _race(seed=0, *, offset=1_200.0, drift_per_hour=-334.0, riders=300, jitter=2
     session_for = lambda t: sessions[min(len(sessions) - 1, int((t - START) / (1.2 * HOUR) * len(sessions)))]
     items = [ClockCrossing(int(t), session_for(t)) for t in np.concatenate([crossings, noise])]
     return chips.tolist(), sorted(items, key=lambda item: item.recorder_ms)
+
+
+@pytest.mark.parametrize("days", [-3, 3])
+def test_date_offset_preserves_drift_and_inverse_in_official_time_domain(days):
+    chips, original = _race()
+    shift = days * 86_400_000
+    shifted = [replace(item, recorder_ms=item.recorder_ms + shift) for item in original]
+    base = calibrate_camera(original, chips, camera_index=1)
+    result = calibrate_camera(shifted, chips, camera_index=1, date_offset_ms=shift)
+    assert result.model is not None and base.model is not None
+    assert result.model.reference_ms == base.model.reference_ms
+    assert result.model.slope == pytest.approx(base.model.slope)
+    assert result.residuals_ms == pytest.approx(base.residuals_ms)
+    for chip in chips:
+        assert result.model.to_recorder(chip) == base.model.to_recorder(chip) + shift
+        assert abs(result.model.to_chip(result.model.to_recorder(chip)) - chip) <= 1
 
 
 def test_coarse_search_finds_single_peak_far_from_any_manual_guess():

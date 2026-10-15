@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -49,6 +49,7 @@ from .clock_sync import CLOCK_MODEL_FILENAME, ClockCrossing, ClockModelStore, ca
 from .crossing_cards import render_cards
 from .crossing_detection import DetectionParams, DetectionResult, LineCrossing, detect_crossings, frame_interval_ms
 from .crossing_pairing import pair_crossings
+from .evidence_clock import align_evidence_timestamp
 from .line_sampling import (
     DEFAULT_DECODE_THREADS,
     DEFAULT_SAMPLES,
@@ -476,6 +477,29 @@ def _bike_verdicts(
     return verdicts
 
 
+def calibrate_evidence_clock(crossings, reads, *, camera_index):
+    """Try receipt-supported calendar offsets, still requiring visual calibration.
+
+    Dates alone never reject a read. A receipt can suggest an integer-day
+    offset, but cannot by itself establish a chip/video match.
+    """
+    offsets = {0}
+    for read in reads:
+        if not read.excluded and not read.manual_entry:
+            offsets.add(align_evidence_timestamp(read.chip_ms, read.received_at_ms) - read.chip_ms)
+    results = [calibrate_camera(
+        crossings, calibration_chip_times(reads), camera_index=camera_index,
+        date_offset_ms=offset,
+    ) for offset in sorted(offsets)]
+    valid = [result for result in results if result.model is not None]
+    if not valid:
+        return results[0]
+    valid.sort(key=lambda result: result.model.support, reverse=True)
+    if len(valid) > 1 and valid[0].model.support == valid[1].model.support:
+        return replace(valid[0], model=None, warnings=("多段录像的日期映射存在歧义，请核对录像会话",))
+    return valid[0]
+
+
 def analyse_camera(
     config: AnalysisConfig,
     workspace: AnalysisWorkspace,
@@ -507,9 +531,9 @@ def analyse_camera(
         ensure_ascii=False,
     ), encoding="utf-8")
 
-    calibration = calibrate_camera(
+    calibration = calibrate_evidence_clock(
         [ClockCrossing(item.recorder_ms, item.session_id) for item in crossings],
-        calibration_chip_times(reads),
+        reads,
         camera_index=camera,
     )
     result: dict = {

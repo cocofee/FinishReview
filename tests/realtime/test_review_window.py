@@ -1020,6 +1020,28 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     restored.close()
 
 
+def test_changing_recording_root_keeps_live_metadata_and_received_passages(qapp, tmp_path):
+    window = _window(tmp_path / "old")
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[-1]
+    metadata = RaceMetadata(race_id="race-2026", stage_id="stage-1", revision=1,
+                            emitted_at_ms=1, race_name="Live race", stage_date="2026-10-18")
+    receiver.deliver_metadata(metadata)
+    qapp.processEvents()
+    _FakeReceiver.instances[-1].deliver(_event(race_id=metadata.race_id))
+    qapp.processEvents()
+    before = window.passage_store.events()
+    try:
+        assert window._apply_settings(replace(window._current_settings(), output_dir=tmp_path / "new"))
+        assert window.metadata_store.current() == metadata
+        assert window.event_name_label.text() == "Live race"
+        assert window.passage_store.events() == before
+        assert window._receiver_metadata_store.current() == metadata
+        assert window._receiver_passage_store.events() == before
+    finally:
+        window.close()
+
+
 def test_cyclerace_workspace_merge_carries_inactive_tombstone(qapp, tmp_path):
     window = _window(tmp_path / "events")
     active = _event(

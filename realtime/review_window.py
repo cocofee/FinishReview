@@ -40,6 +40,7 @@ from .decode_resources import DECODE_RESOURCES
 from .background_wait import wait_for_background
 from .recording_catalog import RecordingCatalog, RecordingCatalogJob
 from .evidence_pipeline import EvidencePassage, EvidencePipeline, EvidenceRefreshJob
+from .evidence_clock import LIVE_DATE_TOLERANCE_MS, align_evidence_timestamp
 from .capture_refresh import (
     ArchiveRefreshJob,
     CaptureRefreshRequest,
@@ -164,7 +165,7 @@ class _VideoCandidatePersistenceFailure:
 IS_WINDOWS = os.name == "nt"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
-LIVE_EVIDENCE_DATE_TOLERANCE_MS = 5 * 60 * 1000
+LIVE_EVIDENCE_DATE_TOLERANCE_MS = LIVE_DATE_TOLERANCE_MS
 CYCLERACE_INBOX_DIRNAME = ".finishreview"
 _TEST_GROUP_NAMES = frozenset({"test", "testgroup"})
 _TEST_GROUP_MARKERS = ("测试", "检测")
@@ -212,31 +213,7 @@ def _align_live_evidence_timestamp(
     *,
     tolerance_ms: int = LIVE_EVIDENCE_DATE_TOLERANCE_MS,
 ) -> int:
-    formal_time = datetime.fromtimestamp(
-        int(timestamp_ms) / 1000.0,
-        tz=BEIJING_TIMEZONE,
-    )
-    received_time = datetime.fromtimestamp(
-        int(received_at_ms) / 1000.0,
-        tz=BEIJING_TIMEZONE,
-    )
-    if formal_time.date() == received_time.date():
-        return int(timestamp_ms)
-    candidates = (
-        datetime.combine(
-            received_time.date() + timedelta(days=offset),
-            formal_time.timetz(),
-        )
-        for offset in (-1, 0, 1)
-    )
-    candidate = min(
-        candidates,
-        key=lambda value: abs(value.timestamp() * 1000.0 - received_at_ms),
-    )
-    candidate_ms = int(candidate.timestamp() * 1000.0)
-    if abs(candidate_ms - int(received_at_ms)) <= max(0, int(tolerance_ms)):
-        return candidate_ms
-    return int(timestamp_ms)
+    return align_evidence_timestamp(timestamp_ms, received_at_ms, tolerance_ms=tolerance_ms)
 
 
 def _is_test_group_name(value: str) -> bool:
@@ -1697,6 +1674,19 @@ class FinishReviewWindow(PassageReviewSurface):
                 preflight_journal = PreflightJournal(
                     output_dir / "preflight_tests.jsonl"
                 )
+                carried_metadata = None
+                if (workspace_root_changed and not timing_changed
+                        and next_timing_provider == "cyclerace"
+                        and self._workspace_mode == "live"
+                        and metadata_store.current() is None):
+                    carried_metadata = self.metadata_store.current()
+                    if carried_metadata is not None:
+                        metadata_store.store(carried_metadata)
+                        for event in self.passage_store.events(include_inactive=True):
+                            if (event.race_id, event.stage_id) == (
+                                carried_metadata.race_id, carried_metadata.stage_id
+                            ):
+                                passage_store.append(event)
                 historical_events = passage_store.events()
                 evidence_timestamp_overrides = (
                     _historical_evidence_timestamp_overrides(historical_events)
@@ -1717,6 +1707,10 @@ class FinishReviewWindow(PassageReviewSurface):
                     receiver_metadata_store = RaceMetadataStore(
                         inbox_dir / "cyclerace_metadata_inbox.json"
                     )
+                    if carried_metadata is not None:
+                        receiver_metadata_store.store(carried_metadata)
+                        for event in passage_store.events(include_inactive=True):
+                            receiver_passage_store.append(event)
                 prepared_data_source = (
                     passage_store,
                     metadata_store,

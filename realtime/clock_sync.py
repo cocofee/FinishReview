@@ -348,6 +348,7 @@ def calibrate_camera(
     window_ms: int = FINE_WINDOW_MS,
     min_drift_support: int = MIN_DRIFT_SUPPORT,
     refinements: int = 2,
+    date_offset_ms: int = 0,
 ) -> CalibrationResult:
     """Coarse search plus robust drift fit for one camera.
 
@@ -360,6 +361,25 @@ def calibrate_camera(
         item if isinstance(item, ClockCrossing) else ClockCrossing(int(item))
         for item in crossings
     ]
+    if date_offset_ms:
+        # Search the same narrow clock-error window on the evidence date,
+        # then restore the official chip -> recorder domain in every result.
+        shift = int(date_offset_ms)
+        result = calibrate_camera(
+            [replace(item, recorder_ms=item.recorder_ms - shift) for item in items],
+            chip_ms, camera_index=camera_index, range_ms=range_ms, bin_ms=bin_ms,
+            isolation_ms=isolation_ms, window_ms=window_ms,
+            min_drift_support=min_drift_support, refinements=refinements,
+        )
+        return replace(
+            result,
+            model=replace(result.model, intercept_ms=result.model.intercept_ms + shift,
+                          coarse_offset_ms=result.model.coarse_offset_ms + shift)
+            if result.model else None,
+            coarse=replace(result.coarse, offset_ms=result.coarse.offset_ms + shift)
+            if result.coarse else None,
+            isolated_pairs=tuple((chip, offset + shift) for chip, offset in result.isolated_pairs),
+        )
     crossing_times = [item.recorder_ms for item in items]
     chips = [float(value) for value in chip_ms]
     coarse = coarse_offset(crossing_times, chips, range_ms=range_ms, bin_ms=bin_ms)

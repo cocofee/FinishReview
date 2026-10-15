@@ -17,7 +17,6 @@ from .chip_history import (
     ChipRead,
     chip_reads,
     dominant_race_date,
-    local_date,
     read_passage_history,
 )
 from .clock_sync import ClockAnchor
@@ -143,7 +142,7 @@ class AnalysisWorkspace:
         self.deleted_event_ids = _applied_deletions(_deletion_marks(self.root), self._latest)
         self.reads: tuple[ChipRead, ...] = chip_reads(
             scoped, race_id=self.race_id, stage_id=self.stage_id,
-            race_date=self.race_date, deleted_event_ids=self.deleted_event_ids,
+            race_date=race_date, deleted_event_ids=self.deleted_event_ids,
         )
         self._timeline: Optional[VideoTimelineStore] = None
 
@@ -271,8 +270,6 @@ class AnalysisWorkspace:
                 continue
             event = self.latest_event(calibration.anchor_event_id)
             if event is None or event.timeline_timestamp_ms <= 0:
-                continue
-            if self.race_date and local_date(event.timeline_timestamp_ms) != self.race_date:
                 continue
             anchors.append(
                 ClockAnchor(

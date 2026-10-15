@@ -40,6 +40,18 @@ def test_scope_prefers_saved_event_scope_over_majority(tmp_path):
     assert workspace.race_date == "2026-09-19"
 
 
+def test_metadata_stage_date_is_not_a_passage_filter(tmp_path):
+    _write_events(tmp_path, [_event("main", 1, DAY + 36_000_000)])
+    (tmp_path / "cyclerace_race_metadata.json").write_text(json.dumps({
+        "schema_version": 1, "message_type": "race_metadata", "race_id": "main",
+        "stage_id": "stage-1", "revision": 1, "emitted_at_ms": 1,
+        "stage_date": "2026-10-18",
+    }), encoding="utf-8")
+    workspace = AnalysisWorkspace(tmp_path)
+    assert workspace.race_date == "2026-10-18"
+    assert [read.bib for read in workspace.reads] == ["1"]
+
+
 def test_archive_segments_skip_clips_missing_files_and_other_races(tmp_path):
     root = tmp_path / "race"
     (root / "videos").mkdir(parents=True)

@@ -183,6 +183,25 @@ def test_clean_race_auto_passes_every_rider(synthetic_race):
     assert after == before
 
 
+@pytest.mark.parametrize("days", [-3, 3])
+def test_different_official_date_pairs_video_and_preserves_export_time(synthetic_race, days):
+    _root, workspace, config, strips = synthetic_race
+    shift = days * 86_400_000
+    reads = tuple(replace(read, chip_ms=read.chip_ms + shift,
+                          latest_chip_ms=read.latest_chip_ms + shift)
+                  for read in workspace.reads)
+    result = analyse_camera(config, workspace, 1, strips, reads=reads)
+    assert result["pairing"]["auto_paired"] == len(CROSSINGS_S)
+    assert _kinds(result) == []
+    assert {item["chip_time_ms"] for item in result["auto_passed"]} == {read.chip_ms for read in reads}
+    missing = analyse_camera(config, workspace, 1, strips,
+                             reads=tuple(read for read in reads if read.bib != "107"))
+    item, = [item for item in missing["items"] if item.pending]
+    assert item.kind == KIND_NO_CHIP_CROSSING
+    assert abs(item.chip_time_ms - (START + 44_500 - OFFSET + shift)) < 150
+    assert item.evidence["frame"]["frame_index"] == pytest.approx(44.5 * FPS, abs=2)
+
+
 def test_deleted_chip_read_becomes_crossing_without_chip(synthetic_race):
     _root, workspace, config, strips = synthetic_race
     reads = tuple(read for read in workspace.reads if read.bib != "107")

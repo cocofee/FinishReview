@@ -1,4 +1,7 @@
 import json
+from dataclasses import replace
+
+import pytest
 
 from realtime.chip_history import (
     EXCLUDED_SPARE,
@@ -115,3 +118,28 @@ def test_reused_passage_id_with_new_bib_is_a_separate_read():
         ("746", 7, False, False),
     ]
     assert len({read.read_id for read in reads}) == 3
+
+
+@pytest.mark.parametrize("days", [-365, -3, 3, 365])
+def test_receipt_calendar_date_does_not_turn_live_read_into_manual_entry(days):
+    formal = DAY + 36_000_000
+    event = _event("live", "901", formal, received=formal + days * 86_400_000 + 78)
+    read, = chip_reads([event])
+    assert read.chip_ms == formal
+    assert not read.manual_entry
+    assert read.receive_delay_ms == 78
+    assert event.passage_timestamp_ms == formal
+
+
+def test_default_reads_include_other_dates_but_still_isolate_race_and_stage():
+    formal = DAY + 36_000_000
+    history = [_event("one", "1", formal), _event("two", "2", formal + 86_400_000),
+               _event("other", "3", formal, race="other"),
+               replace(_event("stage", "4", formal), stage_id="stage-2")]
+    assert [read.bib for read in chip_reads(history, race_id="race", stage_id="stage-1")] == ["1", "2"]
+
+
+def test_delayed_import_still_is_not_live_when_time_of_day_does_not_match():
+    formal = DAY + 36_000_000
+    read, = chip_reads([_event("old", "1", formal, received=formal + 3 * 86_400_000 + 3_600_000)])
+    assert read.manual_entry
