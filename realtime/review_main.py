@@ -80,6 +80,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analyze-problems", metavar="EVENT_DIR", help=argparse.SUPPRESS)
     parser.add_argument("--live-problems", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--finish-live-problems", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--check-live-chips", metavar="EVENT_DIR", help=argparse.SUPPRESS)
+    parser.add_argument("--chip-race-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--chip-stage-id", default="", help=argparse.SUPPRESS)
     return parser
 
 
@@ -647,6 +650,15 @@ def main(argv: list[str] | None = None) -> int:
     app_argv = [sys.argv[0]] if argv is not None else sys.argv
     if getattr(args, "smoke_test", False):
         return run_packaged_smoke_test(app_argv)
+    if getattr(args, "check_live_chips", None):
+        from realtime.analysis_resources import lower_process_priority
+        from realtime.live_chip_checks import live_chip_payload
+
+        lower_process_priority()
+        payload = live_chip_payload(Path(args.check_live_chips), race_id=args.chip_race_id,
+                                    stage_id=args.chip_stage_id)
+        print(json.dumps(payload, ensure_ascii=True), flush=True)
+        return 0
     if getattr(args, "analyze_problems", None):
         return run_problem_analysis(args.analyze_problems, live=args.live_problems,
                                     finish_live=args.finish_live_problems)

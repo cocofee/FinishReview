@@ -343,7 +343,7 @@ def _lap_items(reads: Sequence[ChipRead], context: ChipCheckContext) -> list[Pro
 
 
 def _not_arrived_items(reads: Sequence[ChipRead], context: ChipCheckContext) -> list[ProblemItem]:
-    if not context.roster:
+    if not context.roster or not context.race_finished:
         return []
     arrived = {read.bib for read in reads if read.active_now and not read.excluded}
     missing: dict[str, list[str]] = defaultdict(list)

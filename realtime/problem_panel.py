@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .chip_history import format_chip_time
+from .live_chip_checks import LIVE_CHIP_FILENAME, input_signature, merge_chip_snapshot
 from .problem_analysis import OUTPUT_DIRNAME, PROBLEM_LIST_FILENAME
 from .problem_items import (
     ACTION_CHANGE,
@@ -94,6 +95,15 @@ class ProblemListPanel(QFrame):
         self._render_signature = None
         self._events_provider: Callable[[], object] = lambda: ()
         self._process: Optional[QProcess] = None
+        self._chip_process: Optional[QProcess] = None
+        self._chip_generation = 0
+        self._chip_signature = None
+        self._chip_retry_after = 0.0
+        self.chip_status = "芯片自检等待记录"
+        self._chip_timer = QTimer(self)
+        self._chip_timer.setSingleShot(True)
+        self._chip_timer.setInterval(400)
+        self._chip_timer.timeout.connect(self._start_chip_checks)
         self._progress_buffer = b""
         self.analysis_status = "等待已封存录像"
         self.bunch_store = None
@@ -229,6 +239,12 @@ class ProblemListPanel(QFrame):
             self._drafts[self._shown_id] = [self.bib_input.text(), self.reason_input.text()]
             self._draft_timer.start()
 
+    def closeEvent(self, event):
+        self.stop_chip_checks()
+        self.stop_analysis()
+        self.save_drafts()
+        super().closeEvent(event)
+
     def save_drafts(self):
         self._draft_timer.stop()
         if self.problem_dir is None:
@@ -273,6 +289,7 @@ class ProblemListPanel(QFrame):
         if workspace_dir == self.workspace_dir:
             return
         self.stop_analysis()
+        self.stop_chip_checks()
         self.save_drafts()
         self.workspace_dir = workspace_dir
         self.problem_dir = workspace_dir / OUTPUT_DIRNAME
@@ -310,7 +327,10 @@ class ProblemListPanel(QFrame):
         if scope == self._scope:
             return
         self.stop_analysis()
+        self.stop_chip_checks()
+        self.save_drafts()
         self._scope = scope
+        self.payload = None
         self._signature = None
         self._render_signature = None
         self._last_live_signature = None
@@ -330,20 +350,29 @@ class ProblemListPanel(QFrame):
             return
         current = self.current_item()
         self.items = [item for item in self.items if not item.evidence.get("superseded") or item == current]
-        path = self.problem_dir / PROBLEM_LIST_FILENAME
-        try:
-            stat = path.stat()
-        except OSError:
-            self.payload, self.items = None, []
-            self._signature = None
-            stat = None
-        signature = (stat.st_mtime_ns, stat.st_size) if stat else None
+        paths = [self.problem_dir / name for name in (PROBLEM_LIST_FILENAME, LIVE_CHIP_FILENAME)]
+        signature = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                signature.append((stat.st_mtime_ns, stat.st_size))
+            except FileNotFoundError:
+                signature.append(None)
+            except OSError as error:
+                self.hint.setText(f"问题清单读取失败：{error}")
+                return
         if signature != self._signature:
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                items = [ProblemItem.from_payload(item) for item in payload.get("items", [])]
-                if self._scope[0] and (payload.get("race_id"), payload.get("stage_id", "")) != self._scope:
-                    payload, items = None, []
+                snapshots = []
+                for path, stamp in zip(paths, signature):
+                    snapshot = json.loads(path.read_text(encoding="utf-8")) if stamp else None
+                    if snapshot and self._scope[0] and (snapshot.get("race_id"), snapshot.get("stage_id", "")) != self._scope:
+                        snapshot = None
+                    snapshots.append(snapshot)
+                payload = merge_chip_snapshot(*snapshots)
+                items = [ProblemItem.from_payload(item) for item in (payload or {}).get("items", [])]
+                if snapshots[1] and self._chip_process is None and time.monotonic() >= self._chip_retry_after:
+                    self._chip_status_from_payload(snapshots[1])
             except (OSError, ValueError, KeyError, TypeError) as error:
                 self.hint.setText(f"问题清单读取失败：{error}")
                 return
@@ -387,7 +416,8 @@ class ProblemListPanel(QFrame):
         if not current:
             return False
         involved = [current.get(event_id) for event_id in item.event_ids]
-        return all(event is None or not event.is_active for event in involved)
+        # Absence from a partial receive snapshot does not prove deletion.
+        return all(event is not None and not event.is_active for event in involved)
 
     def state(self, item: ProblemItem) -> str:
         if item.status == STATUS_WAITING:
@@ -715,10 +745,107 @@ class ProblemListPanel(QFrame):
             process.waitForFinished(3000)
             process.deleteLater()
 
+    def stop_chip_checks(self):
+        self._chip_timer.stop()
+        self._chip_generation += 1
+        self._chip_signature = None
+        self._chip_retry_after = 0.0
+        self.chip_status = "芯片自检等待记录"
+        process, self._chip_process = self._chip_process, None
+        if process is not None:
+            process.blockSignals(True)
+            process.kill()
+            process.waitForFinished(3000)
+            process.deleteLater()
+
+    def _chip_status_from_payload(self, payload):
+        pending = sum(ProblemItem.from_payload(item).pending for item in payload["items"])
+        counts = payload["counts"]
+        self.chip_status = (
+            f"芯片自检{'发现 ' + str(pending) + ' 项疑点' if pending else '正常'}"
+            f"（已落盘消息 {counts['journal_messages']} / 有效通过 {counts['effective_passages']}）"
+        )
+        missing = payload.get("missing_inputs", [])
+        self.summary.setToolTip("原始读卡消息数未知；已落盘消息含修订，不等于人数。\n"
+                                + ("未执行的检查，缺少：" + "；".join(missing) if missing else ""))
+
+    def _chip_tick(self):
+        if self.workspace_dir is None or self._chip_process is not None or time.monotonic() < self._chip_retry_after:
+            return
+        try:
+            signature = input_signature(self.workspace_dir)
+        except OSError as error:
+            self.chip_status = f"芯片自检读取失败：{error}"
+            return
+        if not signature:
+            return
+        if self._chip_signature is None:
+            cached = (self.payload or {}).get("chip_checks")
+            if cached:
+                self._chip_signature = cached.get("input_signature")
+        if signature != self._chip_signature and not self._chip_timer.isActive():
+            self.chip_status = "芯片自检等待更新（上一结果保留）"
+            self._chip_timer.start()
+
+    def _start_chip_checks(self):
+        if self.workspace_dir is None or self._chip_process is not None:
+            return
+        process = QProcess(self)
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("PYTHONIOENCODING", "utf-8")
+        environment.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(environment)
+        args = [] if getattr(sys, "frozen", False) else ["-m", "realtime.review_main"]
+        args += ["--check-live-chips", str(self.workspace_dir), "--chip-race-id", self._scope[0],
+                 "--chip-stage-id", self._scope[1]]
+        process.setProgram(sys.executable)
+        process.setArguments(args)
+        generation = self._chip_generation
+        process.finished.connect(lambda code, _status: self._chip_done(process, generation, code))
+        process.errorOccurred.connect(lambda error: self._chip_done(process, generation, -1)
+                                     if error == QProcess.FailedToStart else None)
+        self._chip_process = process
+        self.chip_status = "芯片自检中（视频分析独立运行）"
+        process.start()
+
+    def _chip_done(self, process, generation, code):
+        if generation != self._chip_generation or process is not self._chip_process:
+            return
+        self._chip_process = None
+        try:
+            if code != 0:
+                error = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")[-300:]
+                raise ValueError(error.strip() or "芯片自检进程启动或运行失败")
+            payload = json.loads(bytes(process.readAllStandardOutput()).decode("utf-8"))
+            if self._scope[0] and (payload["race_id"], payload["stage_id"]) != self._scope:
+                raise ValueError("赛事已变化，未发布旧结果")
+            # Validate before replacing the previous successful snapshot. The
+            # GUI is the sole publisher; video workers use a different file.
+            merge_chip_snapshot(None, payload)
+            self._chip_status_from_payload(payload)
+            self.problem_dir.mkdir(parents=True, exist_ok=True)
+            path = self.problem_dir / LIVE_CHIP_FILENAME
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(path)
+            self._chip_signature = payload["input_signature"]
+            self.refresh()
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.chip_status = f"芯片自检失败，保留上一结果：{error}"
+            self._chip_retry_after = time.monotonic() + 5
+        finally:
+            process.deleteLater()
+
     def live_tick(self, recording):
+        self._chip_tick()
         if self._live and not recording:
             self._final_analysis_pending = True
         self._live = bool(recording)
+        if self.workspace_dir is None:
+            return
+        if (not recording and self._process is None and not self._final_analysis_pending
+                and self.analysis_status == "等待已封存录像"):
+            self.analysis_status = "视频分析等待录像；芯片自检独立运行"
         if (not recording and not self._final_analysis_pending) or self._live_paused or self._process is not None or time.monotonic() < self._next_analysis:
             return
         if not any((self.workspace_dir / name).exists() for name in ("finish_lines.json", "long_image_lines.json", "finish_problems/analysis_config.json")):

@@ -1,0 +1,89 @@
+"""Independent chip snapshots; only the GUI publishes the live result file.
+
+The video worker owns problem_list.json. Chip checks never modify it, the
+recording journals, or operator decisions. The panel merges both snapshots.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+from .analysis_workspace import AnalysisWorkspace
+from .chip_checks import ChipCheckContext, chip_check_items
+from .chip_history import group_exclusion
+from .problem_items import CATEGORY_CHIP, KIND_NOT_ARRIVED, ProblemItem, sort_items
+
+
+LIVE_CHIP_FILENAME = "live_chip_checks.json"
+CHIP_INPUTS = (
+    "cyclerace_passage_events.jsonl", "cyclerace_passage_events_deleted.json",
+    "cyclerace_race_metadata.json", "review_event_scope.json",
+)
+
+
+def input_signature(root: Path) -> list:
+    signature = []
+    for name in CHIP_INPUTS:
+        try:
+            stat = (root / name).stat()
+            signature.append([name, stat.st_size, stat.st_mtime_ns])
+        except FileNotFoundError:
+            continue
+    return signature
+
+
+def live_chip_payload(root: Path, *, race_id: str = "", stage_id: str = "") -> dict:
+    root = Path(root)
+    signature = input_signature(root)
+    workspace = AnalysisWorkspace(root, race_id=race_id, stage_id=stage_id)
+    metadata = workspace.metadata()
+    roster = {}
+    if metadata is not None and (metadata.race_id, metadata.stage_id) == (workspace.race_id, workspace.stage_id):
+        roster = {athlete.bib: metadata.group_label(athlete.group_id)
+                  for athlete in metadata.athletes if athlete.bib}
+    context = ChipCheckContext(roster=roster, race_finished=False)
+    reads = []
+    for read in workspace.reads:
+        event = workspace.latest_event(read.event_id)
+        # Historical replaced identities stay available as closed discoveries;
+        # an active identity must be checked at its revised time/group/lap.
+        if read.active_now and event is not None:
+            read = replace(read, chip_ms=int(event.timeline_timestamp_ms),
+                           passage_time_ms=int(event.passage_time_ms), lap=int(event.lap),
+                           group_id=event.group_id, group_name=event.group_name,
+                           excluded=group_exclusion(event.group_name))
+        reads.append(read)
+    items = chip_check_items(reads, context)
+    scoped_history = [event for event in workspace.history if event.race_id == workspace.race_id
+                      and (not workspace.stage_id or event.stage_id == workspace.stage_id)]
+    return {
+        "schema_version": 1, "race_id": workspace.race_id, "stage_id": workspace.stage_id,
+        "input_signature": signature,
+        # Duplicate transport deliveries can be acknowledged without a journal
+        # append. The journal is not a raw reader-message counter.
+        "counts": {"raw_messages": None, "journal_messages": len(scoped_history),
+                   "effective_passages": sum(read.active_now for read in reads),
+                   "video_candidates": None},
+        "missing_inputs": list(context.missing_inputs()),
+        "items": [item.to_payload() for item in items],
+    }
+
+
+def merge_chip_snapshot(video: dict | None, chips: dict | None) -> dict | None:
+    if chips is None:
+        return video
+    if chips.get("schema_version") != 1:
+        raise ValueError("unsupported live chip snapshot schema")
+    if video and (video.get("race_id"), video.get("stage_id", "")) != (chips["race_id"], chips["stage_id"]):
+        return video
+    payload = dict(video or {"race_id": chips["race_id"], "stage_id": chips["stage_id"],
+                             "summary": {}, "auto_passed": [], "cameras": {}})
+    items = [ProblemItem.from_payload(item) for item in payload.get("items", [])
+             if item.get("category") != CATEGORY_CHIP
+             and item.get("kind") != KIND_NOT_ARRIVED]
+    items += [ProblemItem.from_payload(item) for item in chips["items"]]
+    payload["items"] = [item.to_payload() for item in sort_items(items)]
+    payload["chip_checks"] = chips
+    payload["summary"] = dict(payload.get("summary", {}), pending=sum(item.pending for item in items))
+    return payload
