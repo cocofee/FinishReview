@@ -1291,7 +1291,7 @@ class ReviewRingBuffer:
         os.replace(temporary, path)
 
     def retain_filmstrip_segment(self, segment: RecordingSegment,
-                                 store: VideoTimelineStore) -> RecordingSegment:
+                                 store: VideoTimelineStore, *, end_reason="retained_filmstrip_segment") -> RecordingSegment:
         """Pin and register precisely the immutable TS the operator opened."""
         path = Path(segment.video_path).resolve()
         start = int(segment.media_started_at_ms)
@@ -1316,7 +1316,7 @@ class ReviewRingBuffer:
             source_id=segment.source_id, camera_index=segment.camera_index,
             video_path=path, media_started_at_ms=start, media_duration_ms=duration,
             clock_source=segment.clock_source, timing_error_ms=segment.timing_error_ms,
-            end_reason="retained_filmstrip_segment", race_id=segment.race_id,
+            end_reason=end_reason, race_id=segment.race_id,
         )
 
     def create_video_passage_scan_worker(

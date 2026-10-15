@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +51,7 @@ class ArchiveSegment:
     segment: RecordingSegment
     path: Path
     session_id: str
+    excluded_ranges: tuple[tuple[int, int], ...] = ()
 
     @property
     def camera_index(self) -> int:
@@ -115,8 +116,10 @@ class AnalysisWorkspace:
         stage_id: str = "",
         race_date: str = "",
         as_of_ms: Optional[int] = None,
+        include_review_segments: bool = False,
     ):
         self.root = Path(root).expanduser().absolute()
+        self.include_review_segments = include_review_segments
         self.history: tuple[PassageEvent, ...] = read_passage_history(self.root / PASSAGE_JOURNAL)
         if as_of_ms is not None:
             # Replay: only what FinishReview had received by then.
@@ -187,6 +190,10 @@ class AnalysisWorkspace:
         if not (self.root / TIMELINE_JOURNAL).is_file():
             return ()
         store = self.timeline()
+        problem_sessions = {
+            (segment.camera_index, re.sub(r"_review_\d+$", "", Path(segment.video_path).stem))
+            for segment in store.segments() if segment.end_reason == "retained_problem_segment"
+        }
         seen = set()
         for segment in store.segments():
             if camera_index is not None and int(segment.camera_index) != int(camera_index):
@@ -198,13 +205,42 @@ class AnalysisWorkspace:
             if segment.race_id and segment.race_id != self.race_id:
                 continue
             path = store.resolve_video_path(segment)
-            if path.suffix.lower() not in _VIDEO_SUFFIXES or "archive" not in path.stem.lower():
+            short_session = re.sub(r"_review_\d+$", "", path.stem)
+            short = self.include_review_segments and (
+                segment.end_reason == "retained_problem_segment" or (
+                    segment.end_reason == "retained_filmstrip_segment"
+                    and (segment.camera_index, short_session) in problem_sessions
+                )
+            )
+            if path.suffix.lower() not in _VIDEO_SUFFIXES or (not short and "archive" not in path.stem.lower()):
                 continue
             key = str(path).lower()
             if key in seen or not path.is_file():
                 continue
             seen.add(key)
-            segments.append(ArchiveSegment(segment, path, session_id_for_path(path)))
+            session = re.sub(r"_review_\d+$", "", path.stem) if short else session_id_for_path(path)
+            segments.append(ArchiveSegment(segment, path, session))
+        # Prefer retained immutable short segments; never detect a rider twice
+        # when their long archive is published. Non-overlapping history remains.
+        shorts = [item for item in segments if item.segment.end_reason in ("retained_filmstrip_segment", "retained_problem_segment")]
+        if self.include_review_segments and shorts:
+            selected = list(shorts)
+            for item in segments:
+                if item in shorts:
+                    continue
+                overlap = sorted((max(item.start_ms, other.start_ms), min(item.end_ms, other.end_ms))
+                                 for other in shorts if other.camera_index == item.camera_index
+                                 and other.start_ms < item.end_ms and other.end_ms > item.start_ms)
+                cursor = item.start_ms
+                for start, end in overlap:
+                    if start > cursor:
+                        break
+                    cursor = max(cursor, end)
+                if cursor < item.end_ms:
+                    # A late application start or a lost short segment must not
+                    # discard the rest of an otherwise usable archive.
+                    selected.append(replace(item, excluded_ranges=tuple(overlap)))
+            segments = selected
         segments.sort(key=lambda item: (item.camera_index, item.start_ms))
         return tuple(segments)
 

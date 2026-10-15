@@ -525,9 +525,13 @@ class VideoTimelineStore:
     def _index_segment(self, segment: RecordingSegment, order: int) -> None:
         segment_id = segment.segment_id
         self._segment_order_index[segment_id] = int(order)
-        self._segment_ids_by_race.setdefault(segment.race_id, []).append(segment_id)
         path_key = self._path_key(self.resolve_video_path(segment))
         self._segments_by_path.setdefault(path_key, []).append(segment_id)
+        # Analysis evidence is addressable by ID/path and visible in the race
+        # filmstrip, but is not a replacement for a complete passage window.
+        if segment.end_reason == "retained_problem_segment":
+            return
+        self._segment_ids_by_race.setdefault(segment.race_id, []).append(segment_id)
         interval = self._segment_interval(segment)
         if interval is None:
             self._open_segment_ids_by_race.setdefault(segment.race_id, set()).add(

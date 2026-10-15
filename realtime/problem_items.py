@@ -21,6 +21,7 @@ STATUS_DISPUTED = "disputed"
 STATUS_CLOSED_UPSTREAM = "closed_upstream"
 STATUS_EXCLUDED = "excluded"
 STATUS_INFO = "info"
+STATUS_WAITING = "waiting"
 
 # Chip-only checks (plan 7.3, second part).
 KIND_TEST_CHIP = "test_chip"
@@ -45,8 +46,12 @@ KIND_BUNCH = "bunch_check"
 KIND_OBSTRUCTION = "obstruction"
 KIND_STANDING = "standing"
 KIND_NO_VIDEO = "no_video"
+KIND_MANUAL_REVIEW = "manual_review"
+KIND_WAITING = "evidence_pending"
 
 KIND_TITLES = {
+    KIND_MANUAL_REVIEW: "人工发现 · 待核实",
+    KIND_WAITING: "等待录像 / 校时",
     KIND_TEST_CHIP: "测试或备用芯片读数",
     KIND_UNKNOWN_BIB: "名单外的号码",
     KIND_DUPLICATE_READ: "同号重复读数",
@@ -98,6 +103,8 @@ ACTION_LABELS = {
 }
 
 KIND_ACTIONS = {
+    KIND_MANUAL_REVIEW: (ACTION_RECORD_BIB, ACTION_NOT_RIDER, ACTION_CHECKED),
+    KIND_WAITING: (),
     KIND_TEST_CHIP: (ACTION_DELETE_CHIP, ACTION_KEEP),
     KIND_UNKNOWN_BIB: (ACTION_CHANGE, ACTION_DELETE_CHIP, ACTION_KEEP),
     KIND_DUPLICATE_READ: (ACTION_DELETE_EXTRA_CHIP, ACTION_KEEP),

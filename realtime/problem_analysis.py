@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -47,11 +47,12 @@ from .chip_checks import ChipCheckContext, chip_check_items
 from .chip_history import ChipRead, calibration_chip_times, format_chip_time
 from .clock_sync import CLOCK_MODEL_FILENAME, ClockCrossing, ClockModelStore, calibrate_camera, check_anchors
 from .crossing_cards import render_cards
-from .crossing_detection import DetectionParams, detect_crossings, frame_interval_ms
+from .crossing_detection import DetectionParams, DetectionResult, LineCrossing, detect_crossings, frame_interval_ms
 from .crossing_pairing import pair_crossings
 from .line_sampling import (
     DEFAULT_DECODE_THREADS,
     DEFAULT_SAMPLES,
+    LineGeometry,
     line_config_digest,
     load_strip,
     read_strip_meta,
@@ -60,6 +61,10 @@ from .line_sampling import (
 )
 from .problem_items import (
     KIND_NO_VIDEO,
+    KIND_WAITING,
+    STATUS_WAITING,
+    CATEGORY_VIDEO,
+    stable_item_id,
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
     STATUS_EXCLUDED,
@@ -92,6 +97,8 @@ class AnalysisConfig:
     render_cards: bool = True
     check_paired_bikes: bool = False
     min_available_mb: int = MIN_AVAILABLE_MEMORY_MB
+    live: bool = False
+    evidence_delay_ms: int = 10_000
 
     def resolved_output(self) -> Path:
         return Path(self.output_dir) if self.output_dir else Path(self.workspace) / OUTPUT_DIRNAME
@@ -121,6 +128,7 @@ def _strip_is_current(path: Path, segment: ArchiveSegment, digest: str, samples:
         and int(meta.get("samples", 0)) == int(samples)
         and int(meta.get("video_size", -1)) == int(stat.st_size)
         and meta.get("segment_id") == segment.segment.segment_id
+        and meta.get("excluded_ranges", []) == [list(value) for value in segment.excluded_ranges]
     )
 
 
@@ -161,6 +169,7 @@ def extract_strips(
                 "media_started_at_ms": segment.start_ms,
                 "media_duration_ms": segment.end_ms - segment.start_ms,
                 "video_size": segment.path.stat().st_size,
+                "excluded_ranges": [list(value) for value in segment.excluded_ranges],
             })
             logger.info(
                 "sampled %s: %d frames in %.0f s (%s line)",
@@ -210,9 +219,13 @@ def _load_file_strips(paths: list[Path]) -> list[_FileStrip]:
     for path in paths:
         if not path.is_file():
             continue
-        strip = load_strip(path)
-        meta = strip.meta or {}
-        files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), strip.pts_ms, strip.geometry))
+        # Do not decompress every historical image strip on each live tick.
+        with np.load(path) as data:
+            meta = json.loads(bytes(data["meta"]).decode("utf-8"))
+            geometry = LineGeometry(int(meta["width"]), int(meta["height"]),
+                                    data["xs"], data["ys"], data["nx"], data["ny"],
+                                    meta.get("line_source", "configured"), meta.get("snap_offset_px", 0.0))
+            files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), data["pts_ms"], geometry))
     files.sort(key=lambda item: item.start_ms)
     return files
 
@@ -222,12 +235,25 @@ def _segment_points(geometry, r0: int, r1: int) -> tuple[tuple[float, float], ..
     return tuple(geometry.point(int(row)) for row in rows)
 
 
+def uncovered_ranges(start, end, excluded):
+    cursor = start
+    for left, right in sorted(excluded):
+        if right <= cursor or left >= end:
+            continue
+        if left > cursor:
+            yield cursor, min(left, end)
+        cursor = max(cursor, right)
+    if cursor < end:
+        yield cursor, end
+
+
 def detect_session_crossings(
     files: list[_FileStrip],
     camera_index: int,
     params: Optional[DetectionParams] = None,
     *,
     checkpoint: Optional[Callable[[], None]] = None,
+    cache: bool = False,
 ) -> tuple[list[CrossingRecord], list[Obstruction], list[tuple[int, int, str]], list[dict]]:
     """Detect crossings file by file with a few seconds of neighbour context."""
 
@@ -253,25 +279,58 @@ def detect_session_crossings(
 
     for index, item in enumerate(files):
         session = str(item.meta.get("session_id", ""))
-        own = strip_of(index)
         frame_ms = frame_interval_ms(item.pts)
         context = max(1, int(round(CONTEXT_MS / frame_ms)))
-        parts, offsets = [], 0
-        if contiguous(index - 1, index):
-            previous = strip_of(index - 1)[:, -context:]
-            parts.append(previous)
-            offsets = previous.shape[1]
-        parts.append(own)
-        if contiguous(index, index + 1):
-            parts.append(strip_of(index + 1)[:, :context])
-        joined = np.concatenate(parts, axis=1) if len(parts) > 1 else own
-        result = detect_crossings(joined, item.pts, params)
-        total = own.shape[1]
+        previous_index, next_index = index - 1, index + 1
+        while previous_index >= 0 and files[previous_index].meta.get("excluded_ranges"):
+            previous_index -= 1
+        while next_index < len(files) and files[next_index].meta.get("excluded_ranges"):
+            next_index += 1
+        if item.meta.get("excluded_ranges"):
+            previous_index, next_index = -1, len(files)
+        neighbours = [index]
+        if contiguous(previous_index, index):
+            neighbours.insert(0, previous_index)
+        if contiguous(index, next_index):
+            neighbours.append(next_index)
+        offsets = min(context, len(files[previous_index].pts)) if previous_index in neighbours else 0
+        signature = {"version": 1, "params": asdict(params or DetectionParams()), "files": [
+            [str(files[n].path), files[n].path.stat().st_mtime_ns, files[n].path.stat().st_size]
+            for n in neighbours
+        ]} if cache else None
+        cache_path = item.path.with_suffix(".detections.json")
+        result = None
+        if cache:
+            try:
+                saved = json.loads(cache_path.read_text(encoding="utf-8"))
+                if saved["signature"] == signature:
+                    result = DetectionResult(tuple(LineCrossing(**value) for value in saved["crossings"]),
+                                             tuple(tuple(value) for value in saved["obstructions"]), frame_ms)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        if result is None:
+            own = strip_of(index)
+            parts = []
+            if offsets:
+                parts.append(strip_of(previous_index)[:, -context:])
+            parts.append(own)
+            if next_index in neighbours:
+                parts.append(strip_of(next_index)[:, :context])
+            joined = np.concatenate(parts, axis=1) if len(parts) > 1 else own
+            result = detect_crossings(joined, item.pts, params)
+            if cache:
+                temporary = cache_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(dict(signature=signature, crossings=[asdict(c) for c in result.crossings],
+                                                      obstructions=result.obstructions)), encoding="utf-8")
+                temporary.replace(cache_path)
+        total = len(item.pts)
         for crossing in result.crossings:
             column = crossing.c0 - offsets
             if not 0 <= column < total or not crossing.rider_like:
                 continue
             position = int(round(float(item.pts[column])))
+            if any(left <= item.start_ms + position < right for left, right in item.meta.get("excluded_ranges", [])):
+                continue
             record = CrossingRecord(
                 camera_index=camera_index,
                 session_id=session,
@@ -293,10 +352,12 @@ def detect_session_crossings(
         for c0, c1, _r0, _r1 in result.obstructions:
             a, b = max(0, c0 - offsets), min(total - 1, c1 - offsets)
             if a <= b and c0 - offsets < total and c1 - offsets >= 0:
-                obstructions.append(Obstruction(
-                    camera_index, item.start_ms + int(item.pts[a]), item.start_ms + int(item.pts[b]),
+                obstructions.extend(Obstruction(camera_index, left, right) for left, right in uncovered_ranges(
+                    item.start_ms + int(item.pts[a]), item.start_ms + int(item.pts[b]), item.meta.get("excluded_ranges", []),
                 ))
-        coverage.append((item.start_ms + int(item.pts[0]), item.end_ms, session))
+        coverage.extend((left, right, session) for left, right in uncovered_ranges(
+            item.start_ms + int(item.pts[0]), item.end_ms, item.meta.get("excluded_ranges", []),
+        ))
         if checkpoint is not None:
             checkpoint()
     merged: list[list] = []
@@ -312,6 +373,8 @@ def detect_session_crossings(
 def _chip_locator(files: list[_FileStrip], version: int):
     def locate(read: ChipRead, expected_ms: float) -> Optional[dict]:
         for item in files:
+            if any(left <= expected_ms < right for left, right in item.meta.get("excluded_ranges", [])):
+                continue
             if item.start_ms + item.pts[0] <= expected_ms <= item.end_ms:
                 index = int(np.argmin(np.abs(item.start_ms + item.pts - expected_ms)))
                 position = int(round(float(item.pts[index])))
@@ -434,7 +497,7 @@ def analyse_camera(
     files = _load_file_strips(strip_paths)
     progress("过线检测", 0, len(files))
     crossings, obstructions, coverage, raw = detect_session_crossings(
-        files, camera, params, checkpoint=checkpoint,
+        files, camera, params, checkpoint=checkpoint, cache=config.live,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"crossings_camera{camera}.json").write_text(json.dumps(
@@ -460,9 +523,18 @@ def analyse_camera(
     }
     if calibration.model is None:
         result["error"] = "自动校时失败：" + "；".join(calibration.warnings)
+        if config.live:
+            result["items"] = waiting_items(reads, camera, result["error"])
         return result
     store = ClockModelStore(config.clock_model_path or output_dir / CLOCK_MODEL_FILENAME)
     model = store.publish(calibration.model)
+    if config.live and coverage:
+        # The latest seconds still need neighbouring video and delayed chip
+        # delivery. They are not evidence of a missing rider or a missing read.
+        watermark = max(end for _start, end, _session in coverage) - config.evidence_delay_ms
+        result["analyzed_through_ms"] = watermark
+        result["waiting_reads"] = sum(model.to_recorder(read.chip_ms) > watermark for read in reads)
+        waiting = tuple(read for read in reads if model.to_recorder(read.chip_ms) > watermark)
     sessions = set(model.session_ids)
     anchors = [anchor for anchor in workspace.manual_anchors(camera) if anchor.reference in sessions]
     result["calibration"] = {
@@ -553,10 +625,28 @@ def analyse_camera(
     )
     result["rules"] = dict(outcome.stats, late_pairs=outcome.late_pairs)
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
-    result["items"] = outcome.items
+    result["items"] = list(outcome.items)
     result["auto_passed"] = outcome.auto_passed
+    if config.live and coverage:
+        # Pair with the full neighbour context, then publish only settled
+        # evidence. Cutting pairing inputs at the watermark creates false
+        # missing-chip problems for riders straddling that boundary.
+        result["items"] = [item for item in result["items"]
+                           if item.chip_time_ms is not None and model.to_recorder(item.chip_time_ms) <= watermark
+                           and item.evidence.get("recorder_end_ms", watermark) <= watermark]
+        visible_ids = {item.item_id for item in result["items"]}
+        result["items"] = [item for item in result["items"] if not item.grouped or item.grouped in visible_ids]
+        result["items"] += waiting_items(waiting, camera, "等待相邻短段和芯片数据到齐，暂不判定漏读。")
+        result["auto_passed"] = [item for item in outcome.auto_passed if model.to_recorder(item["chip_time_ms"]) <= watermark]
     result["model"] = model
     return result
+
+
+def waiting_items(reads, camera, reason):
+    return [ProblemItem(stable_item_id(KIND_WAITING, camera, read.read_id), KIND_WAITING,
+                        CATEGORY_VIDEO, reason, chip_time_ms=read.chip_ms,
+                        bibs=(read.bib,), event_ids=(read.event_id,), status=STATUS_WAITING)
+            for read in reads if not read.excluded and not read.manual_entry]
 
 
 ANALYSIS_CONFIG_FILENAME = "analysis_config.json"
@@ -608,7 +698,8 @@ def run_offline_analysis(
     per stage in ``summary["memory"]``.
     """
 
-    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id)
+    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
+                                  include_review_segments=True)
     summary: dict = {"race_id": workspace.race_id, "cameras": {}}
     free = available_memory_mb()
     memory: dict = {"available_at_start_mb": free, "stage_peaks_mb": {}}
@@ -689,6 +780,9 @@ def write_problem_list(
     if metadata is not None and metadata.race_id == workspace.race_id:
         roster = {athlete.bib: metadata.group_label(athlete.group_id) for athlete in metadata.athletes if athlete.bib}
     items: list[ProblemItem] = list(chip_check_items(workspace.reads, ChipCheckContext(roster=roster)))
+    if config.live:
+        from .problem_items import KIND_NOT_ARRIVED, KIND_LAP_MISSING
+        items = [item for item in items if item.kind not in (KIND_NOT_ARRIVED, KIND_LAP_MISSING)]
     auto_passed: list[dict] = []
     unverifiable = 0
     cameras = {}
@@ -712,6 +806,7 @@ def write_problem_list(
         "summary": summarize_items(items, auto_passed, unverifiable),
         "items": [item.to_payload() for item in items],
         "auto_passed": auto_passed,
+        "live": config.live,
     }
     target = output_dir / PROBLEM_LIST_FILENAME
     temporary = target.with_name(target.name + ".tmp")

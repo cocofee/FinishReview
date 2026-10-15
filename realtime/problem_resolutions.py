@@ -26,6 +26,7 @@ from .problem_items import (
     ACTION_DELETE_EXTRA_CHIP,
     ACTION_LABELS,
     ACTION_RECORD_BIB,
+    ACTION_SYNCED,
     KIND_TITLES,
     ProblemItem,
 )
@@ -163,7 +164,11 @@ class ProblemResolutionStore:
         position: Sequence[float] = (),
         chip_time_ms: Optional[int] = None,
     ) -> ProblemResolution:
-        if action not in item.actions and action != "reopen":
+        previous, stale = self.state(item)
+        acknowledge = action == ACTION_SYNCED and previous is not None and not stale and previous.action in (
+            ACTION_RECORD_BIB, ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP, ACTION_CHANGE,
+        )
+        if action not in item.actions and action != "reopen" and not acknowledge:
             raise ValueError(f"action {action} is not available for {item.kind}")
         if action == ACTION_RECORD_BIB and not bib.strip():
             raise ValueError("认号补录需要号码")

@@ -78,10 +78,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--analyze-problems", metavar="EVENT_DIR", help=argparse.SUPPRESS)
+    parser.add_argument("--live-problems", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--finish-live-problems", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
-def run_problem_analysis(event_dir: str) -> int:
+def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: bool = False) -> int:
     """Headless offline problem-list run, started by the console in its own process."""
 
     import json as _json
@@ -93,7 +95,12 @@ def run_problem_analysis(event_dir: str) -> int:
         # keeps the pipe protocol independent of the system code page.
         print(_json.dumps({"stage": stage, "done": done, "total": total}, ensure_ascii=True), flush=True)
 
-    summary = run_offline_analysis(config_from_workspace(event_dir), progress=report)
+    config = config_from_workspace(event_dir)
+    if live or finish_live:
+        config.live = True
+    if finish_live:
+        config.evidence_delay_ms = 0
+    summary = run_offline_analysis(config, progress=report)
     if summary.get("skipped"):
         print(_json.dumps({"stage": "skipped", "message": summary["skipped"]}, ensure_ascii=True), flush=True)
         return 1
@@ -641,7 +648,8 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "smoke_test", False):
         return run_packaged_smoke_test(app_argv)
     if getattr(args, "analyze_problems", None):
-        return run_problem_analysis(args.analyze_problems)
+        return run_problem_analysis(args.analyze_problems, live=args.live_problems,
+                                    finish_live=args.finish_live_problems)
     source_override = requested_source(args, parser)
     runtime_root = application_dir(module_file=__file__)
     requested_output_dir = (

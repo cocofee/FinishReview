@@ -802,6 +802,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._init_runtime_status()
         self._init_problem_list()
         self._init_operator_controls()
+        self.problem_list_button.setChecked(True)
+        self._open_problem_list()
         self._high_speed_scan_worker = AuyatRgbScanWorker(
             self._high_speed_catalog,
             self,
@@ -1339,6 +1341,21 @@ class FinishReviewWindow(PassageReviewSurface):
             pane.has_pending_marker for pane in self.evidence_panes
         )
         self.confirm_next_button.setEnabled(bool(identity and has_pending_marker))
+        if getattr(self, "_problem_workbench_active", False):
+            self.confirm_next_button.setEnabled(False)
+        for pane in self.all_evidence_panes:
+            legacy = not getattr(self, "_problem_workbench_active", False)
+            if not legacy and not hasattr(pane, "_workbench_video_minimum"):
+                pane._workbench_video_minimum = pane.video_view.minimumSize()
+                pane.video_view.setMinimumSize(0, 140)
+            elif legacy and hasattr(pane, "_workbench_video_minimum"):
+                pane.video_view.setMinimumSize(pane._workbench_video_minimum)
+                del pane._workbench_video_minimum
+            pane.mark_btn.setVisible(legacy)
+            pane.confirm_btn.setVisible(legacy)
+            pane.status_label.setVisible(legacy)
+            pane.active_badge.setVisible(legacy)
+            pane.video_view.set_identity_badge_visible(legacy)
 
     def _pending_marker_pane(self):
         return next(
@@ -2078,6 +2095,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_list_button.setToolTip("只处理有问题的：自动通过、待处理和无法核实")
         self.problem_list_button.clicked.connect(self._open_problem_list)
         top_layout.addWidget(self.problem_list_button)
+        self.passages_button = QPushButton("通过记录", panel)
+        self.passages_button.setCheckable(True)
+        self.passages_button.setFixedHeight(32)
+        self.passages_button.clicked.connect(self._open_passages)
+        top_layout.addWidget(self.passages_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2088,6 +2110,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.problem_list_button.setStyleSheet(tool_button_style)
+        self.passages_button.setStyleSheet(tool_button_style)
         self.select_event_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
@@ -2183,32 +2206,67 @@ class FinishReviewWindow(PassageReviewSurface):
             self.event_path_label.setText("此目录包含多场赛事")
 
     def _set_problem_list_layout(self, expanded: bool) -> None:
-        before = getattr(self, "_problem_list_layout_before", None)
-        if expanded and before is None:
-            sizes = self.review_content_splitter.sizes()
-            self._problem_list_layout_before = (
-                self.preview_panel.minimumHeight(), self.video_filmstrip.minimumHeight(),
-                self.results_panel.minimumHeight(), self.table.minimumHeight(),
-                self._review_split_manually_sized, sizes,
-            )
-            self.preview_panel.setMinimumHeight(300)
-            self.video_filmstrip.setMinimumHeight(240)
-            self.results_panel.setMinimumHeight(300)
-            self.table.setMinimumHeight(100)
-            self._review_split_manually_sized = True
-            if sum(sizes):
-                transfer = min(120, max(0, sizes[0] - 300))
-                self.review_content_splitter.setSizes([sizes[0] - transfer, sizes[1] + transfer])
-        elif not expanded and before is not None:
-            preview_minimum, filmstrip_minimum, results_minimum, table_minimum, manually_sized, sizes = before
-            self.preview_panel.setMinimumHeight(preview_minimum)
-            self.video_filmstrip.setMinimumHeight(filmstrip_minimum)
-            self.results_panel.setMinimumHeight(results_minimum)
-            self.table.setMinimumHeight(table_minimum)
-            self._review_split_manually_sized = manually_sized
-            if sum(sizes):
-                self.review_content_splitter.setSizes(sizes)
-            self._problem_list_layout_before = None
+        self._problem_workbench_active = expanded
+        self.setMinimumHeight(700 if expanded else 760)
+        self.passages_button.setChecked(not expanded)
+        self.problem_panel.card.setVisible(not expanded)
+        self.problem_panel.filmstrip.setVisible(not expanded)
+        self.filter_bar.setVisible(not expanded)
+        self.table.setVisible(not expanded)
+        self.video_discovered_table.setVisible(False)
+        self.transport.setVisible(not expanded)
+        self.preview_panel.setMinimumHeight(190 if expanded else 420)
+        self.video_filmstrip.setMinimumHeight(180 if expanded else 360)
+        self.workspace_splitter.setMinimumHeight(300 if expanded else 180)
+        self._review_split_manually_sized = expanded
+        if expanded:
+            self._selected_event_id = ""
+            self.problem_panel.splitter.insertWidget(1, self.evidence_splitter)
+            self.problem_panel.splitter.setSizes([310, 680, 280])
+            self.review_content_splitter.insertWidget(0, self.workspace_splitter)
+            self.review_content_splitter.setSizes([520, 210])
+            self.evidence_splitter.show()
+            self.auto_advance_checkbox.setChecked(False)
+        else:
+            self.workspace_splitter.addWidget(self.evidence_splitter)
+            self.review_content_splitter.insertWidget(0, self.preview_panel)
+            self._set_continuous_review_layout(False)
+        self.return_problem_button.setVisible(expanded)
+        self.manual_problem_button.setVisible(expanded)
+        self.pipeline_label.setVisible(expanded)
+        self._update_operator_controls()
+
+    def _uses_popup_judging(self):
+        return not getattr(self, "_problem_workbench_active", False) and super()._uses_popup_judging()
+
+    def _begin_marking(self, pane):
+        if not getattr(self, "_problem_workbench_active", False):
+            return super()._begin_marking(pane)
+
+    def _confirm_pending_marker(self, pane):
+        if getattr(self, "_problem_workbench_active", False):
+            return False
+        return super()._confirm_pending_marker(pane)
+
+    def _select_event(self, *args, **kwargs):
+        # Incoming chip messages and CycleRace focus never take over the
+        # evidence frame while an operator works through exceptions.
+        if getattr(self, "_problem_workbench_active", False):
+            return
+        return super()._select_event(*args, **kwargs)
+
+    def _initialize_review_splitters(self):
+        if getattr(self, "_problem_workbench_active", False):
+            self.evidence_splitter.show()
+            self._distribute_evidence_panes()
+            return
+        super()._initialize_review_splitters()
+
+    def _toggle_filmstrip_size(self):
+        if not getattr(self, "_problem_workbench_active", False):
+            return super()._toggle_filmstrip_size()
+        sizes = self.review_content_splitter.sizes()
+        self.review_content_splitter.setSizes([sum(sizes) // 2, sum(sizes) // 2])
 
     def _init_problem_list(self) -> None:
         from .problem_panel import ProblemListPanel
@@ -2220,26 +2278,117 @@ class FinishReviewWindow(PassageReviewSurface):
             lambda: self.passage_store.events(include_inactive=True)
         )
         self.problem_panel.jump_requested.connect(self._open_problem_frame)
+        self.problem_panel.current_changed.connect(self._problem_selection_changed)
         self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
+        self.return_problem_button = QPushButton("回到当前问题", self)
+        self.return_problem_button.clicked.connect(self._return_to_problem)
+        self.manual_problem_button = QPushButton("＋ 人工问题", self)
+        self.manual_problem_button.clicked.connect(self._add_manual_problem)
+        rail = self.video_filmstrip.full_race
+        rail.toolbar.insertWidget(3, self.return_problem_button)
+        rail.toolbar.insertWidget(4, self.manual_problem_button)
+        rail.follow_button.setProperty("alwaysVisible", True)
+        rail.follow_button.show()
+        rail.navigation_started.connect(self._problem_browse_started)
+        rail.follow_button.toggled.connect(lambda enabled: self._problem_browse_started() if enabled else None)
+        self.pipeline_label = QLabel("录像未启动 · 等待已封存短段 · 只处理问题，不逐人确认", self)
+        self.pipeline_label.setWordWrap(True)
+        self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
+        self.layout().insertWidget(1, self.pipeline_label)
         self.problem_panel.set_workspace(self.output_dir)
-        if self.problem_panel.payload is not None:
-            # A finished analysis makes the problem list the main entry.
-            self.problem_list_button.setChecked(True)
-            self._open_problem_list()
+
+    def _problem_selection_changed(self, item):
+        if getattr(self, "_problem_workbench_active", False):
+            self._return_to_problem()
+
+    def _problem_browse_started(self):
+        if getattr(self, "_problem_workbench_active", False):
+            self.problem_panel.set_browsing(True)
+
+    def _return_to_problem(self):
+        item = self.problem_panel.current_item()
+        self.video_filmstrip.full_race.follow_button.setChecked(False)
+        if item is not None and item.evidence.get("frame"):
+            self.problem_panel.set_browsing(True)
+            self._open_problem_frame(dict(item.evidence["frame"]))
+        else:
+            self._set_sync_playing(False, seek_final=False)
+            for pane in self.evidence_panes:
+                pane.clear_passage("此问题暂无原帧；请查看右侧芯片信息")
+            self.problem_panel.set_browsing(False)
+
+    def _on_preview_frame_ready(self, pane, image, position_ms, frame_index):
+        super()._on_preview_frame_ready(pane, image, position_ms, frame_index)
+        if not getattr(self, "_problem_workbench_active", False):
+            return
+        pane.video_view.set_identity_badge_visible(False)
+        pane.active_badge.hide()
+        pane.status_label.hide()
+        if pane is not self._active_playback_pane():
+            return
+        item = self.problem_panel.current_item()
+        frame = item.evidence.get("frame", {}) if item else {}
+        if frame:
+            same = pane.location is not None and pane.location.segment.segment_id == frame.get("segment_id")
+            same = same and abs(int(position_ms) - int(frame.get("position_ms", 0))) <= 1000
+            self.problem_panel.set_browsing(not same)
+
+    def _open_race_filmstrip_frame(self, frame):
+        if getattr(self, "_problem_workbench_active", False):
+            self.problem_panel.set_browsing(True)
+        return super()._open_race_filmstrip_frame(frame)
+
+    def _add_manual_problem(self):
+        pane = self._active_playback_pane()
+        if pane.location is None or pane._current_frame_index < 0 or not pane.video_view.has_frame:
+            self.problem_panel.hint.setText("请先从时间胶卷打开一张可用原帧。")
+            return
+        self._set_sync_playing(False, seek_final=False)
+        location, index, position = pane.location, pane._current_frame_index, pane._current_position_ms
+        reason, ok = QInputDialog.getText(self, "添加人工问题", "发现了什么问题？（必填，芯片状态仍待核实）")
+        if not ok or not reason.strip():
+            return
+        try:
+            location = self._persist_filmstrip_location(location)
+            self.problem_panel.add_manual_problem({
+                "camera_index": pane.camera_index, "segment_id": location.segment.segment_id,
+                "video_path": str(location.video_path), "frame_index": index, "position_ms": position,
+            }, reason)
+        except (OSError, ValueError, RuntimeError) as error:
+            self.problem_panel.hint.setText(f"人工问题未保存：{error}")
 
     def _open_problem_list(self) -> None:
         expanded = self.problem_list_button.isChecked()
         self.problem_panel.setVisible(expanded)
         self._set_problem_list_layout(expanded)
         self._refresh_problem_list()
+        if expanded:
+            self._return_to_problem()
+
+    def _open_passages(self):
+        self.problem_list_button.setChecked(False)
+        self._open_problem_list()
+        self._refresh_filtered_view()
 
     def _refresh_problem_list(self) -> None:
         panel = getattr(self, "problem_panel", None)
         if panel is None:
             return
         panel.set_workspace(self.output_dir)
+        metadata = self._current_metadata()
+        panel.set_scope(metadata.race_id if metadata else "", metadata.stage_id if metadata else "")
         if panel.isVisible():
             panel.refresh()
+        result = (panel.payload or {}).get("cameras", {}).get(str(self._camera_one_pane().camera_index), {})
+        ranges = [(start, min(end, result.get("analyzed_through_ms", end)))
+                  for start, end, _session in result.get("coverage", []) if not result.get("error")]
+        current = panel.current_item()
+        frame = current.evidence.get("frame", {}) if current else {}
+        segment = self.timeline_store.get_segment(frame.get("segment_id", ""))
+        timestamp = (segment.media_started_at_ms + int(frame.get("position_ms", 0))) if (
+            segment and segment.media_started_at_ms is not None and segment.camera_index == self._camera_one_pane().camera_index
+        ) else None
+        self.video_filmstrip.full_race.set_analysis_progress(ranges, timestamp, enabled=self._problem_workbench_active)
 
     def _open_problem_frame(self, frame) -> None:
         """Open the item's original frame in its camera's pane, without changing identity."""
@@ -2257,6 +2406,8 @@ class FinishReviewWindow(PassageReviewSurface):
         location = PassageVideoLocation(segment, path, position, position, 0,
                                         segment.timing_error_ms, "located")
         self._set_sync_playing(False, seek_final=False)
+        if segment.media_started_at_ms is not None:
+            self.video_filmstrip.full_race.browse_to(segment.media_started_at_ms + position)
         if self._seek_retained_camera_frame(location, position, index, int(frame.get("camera_index", 1) or 1)):
             self.problem_panel.hint.setText(f"已定位原录像第 {index + 1} 帧，请逐帧核对号码后在清单中处理。")
 
@@ -3000,6 +3151,25 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _on_clock_tick(self) -> None:
         self._refresh_problem_list()
+        panel = self.problem_panel
+        recording = self._recording_any_active()
+        panel.live_tick(recording)
+        live_cameras = (panel.payload or {}).get("cameras", {})
+        through = [value.get("analyzed_through_ms") for value in live_cameras.values() if value.get("analyzed_through_ms")]
+        analyzed = datetime.fromtimestamp(min(through) / 1000).strftime("%H:%M:%S") if through else "等待录像 / 校时"
+        self.pipeline_label.setToolTip(panel.analysis_status)
+        analysis_state = panel.analysis_status.replace("\n", " ")[:120]
+        short_ends = [segment.media_started_at_ms + segment.media_duration_ms for segment in self.timeline_store.segments()
+                      if segment.end_reason == "retained_problem_segment" and segment.media_started_at_ms is not None
+                      and segment.media_duration_ms is not None and (not panel._scope[0] or segment.race_id == panel._scope[0])]
+        sealed = datetime.fromtimestamp(max(short_ends) / 1000).strftime("%H:%M:%S") if short_ends else "等待首段"
+        seconds = max(0, int(time.monotonic() - self._recording_started_at)) if recording else 0
+        duration = f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
+        backlog = f" · 待分析约 {max(0, (max(short_ends) - min(through)) // 1000)} 秒" if short_ends and through else ""
+        self.pipeline_label.setText(
+            f"{'● 持续录像 ' + duration + '（当前段写入中）' if recording else '录像未启动'} · 封存到 {sealed}  |  "
+            f"{analysis_state} · 分析到 {analyzed}{backlog}"
+        )
         self._poll_recording_health()
         self._update_runtime_status()
 
@@ -3640,6 +3810,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 self._camera_one_pane().camera_index, str(race_id), tuple(self._ring_buffers.values()),
             ),
             storage_path=self.output_dir,
+            problem_timeline=self.timeline_store,
+            problem_race_id=str(race_id),
         )
 
     def _recording_sources_for_filmstrip(self, pane, race_id):
@@ -4363,6 +4535,8 @@ class FinishReviewWindow(PassageReviewSurface):
             event.ignore()
             return
         self._clock_timer.stop()
+        self.problem_panel.stop_analysis()
+        self.problem_panel.save_drafts()
         if hasattr(self, "_ui_latency_probe"):
             self._ui_latency_probe.stop()
         if not self.stop():

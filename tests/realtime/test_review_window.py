@@ -276,10 +276,10 @@ def _event(*, absolute=True, **overrides):
     return PassageEvent(**values)
 
 
-def _window(tmp_path, *, passage_batch_interval_ms=0):
+def _window(tmp_path, *, passage_batch_interval_ms=0, workbench=False):
     _FakeRecorder.instances.clear()
     _FakeReceiver.instances.clear()
-    return FinishReviewWindow(
+    window = FinishReviewWindow(
         "rtsp://camera/live",
         tmp_path,
         passage_host="127.0.0.1",
@@ -288,6 +288,10 @@ def _window(tmp_path, *, passage_batch_interval_ms=0):
         recorder_factory=_FakeRecorder,
         receiver_factory=_FakeReceiver,
     )
+    # Legacy judging tests explicitly enter the auxiliary passage workflow.
+    if not workbench:
+        window.problem_list_button.click()
+    return window
 
 
 def _wait_until(qapp, predicate, timeout=5):
@@ -297,6 +301,71 @@ def _wait_until(qapp, predicate, timeout=5):
         QTest.qWait(5)
     qapp.processEvents()
     assert predicate()
+
+
+def test_workbench_is_default_and_incoming_passages_do_not_take_over(qapp, tmp_path):
+    import json
+    from PyQt5.QtGui import QImage
+    from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
+    window = _window(tmp_path, workbench=True)
+    assert window._problem_workbench_active
+    assert window.table.isHidden()
+    assert window.review_content_splitter.widget(1) is window.preview_panel
+    video = tmp_path / "original.mkv"
+    video.write_bytes(b"video")
+    segment = window.timeline_store.add_completed_segment(
+        source_id="camera_01", camera_index=1, video_path=video,
+        media_started_at_ms=1_789_600_000_000, media_duration_ms=6000,
+        clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+    )
+    frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                 position_ms=2000, frame_index=50)
+    item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": frame})
+    path = tmp_path / "finish_problems/problem_list.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
+    window.problem_panel.refresh()
+    pane = window.regular_pane
+    image = QImage(640, 360, QImage.Format_RGB888)
+    image.fill(0)
+    pane._worker.frame_ready.emit(image, 2000, 50)
+    assert not window.problem_panel._browsing
+    window.video_filmstrip.full_race._begin_browsing()
+    assert window.problem_panel._browsing
+    window._return_to_problem()
+    pane._worker.frame_ready.emit(image, 2000, 50)
+    assert not window.problem_panel._browsing
+    window.problem_panel.bib_input.setText("307")
+    window.passage_store.append(_event(event_id="new"))
+    window.refresh()
+    assert pane.location.segment.segment_id == segment.segment_id
+    assert pane._current_frame_index == 50
+    assert window.problem_panel.current_item().item_id == "test:1"
+    assert window.problem_panel.bib_input.text() == "307"
+    pane._worker.frame_ready.emit(image, 4000, 100)
+    assert window.problem_panel._browsing
+    window.problem_panel._resolve("record_bib")
+    assert window.problem_panel.store.get("test:1") is None
+    window._return_to_problem()
+    pane._worker.frame_ready.emit(image, 2000, 50)
+    assert not window.problem_panel._browsing
+    assert not window._confirm_pending_marker(pane)
+    window.close()
+
+
+def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
+    window = _window(tmp_path, workbench=True)
+    window.resize(1280, 720)
+    window.show()
+    qapp.processEvents()
+    assert window.height() <= 720
+    assert window.video_filmstrip.height() >= 180
+    assert not window.evidence_splitter.isHidden()
+    assert not window.video_filmstrip.full_race.follow_button.isHidden()
+    window.video_filmstrip.full_race.follow_button.setChecked(True)
+    window.video_filmstrip.full_race.follow_button.setChecked(False)
+    assert not window.video_filmstrip.full_race.follow_button.isHidden()
+    window.close()
 
 
 def _legacy_mixed_workspace(path):
@@ -456,13 +525,17 @@ def test_problem_list_toggle_restores_layout_without_filtering_passages(qapp, tm
         for _ in range(2):
             window.problem_list_button.click()
             assert not window.problem_panel.isHidden()
-            assert window._problem_list_layout_before is not None
+            assert window._problem_workbench_active
+            assert window.review_content_splitter.widget(1) is window.preview_panel
+            assert window.problem_panel.splitter.widget(1) is window.evidence_splitter
+            assert window.table.isHidden()
             assert window.problem_panel.bunch_button.text() == "打开集团逐帧核对"
             window._on_clock_tick()
             assert [event.event_id for event in window._visible_events] == ["visible"]
             window.problem_list_button.click()
             assert window.problem_panel.isHidden()
-            assert window._problem_list_layout_before is None
+            assert not window._problem_workbench_active
+            assert window.workspace_splitter.widget(1) is window.evidence_splitter
             assert tuple(widget.minimumHeight() for widget in widgets) == minimums
             assert window._review_split_manually_sized == manually_sized
     finally:
@@ -1328,7 +1401,9 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert window.group_value.text() == "男子公开组"
     assert window.operator_identity_label.text() == "男子公开组 · 1 / 1 · 未确认"
     assert window.table.item(0, 6).text() == "未确认"
-    assert len(window.timeline_store.segments()) == 1
+    assert len([segment for segment in window.timeline_store.segments()
+                if segment.end_reason == "passage_review_window"]) == 1
+    assert any(segment.end_reason == "retained_problem_segment" for segment in window.timeline_store.segments())
     assert "可核对 1" in window.capture_status_label.text()
 
     recorder = window.recorder
@@ -1573,6 +1648,7 @@ def test_live_passage_shows_preview_before_full_post_roll_is_ready(
         recorder_factory=_PreviewRecorder,
         receiver_factory=_FakeReceiver,
     )
+    window._open_passages()
     window.start()
     _FakeReceiver.instances[-1].deliver(_event())
     _wait_until(qapp, lambda: window.regular_pane.location is not None)
@@ -1583,7 +1659,7 @@ def test_live_passage_shows_preview_before_full_post_roll_is_ready(
     assert preview_location.segment.end_reason == "passage_review_preview"
     assert preview_location.video_path.name.startswith("preview_")
     assert window.regular_pane.status_label.text() == "录像处理中"
-    assert window.timeline_store.segments() == ()
+    assert all(segment.end_reason == "retained_problem_segment" for segment in window.timeline_store.segments())
     group_index = window.group_combo.findData("men-open")
     assert group_index >= 0
     window.group_combo.setCurrentIndex(group_index)
@@ -1601,7 +1677,8 @@ def test_live_passage_shows_preview_before_full_post_roll_is_ready(
     assert final_location.segment.end_reason == "passage_review_window"
     assert final_location.video_path.name.startswith("evidence_")
     assert final_location.video_path != preview_location.video_path
-    assert len(window.timeline_store.segments()) == 1
+    assert len([segment for segment in window.timeline_store.segments()
+                if segment.end_reason == "passage_review_window"]) == 1
     window.close()
 
 
@@ -2573,6 +2650,7 @@ def test_apply_settings_refreshes_lookup_after_camera_toggle(
         recorder_factory=_FakeRecorder,
         receiver_factory=_FakeReceiver,
     )
+    window._open_passages()
     for camera_index in (1, 2):
         video_path = tmp_path / f"camera_{camera_index}.mkv"
         video_path.write_bytes(b"video")
@@ -2623,6 +2701,7 @@ def test_operator_regular_marking_uses_camera_with_a_frame(
         recorder_factory=_FakeRecorder,
         receiver_factory=_FakeReceiver,
     )
+    window._open_passages()
     for camera_index in (1, 2):
         video_path = tmp_path / f"camera_{camera_index}.mkv"
         video_path.write_bytes(b"video")

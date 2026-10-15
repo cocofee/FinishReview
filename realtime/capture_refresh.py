@@ -40,6 +40,8 @@ class CaptureRefreshRequest:
     evidence_job: EvidenceRefreshJob | None = None
     catalog_job: RecordingCatalogJob | None = None
     storage_path: Path | None = None
+    problem_timeline: object | None = None
+    problem_race_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +144,8 @@ class CaptureRefreshWorker:
                     storage_path=request.storage_path or pending.storage_path,
                     scan=request.scan or pending.scan,
                     archive_jobs=request.archive_jobs or pending.archive_jobs,
+                    problem_timeline=request.problem_timeline or pending.problem_timeline,
+                    problem_race_id=request.problem_race_id or pending.problem_race_id,
                     apply_state=request.apply_state or pending.apply_state,
                 )
             self._pending = request
@@ -292,6 +296,13 @@ class CaptureRefreshWorker:
                 logger.exception("Background ring-buffer scan failed")
                 continue
             discovered_count += len(discovered)
+            if request.problem_timeline is not None and request.problem_race_id:
+                try:
+                    from .live_problems import publish_sealed_segments
+                    publish_sealed_segments(ring_buffer, request.problem_timeline, request.problem_race_id)
+                except Exception as error:
+                    errors.append(f"problem segment publish: {error}")
+                    logger.exception("Failed to retain sealed problem evidence")
             self._observe(
                 "background_ring_scan",
                 started,
@@ -336,7 +347,7 @@ class CaptureRefreshWorker:
         with self._condition:
             pending_evidence = self._pending is not None and self._pending.evidence_job is not None
         # Failed or queued registrations must retain media until they can pin it.
-        if request.cleanup and not (request.evidence_job is not None and errors) and not pending_evidence:
+        if request.cleanup and not (errors and (request.evidence_job is not None or request.problem_timeline is not None)) and not pending_evidence:
             for ring_buffer in request.ring_buffers:
                 if self._is_cancelled(request):
                     break

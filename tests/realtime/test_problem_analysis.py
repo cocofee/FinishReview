@@ -96,6 +96,77 @@ def _kinds(result):
     return sorted(item.kind for item in result["items"] if item.pending)
 
 
+def test_live_analysis_defers_tail_and_reuses_detection_cache(synthetic_race, monkeypatch):
+    _root, workspace, config, strips = synthetic_race
+    live = replace(config, live=True)
+    result = analyse_camera(live, workspace, 1, strips)
+    from realtime.problem_items import KIND_WAITING
+    assert result["analyzed_through_ms"] < START + 85_000
+    assert result["waiting_reads"] == 1
+    assert len([item for item in result["items"] if item.kind == KIND_WAITING]) == 1
+    assert _kinds(result) == []
+    assert len(result["auto_passed"]) == len(CROSSINGS_S) - 1
+    monkeypatch.setattr(problem_analysis, "detect_crossings", lambda *_args: pytest.fail("cached strip detected again"))
+    repeated = analyse_camera(live, workspace, 1, strips)
+    assert len(repeated["auto_passed"]) == len(result["auto_passed"])
+
+
+def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_race, tmp_path):
+    root, _workspace, _config, _strips = synthetic_race
+    for name in ("cyclerace_passage_events.jsonl", "finish_lines.json"):
+        (tmp_path / name).write_bytes((root / name).read_bytes())
+    source = next((root / "videos").glob("*.avi"))
+    capture = cv2.VideoCapture(str(source))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    index = 0
+    while True:
+        frames = []
+        for _ in range(2 * FPS):
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(frame)
+        if not frames:
+            break
+        path = tmp_path / f"camera_01_session_review_{index:016d}.avi"
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (WIDTH, HEIGHT))
+        for frame in frames:
+            writer.write(frame)
+        writer.release()
+        timeline.add_completed_segment(source_id="camera_01_review", camera_index=1, video_path=path,
+                                       media_started_at_ms=START + index * 2_000,
+                                       media_duration_ms=len(frames) * 1000 // FPS,
+                                       clock_source="videopipe_system_clock", timing_error_ms=0,
+                                       end_reason="retained_problem_segment", race_id=RACE)
+        index += 1
+    capture.release()
+    config = AnalysisConfig(workspace=tmp_path, live=True, render_cards=False, min_available_mb=0)
+    live = run_offline_analysis(config, lower_priority=False)
+    payload = json.loads((tmp_path / "finish_problems/problem_list.json").read_text(encoding="utf-8"))
+    assert live["summary"]["auto_passed"] >= len(CROSSINGS_S) - 2
+    before = {item["frame"]["segment_id"] for item in payload["auto_passed"]}
+    archive = tmp_path / "camera_01_session_archive_0000.avi"
+    archive.write_bytes(source.read_bytes())
+    timeline.add_completed_segment(source_id="camera_01_review", camera_index=1, video_path=archive,
+                                   media_started_at_ms=START, media_duration_ms=95_000,
+                                   clock_source="videopipe_system_clock", timing_error_ms=0,
+                                   end_reason="continuous_archive_fallback", race_id=RACE)
+    workspace = AnalysisWorkspace(tmp_path, include_review_segments=True)
+    assert len(workspace.archive_segments()) == index
+    config.live = False
+    run_offline_analysis(config, lower_priority=False)
+    final = json.loads((tmp_path / "finish_problems/problem_list.json").read_text(encoding="utf-8"))
+    assert before <= {item["frame"]["segment_id"] for item in final["auto_passed"]}
+    assert not any(item["kind"] == "evidence_pending" for item in final["items"])
+    # A partial short-segment gap uses the archive for just the missing span,
+    # without dropping historical coverage or counting every rider twice.
+    (tmp_path / "camera_01_session_review_0000000000000022.avi").unlink()
+    run_offline_analysis(config, lower_priority=False)
+    repaired = json.loads((tmp_path / "finish_problems/problem_list.json").read_text(encoding="utf-8"))
+    bibs = [item["bib"] for item in repaired["auto_passed"]]
+    assert len(bibs) == len(set(bibs)) == len(CROSSINGS_S)
+
+
 def test_clean_race_auto_passes_every_rider(synthetic_race):
     root, workspace, config, strips = synthetic_race
     before = {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()}

@@ -222,6 +222,16 @@ class RaceFilmstripCanvas(QAbstractScrollArea):
                 text = "录像缺口" if source is None else "录像文件不可用" if not source.available else owner.errors.get(key, "加载中…")
                 painter.setPen(QColor("#64748b" if source is None else "#f1f5f9"))
                 painter.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, text)
+            if owner.analysis_enabled and source is not None and source.available:
+                analyzed = any(start <= sample <= end for start, end in owner.analysis_ranges)
+                badge = QRectF(rect.x() + 3, rect.y() + 3, min(84, rect.width() - 6), 21)
+                painter.fillRect(badge, QColor("#17675b" if analyzed else "#a56711"))
+                painter.setPen(QColor("white"))
+                painter.drawText(badge, Qt.AlignCenter, "已分析" if analyzed else "待分析")
+                if owner.problem_time is not None and timestamp <= owner.problem_time < timestamp + owner.interval_ms:
+                    badge.moveTop(rect.bottom() - 24)
+                    painter.fillRect(badge, QColor("#b54747"))
+                    painter.drawText(badge, Qt.AlignCenter, "当前问题")
             for left, right in checked_ranges:
                 start, end = max(timestamp, left), min(timestamp + owner.interval_ms, right)
                 if start < end:
@@ -391,6 +401,7 @@ class RaceFilmstripPanel(QWidget):
     saved_judgment_requested = pyqtSignal(str)
     refresh_requested = pyqtSignal()
     enlarge_requested = pyqtSignal()
+    navigation_started = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -400,6 +411,9 @@ class RaceFilmstripPanel(QWidget):
         self.tile_pitch = self.tile_width + TILE_GAP
         self._image_aspect = 4 / 3
         self.current_time = None
+        self.analysis_enabled = False
+        self.analysis_ranges = ()
+        self.problem_time = None
         self.markers = ()
         self._judgments = ()
         self._judgment_times = ()
@@ -822,9 +836,15 @@ class RaceFilmstripPanel(QWidget):
         self.inspection_action.setText(self.inspection_label.text())
         self.more_button.setToolTip(self.inspection_label.toolTip())
 
+    def set_analysis_progress(self, ranges, problem_time=None, *, enabled=True):
+        state = (bool(enabled), tuple(ranges), problem_time)
+        if state != (self.analysis_enabled, self.analysis_ranges, self.problem_time):
+            self.analysis_enabled, self.analysis_ranges, self.problem_time = state
+            self.canvas.viewport().update()
+
     def _follow_changed(self, enabled):
         self.follow_button.setText("正在跟随" if enabled else "跟随最新")
-        self.follow_button.setVisible(enabled)
+        self.follow_button.setVisible(enabled or bool(self.follow_button.property("alwaysVisible")))
         if enabled:
             self.canvas.stop_scroll()
             self._user_navigated = True
@@ -876,6 +896,7 @@ class RaceFilmstripPanel(QWidget):
         self._position_scroll(timestamp)
 
     def _begin_browsing(self, *_, keep_wheel=False):
+        self.navigation_started.emit()
         if not keep_wheel:
             self.canvas.stop_scroll()
         self._user_navigated = True
