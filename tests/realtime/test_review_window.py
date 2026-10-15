@@ -413,98 +413,58 @@ def test_receiver_keeps_other_stage_in_inbox_before_metadata_arrives(qapp, tmp_p
         window.close()
 
 
-def _count_report(window, tmp_path, event_ids):
-    import json
-    timestamp = window.passage_store.get(event_ids[0]).timeline_timestamp_ms if event_ids else int(time.time() * 1000)
-    row = {"window_id": "count-group", "start_ms": timestamp, "end_ms": timestamp + 100,
-           "evidence_start_ms": timestamp - 700, "video_count": len(event_ids) + 1,
-           "chip_count": len(event_ids), "pending_count": 0, "excluded_count": 0,
-           "status": "unresolved", "reasons": ["count_difference"], "chip_event_ids": event_ids,
-           "video_event_uids": ["v1", "v2"]}
-    data = {"schema_version": 1, "scope": {"race_id": "race-1", "stage_id": "stage-1", "source_id": "cam"},
-            "clock": {"calibrated": True}, "updated_at_ms": int(time.time() * 1000),
-            "chip_watermark_ms": None, "groups": [row]}
-    (tmp_path / "count_reconciliation.json").write_text(json.dumps(data), encoding="utf-8")
-    window._refresh_count_reconciliation()
-    return row
+def test_removed_count_workflow_ignores_and_preserves_legacy_files(qapp, tmp_path, monkeypatch):
+    legacy_files = {
+        name: b"legacy data is not a current report\n"
+        for name in ("count_reconciliation.json", "count_reviews.jsonl", "count_anomaly_history.jsonl")
+    }
+    for name, data in legacy_files.items():
+        (tmp_path / name).write_bytes(data)
+    original_open = Path.open
+
+    def reject_legacy_access(path, *args, **kwargs):
+        if path.name in legacy_files:
+            pytest.fail(f"Removed count workflow accessed {path.name}")
+        return original_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", reject_legacy_access)
+        window = _window(tmp_path)
+        try:
+            assert window.findChild(QPushButton, "finishCountReviewButton") is None
+            assert not hasattr(window, "count_panel")
+            assert not hasattr(window, "count_status_label")
+            for index in range(3):
+                window.passage_store.append(_event(event_id=f"c{index}", sequence=index + 1, bib=str(index + 1)))
+            window.refresh()
+            window._on_clock_tick()
+            assert {event.event_id for event in window._visible_events} == {"c0", "c1", "c2"}
+        finally:
+            window.close()
+    for name, data in legacy_files.items():
+        assert (tmp_path / name).read_bytes() == data
 
 
-def test_count_group_is_inline_and_filters_existing_passages_without_creating_identity(qapp, tmp_path):
+def test_problem_list_toggle_restores_layout_without_filtering_passages(qapp, tmp_path):
     window = _window(tmp_path)
     try:
-        for index in range(3):
-            window.passage_store.append(_event(event_id=f"c{index}", sequence=index+1, bib=str(index+1)))
+        window.passage_store.append(_event(event_id="visible"))
         window.refresh()
-        row = _count_report(window, tmp_path, ["c0", "c1"])
-        window.count_review_button.click()
-        assert not window.count_panel.isHidden()
-        assert window.count_panel.parent() is window.results_panel
-        from realtime.count_review import CountReviewDialog
-        assert not window.findChildren(CountReviewDialog)
-        window.count_panel.table.setCurrentCell(0, 0)
-        assert {event.event_id for event in window._visible_events} == {"c0", "c1"}
-        assert len(window.passage_store.events()) == 3
-        window.count_review_button.click()
-        assert window.count_panel.isHidden()
-        assert {event.event_id for event in window._visible_events} == {"c0", "c1", "c2"}
-        window.count_review_button.click()
-        window.count_panel.table.setCurrentCell(0, 0)
-        window.count_panel.clear_button.click()
-        assert {event.event_id for event in window._visible_events} == {"c0", "c1", "c2"}
-    finally:
-        window.close()
-
-
-def test_count_group_locates_existing_single_camera_filmstrip_with_native_clock_offset(qapp, tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="c1"))
-        window.refresh()
-        row = _count_report(window, tmp_path, ["c1"])
-        window.count_panel.table.setCurrentCell(0, 0)
-        panel = window.video_filmstrip.full_race
-        timestamp = row["evidence_start_ms"]
-        offset = 250
-        monkeypatch.setattr(window, "_update_filmstrip", lambda: None)
-        monkeypatch.setattr(panel, "index", SimpleNamespace(sources=[SimpleNamespace(
-            available=True, start_ms=timestamp-1000, end_ms=timestamp+1000, priority=0, key=("primary",),
-            location=SimpleNamespace(clock_offset_ms=offset))]))
-        browsed, opened = [], []
-        monkeypatch.setattr(panel, "browse_to", browsed.append)
-        monkeypatch.setattr(panel, "open_time", opened.append)
-        window.count_panel.locate_button.click()
-        assert browsed == opened == [timestamp + offset]
-        assert window._selected_event_id == "c1"
-        assert len(window.passage_store.events()) == 1
-    finally:
-        window.close()
-
-
-def test_count_group_opens_its_original_frame_and_rejects_a_different_recording(qapp, tmp_path, monkeypatch):
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="c1"))
-        window.refresh()
-        row = _count_report(window, tmp_path, ["c1"])
-        video = tmp_path / "original.mkv"
-        video.write_bytes(b"video")
-        segment = window.timeline_store.add_completed_segment(
-            source_id="camera_01", camera_index=1, video_path=video,
-            media_started_at_ms=row["start_ms"]-1000, media_duration_ms=5000,
-            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
-            end_reason="continuous_archive_fallback", race_id="race-1")
-        row["frame_locator"] = dict(segment_id=segment.segment_id, video_path=str(video),
-                                    camera_index=1, frame_index=37, position_ms=1850)
-        opened = []
-        monkeypatch.setattr(window, "_seek_retained_camera_frame",
-                            lambda loc, pos, frame: opened.append((loc.video_path,pos,frame)) or True)
-        window._locate_count_group(row)
-        assert opened == [(video,1850,37)]
-        row["frame_locator"]["video_path"] = str(tmp_path / "other.mkv")
-        window._locate_count_group(row)
-        assert len(opened) == 1
-        assert "不匹配" in window.count_panel.hint.text()
+        widgets = (window.preview_panel, window.video_filmstrip, window.results_panel, window.table)
+        minimums = tuple(widget.minimumHeight() for widget in widgets)
+        manually_sized = window._review_split_manually_sized
+        for _ in range(2):
+            window.problem_list_button.click()
+            assert not window.problem_panel.isHidden()
+            assert window._problem_list_layout_before is not None
+            assert window.problem_panel.bunch_button.text() == "打开集团逐帧核对"
+            window._on_clock_tick()
+            assert [event.event_id for event in window._visible_events] == ["visible"]
+            window.problem_list_button.click()
+            assert window.problem_panel.isHidden()
+            assert window._problem_list_layout_before is None
+            assert tuple(widget.minimumHeight() for widget in widgets) == minimums
+            assert window._review_split_manually_sized == manually_sized
     finally:
         window.close()
 
@@ -533,150 +493,6 @@ def test_problem_item_opens_its_original_frame_in_its_own_camera(qapp, tmp_path,
         window.close()
 
 
-@pytest.mark.parametrize("observations_change", [False, True])
-def test_count_group_number_review_persists_only_for_unchanged_observations(
-        qapp, tmp_path, monkeypatch, observations_change):
-    from PyQt5.QtWidgets import QInputDialog
-    from realtime.video_timeline import PassageVideoLocation
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="c1"))
-        window.refresh()
-        row = _count_report(window, tmp_path, ["c1"])
-        window.count_panel.table.setCurrentCell(0, 0)
-        video = tmp_path / "original.mkv"
-        video.write_bytes(b"video")
-        segment = window.timeline_store.add_completed_segment(
-            source_id="camera_01", camera_index=1, video_path=video,
-            media_started_at_ms=row["start_ms"]-1000, media_duration_ms=5000,
-            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
-            end_reason="continuous_archive_fallback", race_id="race-1")
-        pane = window._active_pane
-        pane._location = PassageVideoLocation(segment,video,1000,1000,0,0,"located")
-        pane._current_frame_index = 20
-        pane._current_position_ms = 1000
-        def confirm_count(*_args):
-            if observations_change:
-                window.count_panel.report["groups"][0]["video_event_uids"] = ["revised-track"]
-            return 1, True
-
-        monkeypatch.setattr(QInputDialog, "getInt", confirm_count)
-        window.count_panel.verify_button.click()
-        if observations_change:
-            assert not (tmp_path / "count_reviews.jsonl").exists()
-            assert "观测已更新" in window.count_panel.hint.text()
-        else:
-            assert (tmp_path / "count_reviews.jsonl").exists()
-            assert window.count_panel.report["groups"][0]["video_count"] == 1
-            assert window.count_panel.report["groups"][0]["status"] == "resolved"
-        assert len(window.passage_store.events()) == 1
-    finally:
-        window.close()
-
-
-def test_count_group_without_chip_keeps_native_queue_empty_and_missing_video_is_explicit(qapp, tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="outside"))
-        window.refresh()
-        row = _count_report(window, tmp_path, [])
-        window.count_panel.table.setCurrentCell(0, 0)
-        assert window.table.rowCount() == 0
-        assert window._selected_event_id == ""
-        assert len(window.passage_store.events()) == 1
-        monkeypatch.setattr(window, "_update_filmstrip", lambda: None)
-        monkeypatch.setattr(window.video_filmstrip.full_race, "index", SimpleNamespace(sources=[]))
-        window.count_panel.locate_button.click()
-        assert "没有可用原录像" in window.count_panel.hint.text()
-    finally:
-        window.close()
-
-
-def test_count_group_reuses_video_discovery_without_fabricating_missing_chip(qapp, tmp_path, monkeypatch):
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="outside"))
-        window.refresh()
-        row = _count_report(window, tmp_path, [])
-        window.count_panel.table.setCurrentCell(0, 0)
-        assert window.video_discovered_btn.isEnabled()
-        pane = window.regular_pane
-        video = tmp_path / "demo.mkv"
-        video.write_bytes(b"video")
-        segment = window.timeline_store.add_completed_segment(
-            source_id="camera_01", camera_index=1, video_path=video,
-            media_started_at_ms=row["start_ms"]-1000, media_duration_ms=5000,
-            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
-            end_reason="continuous_archive_fallback", race_id="race-1")
-        from realtime.video_timeline import PassageVideoLocation
-        pane._location = PassageVideoLocation(segment, video, 0, 1500, 0, 0, "located")
-        pane._current_frame_index = 37
-        pane._current_position_ms = 1500
-        monkeypatch.setattr(passage_review.QInputDialog, "getText", lambda *_args: ("99", True))
-        window.count_panel.discovery_button.click()
-        record, = window.video_discovery_store.records()
-        assert record.bib == "99"
-        assert (record.race_id, record.stage_id) == ("race-1", "stage-1")
-        assert record.frame_index == 37 and record.position_ms == 1500
-        assert record.segment_id == segment.segment_id
-        assert Path(record.video_path) == video
-        assert record.status == "pending_manual_entry"
-        assert window.video_discovered_table.rowCount() == 1
-        assert len(window.passage_store.events()) == 1
-        assert window._selected_event_id == ""
-    finally:
-        window.close()
-
-
-def test_count_group_cannot_record_discovery_before_an_original_frame_is_loaded(qapp, tmp_path, monkeypatch):
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="outside"))
-        window.refresh()
-        _count_report(window, tmp_path, [])
-        window.count_panel.table.setCurrentCell(0, 0)
-        def reject_prompt(*_args):
-            pytest.fail("A discovery without an original frame must not ask for a bib")
-        monkeypatch.setattr(passage_review.QInputDialog, "getText", reject_prompt)
-        window.count_panel.discovery_button.click()
-        assert not window.video_discovery_store.records()
-        assert "实际帧" in window.summary_label.toolTip()
-        assert len(window.passage_store.events()) == 1
-    finally:
-        window.close()
-
-
-@pytest.mark.parametrize("mismatch", ["time", "race"])
-def test_count_discovery_rejects_frame_outside_selected_group(qapp, tmp_path, monkeypatch, mismatch):
-    from realtime.video_timeline import PassageVideoLocation
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="outside"))
-        window.refresh()
-        row = _count_report(window, tmp_path, [])
-        window.count_panel.table.setCurrentCell(0, 0)
-        video = tmp_path / "other.mkv"
-        video.write_bytes(b"video")
-        segment = window.timeline_store.add_completed_segment(
-            source_id="camera_01", camera_index=1, video_path=video,
-            media_started_at_ms=row["start_ms"] - (100_000 if mismatch == "time" else 1000),
-            media_duration_ms=5000, clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
-            end_reason="continuous_archive_fallback", race_id="another-race" if mismatch == "race" else "race-1")
-        pane = window.regular_pane
-        pane._location = PassageVideoLocation(segment, video, 1500, 1500, 0, 0, "located")
-        pane._current_position_ms = 1500
-        pane._current_frame_index = 37
-        def reject_prompt(*_args):
-            pytest.fail("An unrelated frame must not be recorded in the selected group")
-        monkeypatch.setattr(passage_review.QInputDialog, "getText", reject_prompt)
-        window.count_panel.discovery_button.click()
-        assert not window.video_discovery_store.records()
-        assert "不属于选中集团" in window.summary_label.toolTip()
-    finally:
-        window.close()
-
-
 def test_video_discovery_store_follows_workspace_switch_and_restores_records(qapp, tmp_path):
     from realtime.video_discovery import VideoDiscoveryStore
     first = tmp_path / "first"
@@ -697,27 +513,6 @@ def test_video_discovery_store_follows_workspace_switch_and_restores_records(qap
         assert window._apply_settings(replace(window._current_settings(), output_dir=first))
         assert [entry["bib"] for entry in window._video_discovered_entries] == ["11"]
         assert window.video_discovery_store.journal_path.parent == first
-    finally:
-        window.close()
-
-
-def test_count_calibration_change_disables_native_discovery_action(qapp, tmp_path, monkeypatch):
-    window = _window(tmp_path)
-    try:
-        window.passage_store.append(_event(event_id="outside"))
-        window.refresh()
-        row = _count_report(window, tmp_path, [])
-        window.count_panel.table.setCurrentCell(0, 0)
-        assert window.video_discovered_btn.isEnabled()
-        window.count_panel.report["clock"]["calibrated"] = False
-        window._select_count_group(row)
-        assert not window.video_discovered_btn.isEnabled()
-        def reject_prompt(*_args):
-            pytest.fail("The native discovery action must honor count clock calibration")
-        monkeypatch.setattr(passage_review.QInputDialog, "getText", reject_prompt)
-        window._add_video_discovered_bib()
-        assert "待校准" in window.summary_label.toolTip()
-        assert not window.video_discovery_store.records()
     finally:
         window.close()
 
