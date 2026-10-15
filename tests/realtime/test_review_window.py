@@ -467,6 +467,71 @@ def test_ambiguous_legacy_workspace_requires_selection_and_remembers_it(qapp, tm
         restored.close()
 
 
+def test_received_race_can_be_selected_without_metadata_and_survives_restart(qapp, tmp_path):
+    old = RaceMetadata(race_id="old-race", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                       race_name="Old race")
+    RaceMetadataStore(tmp_path / "cyclerace_race_metadata.json").store(old)
+    RaceMetadataStore(tmp_path / ".finishreview/cyclerace_metadata_inbox.json").store(old)
+    original = (tmp_path / "cyclerace_race_metadata.json").read_bytes()
+    window = _window(tmp_path)
+    window.start_receiver()
+    incoming = _event(event_id="current-read", race_id="current-race", race_name="Current race",
+                      group_name="test", is_active=False)
+    _FakeReceiver.instances[-1].deliver(incoming)
+    qapp.processEvents()
+    try:
+        assert window._select_received_event("current-race", "stage-1")
+        target = window.output_dir
+        assert target != tmp_path
+        assert window._current_metadata().race_id == "current-race"
+        assert window._workspace_mode == "live"
+        assert window.passage_store.get(incoming.event_id) is not None
+        assert not (target / "cyclerace_race_metadata.json").exists()
+        assert (tmp_path / "cyclerace_race_metadata.json").read_bytes() == original
+        window.timeline_store.add_completed_segment(
+            source_id="camera_01_review", camera_index=1, video_path=target / "recorded.mkv",
+            media_started_at_ms=1000, media_duration_ms=2000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="current-race",
+        )
+    finally:
+        window.close()
+    restored = _window(tmp_path)
+    try:
+        assert restored.output_dir == target
+        assert restored._workspace_mode == "live"
+        assert restored._current_metadata().race_id == "current-race"
+        restored.start_receiver()
+        receiver = _FakeReceiver.instances[-1]
+        receiver.deliver(_event(event_id="old-replay", race_id="old-race"))
+        qapp.processEvents()
+        assert restored._current_metadata().race_id == "current-race"
+        authoritative = RaceMetadata(race_id="current-race", stage_id="stage-1", revision=1,
+                                     emitted_at_ms=1, race_name="Full current race")
+        receiver.deliver_metadata(authoritative)
+        qapp.processEvents()
+        assert restored.metadata_store.current() == authoritative
+    finally:
+        restored.close()
+
+
+def test_changing_root_keeps_inbox_races_even_when_target_has_old_metadata(qapp, tmp_path):
+    window = _window(tmp_path / "old")
+    window.start_receiver()
+    _FakeReceiver.instances[-1].deliver(_event(race_id="current-race", race_name="Current race", is_active=False))
+    qapp.processEvents()
+    target = tmp_path / "new"
+    RaceMetadataStore(target / "cyclerace_race_metadata.json").store(
+        RaceMetadata(race_id="historical", stage_id="stage-1", revision=1, emitted_at_ms=1))
+    try:
+        assert window._apply_settings(replace(window._current_settings(), output_dir=target))
+        assert "current-race" in {item.race_id for item in window._received_event_candidates()}
+        assert window._select_received_event("current-race", "stage-1")
+        assert window._current_metadata().race_id == "current-race"
+    finally:
+        window.close()
+
+
 def test_receiver_keeps_other_stage_in_inbox_before_metadata_arrives(qapp, tmp_path):
     window = _window(tmp_path)
     try:

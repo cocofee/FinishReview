@@ -88,7 +88,7 @@ from .preflight import (
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
 from .workspace_context import (
-    EventWorkspaceMetadataStore, recovered_archive_path, saved_archive_path, save_workspace_mode,
+    EventWorkspaceMetadataStore, recovered_archive_path, saved_archive_path, saved_received_path, save_workspace_mode,
 )
 from .review_export import export_review_summary
 from .review_clip import PassageReviewBindingStore
@@ -279,6 +279,15 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
             existing = None
         if existing is not None and existing.race_id == metadata.race_id:
             return candidate
+        scope_path = candidate / "review_event_scope.json"
+        if existing is None and scope_path.is_file():
+            import json
+            try:
+                scope = json.loads(scope_path.read_text(encoding="utf-8"))
+                if isinstance(scope, dict) and scope.get("race_id") == metadata.race_id:
+                    return candidate
+            except (OSError, ValueError):
+                pass
         try:
             is_empty = not any(candidate.iterdir())
         except OSError:
@@ -570,6 +579,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._settings_saver = settings_saver
         self._workspace_mode = "live"
         self._archive_background_passage_count = 0
+        self._live_metadata_scope = None
         # The base review surface starts timers while the production window is
         # still being assembled. Initialise health-check state before that
         # happens so an early clock tick cannot observe half-built state.
@@ -583,14 +593,19 @@ class FinishReviewWindow(PassageReviewSurface):
         self._receiver_metadata_store = RaceMetadataStore(
             inbox_dir / "cyclerace_metadata_inbox.json"
         )
-        restored_archive = ((saved_archive_path(self.workspace_root) or recovered_archive_path(self.workspace_root))
+        restored_received = (saved_received_path(self.workspace_root)
+                             if self.timing_provider == "cyclerace" else None)
+        restored_archive = ((saved_archive_path(self.workspace_root) or
+                             (None if restored_received else recovered_archive_path(self.workspace_root)))
                             if self.timing_provider == "cyclerace" else None)
+        if restored_received is not None:
+            self.output_dir = restored_received
         if restored_archive is not None:
             self.output_dir = restored_archive
             self._workspace_mode = "archive"
         if self.timing_provider == "cyclerace":
             inbox_metadata = self._receiver_metadata_store.current()
-            if inbox_metadata is not None and restored_archive is None:
+            if inbox_metadata is not None and restored_archive is None and restored_received is None:
                 restored_output_dir = _event_workspace_dir(
                     self.workspace_root,
                     inbox_metadata,
@@ -611,7 +626,8 @@ class FinishReviewWindow(PassageReviewSurface):
         # latest revisions, including inactive tombstones, before building the
         # review surface so an idle/withdrawn passage cannot reappear after a
         # restart.
-        if self.timing_provider == "cyclerace" and inbox_metadata is not None and self._workspace_mode == "live":
+        if (self.timing_provider == "cyclerace" and inbox_metadata is not None
+                and self._workspace_mode == "live" and restored_received is None):
             self._merge_cyclerace_events(
                 passage_store,
                 inbox_metadata.race_id,
@@ -623,7 +639,8 @@ class FinishReviewWindow(PassageReviewSurface):
             else EventWorkspaceMetadataStore(self.output_dir / "cyclerace_race_metadata.json",
                                              passage_store, timeline_store)
         )
-        if metadata_store is not None and metadata_store.recovered and timeline_store.segments():
+        if (metadata_store is not None and metadata_store.recovered and timeline_store.segments()
+                and restored_received is None):
             self._workspace_mode = "archive"
             metadata = metadata_store.current()
             metadata_store.select(metadata.race_id, metadata.stage_id)
@@ -1421,23 +1438,82 @@ class FinishReviewWindow(PassageReviewSurface):
         if not isinstance(self.metadata_store, EventWorkspaceMetadataStore):
             return
         candidates = self.metadata_store.candidates()
+        received = self._received_event_candidates()
         events = self.passage_store.events()
         counts = {}
         for event in events:
             scope = (event.race_id, event.stage_id)
             counts[scope] = counts.get(scope, 0) + 1
-        labels = [f"{index + 1}. {item.race_name} · {item.stage_name}"
+        labels = [f"历史目录 · {item.race_name} · {item.stage_name}"
                   f"（{counts.get((item.race_id, item.stage_id), 0)} 条）"
                   for index, item in enumerate(candidates)]
+        received_labels = [f"接入已收到的赛事 · {item.race_name} · {item.stage_name} [{item.race_id}]"
+                           for item in received]
+        labels = received_labels + labels
         if not labels:
             return
         current = self._current_metadata()
         index = next((i for i, item in enumerate(candidates) if current is not None
                       and (item.race_id, item.stage_id) == (current.race_id, current.stage_id)), 0)
-        label, accepted = QInputDialog.getItem(self, "选择赛事", "此目录中的赛事 / 赛段", labels, index, False)
+        label, accepted = QInputDialog.getItem(self, "选择赛事", "接入实时赛事，或查看历史目录", labels,
+                                              0 if received else index, False)
         if accepted:
-            item = candidates[labels.index(label)]
-            self._select_workspace_event(item.race_id, item.stage_id)
+            index = labels.index(label)
+            if index < len(received):
+                item = received[index]
+                self._select_received_event(item.race_id, item.stage_id)
+            else:
+                item = candidates[index - len(received)]
+                self._select_workspace_event(item.race_id, item.stage_id)
+
+    def _received_event_candidates(self):
+        if self.timing_provider != "cyclerace":
+            return ()
+        store = EventWorkspaceMetadataStore(
+            self._receiver_metadata_store.snapshot_path, self._receiver_passage_store,
+            VideoTimelineStore(self.workspace_root / ".finishreview" / "inbox_timeline.jsonl"),
+        )
+        received = self._receiver_passage_store.events(include_inactive=True)
+        times = {}
+        for event in received:
+            scope = (event.race_id, event.stage_id)
+            times[scope] = max(times.get(scope, 0), event.received_at_ms)
+        return tuple(sorted(store.candidates(), key=lambda item: -times.get((item.race_id, item.stage_id), 0)))
+
+    def _select_received_event(self, race_id, stage_id) -> bool:
+        if self._recording_any_active():
+            QMessageBox.warning(self, "无法切换赛事", "请先停止普通录像，再接入当前赛事。")
+            return False
+        metadata = next((item for item in self._received_event_candidates()
+                         if (item.race_id, item.stage_id) == (race_id, stage_id)), None)
+        if metadata is None:
+            return False
+        authoritative = self._receiver_metadata_store.current()
+        if authoritative is not None and (authoritative.race_id, authoritative.stage_id) == (race_id, stage_id):
+            return self._activate_cyclerace_workspace(authoritative, force=True, preserve_cyclerace_receiver=True)
+        try:
+            target = _event_workspace_dir(self.workspace_root, metadata)
+            target.mkdir(parents=True, exist_ok=True)
+            passages = PassageEventStore(target / "cyclerace_passage_events.jsonl")
+            self._merge_cyclerace_events(passages, race_id)
+            local = EventWorkspaceMetadataStore(target / "cyclerace_race_metadata.json", passages,
+                                                VideoTimelineStore(target / "video_timeline.jsonl"))
+            local.select(race_id, stage_id)
+            applied = self._apply_settings(
+                self._current_settings(output_dir=target), persist_settings=False,
+                update_workspace_root=False, preserve_cyclerace_receiver=True, reload_data_source=True,
+            )
+            if applied:
+                self._workspace_mode = "live"
+                save_workspace_mode(self.workspace_root, target, "live_received")
+                self._workspace_notice = "已接入收到的赛事；完整名单等待 CycleRace 同步"
+                self._capture_error = ""
+                self.refresh()
+                self._update_runtime_status()
+            return applied
+        except (OSError, RuntimeError, ValueError) as error:
+            QMessageBox.warning(self, "无法接入赛事", str(error))
+            return False
 
     def _select_workspace_event(self, race_id, stage_id) -> bool:
         if self._recording_any_active():
@@ -1707,6 +1783,14 @@ class FinishReviewWindow(PassageReviewSurface):
                     receiver_metadata_store = RaceMetadataStore(
                         inbox_dir / "cyclerace_metadata_inbox.json"
                     )
+                    # Changing storage roots must not discard already received
+                    # races merely because the destination contains an archive.
+                    for event in self._receiver_passage_store.events(include_inactive=True):
+                        receiver_passage_store.append(event)
+                    live_metadata = self._receiver_metadata_store.current()
+                    if (live_metadata is not None and self._live_metadata_scope ==
+                            (live_metadata.race_id, live_metadata.stage_id)):
+                        receiver_metadata_store.store(live_metadata)
                     if carried_metadata is not None:
                         receiver_metadata_store.store(carried_metadata)
                         for event in passage_store.events(include_inactive=True):
@@ -2000,7 +2084,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.event_name_label.setStyleSheet(
             "font-size: 11pt; font-weight: 700; color: #17212b;"
         )
-        self.event_name_label.setMinimumWidth(180)
+        self.event_name_label.setMinimumWidth(120)
         self.event_name_label.setSizePolicy(
             QSizePolicy.Ignored,
             QSizePolicy.Preferred,
@@ -2012,7 +2096,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.event_path_label.setStyleSheet(
             "font-size: 10pt; font-weight: 600; color: #667085;"
         )
-        self.event_path_label.setMinimumWidth(150)
+        self.event_path_label.setMinimumWidth(100)
         self.event_path_label.setSizePolicy(
             QSizePolicy.Ignored,
             QSizePolicy.Preferred,
@@ -2182,6 +2266,9 @@ class FinishReviewWindow(PassageReviewSurface):
         for value in context_values:
             if value and value not in detail_parts:
                 detail_parts.append(value)
+        if (self._workspace_mode == "live" and isinstance(self.metadata_store, EventWorkspaceMetadataStore)
+                and self.metadata_store.recovered):
+            detail_parts.append("完整赛事信息待同步")
         detail_text = " · ".join(detail_parts)
         identity_text = f"赛事ID：{race_id}\n" if race_id else ""
         self.event_name_label.setText(race_name)
@@ -2192,8 +2279,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.event_path_label.setToolTip(
             f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
         )
-        self.select_event_button.setVisible(isinstance(self.metadata_store, EventWorkspaceMetadataStore)
-                                            and len(self.metadata_store.candidates()) > 1)
+        self.select_event_button.setVisible(isinstance(self.metadata_store, EventWorkspaceMetadataStore))
         if metadata is None and len({(item.race_id, item.stage_id)
                                      for item in self.passage_store.events()}) > 1:
             self.event_name_label.setText("请选择赛事")
@@ -3430,6 +3516,7 @@ class FinishReviewWindow(PassageReviewSurface):
     def _on_passage_received(self, event: PassageEvent) -> None:
         if self._defer_capture_callback(self._on_passage_received, event):
             return
+        self._last_passage_monotonic = time.monotonic()
         if self.timing_provider == "cyclerace":
             if self._workspace_mode == "archive":
                 self._archive_background_passage_count += 1
@@ -3447,7 +3534,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 and inbox_metadata.race_id == event.race_id
                 and (
                     active_metadata is None
-                    or active_metadata.race_id != event.race_id
+                    or (active_metadata.race_id != event.race_id
+                        and self._live_metadata_scope == (event.race_id, event.stage_id))
                 )
             ):
                 self._activate_cyclerace_workspace(inbox_metadata)
@@ -3461,7 +3549,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 and (active_metadata.race_id, active_metadata.stage_id) != (event.race_id, event.stage_id)
             ):
                 self._capture_error = (
-                    f"收到赛事 {event.race_id} 的通过记录，等待CycleRace赛事信息"
+                    f"收到其他赛事：{event.race_name or event.race_id}。"
+                    "请点“选择赛事”接入，或等待 CycleRace 同步赛事信息。"
                 )
                 self._update_runtime_status()
                 return
@@ -3550,6 +3639,7 @@ class FinishReviewWindow(PassageReviewSurface):
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
         if self._defer_capture_callback(self._on_metadata_received, metadata):
             return
+        self._live_metadata_scope = (metadata.race_id, metadata.stage_id)
         if self._workspace_mode == "archive":
             self._update_runtime_status()
             return

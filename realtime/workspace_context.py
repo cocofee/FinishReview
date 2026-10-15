@@ -39,10 +39,19 @@ def _write_object(path, value):
 
 def saved_archive_path(root):
     """Restore only a root or direct-child archive inside the configured root."""
+    return _saved_path(root, "archive")
+
+
+def saved_received_path(root):
+    """An explicit live selection from the inbox must outrank old disk caches."""
+    return _saved_path(root, "live_received")
+
+
+def _saved_path(root, mode):
     root = Path(root).resolve()
     value = _read_object(root / ".finishreview" / ARCHIVE_FILENAME)
     relative = value.get("relative_path")
-    if value.get("mode") != "archive" or not isinstance(relative, str):
+    if value.get("mode") != mode or not isinstance(relative, str):
         return None
     candidate = (root / relative).resolve()
     if ((candidate == root or candidate.parent == root) and candidate.is_dir()
