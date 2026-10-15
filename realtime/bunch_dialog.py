@@ -16,9 +16,10 @@ from PyQt5.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .bunch_review import BunchContext, BunchReviewStore, align_counts, completion_issue, is_excluded, load_context
+from .bunch_review import (BunchContext, BunchReviewStore, align_counts, completion_issue, is_excluded, load_context,
+                           add_viewed, uncovered_intervals, review_candidates, group_member_batch)
 from .chip_history import format_chip_time
-from .line_sampling import load_strip
+from .line_sampling import load_strip, line_config_digest
 
 
 @dataclass
@@ -117,6 +118,9 @@ def group_strip(context: BunchContext, cancelled=lambda: False) -> tuple[np.ndar
             continue
         strip = load_strip(path)
         if (strip.meta or {}).get('segment_id') != segment.segment.segment_id:
+            continue
+        line = context.lines.get(segment.segment.segment_id, context.line)
+        if not line or (strip.meta or {}).get("line_digest") != line_config_digest(line):
             continue
         times = strip.pts_ms + segment.start_ms
         a, b = np.searchsorted(times, (context.start_ms, context.end_ms))
@@ -283,6 +287,8 @@ class BunchTimeline(QWidget):
         super().__init__()
         self.setFixedHeight(140)
         self.context, self.image, self.marks, self.current = None, None, [], None
+        self.viewed = []
+        self.candidates = []
         self.setToolTip('整团过线图：红色为芯片预期时刻，绿色为选手计数，灰色为已排除人员；点击跳到原帧')
 
     def paintEvent(self, event):
@@ -306,6 +312,11 @@ class BunchTimeline(QWidget):
         if self.current is not None:
             painter.setPen(QPen(QColor('#b400cc'), 2))
             painter.drawLine(xof(self.current), 35, xof(self.current), 119)
+        for left, right in self.viewed:
+            painter.fillRect(xof(left), 119, max(1, xof(right)-xof(left)), 4, QColor("#18834a"))
+        for candidate in self.candidates:
+            painter.setPen(QColor("#bb6b00"))
+            painter.drawLine(xof(candidate["start_ms"]), 39, xof(candidate["end_ms"]), 39)
         painter.setPen(QColor('#374151'))
         painter.drawText(0, 136, format_chip_time(ctx.start_ms))
         painter.drawText(max(0, self.width() - 100), 136, format_chip_time(ctx.end_ms))
@@ -341,7 +352,22 @@ class BunchReviewDialog(QDialog):
         header.addWidget(self.clock)
         layout.addLayout(header)
         self.timeline = BunchTimeline()
+        layout.addWidget(QLabel("整团过线图 / 芯片刻度（主界面的整场时间胶卷仍用于浏览整场录像）"))
         layout.addWidget(self.timeline)
+        attention = QHBoxLayout()
+        self.previous_candidate = QPushButton("上一候选疑点")
+        self.next_candidate = QPushButton("下一候选疑点")
+        self.previous_candidate.clicked.connect(lambda: self.navigate_candidate(-1))
+        self.next_candidate.clicked.connect(lambda: self.navigate_candidate(1))
+        attention.addWidget(self.previous_candidate)
+        attention.addWidget(self.next_candidate)
+        self.candidate_label = QLabel("候选定位不是已找全漏读；本团仍须完整点数。")
+        self.candidate_label.setWordWrap(True)
+        attention.addWidget(self.candidate_label, 1)
+        layout.addLayout(attention)
+        self.coverage_label = QLabel()
+        self.coverage_label.setWordWrap(True)
+        layout.addWidget(self.coverage_label)
         self.near = QLabel()
         self.near.setWordWrap(True)
         layout.addWidget(self.near)
@@ -350,7 +376,7 @@ class BunchReviewDialog(QDialog):
         split.addWidget(self.view)
         sidebar = QWidget()
         side = QVBoxLayout(sidebar)
-        instructions = QLabel('① 从头逐帧看，点前轮每人一次\n② 看清号码后填入所选计数\n③ 核对芯片与人数，再确认完成\n滚轮放大，拖动查看；双击还原')
+        instructions = QLabel('① 检查候选疑点，再逐帧完整点数\n② 正常计数不必填号码；只对漏读等疑点认号\n③ 局部查看或总数相等不能直接关闭整团\n滚轮放大，拖动查看；双击还原')
         instructions.setWordWrap(True)
         side.addWidget(instructions)
         self.count_table = QTableWidget(0, 4)
@@ -393,6 +419,9 @@ class BunchReviewDialog(QDialog):
         self.chip_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.chip_table.verticalHeader().hide()
         side.addWidget(self.chip_table, 1)
+        self.members_button = QPushButton("按成员核对额外芯片 / 暂存")
+        self.members_button.clicked.connect(self.review_members)
+        side.addWidget(self.members_button)
         bias_row = QHBoxLayout()
         bias_row.addWidget(QLabel('前轮比刻度晚'))
         self.bias = QSpinBox()
@@ -422,7 +451,7 @@ class BunchReviewDialog(QDialog):
         self.position = QLabel()
         navigation.addWidget(self.position)
         layout.addLayout(navigation)
-        self.notice = QLabel('左键点击压线前轮计一人；相隔 150 ms 以内，时间顺序不能认人，须看号码或按名单排除。')
+        self.notice = QLabel('左键点击压线前轮计一人；密集刻度只作顺序参考，不要求给正常成员逐一认号；遮挡无法点清则保留待核。')
         self.notice.setWordWrap(True)
         layout.addWidget(self.notice)
         bottom = QHBoxLayout()
@@ -472,6 +501,9 @@ class BunchReviewDialog(QDialog):
     def restore(self):
         record = self.store.get(self.context) or {}
         self.marks = list(record.get('marks', []))
+        self.viewed_ranges = list(record.get("viewed_ranges", []))
+        self.visited_candidates = set(record.get("visited_candidates", []))
+        self.selected_candidate = None
         self.elapsed, self.started = float(record.get('seconds', 0)), None
         self.fully_viewed.blockSignals(True)
         self.fully_viewed.setChecked(record.get('fully_viewed', False))
@@ -546,6 +578,13 @@ class BunchReviewDialog(QDialog):
         if number != self.request_number or self.closing:
             return
         self.frame, self.busy = frame, False
+        self.viewed_ranges = add_viewed(self.viewed_ranges, frame.recorder_ms, self.context.start_ms, self.context.end_ms)
+        if self.selected_candidate:
+            candidate = next((c for c in self.candidates if c["id"] == self.selected_candidate), None)
+            if candidate and candidate["start_ms"]-100 <= frame.recorder_ms <= candidate["end_ms"]+100:
+                self.visited_candidates.add(candidate["id"])
+        self.dirty = True
+        self.update_attention()
         self.prev_button.setEnabled(frame.recorder_ms > self.context.start_ms + 20)
         self.next_button.setEnabled(frame.recorder_ms < self.context.end_ms - 20)
         self.position.setText(f"{format_chip_time(frame.recorder_ms)} · 第 {frame.ref['frame_index'] + 1} 帧")
@@ -560,7 +599,7 @@ class BunchReviewDialog(QDialog):
         image = cv2.imdecode(np.frombuffer(frame.jpeg, np.uint8), cv2.IMREAD_COLOR)
         marks = [(i, m) for i, m in enumerate(self.marks) if m['frame']['segment_id'] == frame.ref['segment_id']
                  and m['frame']['frame_index'] == frame.ref['frame_index']]
-        self.view.show_frame(image, self.context.line, marks, frame)
+        self.view.show_frame(image, self.context.lines.get(frame.ref['segment_id'], self.context.line), marks, frame)
         result = align_counts(self.context.chips, self.marks, self.bias.value())
         nearby = [f'{chip.bib}（{chip.recorder_ms + result["bias_ms"] - frame.recorder_ms:+d} ms）'
                   for chip in self.context.chips if abs(chip.recorder_ms + result['bias_ms'] - frame.recorder_ms) <= 200]
@@ -606,6 +645,7 @@ class BunchReviewDialog(QDialog):
         result = align_counts(self.context.chips, self.marks, self.bias.value())
         excluded = sum(is_excluded(mark) for mark in self.marks)
         self.summary.setText(f'芯片 {len(self.context.chips)} 个 · 选手计数 {len(self.marks) - excluded} 人 · '
+                             f'人工认号 {sum(bool(m.get("bib")) and not is_excluded(m) for m in self.marks)} 人 · '
                              f'已排除 {excluded} 人 · '
                              f'多出 {len(result["extras"])} 人 · 未对应芯片 {len(result["missing"])} 个')
         selected = self.count_table.currentRow()
@@ -619,7 +659,7 @@ class BunchReviewDialog(QDialog):
                 chip = self.context.chips[result['pairs'][i]]
                 status = ('同号芯片 ' if mark.get('bib') else '顺序参考 ') + chip.bib
                 if i in result['ambiguous']:
-                    status += '；密集，须认号'
+                    status += '；密集，仅作参考'
             else:
                 extra = extras[i]
                 status = ('多出；估算 ' + format_chip_time(extra['chip_time_ms']) if extra['chip_time_ms'] is not None
@@ -641,7 +681,58 @@ class BunchReviewDialog(QDialog):
                 self.chip_table.setItem(i, column, QTableWidgetItem(value))
         self.chip_table.resizeColumnsToContents()
         self.timeline.marks = self.marks
+        self.update_attention()
         self.timeline.update()
+
+    def update_attention(self):
+        result = align_counts(self.context.chips, self.marks, self.bias.value())
+        self.candidates = review_candidates(self.context, self.marks, result)
+        unseen = [c for c in self.candidates if c["id"] not in self.visited_candidates]
+        self.previous_candidate.setEnabled(bool(self.candidates))
+        self.next_candidate.setEnabled(bool(self.candidates))
+        selected = next((c for c in self.candidates if c["id"] == self.selected_candidate), None)
+        self.candidate_label.setText(f"候选 {len(self.candidates)} 处 / 未查看 {len(unseen)} 处；"
+                                     + (selected["reason"] if selected else "只定位已有证据，仍须完整点数"))
+        missing = uncovered_intervals(self.context.start_ms, self.context.end_ms, self.viewed_ranges, tolerance=100)
+        ranges = "、".join(f"{format_chip_time(a)}–{format_chip_time(b)}" for a, b in missing[:3])
+        self.coverage_label.setText(f"未查看 {sum(b-a for a,b in missing)/1000:.1f} 秒"
+                                   + (f"：{ranges}" if ranges else "；本团已逐帧覆盖，请确认计数完整")
+                                   + (f"；原录像缺口 {len(self.context.gaps)} 处，保留待核" if self.context.gaps else ""))
+        self.fully_viewed.setEnabled(not missing and not self.context.gaps)
+        if missing or self.context.gaps:
+            self.fully_viewed.blockSignals(True)
+            self.fully_viewed.setChecked(False)
+            self.fully_viewed.blockSignals(False)
+        self.timeline.viewed, self.timeline.candidates = self.viewed_ranges, self.candidates
+        self.timeline.update()
+
+    def navigate_candidate(self, direction):
+        if not self.candidates:
+            return
+        indexes = [i for i, c in enumerate(self.candidates) if c["id"] == self.selected_candidate]
+        index = ((indexes[0]+direction) % len(self.candidates)) if indexes else (0 if direction > 0 else len(self.candidates)-1)
+        candidate = self.candidates[index]
+        self.selected_candidate = candidate["id"]
+        self.seek(candidate["start_ms"])
+        self.update_attention()
+
+    def review_members(self):
+        from .batch_dialog import BatchReviewDialog
+        self.view.flush_click()
+        if self.dirty and not self.save(False):
+            return
+        try:
+            batch = group_member_batch(self.context)
+            def current(_identity):
+                return group_member_batch(load_context(self.context.workspace, self.context.item, self.context.camera))
+            dialog = BatchReviewDialog(self.context.workspace / "finish_problems", batch, current, lambda: (),
+                                       lambda frame: self.seek(next((s.start_ms for s in self.context.segments
+                                           if s.segment.segment_id == frame.get("segment_id")), self.context.start_ms)
+                                           + frame.get("position_ms", 0)), self)
+            dialog.exec_()
+            self.notice.setText("成员决定已保留；未对应芯片仍须核实，整团继续待核。")
+        except (OSError, ValueError, RuntimeError) as error:
+            self.notice.setText(f"成员核对不可用：{error}")
 
     def select_count(self, row, *_args):
         valid = 0 <= row < len(self.marks)
@@ -693,6 +784,9 @@ class BunchReviewDialog(QDialog):
         self.view.flush_click()
         result = align_counts(self.context.chips, self.marks, self.bias.value())
         if completed:
+            if self.context.gaps or uncovered_intervals(self.context.start_ms, self.context.end_ms, self.viewed_ranges, tolerance=100):
+                self.notice.setText("仍有未查看范围或原录像缺口；不能只查看候选就关闭整团。")
+                return False
             issue = completion_issue(self.context.chips, self.marks, result, self.fully_viewed.isChecked())
             if issue:
                 self.notice.setText(issue)
@@ -709,7 +803,8 @@ class BunchReviewDialog(QDialog):
             if current.signature != self.context.signature:
                 raise ValueError('芯片、录像索引或校时已变化，请重新打开本团核对；当前结果未覆盖。')
             self.store.save(self.context, self.marks, self.seconds(), completed=completed,
-                            fully_viewed=self.fully_viewed.isChecked(), fallback_bias_ms=self.bias.value())
+                            fully_viewed=self.fully_viewed.isChecked(), fallback_bias_ms=self.bias.value(),
+                            viewed_ranges=self.viewed_ranges, visited_candidates=self.visited_candidates)
         except (ValueError, RuntimeError, OSError) as error:
             self.notice.setText(f'未保存：{error}')
             return False

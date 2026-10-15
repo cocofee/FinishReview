@@ -328,9 +328,18 @@ def export_lists(
                 "、".join(_passage_number(event_id) for event_id in item.event_ids), title, resolution.reason,
             ))
     from .batch_review import BatchDecisionStore, member_key
+    from .bunch_review import group_member_batch, load_context
+    from .problem_items import KIND_BUNCH, KIND_OBSTRUCTION
     batch_store = BatchDecisionStore(store.journal_path.parent)
     exported = set()
     for item in items:
+        if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION) and not item.grouped:
+            try:
+                record = bunches.latest_for(item)
+                context = load_context(store.journal_path.parent.parent, item, record["camera"] if record else None)
+                item = group_member_batch(context)
+            except (ValueError, OSError):
+                continue
         for member in item.evidence.get("batch_members", []):
             key = member_key(item, member)
             if key in exported or batch_store.state(item, member, events) != "待 CycleRace":

@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import QApplication
 from realtime.bunch_dialog import BunchDecoder, BunchReviewDialog, CountView
 from realtime.bunch_review import (
     BunchChip, BunchReviewStore, align_counts, completion_issue, load_context,
+    add_viewed, uncovered_intervals, review_candidates, group_member_batch,
 )
 from realtime.clock_sync import ClockModel, ClockModelStore
 from realtime.passage_receiver import PassageEvent
@@ -356,3 +357,245 @@ def test_zoom_double_click_adds_no_rider_and_rapid_clicks_keep_source_frame():
     assert len(counted) == 2
     assert all(args[3] is source for args in counted)
     view.close()
+
+
+def test_legacy_group_without_frame_uses_only_unique_calibrated_camera(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    original = load_context(root, item)
+    legacy = replace(item, evidence={})
+    assert load_context(root, legacy).camera == 1
+    # Another available camera makes an unlabelled legacy item ambiguous.
+    timeline = VideoTimelineStore(root / 'video_timeline.jsonl')
+    segment = original.segments[0]
+    camera2_path = segment.path.with_name('camera_02_20260919_100000_archive_0000.avi')
+    camera2_path.write_bytes(segment.path.read_bytes())
+    timeline.add_completed_segment(source_id='cam2', camera_index=2, video_path=camera2_path,
+                                   media_started_at_ms=T, media_duration_ms=8000, clock_source='videopipe_system_clock',
+                                   timing_error_ms=0, end_reason='continuous_archive_fallback', race_id='synthetic')
+    ClockModelStore(root / 'video_clock_models.jsonl').publish(replace(original.model, camera_index=2))
+    with pytest.raises(ValueError, match='唯一'):
+        load_context(root, legacy)
+    assert load_context(root, replace(legacy, evidence={'camera_index': 2})).camera == 2
+
+
+def test_seeking_first_and_last_frames_cannot_cover_unseen_middle(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    ranges = add_viewed([], context.start_ms, context.start_ms, context.end_ms)
+    ranges = add_viewed(ranges, context.end_ms, context.start_ms, context.end_ms)
+    assert uncovered_intervals(context.start_ms, context.end_ms, ranges)
+    counts = [mark(c.recorder_ms-T) for c in context.chips]
+    result = align_counts(context.chips, counts)
+    assert not result['missing'] and not result['extras']
+    store = BunchReviewStore(root / 'finish_problems')
+    with pytest.raises(ValueError, match='未查看'):
+        store.save(context, counts, 10, completed=True, fully_viewed=True, viewed_ranges=ranges)
+    store.save(context, counts, 10, viewed_ranges=ranges, visited_candidates=['count_difference'])
+    restored = store.get(context)
+    assert restored['viewed_ranges'] == ranges
+    assert restored['visited_candidates'] == ['count_difference']
+    assert not restored['completed']
+
+
+def test_normal_complete_count_does_not_require_names(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    counts = [mark(c.recorder_ms-T) for c in context.chips]
+    ranges = []
+    for timestamp in range(context.start_ms, context.end_ms+50, 50):
+        ranges = add_viewed(ranges, timestamp, context.start_ms, context.end_ms)
+    store = BunchReviewStore(root / 'finish_problems')
+    saved = store.save(context, counts, 20, fully_viewed=True, completed=True, viewed_ranges=ranges)
+    assert saved['counted_riders'] == 4 and saved['identified_riders'] == 0
+    assert saved['completed'] and not saved['extras']
+
+
+def test_actual_recording_gap_blocks_completion_even_if_checkbox_set(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    # First segment ends before this final group time, and the second was lost.
+    next((root / 'videos').glob('*0001.avi')).unlink()
+    context = load_context(root, item)
+    assert context.gaps
+    counts = [mark(c.recorder_ms-T) for c in context.chips]
+    store = BunchReviewStore(root / 'finish_problems')
+    with pytest.raises(ValueError, match='缺口'):
+        store.save(context, counts, 10, completed=True, fully_viewed=True)
+    assert any(c['id'].startswith('gap:') for c in review_candidates(context, counts, align_counts(context.chips, counts)))
+
+
+def test_candidate_navigation_uses_child_evidence_and_unmatched_counts(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    item = replace(item, evidence=dict(item.evidence, video_count=3))
+    context = load_context(root, item)
+    directory = root / 'finish_problems'
+    directory.mkdir()
+    child = ProblemItem('child', 'no_chip_crossing', CATEGORY_VIDEO, 'candidate',
+                        evidence={'group': item.item_id, 'recorder_ms': T+2800, 'frame': {'camera_index': 1}})
+    (directory / 'problem_list.json').write_text(json.dumps({'items': [item.to_payload(), child.to_payload()]}))
+    counts = [mark(2300), mark(2800, 'unread'), mark(3300)]
+    candidates = review_candidates(context, counts, align_counts(context.chips, counts))
+    assert {c['id'] for c in candidates} >= {'child', 'count_difference', 'extra:1', 'chip:e-2'}
+    assert next(c for c in candidates if c['id']=='child')['start_ms'] == T+2550
+
+
+def test_member_deletion_in_group_exports_one_record_and_blocks_completion(synthetic_bunch):
+    from realtime.batch_review import BatchDecisionStore
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    batch = group_member_batch(context)
+    store = BatchDecisionStore(root / 'finish_problems')
+    store.save(batch, [context.chips[0].event_id], 'delete', 'extra chip reviewed')
+    resolutions = ProblemResolutionStore(root / 'finish_problems/problem_resolutions.jsonl')
+    assert export_lists([item], resolutions, root / 'exports')['建议删除清单.csv'] == 1
+    rows = list(csv.DictReader((root / 'exports/建议删除清单.csv').open(encoding='utf-8-sig')))
+    assert rows[0]['事件ID'] == context.chips[0].event_id
+    counts = [mark(c.recorder_ms-T) for c in context.chips]
+    with pytest.raises(ValueError, match='成员'):
+        BunchReviewStore(root / 'finish_problems').save(context, counts, 30, completed=True, fully_viewed=True)
+
+
+def test_group_context_revision_changes_invalidate_draft(synthetic_bunch):
+    root, item, events = synthetic_bunch
+    context = load_context(root, item)
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, [], 10)
+    with (root / 'cyclerace_passage_events.jsonl').open('a', encoding='utf-8') as stream:
+        stream.write(json.dumps(replace(events[0], revision=events[0].revision+1).to_payload())+'\n')
+    revised = load_context(root, item)
+    assert revised.chips[0].revision != context.chips[0].revision
+    assert store.get(revised) is None
+
+
+def test_dialog_local_navigation_leaves_group_pending_and_tracks_frames(synthetic_bunch):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    item = replace(item, evidence=dict(item.evidence, video_count=2))
+    dialog = BunchReviewDialog(root, item)
+    try:
+        for _ in range(100):
+            app.processEvents(QEventLoop.AllEvents, 50)
+            if not dialog.busy:
+                break
+            QTest.qWait(10)
+        assert dialog.frame is not None
+        assert dialog.candidates and dialog.viewed_ranges
+        assert not dialog.fully_viewed.isEnabled()
+        assert not dialog.save(True)
+        dialog.navigate_candidate(1)
+        for _ in range(100):
+            app.processEvents(QEventLoop.AllEvents, 50)
+            if not dialog.busy:
+                break
+            QTest.qWait(10)
+        assert 'count_difference' in dialog.visited_candidates
+        assert dialog.save(False)
+        assert not dialog.store.get(dialog.context)['completed']
+    finally:
+        dialog.close()
+        dialog.worker.requestInterruption()
+        assert dialog.worker.wait(3000)
+        app.processEvents()
+
+
+@pytest.mark.parametrize('running,paused', [(True, False), (True, True), (False, False), (False, True)])
+def test_group_entry_preserves_analysis_schedule_and_chip_receiver(synthetic_bunch, monkeypatch, running, paused):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    directory = root / 'finish_problems'
+    directory.mkdir()
+    (directory / 'problem_list.json').write_text(json.dumps({'items': [item.to_payload()]}))
+    panel = ProblemListPanel()
+    panel.set_workspace(root)
+    panel.table.setCurrentCell(0, 0)
+    receiver = object()
+    panel._chip_process = receiver
+    panel._process = object() if running else None
+    panel._live_paused = paused
+    calls = []
+
+    def stop():
+        assert panel._live_paused
+        panel._process = None
+        calls.append('stop')
+
+    class Dialog:
+        saved_completed = False
+
+        def __init__(self, *args):
+            pass
+
+        def exec_(self):
+            assert panel._process is None and panel._live_paused
+            assert panel._chip_process is receiver
+            calls.append('dialog')
+
+    monkeypatch.setattr('realtime.bunch_dialog.BunchReviewDialog', Dialog)
+    monkeypatch.setattr(panel, 'stop_analysis', stop)
+    monkeypatch.setattr(panel, '_start_analysis', lambda: calls.append('start'))
+    try:
+        panel._open_bunch()
+        assert calls == ['stop', 'dialog'] + (['start'] if running and not paused else [])
+        assert panel._live_paused == paused and panel._chip_process is receiver
+    finally:
+        panel._chip_process = None
+        monkeypatch.setattr(panel, 'stop_analysis', lambda: None)
+        panel.close()
+        app.processEvents()
+
+
+def test_cross_segment_strip_rejects_stale_line_and_keeps_cache_gap(synthetic_bunch):
+    from realtime.bunch_dialog import group_strip
+    from realtime.line_sampling import LineGeometry, LineStrip, line_config_digest, save_strip
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    directory = root / 'finish_problems/strips/camera_01'
+    directory.mkdir(parents=True)
+    for segment in context.segments:
+        line = context.lines[segment.segment.segment_id]
+        geometry = LineGeometry.from_config(line, 160, 120, samples=10)
+        strip = LineStrip(np.zeros((10, 80, 3), np.uint8), np.arange(80)*50, geometry, str(segment.path), 20)
+        save_strip(directory / (segment.path.stem+'.npz'), strip,
+                   {'segment_id': segment.segment.segment_id, 'line_digest': line_config_digest(line)})
+    image, present = group_strip(context)
+    assert present and image[:, :800].mean() < 30 and image[:, 1000:].mean() < 30
+    last = context.segments[-1].segment.segment_id
+    changed = dict(context.lines[last], y1=.7)
+    context.lines[last] = changed
+    image, present = group_strip(context)
+    assert present and image[:, :700].mean() < 30
+    assert np.all(image[:, 1000:] == 230)
+
+
+def test_later_member_hold_reopens_group_and_suppresses_manual_export(synthetic_bunch):
+    from realtime.batch_review import BatchDecisionStore
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    counts = [mark(c.recorder_ms-T) for c in context.chips] + [mark(2800, '319')]
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, counts, 20, completed=True, fully_viewed=True)
+    assert len(store.manual_entries([item], root)) == 1
+    BatchDecisionStore(root / 'finish_problems').save(
+        group_member_batch(context), [context.chips[0].event_id], 'hold', 'needs another camera')
+    assert store.manual_entries([item], root) == []
+    (root / 'finish_problems/problem_list.json').write_text(json.dumps({'items': [item.to_payload()]}))
+    panel = ProblemListPanel()
+    panel.set_workspace(root)
+    assert panel.state(item) == '待处理'
+    panel.close()
+    app.processEvents()
+
+
+def test_obstruction_and_two_unread_counts_remain_pending(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, replace(item, kind='obstruction'))
+    counts = [mark(c.recorder_ms-T) for c in context.chips] + [mark(2800), mark(3900)]
+    result = align_counts(context.chips, counts)
+    assert len(result['extras']) == 2
+    assert any(c['id'] == 'obstruction' for c in review_candidates(context, counts, result))
+    store = BunchReviewStore(root / 'finish_problems')
+    saved = store.save(context, counts, 20, viewed_ranges=[[context.start_ms, context.end_ms]])
+    assert saved['counted_riders'] == 6 and saved['identified_riders'] == 0
+    with pytest.raises(ValueError, match='号码'):
+        store.save(context, counts, 20, completed=True, fully_viewed=True)
+    assert store.manual_entries([context.item], root) == []

@@ -505,7 +505,7 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
         start = model.to_recorder(group[0].chip_ms) - BUNCH_MARGIN_MS
         end = model.to_recorder(group[-1].chip_ms) + BUNCH_MARGIN_MS
         video = sum(start <= value <= end for value in crossings)
-        evidence = {"recorder_start_ms": int(start), "recorder_end_ms": int(end), "video_count": video,
+        evidence = {"camera_index": camera_index, "recorder_start_ms": int(start), "recorder_end_ms": int(end), "video_count": video,
                     "chip_count": len(group)}
         evidence.update(_period_anchor(records, start, end, version))
         items.append(ProblemItem(
@@ -551,7 +551,7 @@ def _obstruction_items(
             chip_time_ms=model.to_chip(start), bibs=tuple(read.bib for read in inside),
             event_ids=tuple(read.event_id for read in inside), status=STATUS_OPEN, priority=60,
             evidence={
-                "recorder_start_ms": int(start), "recorder_end_ms": int(end), "unverified": weak,
+                "camera_index": camera_index, "recorder_start_ms": int(start), "recorder_end_ms": int(end), "unverified": weak,
                 **_period_anchor(records, start, end, version),
             },
             calibration_version=version,

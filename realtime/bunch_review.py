@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,8 @@ class BunchChip:
     bib: str
     chip_ms: int
     recorder_ms: int
+    revision: int = 0
+    chip_id: str = ""
 
 
 @dataclass
@@ -42,6 +45,16 @@ class BunchContext:
     start_ms: int
     end_ms: int
     line: dict
+    lines: dict = field(default_factory=dict)
+    gaps: list = field(default_factory=list)
+    settings_token: str = ""
+
+    @cached_property
+    def child_items(self):
+        path = self.workspace / "finish_problems/problem_list.json"
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        return [child for child in payload.get("items", [])
+                if child.get("evidence", {}).get("group") == self.item.item_id]
 
     @property
     def signature(self) -> str:
@@ -50,6 +63,7 @@ class BunchContext:
             "model": self.model.to_payload(), "chips": [asdict(chip) for chip in self.chips],
             "segments": [(s.segment.segment_id, str(s.path), s.start_ms, s.end_ms) for s in self.segments],
             "line": self.line,
+            "lines": self.lines, "gaps": self.gaps, "settings_token": self.settings_token,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -58,11 +72,19 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
     from .problem_analysis import config_from_workspace, line_for_segment
 
     workspace = Path(workspace)
-    source = AnalysisWorkspace(workspace)
+    if item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
+        raise ValueError("本团证据已变化，请重新分析后再核对。")
+    source = AnalysisWorkspace(workspace, include_review_segments=True)
     frame = item.evidence.get("frame") or {}
-    camera = camera or int(frame.get("camera_index", 1))
     clocks = ClockModelStore(workspace / CLOCK_MODEL_FILENAME)
-    model = (clocks.get(camera, item.calibration_version) if camera == frame.get("camera_index")
+    primary = frame.get("camera_index") or item.evidence.get("camera_index")
+    if camera is None and primary is None:
+        candidates = [index for index in source.camera_indexes() if clocks.get(index, item.calibration_version)]
+        if len(candidates) != 1:
+            raise ValueError("旧集团缺少机位证据，无法唯一确定原机位；请重新分析生成集团入口。")
+        primary = candidates[0]
+    camera = int(camera or primary)
+    model = (clocks.get(camera, item.calibration_version) if primary is None or camera == int(primary)
              else clocks.latest(camera))
     if model is None:
         raise ValueError(f"机位 {camera} 缺少本条问题对应的校时版本，请先校时或重新分析。")
@@ -79,12 +101,16 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
                     if segment.start_ms <= model.to_recorder(read.chip_ms, segment.session_id) <= segment.end_ms]
         session = next((segment.session_id for segment in sessions if segment.session_id == frame.get('session_id')),
                        sessions[0].session_id if sessions else '')
-        chips.append(BunchChip(event_id, bib, read.chip_ms, int(model.to_recorder(read.chip_ms, session))))
+        latest = source.latest_event(event_id)
+        if latest is not None and (latest.lap != read.lap or latest.bib != bib):
+            raise ValueError(f"芯片 {bib} 的身份或圈次已变化，请重新分析。")
+        chips.append(BunchChip(event_id, bib, read.chip_ms, int(model.to_recorder(read.chip_ms, session)),
+                               latest.revision if latest else read.latest_revision, read.chip_id))
     chips.sort(key=lambda c: c.chip_ms)
     if not chips:
         raise ValueError("本团没有可核对的芯片记录。")
     start, end = chips[0].recorder_ms - 1500, chips[-1].recorder_ms + 1500
-    if camera == frame.get("camera_index"):
+    if primary is not None and camera == int(primary):
         start = min(start, int(item.evidence.get("recorder_start_ms", start)))
         end = max(end, int(item.evidence.get("recorder_end_ms", end)))
     segments = tuple(s for s in archives if s.start_ms <= end and s.end_ms >= start)
@@ -94,7 +120,96 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
     anchor = next((segment for segment in segments if segment.segment.segment_id == frame.get("segment_id")), segments[0])
     line = dict((frame.get("line_config") if camera == frame.get("camera_index") else None)
                 or line_for_segment(config, source, anchor) or {})
-    return BunchContext(workspace, item, camera, model, chips, segments, start, end, line)
+    lines = {s.segment.segment_id: dict(line_for_segment(config, source, s) or {}) for s in segments}
+    if frame.get("line_config") and camera == frame.get("camera_index"):
+        lines[anchor.segment.segment_id] = dict(frame["line_config"])
+    gaps = uncovered_intervals(start, end, [(s.start_ms, s.end_ms) for s in segments], tolerance=100)
+    return BunchContext(workspace, item, camera, model, chips, segments, start, end, line,
+                        lines, gaps, config.settings_token)
+
+
+def uncovered_intervals(start, end, ranges, tolerance=0):
+    cursor, gaps = start, []
+    for left, right in sorted(ranges):
+        if right < cursor or left > end:
+            continue
+        if left > cursor + tolerance:
+            gaps.append([cursor, min(left, end)])
+        cursor = max(cursor, min(right, end))
+    if cursor < end - tolerance:
+        gaps.append([cursor, end])
+    return gaps
+
+
+def add_viewed(ranges, timestamp, start, end):
+    """Only decoded frames contribute; seeking across a gap never fills it."""
+    merged = []
+    for left, right in sorted([*ranges, [max(start, timestamp-50), min(end, timestamp+50)]]):
+        if right < left:
+            continue
+        if merged and left <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], right)
+        else:
+            merged.append([left, right])
+    return merged
+
+
+def review_candidates(context, marks, result):
+    """Explainable navigation hints, never a claim to have found every rider."""
+    candidates = {}
+    def add(key, start, end, reason):
+        start, end = max(context.start_ms, int(start)), min(context.end_ms, int(end))
+        if start <= end:
+            candidates[str(key)] = {"id": str(key), "start_ms": start, "end_ms": end, "reason": reason}
+    item = context.item
+    if item.kind == "obstruction":
+        add("obstruction", context.start_ms, context.end_ms, "遮挡 / 拥挤：仍须检查完整时段")
+    count = item.evidence.get("video_count")
+    if count is not None and count != len(context.chips):
+        add("count_difference", context.start_ms, context.end_ms, f"自动候选 {count} / 芯片 {len(context.chips)}：数量差仅定位本团")
+    for child in context.child_items:
+        evidence = child.get("evidence", {})
+        child_frame = evidence.get("frame") or {}
+        if child_frame.get("camera_index", context.camera) != context.camera:
+            continue
+        timestamp = evidence.get("recorder_ms", evidence.get("expected_recorder_ms"))
+        if timestamp is not None:
+            add(child["item_id"], timestamp-250, timestamp+250, child.get("title", child["kind"]))
+    for a, b in zip(context.chips, context.chips[1:]):
+        if b.recorder_ms-a.recorder_ms <= 150:
+            add("dense:"+a.event_id, a.recorder_ms-250, b.recorder_ms+250, "密集 / 可能并排：时间刻度不代表身份")
+    if marks:
+        for extra in result["extras"]:
+            index = extra["mark"]
+            timestamp = marks[index]["recorder_ms"]
+            add(f"extra:{index}", timestamp-150, timestamp+150, "人工计数未对应芯片；号码可暂留空")
+        for index in result["missing"]:
+            chip = context.chips[index]
+            add("chip:"+chip.event_id, chip.recorder_ms-250, chip.recorder_ms+250, "芯片尚无人工计数对应："+chip.bib)
+    for index, (left, right) in enumerate(context.gaps):
+        add(f"gap:{index}", left, right, "原录像缺口：不能确认完整团段")
+    return sorted(candidates.values(), key=lambda c: (c["start_ms"], c["end_ms"], c["id"]))
+
+
+def group_member_batch(context):
+    """Use the same member decision contract for extra chips within a group."""
+    from .batch_review import read_snapshots
+    from .problem_items import KIND_BATCH_READS
+    from dataclasses import replace
+    source = AnalysisWorkspace(context.workspace)
+    snapshots = read_snapshots(source.reads, source.metadata(), source.latest_event)
+    members = [snapshots[c.event_id] for c in context.chips if c.event_id in snapshots]
+    return replace(context.item, kind=KIND_BATCH_READS,
+                   evidence=dict(context.item.evidence, batch_scope=[source.race_id, source.stage_id],
+                                 batch_members=members, analysis_signature=context.signature))
+
+
+def pending_member_decisions(context):
+    from .batch_review import BatchDecisionStore
+    batch = group_member_batch(context)
+    decisions = BatchDecisionStore(context.workspace / "finish_problems")
+    return any(decisions.state(batch, member) in ("待 CycleRace", "需要重查", "暂存")
+               for member in batch.evidence["batch_members"])
 
 
 def is_excluded(mark: dict) -> bool:
@@ -217,9 +332,15 @@ class BunchReviewStore:
         return records[-1] if records else None
 
     def save(self, context: BunchContext, marks: list[dict], seconds: float, *, completed=False,
-             fully_viewed=False, fallback_bias_ms=0) -> dict:
+             fully_viewed=False, fallback_bias_ms=0, viewed_ranges=None, visited_candidates=()) -> dict:
         result = align_counts(context.chips, marks, fallback_bias_ms)
         if completed:
+            if context.gaps:
+                raise ValueError("原录像存在缺口，不能确认本团已完整核对。")
+            if viewed_ranges is not None and uncovered_intervals(context.start_ms, context.end_ms, viewed_ranges, tolerance=100):
+                raise ValueError("仍有未查看范围，不能只查看局部候选就关闭整团。")
+            if pending_member_decisions(context):
+                raise ValueError("仍有成员建议待交接、暂存或需重查，整团不能确认完成。")
             issue = completion_issue(context.chips, marks, result, fully_viewed)
             if issue:
                 raise ValueError(issue)
@@ -229,6 +350,11 @@ class BunchReviewStore:
                   "marks": marks, "seconds": round(seconds, 1), "completed": completed,
                   "fully_viewed": fully_viewed, "fallback_bias_ms": fallback_bias_ms,
                   "extras": result["extras"]}
+        if viewed_ranges is not None:
+            record["viewed_ranges"] = viewed_ranges
+            record["visited_candidates"] = list(visited_candidates)
+        record["counted_riders"] = sum(not is_excluded(m) for m in marks)
+        record["identified_riders"] = sum(not is_excluded(m) and bool(m.get("bib", "").strip()) for m in marks)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         append_jsonl_records(self.path, [json.dumps(record, ensure_ascii=False).encode("utf-8")],
                              description="bunch review journal")
@@ -253,6 +379,11 @@ class BunchReviewStore:
                 continue
             if self.get(context) is None:
                 continue  # changed chips, calibration, geometry or evidence: ask again
+            if pending_member_decisions(context):
+                continue
+            if context.gaps or ("viewed_ranges" in record and uncovered_intervals(
+                    context.start_ms, context.end_ms, record["viewed_ranges"], tolerance=100)):
+                continue
             # Recompute from the saved evidence so stale cached extras cannot
             # reintroduce an excluded person or an incomplete group's suggestions.
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))

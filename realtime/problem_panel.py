@@ -514,6 +514,15 @@ class ProblemListPanel(QFrame):
         if record is not None:
             if record.get("item_snapshot") != item.to_payload():
                 return STATE_STALE
+            from .bunch_review import load_context, pending_member_decisions
+            try:
+                context = load_context(self.workspace_dir, item, record["camera"])
+                if self.bunch_store.get(context) is None:
+                    return STATE_STALE
+                if record.get("completed") and pending_member_decisions(context):
+                    return STATE_PENDING
+            except (ValueError, OSError):
+                return STATE_STALE
             current = {event.event_id: event for event in self._events_provider()}
             for chip in record.get("chips", []):
                 event = current.get(chip["event_id"])
@@ -738,6 +747,7 @@ class ProblemListPanel(QFrame):
             self.hint.setText(f"批次处理不可用：{error}")
 
     def _open_bunch(self) -> None:
+        self.refresh()
         item = self.current_item()
         if item is None or self.workspace_dir is None or self._browsing or item.evidence.get("superseded") or item.status == STATUS_WAITING:
             return
@@ -748,6 +758,7 @@ class ProblemListPanel(QFrame):
             self.hint.setText(f"无法打开集团核对：{error}")
             return
         paused = self._live_paused
+        running = self._process is not None
         self._live_paused = True
         self.stop_analysis()
         try:
@@ -756,6 +767,8 @@ class ProblemListPanel(QFrame):
             self._live_paused = paused
             self._last_live_signature = None
             self._next_analysis = time.monotonic() + 10
+            if running and not paused:
+                self._start_analysis()
         self.refresh()
         self.hint.setText("集团核对结果已保存。" if dialog.saved_completed else "集团进度已保留，可再次打开继续核对。")
 
