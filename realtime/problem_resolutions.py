@@ -262,10 +262,14 @@ def export_lists(
     output_dir.mkdir(parents=True, exist_ok=True)
     by_id = {item.item_id: item for item in items}
     manual, deletions, changes = [], [], []
+    from .bunch_review import BunchReviewStore
+    bunches = BunchReviewStore(store.journal_path.parent)
     for resolution in sorted(store.resolutions(), key=lambda value: value.chip_time_ms or 0):
         item = by_id.get(resolution.item_id)
         if item is None:
             continue
+        if bunches.latest_for(item) is not None:
+            continue  # the per-rider bunch review supersedes an old group-level decision
         _decision, stale = store.state(item)
         if stale:
             continue
@@ -291,6 +295,7 @@ def export_lists(
                 item.bibs[0] if item.bibs else "", resolution.target_bib, format_chip_time(item.chip_time_ms),
                 "、".join(_passage_number(event_id) for event_id in item.event_ids), title, resolution.reason,
             ))
+    manual.extend(bunches.manual_entries(items, store.journal_path.parent.parent))
     tables = (
         (EXPORT_MANUAL_ENTRIES, ("号码", "芯片域时间", "证据帧", "机位", "校时版本", "说明"), manual),
         (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因"), deletions),

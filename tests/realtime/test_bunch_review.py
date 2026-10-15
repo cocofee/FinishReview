@@ -1,0 +1,271 @@
+import csv
+import json
+from dataclasses import replace
+
+import cv2
+import numpy as np
+import pytest
+from PyQt5.QtCore import QEventLoop, QPoint, Qt
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication
+
+from realtime.bunch_dialog import BunchDecoder, BunchReviewDialog, CountView
+from realtime.bunch_review import (
+    BunchChip, BunchReviewStore, align_counts, completion_issue, load_context,
+)
+from realtime.clock_sync import ClockModel, ClockModelStore
+from realtime.passage_receiver import PassageEvent
+from realtime.problem_items import CATEGORY_VIDEO, KIND_BUNCH, ProblemItem
+from realtime.problem_panel import ProblemListPanel
+from realtime.problem_resolutions import ProblemResolutionStore, export_lists
+from realtime.video_timeline import VideoTimelineStore
+
+
+T = 1_789_784_000_000
+
+
+def chips(*times):
+    return [BunchChip(f'e-{i}', str(101 + i), T + t, T + t + 300) for i, t in enumerate(times)]
+
+
+def mark(t, bib='', x=.3):
+    return {'recorder_ms': T + t, 'bib': bib, 'x': x, 'y': .5,
+            'frame': {'video_path': 'synthetic.avi', 'segment_id': 's', 'frame_index': t // 50,
+                      'position_ms': t, 'camera_index': 1}}
+
+
+def test_typed_plate_has_priority_and_two_missing_riders_get_individual_times():
+    cc = chips(1000, 2000, 3000)
+    counts = [mark(1420, '101'), mark(1920, '319'), mark(2420, '102'),
+              mark(2920, '550'), mark(3420, '103')]
+    result = align_counts(cc, counts, 120)
+    assert result['pairs'] == {0: 0, 2: 1, 4: 2}
+    assert [(e['bib'], e['chip_time_ms']) for e in result['extras']] == [('319', T + 1500), ('550', T + 2500)]
+    assert not result['missing']
+    assert not completion_issue(cc, counts, result, True)
+
+
+def test_side_by_side_plate_without_chip_is_never_assigned_to_nearby_chip():
+    cc = [BunchChip('a', '348', T + 1000, T + 1300), BunchChip('b', '685', T + 1100, T + 1400),
+          BunchChip('c', '999', T + 2000, T + 2300)]
+    counts = [mark(1420, '348'), mark(1420, '319', .6), mark(1520, '685'), mark(2420, '999')]
+    result = align_counts(cc, counts, 120)
+    assert result['extras'] == [{'mark': 1, 'bib': '319', 'chip_time_ms': T + 1000}]
+    assert result['pairs'][0] == 0 and result['pairs'][2] == 1
+    untyped = align_counts(cc, [mark(1420), mark(1520), mark(2420)], 120)
+    assert set(untyped['ambiguous']) == {0, 1}
+
+
+def test_bias_uses_three_isolated_riders_and_no_extrapolation_at_bunch_edge():
+    cc = chips(1000, 2000, 3000)
+    counts = [mark(t + 420) for t in (1000, 2000, 3000)]
+    result = align_counts(cc, counts, 0)
+    assert result['bias_ms'] == 120 and result['lone_count'] == 3
+    result = align_counts(cc, [mark(500, '319'), *counts], 0)
+    assert result['extras'][0]['chip_time_ms'] is None
+    assert '前后' in completion_issue(cc, [mark(500, '319'), *counts], result, True)
+
+
+def test_cannot_complete_empty_unviewed_missing_or_duplicate_counts():
+    cc = chips(1000, 2000)
+    counts = [mark(1300, '101')]
+    assert '完整' in completion_issue(cc, counts, align_counts(cc, counts), False)
+    assert '没有对应' in completion_issue(cc, counts, align_counts(cc, counts), True)
+    assert '先' in completion_issue(cc, [], align_counts(cc, []), True)
+    duplicate = [mark(1300, '101'), mark(2300, '101')]
+    assert '同一号码' in completion_issue(cc, duplicate, align_counts(cc, duplicate), True)
+
+
+@pytest.fixture
+def synthetic_bunch(tmp_path):
+    videos = tmp_path / 'videos'
+    videos.mkdir()
+    timeline = VideoTimelineStore(tmp_path / 'video_timeline.jsonl')
+    segments = []
+    for index in range(2):
+        video = videos / f'camera_01_20260919_100000_archive_{index:04d}.avi'
+        writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*'MJPG'), 20, (160, 120))
+        assert writer.isOpened()
+        for frame_index in range(80):
+            frame = np.full((120, 160, 3), 40 + index * 80 + frame_index, np.uint8)
+            writer.write(frame)
+        writer.release()
+        segment = timeline.add_completed_segment(
+            source_id='camera_01_review', camera_index=1, video_path=video,
+            media_started_at_ms=T + index * 4000, media_duration_ms=4000,
+            clock_source='videopipe_system_clock', timing_error_ms=10,
+            end_reason='continuous_archive_fallback', race_id='synthetic',
+        )
+        segments.append(segment)
+    events = [PassageEvent(event_id=f'e-{i}', race_id='synthetic', stage_id='stage-1', group_id='1',
+                          sequence=i + 1, bib=str(101 + i), passage_time_ms=t,
+                          passage_timestamp_ms=T + t, received_at_ms=T + t + 100)
+              for i, t in enumerate((2000, 3000, 4200, 5000))]
+    (tmp_path / 'cyclerace_passage_events.jsonl').write_text(
+        ''.join(json.dumps(e.to_payload()) + '\n' for e in events), encoding='utf-8')
+    clock = ClockModelStore(tmp_path / 'video_clock_models.jsonl').publish(ClockModel(
+        1, 300, 0, T, T, T + 8000, 10, 10, 0, 300, 10))
+    (tmp_path / 'finish_lines.json').write_text(json.dumps({'finish_lines': [
+        {'camera_index': 1, 'x1': .1, 'y1': .5, 'x2': .9, 'y2': .5}]}), encoding='utf-8')
+    item = ProblemItem('bunch:synthetic', KIND_BUNCH, CATEGORY_VIDEO, 'synthetic bunch',
+                       chip_time_ms=T + 2000, bibs=tuple(e.bib for e in events),
+                       event_ids=tuple(e.event_id for e in events), calibration_version=clock.version,
+                       evidence={'frame': {'camera_index': 1, 'segment_id': segments[0].segment_id,
+                                          'video_path': str(videos / 'camera_01_20260919_100000_archive_0000.avi'),
+                                          'position_ms': 2300, 'frame_index': 46}})
+    return tmp_path, item, events
+
+
+def test_context_and_decoder_span_recording_files_using_actual_frame_times(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    inputs = {p: p.read_bytes() for p in root.iterdir() if p.is_file()}
+    context = load_context(root, item)
+    assert len(context.segments) == 2
+    decoder = BunchDecoder()
+    try:
+        first = decoder.read(context, T + 3950)
+        following = decoder.read(context, first.recorder_ms, 1)
+        previous = decoder.read(context, following.recorder_ms, -1)
+        assert first.recorder_ms == T + 3950
+        assert following.recorder_ms == T + 4000
+        assert first.ref['segment_id'] != following.ref['segment_id']
+        assert previous.recorder_ms == first.recorder_ms
+        assert first.ref['frame_index'] == 79 and following.ref['frame_index'] == 0
+        assert decoder.read(context, T - 10000) is None
+    finally:
+        decoder.close()
+    assert all(p.read_bytes() == value for p, value in inputs.items())
+
+
+def test_context_uses_recording_session_clock_offset_once(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    original = load_context(root, item)
+    clock = replace(original.model, version=2, session_offsets=((original.segments[0].session_id, 50),))
+    with (root / 'video_clock_models.jsonl').open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(clock.to_payload()) + '\n')
+    context = load_context(root, replace(item, calibration_version=2))
+    assert context.chips[0].recorder_ms == T + 2000 + 300 + 50
+
+
+def test_drafts_roundtrip_and_completed_export_has_multiple_individual_frames(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
+    counts += [mark(2800, '319'), mark(4000, '550')]
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, counts, 12.5)
+    assert BunchReviewStore(root / 'finish_problems').get(context)['marks'] == counts
+    assert store.manual_entries([item], root) == []
+    store.save(context, counts, 18.2, completed=True, fully_viewed=True)
+    assert len(store.manual_entries([item], root)) == 2
+    resolutions = ProblemResolutionStore(root / 'finish_problems' / 'problem_resolutions.jsonl')
+    result = export_lists([item], resolutions, root / 'exports')
+    assert result['补录清单.csv'] == 2
+    rows = list(csv.DictReader((root / 'exports' / '补录清单.csv').open(encoding='utf-8-sig')))
+    assert {r['号码'] for r in rows} == {'319', '550'}
+    assert len({r['证据帧'] for r in rows}) == 2
+    assert all('插值估算' in r['说明'] for r in rows)
+    # A change in the item or clock must never export an old result.
+    changed_item = replace(item, bibs=('999', *item.bibs[1:]))
+    assert store.manual_entries([changed_item], root) == []
+    changed = replace(context, model=replace(context.model, intercept_ms=900))
+    assert store.get(changed) is None
+    # Different camera drafts must survive a switch back.
+    other_camera = replace(context, camera=2)
+    store.save(other_camera, [], 2)
+    restored = BunchReviewStore(root / 'finish_problems')
+    assert restored.get(context)['marks'] == counts
+    assert restored.get(other_camera)['marks'] == []
+    assert restored.manual_entries([item], root) == []  # latest review is unfinished
+
+
+def test_incomplete_group_stays_pending_and_group_has_no_one_click_checked(synthetic_bunch):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    directory = root / 'finish_problems'
+    directory.mkdir()
+    (directory / 'problem_list.json').write_text(json.dumps({
+        'items': [item.to_payload()], 'summary': {}, 'auto_passed': []}), encoding='utf-8')
+    panel = ProblemListPanel()
+    panel.set_workspace(root)
+    panel.table.setCurrentCell(0, 0)
+    assert panel.bunch_button.isHidden() is False
+    assert not panel.action_buttons
+    context = load_context(root, item)
+    store = BunchReviewStore(directory)
+    store.save(context, [mark(2300, '101')], 10)
+    panel.refresh()
+    assert panel.state(item) == '待处理'
+    counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
+    store.save(context, counts, 20, completed=True, fully_viewed=True)
+    panel.refresh()
+    assert panel.state(item).startswith('已处理')
+    store.save(context, counts[:-1], 23)
+    panel.refresh()
+    assert panel.state(item) == '待处理'
+    app.processEvents()
+
+
+def test_dialog_reads_counts_saves_reopens_and_releases_worker(synthetic_bunch):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    dialog = BunchReviewDialog(root, item)
+    try:
+        for _ in range(100):
+            app.processEvents(QEventLoop.AllEvents, 50)
+            if dialog.frame is not None:
+                break
+            QTest.qWait(10)
+        assert dialog.frame is not None, dialog.notice.text()
+        dialog.count_at(.3, .5)
+        dialog.count_at(.3, .5)  # accidental repeat click is ignored
+        dialog.count_at(.6, .5)  # two abreast in the same actual frame
+        assert len(dialog.marks) == 2
+        original_frame = dialog.frame
+        dialog.frame = replace(original_frame, ref=dict(original_frame.ref, frame_index=999))
+        dialog.count_at(.8, .5, False, original_frame)
+        assert dialog.marks[-1]['frame']['frame_index'] == original_frame.ref['frame_index']
+        dialog.marks.pop()
+        dialog.frame = original_frame
+        dialog.update_results()
+        dialog.count_table.setCurrentCell(1, 0)
+        dialog.bib_input.setText('319')
+        dialog.assign_bib()
+        assert dialog.marks[1]['bib'] == '319'
+        assert dialog.save(False)
+        assert not dialog.save(True)
+        dialog.close()
+        for _ in range(100):
+            app.processEvents(QEventLoop.AllEvents, 50)
+            if not dialog.worker.isRunning():
+                break
+            QTest.qWait(10)
+        assert not dialog.worker.isRunning()
+        record = BunchReviewStore(root / 'finish_problems').get(dialog.context)
+        assert len(record['marks']) == 2 and not record['completed']
+    finally:
+        dialog.worker.requestInterruption()
+        assert dialog.worker.wait(3000)
+
+
+def test_zoom_double_click_adds_no_rider_and_rapid_clicks_keep_source_frame():
+    app = QApplication.instance() or QApplication([])
+    view = CountView()
+    view.resize(600, 400)
+    view.show()
+    source = object()
+    view.show_frame(np.zeros((300, 500, 3), np.uint8), {}, [], source)
+    counted = []
+    view.counted.connect(lambda *args: counted.append(args))
+    app.processEvents()
+    QTest.mouseDClick(view.viewport(), Qt.LeftButton, pos=QPoint(200, 200))
+    QTest.mouseRelease(view.viewport(), Qt.LeftButton, pos=QPoint(200, 200))
+    QTest.qWait(QApplication.doubleClickInterval() * 2 + 50)
+    assert counted == []
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=QPoint(150, 200))
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=QPoint(400, 200))
+    view.show_frame(np.zeros((300, 500, 3), np.uint8), {}, [], object())
+    QTest.qWait(QApplication.doubleClickInterval() * 2 + 50)
+    assert len(counted) == 2
+    assert all(args[3] is source for args in counted)
+    view.close()

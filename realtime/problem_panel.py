@@ -43,6 +43,8 @@ from .problem_items import (
     STATUS_DISPUTED,
     STATUS_EXCLUDED,
     STATUS_INFO,
+    KIND_BUNCH,
+    KIND_OBSTRUCTION,
     ProblemItem,
 )
 from .problem_resolutions import (
@@ -80,6 +82,7 @@ class ProblemListPanel(QFrame):
         self._events_provider: Callable[[], object] = lambda: ()
         self._process: Optional[QProcess] = None
         self._progress_buffer = b""
+        self.bunch_store = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(4)
@@ -94,6 +97,9 @@ class ProblemListPanel(QFrame):
         self.expand_groups.setToolTip("集团和拥挤时段里的问题归在一条里核对；展开后逐条显示")
         self.expand_groups.toggled.connect(self._render)
         controls.addWidget(self.expand_groups)
+        self.bunch_button = QPushButton("打开集团逐帧核对", self)
+        self.bunch_button.clicked.connect(self._open_bunch)
+        controls.addWidget(self.bunch_button)
         self.analyze_button = QPushButton("分析录像", self)
         self.analyze_button.setToolTip("在单独的低优先级进程中分析整段录像，不影响录像和计时")
         self.analyze_button.clicked.connect(self._toggle_analysis)
@@ -152,7 +158,7 @@ class ProblemListPanel(QFrame):
         self.action_row.addWidget(self.jump_button)
         self.action_buttons: list[QPushButton] = []
         self.reopen_button = QPushButton("重新处理", detail)
-        self.reopen_button.clicked.connect(lambda: self._resolve("reopen"))
+        self.reopen_button.clicked.connect(self._reopen)
         self.action_row.addWidget(self.reopen_button)
         self.action_row.addStretch(1)
         detail_layout.addLayout(self.action_row)
@@ -174,6 +180,7 @@ class ProblemListPanel(QFrame):
         self.workspace_dir = workspace_dir
         self.problem_dir = workspace_dir / OUTPUT_DIRNAME
         self.store = None
+        self.bunch_store = None
         self._signature = None
         self.refresh()
 
@@ -203,6 +210,11 @@ class ProblemListPanel(QFrame):
             self._signature = signature
         if self.store is None:
             self.store = ProblemResolutionStore(self.problem_dir / RESOLUTIONS_FILENAME)
+        from .bunch_review import BunchReviewStore
+        try:
+            self.bunch_store = BunchReviewStore(self.problem_dir)
+        except (OSError, ValueError) as error:
+            self.hint.setText(f"集团核对记录读取失败：{error}")
         self._render()
 
     def _upstream_closed(self, item: ProblemItem) -> bool:
@@ -226,6 +238,17 @@ class ProblemListPanel(QFrame):
             return STATE_INFO
         if item.status == STATUS_CLOSED_UPSTREAM or (item.pending and self._upstream_closed(item)):
             return STATE_UPSTREAM
+        record = self.bunch_store.latest_for(item) if self.bunch_store is not None else None
+        if record is not None:
+            if record.get("item_snapshot") != item.to_payload():
+                return STATE_STALE
+            current = {event.event_id: event for event in self._events_provider()}
+            for chip in record.get("chips", []):
+                event = current.get(chip["event_id"])
+                if event is not None and (not event.is_active or event.bib != chip["bib"]
+                                          or int(event.timeline_timestamp_ms) != chip["chip_ms"]):
+                    return STATE_STALE
+            return f"{STATE_RESOLVED}：集团人工核对" if record.get("completed") else STATE_PENDING
         if self.store is not None:
             resolution, stale = self.store.state(item)
             if resolution is not None:
@@ -310,7 +333,12 @@ class ProblemListPanel(QFrame):
             self.detail.setText("")
             self.jump_button.setEnabled(False)
             self.reopen_button.setEnabled(False)
+            self.bunch_button.hide()
             return
+        is_bunch = item.kind in (KIND_BUNCH, KIND_OBSTRUCTION)
+        self.bunch_button.setVisible(is_bunch)
+        self.bib_input.setVisible(not is_bunch)
+        self.reason_input.setVisible(not is_bunch)
         state = self.state(item)
         self.title.setText(
             f"{item.title} · {format_chip_time(item.chip_time_ms) if item.chip_time_ms else '--'} · {state}"
@@ -333,15 +361,42 @@ class ProblemListPanel(QFrame):
                         target.setPixmap(pixmap.scaledToHeight(80, Qt.SmoothTransformation))
         self.jump_button.setEnabled(bool(item.evidence.get("frame")))
         self.reopen_button.setEnabled(state.startswith(STATE_RESOLVED))
-        for action in item.actions:
+        for action in (() if is_bunch else item.actions):
             button = QPushButton(ACTION_LABELS.get(action, action), self)
             button.setProperty("problemAction", action)
             button.clicked.connect(lambda _checked=False, action=action: self._resolve(action))
             self.action_row.insertWidget(self.action_row.count() - 1, button)
             self.action_buttons.append(button)
 
+    def _reopen(self) -> None:
+        item = self.current_item()
+        if item is not None and item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
+            self._open_bunch()
+        else:
+            self._resolve("reopen")
+
+    def _open_bunch(self) -> None:
+        item = self.current_item()
+        if item is None or self.workspace_dir is None:
+            return
+        if self._process is not None:
+            self.hint.setText("请先停止后台分析，再打开集团核对，避免同时解码占用资源。")
+            return
+        from .bunch_dialog import BunchReviewDialog
+        try:
+            dialog = BunchReviewDialog(self.workspace_dir, item, self)
+        except (ValueError, RuntimeError, OSError) as error:
+            self.hint.setText(f"无法打开集团核对：{error}")
+            return
+        dialog.exec_()
+        self.refresh()
+        self.hint.setText("集团核对结果已保存。" if dialog.saved_completed else "集团进度已保留，可再次打开继续核对。")
+
     def _jump(self) -> None:
         item = self.current_item()
+        if item is not None and item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
+            self._open_bunch()
+            return
         if item is not None and item.evidence.get("frame"):
             self.jump_requested.emit(dict(item.evidence["frame"]))
             self.hint.setText("已跳到原帧；在机位画面中逐帧核对号码，再回到清单处理。")
@@ -405,7 +460,7 @@ class ProblemListPanel(QFrame):
             return None
         try:
             counts = export_lists(self.items, self.store, self.problem_dir / "exports")
-        except OSError as error:
+        except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"导出失败：{error}")
             return None
         self.hint.setText(
