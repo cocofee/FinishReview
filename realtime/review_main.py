@@ -83,6 +83,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-live-chips", metavar="EVENT_DIR", help=argparse.SUPPRESS)
     parser.add_argument("--chip-race-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--chip-stage-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--probe-bike-model", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -650,6 +651,13 @@ def main(argv: list[str] | None = None) -> int:
     app_argv = [sys.argv[0]] if argv is not None else sys.argv
     if getattr(args, "smoke_test", False):
         return run_packaged_smoke_test(app_argv)
+    if getattr(args, "probe_bike_model", False):
+        from realtime.analysis_resources import lower_process_priority
+        from realtime.bike_check import probe_model
+
+        lower_process_priority()
+        print(json.dumps(probe_model(json.loads(sys.stdin.read())), ensure_ascii=True), flush=True)
+        return 0
     if getattr(args, "check_live_chips", None):
         from realtime.analysis_resources import lower_process_priority
         from realtime.live_chip_checks import live_chip_payload

@@ -38,6 +38,7 @@ from PyQt5.QtWidgets import (
 
 from .chip_history import format_chip_time
 from .live_chip_checks import LIVE_CHIP_FILENAME, input_signature, merge_chip_snapshot
+from .analysis_settings import read_settings, settings_token
 from .problem_analysis import OUTPUT_DIRNAME, PROBLEM_LIST_FILENAME
 from .problem_items import (
     ACTION_CHANGE,
@@ -131,6 +132,14 @@ class ProblemListPanel(QFrame):
         self.summary = QLabel("问题清单：尚未分析录像", self)
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
+        settings_row = QHBoxLayout()
+        self.sampling_button = QPushButton("取样线 / 认车", self)
+        self.sampling_button.clicked.connect(self._configure_sampling)
+        settings_row.addWidget(self.sampling_button)
+        self.analysis_details = QLabel("实际终点线按机位和录制会话配置；只分析已封存录像。", self)
+        self.analysis_details.setWordWrap(True)
+        settings_row.addWidget(self.analysis_details, 1)
+        layout.addLayout(settings_row)
         self.queue_filter = QComboBox(self)
         self.queue_filter.addItems(["待处理", "待证据", "暂存", "交接 / 已处理", "全部"])
         self.queue_filter.currentIndexChanged.connect(self._render)
@@ -361,6 +370,13 @@ class ProblemListPanel(QFrame):
             except OSError as error:
                 self.hint.setText(f"问题清单读取失败：{error}")
                 return
+        try:
+            token = settings_token(self.workspace_dir)
+            enforce_settings = bool(read_settings(self.workspace_dir).get("settings_revision"))
+        except (OSError, ValueError) as error:
+            token, enforce_settings = "invalid", True
+            self.analysis_details.setText(f"分析配置不可用：{error}")
+        signature.append(token)
         if signature != self._signature:
             try:
                 snapshots = []
@@ -370,6 +386,9 @@ class ProblemListPanel(QFrame):
                         snapshot = None
                     snapshots.append(snapshot)
                 payload = merge_chip_snapshot(*snapshots)
+                if payload and (enforce_settings or payload.get("settings_token")) and payload.get("settings_token", "") != token:
+                    payload = dict(payload, settings_stale=True, auto_passed=[],
+                                   summary=dict(payload.get("summary", {}), auto_passed=0))
                 items = [ProblemItem.from_payload(item) for item in (payload or {}).get("items", [])]
                 if snapshots[1] and self._chip_process is None and time.monotonic() >= self._chip_retry_after:
                     self._chip_status_from_payload(snapshots[1])
@@ -397,6 +416,29 @@ class ProblemListPanel(QFrame):
             self.items.append(replace(current, status=STATUS_INFO,
                                       status_note="后台证据已更新，此旧问题仅保留供查看；请选择清单中的新问题。",
                                       evidence=dict(current.evidence, superseded=True)))
+        fresh_ids = {value["item_id"] for value in (self.payload or {}).get("items", [])}
+        self.items = [replace(item, status=STATUS_WAITING, status_note="配置已变更，保留旧建议供追溯；须重新取得适用证据。",
+                              evidence=dict(item.evidence, configuration_stale=True))
+                      if token and item.item_id in self._operator_items and item.item_id not in fresh_ids
+                      and item.category == CATEGORY_VIDEO and item.kind != KIND_MANUAL_REVIEW
+                      and item.evidence.get("operator_settings_token", "") != token else item for item in self.items]
+        if (self.payload or {}).get("settings_stale"):
+            self.items = [replace(item, status=STATUS_WAITING, status_note="取样线或认车配置已变更，等待重新分析。",
+                                  evidence=dict(item.evidence, configuration_stale=True))
+                          if item.category == CATEGORY_VIDEO and item.kind != KIND_MANUAL_REVIEW else item for item in self.items]
+            self.analysis_details.setText("配置已变更：旧视频结论不可提交，等待重新取样、校时与认车；芯片自检继续。")
+        elif token != "invalid":
+            cameras = (self.payload or {}).get("cameras", {})
+            statuses = []
+            for camera, value in cameras.items():
+                detail = value.get('error') or value.get('bike_status', {}).get('message', '')
+                for key, label in (("sealed_through_ms", "本轮封存至"), ("analyzed_through_ms", "分析至")):
+                    if value.get(key) is not None:
+                        detail += f"；{label} {format_chip_time(value[key], date=True)}"
+                if value.get("missing_line_segments"):
+                    detail += "；部分片段缺线或跨改线边界，尚未核清"
+                statuses.append(f"机位 {camera}：{detail}")
+            self.analysis_details.setText("；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。")
         from .bunch_review import BunchReviewStore
         try:
             self.bunch_store = BunchReviewStore(self.problem_dir)
@@ -571,6 +613,7 @@ class ProblemListPanel(QFrame):
         self.hold_button.setText("返回待处理" if item.item_id in self._held else "暂存")
         is_bunch = item.kind in (KIND_BUNCH, KIND_OBSTRUCTION)
         self.bunch_button.setVisible(is_bunch)
+        self.bunch_button.setEnabled(item.status != STATUS_WAITING)
         self.bib_input.setVisible(not is_bunch)
         self.reason_input.setVisible(True)
         state = self.state(item)
@@ -597,7 +640,7 @@ class ProblemListPanel(QFrame):
         resolved = state.startswith((STATE_RESOLVED, STATE_HANDOFF))
         self.reopen_button.setEnabled(resolved)
         self.reopen_button.setVisible(resolved)
-        actions = (ACTION_SYNCED,) if state.startswith(STATE_HANDOFF) else (() if is_bunch or resolved else item.actions)
+        actions = (ACTION_SYNCED,) if state.startswith(STATE_HANDOFF) else (() if is_bunch or resolved or item.status == STATUS_WAITING else item.actions)
         if item.evidence.get("superseded"):
             actions = ()
             self.hold_button.setEnabled(False)
@@ -621,7 +664,7 @@ class ProblemListPanel(QFrame):
 
     def _open_bunch(self) -> None:
         item = self.current_item()
-        if item is None or self.workspace_dir is None or self._browsing or item.evidence.get("superseded"):
+        if item is None or self.workspace_dir is None or self._browsing or item.evidence.get("superseded") or item.status == STATUS_WAITING:
             return
         from .bunch_dialog import BunchReviewDialog
         try:
@@ -663,8 +706,12 @@ class ProblemListPanel(QFrame):
         return claims
 
     def _resolve(self, action: str) -> None:
+        self.refresh()
         item = self.current_item()
         if item is None or self.store is None:
+            return
+        if item.evidence.get("configuration_stale") or item.status == STATUS_WAITING:
+            self.hint.setText("证据等待重新分析，不能提交旧结论。")
             return
         if item.evidence.get("superseded"):
             self.hint.setText("此问题已被后台更新，请选择最新问题后处理。")
@@ -696,6 +743,7 @@ class ProblemListPanel(QFrame):
             self.hint.setText("建议改号改圈需要在号码框填写改成的号码或圈数。")
             return
         try:
+            operator_token = settings_token(self.workspace_dir)
             self.store.resolve(
                 item, action,
                 bib=bib if action == ACTION_RECORD_BIB else "",
@@ -708,7 +756,8 @@ class ProblemListPanel(QFrame):
         self.bib_input.clear()
         self.reason_input.clear()
         self._held.pop(item.item_id, None)
-        self._operator_items[item.item_id] = replace(item, evidence=dict(item.evidence, operator_scope=self._scope)).to_payload()
+        self._operator_items[item.item_id] = replace(item, evidence=dict(item.evidence, operator_scope=self._scope,
+                                                                       operator_settings_token=operator_token)).to_payload()
         self.save_drafts()
         self.hint.setText(f"已记录：{ACTION_LABELS.get(action, '重新处理')}。")
         self._render()
@@ -729,6 +778,32 @@ class ProblemListPanel(QFrame):
         return counts
 
     # ----- background analysis ----------------------------------------
+    def _configure_sampling(self):
+        if self.workspace_dir is None:
+            return
+        from .sampling_dialog import SamplingSettingsDialog
+        from PyQt5.QtWidgets import QDialog
+
+        paused = self._live_paused
+        running = self._process is not None
+        saved = False
+        self._live_paused = True
+        self.stop_analysis()
+        try:
+            dialog = SamplingSettingsDialog(self.workspace_dir, self, race_id=self._scope[0], stage_id=self._scope[1])
+            if dialog.exec_() == QDialog.Accepted:
+                saved = True
+                self._last_live_signature = None
+                self._signature = None
+                self._next_analysis = 0
+                self.refresh()
+        except (OSError, ValueError, KeyError) as error:
+            self.hint.setText(f"配置窗口无法打开：{error}")
+        finally:
+            self._live_paused = paused
+            if not paused and (saved or running):
+                self._start_analysis()
+
     def analysis_command(self) -> tuple[str, list[str]]:
         extra = ["--live-problems"] if self._live else []
         if self._finalizing_live:
@@ -860,6 +935,11 @@ class ProblemListPanel(QFrame):
                 signature.append((name, stat.st_size, stat.st_mtime_ns))
             except OSError:
                 pass
+        try:
+            signature.append(("settings", settings_token(self.workspace_dir)))
+        except (OSError, ValueError) as error:
+            self.analysis_status = f"分析配置错误：{error}"
+            return
         if not signature or (signature == self._last_live_signature and not self._final_analysis_pending):
             return
         self._last_live_signature = signature

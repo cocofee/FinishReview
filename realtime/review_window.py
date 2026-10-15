@@ -722,7 +722,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._video_scan_tokens: dict[int, object] = {}
         self._video_scan_state_lock = threading.RLock()
         self._finish_line_store = FinishLineStore(
-            self.output_dir / "finish_lines.json"
+            self.output_dir / "motion_finish_lines.json", legacy_path=self.output_dir / "finish_lines.json"
         )
         self._finish_line_rois = self._finish_line_store.rois()
         self._video_review_journal = VideoReviewJournal(
@@ -1942,7 +1942,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 self._receiver_metadata_store = receiver_metadata_store
             self.output_dir = output_dir
             self._finish_line_store = FinishLineStore(
-                self.output_dir / "finish_lines.json"
+                self.output_dir / "motion_finish_lines.json", legacy_path=self.output_dir / "finish_lines.json"
             )
             self._finish_line_rois = self._finish_line_store.rois()
             self._video_review_journal = VideoReviewJournal(

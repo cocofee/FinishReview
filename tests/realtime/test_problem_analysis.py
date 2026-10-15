@@ -376,6 +376,7 @@ def test_bike_check_keeps_one_decoder_open_at_a_time(monkeypatch, tmp_path):
         for index in range(9)
     ]
     config = AnalysisConfig(workspace=tmp_path, output_dir=tmp_path / "out", model_path=tmp_path / "m.onnx")
+    config.model_path.write_bytes(b"mocked model content")
 
     verdicts = problem_analysis._bike_verdicts(
         config, 1, crossings, lambda _ms: False, progress=lambda *args: None, checkpoint=None,
@@ -391,7 +392,9 @@ def test_cached_bike_verdicts_are_re_decided_with_current_rules(tmp_path):
 
     crossing = CrossingRecord(1, "s", "seg", "video.mkv", 5_000, 100, 5_000, 0, 0, 1)
     config = AnalysisConfig(workspace=tmp_path, output_dir=tmp_path, model_path=tmp_path / "m.onnx")
-    key = f"m.onnx@640|up|{crossing.key}|0"
+    config.model_path.write_bytes(b"cached model content")
+    key = problem_analysis.bike_cache_key(problem_analysis.model_fingerprint(config.model_path, 640),
+                                         problem_analysis.CropPlan.for_mode("up"), crossing)
     (tmp_path / "bike_camera1.json").write_text(json.dumps({key: {
         "label": "vehicle", "score": 0.9, "decision": "disputed", "reason": "把握不高或几帧不一致",
         "frames": 3, "vehicle": "摩托车", "details": [[0, 0, 0], [0, 0, 0.9], [0, 0, 0.85]],
@@ -402,3 +405,55 @@ def test_cached_bike_verdicts_are_re_decided_with_current_rules(tmp_path):
     )
 
     assert verdicts[crossing.key].decision == "exclude"
+
+
+def test_editor_line_drives_full_pipeline_and_new_calibration_version(synthetic_race, tmp_path):
+    import shutil
+    import time
+    from PyQt5.QtWidgets import QApplication
+    from realtime.sampling_dialog import SamplingSettingsDialog
+    from realtime.line_sampling import read_strip_meta
+
+    source, _workspace, _config, _strips = synthetic_race
+    root = tmp_path / "isolated"
+    shutil.copytree(source, root)
+    app = QApplication.instance() or QApplication([])
+    before = run_offline_analysis(replace(config_from_workspace(root), render_cards=False, min_available_mb=0), lower_priority=False)
+    previous = before["cameras"][1]["calibration"]["version"]
+    dialog = SamplingSettingsDialog(root)
+    deadline = time.monotonic() + 10
+    while dialog.worker is not None and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(.01)
+    assert dialog.worker is None
+    dialog.view.points = [[.5, .15 + i * .7 / 8] for i in range(9)]
+    dialog._save()
+    summary = run_offline_analysis(replace(config_from_workspace(root), render_cards=False, min_available_mb=0), lower_priority=False)
+    assert summary["summary"]["auto_passed"] == len(CROSSINGS_S)
+    assert summary["cameras"][1]["calibration"]["version"] > previous
+    strips = list((root / "finish_problems/strips/camera_01").glob("*.npz"))
+    assert len(read_strip_meta(strips[0])["line_config"]["points"]) == 9
+    payload = json.loads((root / "finish_problems/problem_list.json").read_text(encoding="utf-8"))
+    assert payload["auto_passed"][0]["frame"]["line_config"]["revision"] == 1
+    assert payload["auto_passed"][0]["frame"]["geometry_digest"]
+
+
+def test_model_disabled_failure_and_enabled_keep_same_missing_candidate(synthetic_race, tmp_path, monkeypatch):
+    from realtime.bike_check import BikeVerdict
+
+    _root, workspace, original, strips = synthetic_race
+    reads = tuple(read for i, read in enumerate(workspace.reads) if i != 5)
+    config = replace(original, output_dir=tmp_path)
+    disabled = analyse_camera(config, workspace, 1, strips, reads=reads)
+    assert disabled["bike_status"]["state"] == "not_configured"
+    config.model_path = tmp_path / "bad.onnx"
+    config.model_path.write_bytes(b"invalid model")
+    failed = analyse_camera(config, workspace, 1, strips, reads=reads)
+    assert failed["bike_status"]["state"] == "failed"
+    assert KIND_NO_CHIP_CROSSING in _kinds(failed)
+    assert _kinds(failed) == _kinds(disabled)
+    monkeypatch.setattr(problem_analysis, "YoloxDetector", lambda *a: object())
+    monkeypatch.setattr(problem_analysis, "classify_frames", lambda *a, **kw: BikeVerdict("bicycle", .9, "keep"))
+    enabled = analyse_camera(config, workspace, 1, strips, reads=reads)
+    assert enabled["bike_status"]["state"] == "enabled"
+    assert _kinds(enabled) == _kinds(disabled)

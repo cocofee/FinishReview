@@ -16,6 +16,7 @@ reads the event workspace and writes into its own output folder.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -33,6 +34,8 @@ from .analysis_resources import (
     peak_memory_mb,
 )
 from .analysis_workspace import AnalysisWorkspace, ArchiveSegment
+from .analysis_settings import (read_settings, resolved_model_path, settings_token, model_fingerprint,
+                                profile_for_segment, crosses_profile_boundary)
 from .bike_check import (
     LABEL_PEDESTRIAN,
     LABEL_VEHICLE,
@@ -100,6 +103,8 @@ class AnalysisConfig:
     min_available_mb: int = MIN_AVAILABLE_MEMORY_MB
     live: bool = False
     evidence_delay_ms: int = 10_000
+    sampling_profiles: tuple[dict, ...] = ()
+    settings_token: str = ""
 
     def resolved_output(self) -> Path:
         return Path(self.output_dir) if self.output_dir else Path(self.workspace) / OUTPUT_DIRNAME
@@ -145,24 +150,33 @@ def extract_strips(
     """Sample every recording file of one camera; reuse up-to-date strips."""
 
     output_dir = config.resolved_output()
-    digest = line_config_digest(line_config)
+    if config.sampling_profiles and not config.race_id:
+        scope = AnalysisWorkspace(config.workspace)
+        config = replace(config, race_id=scope.race_id, stage_id=scope.stage_id)
     paths = []
     for index, segment in enumerate(segments):
         if cancelled():
             break
+        if crosses_profile_boundary(config.sampling_profiles, segment, config.race_id, config.stage_id):
+            continue
+        effective = profile_for_segment(config.sampling_profiles, segment, config.race_id, config.stage_id) or line_config
+        if not effective:
+            continue
+        digest = line_config_digest(effective)
         target = strip_path(output_dir, segment)
         progress("线取样", index, len(segments))
         if not _strip_is_current(target, segment, digest, config.samples):
             started = time.perf_counter()
             strip = sample_video_file(
-                segment.path, line_config,
+                segment.path, effective,
                 samples=config.samples, threads=config.decode_threads,
-                snap=bool(line_config.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
+                snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
             )
             if cancelled():
                 break
             save_strip(target, strip, {
                 "line_digest": digest,
+                "line_config": dict(effective),
                 "samples": config.samples,
                 "segment_id": segment.segment.segment_id,
                 "session_id": segment.session_id,
@@ -185,6 +199,13 @@ def line_for_camera(config: AnalysisConfig, workspace: AnalysisWorkspace, camera
     if camera in config.finish_lines:
         return config.finish_lines[camera]
     return workspace.finish_lines().get(camera)
+
+
+def line_for_segment(config, workspace, segment):
+    if crosses_profile_boundary(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id):
+        return None
+    return (profile_for_segment(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id)
+            or line_for_camera(config, workspace, segment.camera_index))
 
 
 def load_line_overrides(path: Optional[Path]) -> dict[int, dict]:
@@ -275,6 +296,7 @@ def detect_session_crossings(
         return (
             0 <= a < len(files) and 0 <= b < len(files)
             and files[a].meta.get("session_id") == files[b].meta.get("session_id")
+            and files[a].meta.get("line_digest") == files[b].meta.get("line_digest")
             and abs(files[b].start_ms + float(files[b].pts[0]) - files[a].end_ms) <= CONTIGUOUS_MS
         )
 
@@ -397,6 +419,16 @@ def _chip_locator(files: list[_FileStrip], version: int):
     return locate
 
 
+def bike_cache_key(model_key, plan, crossing):
+    try:
+        stat = Path(crossing.video_path).stat()
+        video_stamp = [stat.st_size, stat.st_mtime_ns]
+    except OSError:
+        video_stamp = None
+    geometry = hashlib.sha256(json.dumps([crossing.segment_points, video_stamp], sort_keys=True).encode()).hexdigest()
+    return f"{model_key}|{plan.mode}|{plan.offsets_ms}|{crossing.key}|{geometry}"
+
+
 def _bike_verdicts(
     config: AnalysisConfig,
     camera: int,
@@ -409,7 +441,7 @@ def _bike_verdicts(
     if not config.model_path:
         return {}
     cache_path = config.resolved_output() / f"bike_camera{camera}.json"
-    model_key = f"{Path(config.model_path).name}@{config.model_input}"
+    model_key = model_fingerprint(config.model_path, config.model_input)
     cache: dict = {}
     if cache_path.is_file():
         try:
@@ -426,10 +458,9 @@ def _bike_verdicts(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         for index, crossing in enumerate(ordered):
-            key = f"{model_key}|{plan.mode}|{crossing.key}"
-            # Older caches added the crowded flag to the key; detections do not
-            # depend on it, the decision is re-made below.
-            entry = cache.get(key) or cache.get(key + "|0") or cache.get(key + "|1")
+            key = bike_cache_key(model_key, plan, crossing)
+            # Legacy filename-only caches are intentionally not trusted.
+            entry = cache.get(key)
             if entry is not None:
                 verdict = BikeVerdict(**{
                     name: tuple(value) if name == "details" else value
@@ -469,12 +500,18 @@ def _bike_verdicts(
             if checkpoint is not None:
                 checkpoint()
             if index % 20 == 0:
-                cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+                _save_bike_cache(cache_path, cache)
     finally:
         if reader is not None:
             reader.close()
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        _save_bike_cache(cache_path, cache)
     return verdicts
+
+
+def _save_bike_cache(path, payload):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
 
 
 def calibrate_evidence_clock(crossings, reads, *, camera_index):
@@ -544,6 +581,9 @@ def analyse_camera(
         "calibration_warnings": list(calibration.warnings),
         "items": [],
         "auto_passed": [],
+        "bike_status": {"state": "not_configured" if not config.model_path else "waiting_calibration",
+                        "message": "认车未配置，降噪未启用" if not config.model_path else "认车等待校时及候选",
+                        "crop_mode": config.crop_modes.get(camera, "up")},
     }
     if calibration.model is None:
         result["error"] = "自动校时失败：" + "；".join(calibration.warnings)
@@ -551,7 +591,11 @@ def analyse_camera(
             result["items"] = waiting_items(reads, camera, result["error"])
         return result
     store = ClockModelStore(config.clock_model_path or output_dir / CLOCK_MODEL_FILENAME)
-    model = store.publish(calibration.model)
+    line_signature = hashlib.sha256(json.dumps(sorted({(item.meta.get("line_digest", ""), item.meta.get("geometry_digest", ""))
+                                                       for item in files})).encode()).hexdigest()
+    model = store.publish(replace(calibration.model, evidence_signature=line_signature))
+    if coverage:
+        result["analyzed_through_ms"] = max(end for _start, end, _session in coverage)
     if config.live and coverage:
         # The latest seconds still need neighbouring video and delayed chip
         # delivery. They are not evidence of a missing rider or a missing read.
@@ -629,7 +673,16 @@ def analyse_camera(
     to_check = [item for item in video_only if not item.in_obstruction]
     if config.check_paired_bikes:
         to_check += [item[0] for item in matched]
-    verdicts = _bike_verdicts(config, camera, to_check, crowded, progress=progress, checkpoint=checkpoint)
+    try:
+        verdicts = _bike_verdicts(config, camera, to_check, crowded, progress=progress, checkpoint=checkpoint)
+        if config.model_path:
+            result["bike_status"].update(state="enabled" if to_check else "no_candidates",
+                                         message="认车已启用（含有效缓存）" if to_check else "已配置；本轮无待认车候选",
+                                         model_digest=model_fingerprint(config.model_path, config.model_input))
+    except Exception as error:  # A model/candidate failure must never erase the unclassified crossings.
+        logger.warning("bike check unavailable: %s", error)
+        verdicts = {}
+        result["bike_status"].update(state="failed", message=f"认车加载/推理失败，候选保留：{error}")
     if config.check_paired_bikes and verdicts:
         labels = [verdicts[item[0].key].label for item in matched if item[0].key in verdicts]
         result["paired_bicycle_share"] = round(sum(label == "bicycle" for label in labels) / max(1, len(labels)), 4)
@@ -651,6 +704,22 @@ def analyse_camera(
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
     result["items"] = list(outcome.items)
     result["auto_passed"] = outcome.auto_passed
+    recognition = result["bike_status"]
+    evidence_signature = hashlib.sha256(json.dumps([line_signature, recognition], sort_keys=True).encode()).hexdigest()
+    by_segment = {item.meta.get("segment_id"): dict(item.meta, geometry_path=str(item.path.parent / item.meta["geometry_file"])
+                                                  if item.meta.get("geometry_file") else "") for item in files}
+
+    def evidence_frame(frame):
+        meta = by_segment.get(frame.get("segment_id"), {})
+        return dict(frame, line_digest=meta.get("line_digest", ""), line_config=meta.get("line_config", {}),
+                    geometry_digest=meta.get("geometry_digest", ""), line_source=meta.get("line_source", "configured"),
+                    geometry_path=meta.get("geometry_path", ""),
+                    snap_offset_px=meta.get("snap_offset_px", 0))
+
+    result["items"] = [replace(item, evidence=dict(item.evidence, analysis_signature=evidence_signature,
+                        **({"frame": evidence_frame(item.evidence["frame"])} if item.evidence.get("frame") else {})))
+                       for item in result["items"]]
+    result["auto_passed"] = [dict(item, frame=evidence_frame(item["frame"])) for item in result["auto_passed"]]
     if config.live and coverage:
         # Pair with the full neighbour context, then publish only settled
         # evidence. Cutting pairing inputs at the watermark creates false
@@ -661,7 +730,7 @@ def analyse_camera(
         visible_ids = {item.item_id for item in result["items"]}
         result["items"] = [item for item in result["items"] if not item.grouped or item.grouped in visible_ids]
         result["items"] += waiting_items(waiting, camera, "等待相邻短段和芯片数据到齐，暂不判定漏读。")
-        result["auto_passed"] = [item for item in outcome.auto_passed if model.to_recorder(item["chip_time_ms"]) <= watermark]
+        result["auto_passed"] = [item for item in result["auto_passed"] if model.to_recorder(item["chip_time_ms"]) <= watermark]
     result["model"] = model
     return result
 
@@ -688,22 +757,20 @@ def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
 
     root = Path(workspace_dir)
     output = root / OUTPUT_DIRNAME
-    settings: dict = {}
-    try:
-        settings = json.loads((output / ANALYSIS_CONFIG_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        settings = {}
+    settings = read_settings(root)
     lines = settings.get("finish_lines") or []
     return AnalysisConfig(
         workspace=root,
         output_dir=output,
         finish_lines={int(item["camera_index"]): dict(item) for item in lines if "camera_index" in item},
         cameras=tuple(int(value) for value in settings.get("cameras", ())),
-        model_path=Path(settings["model_path"]) if settings.get("model_path") else None,
+        model_path=resolved_model_path(root, settings),
         model_input=int(settings.get("model_input", 640)),
         crop_modes={int(key): str(value) for key, value in (settings.get("crop_modes") or {}).items()},
         clock_model_path=root / CLOCK_MODEL_FILENAME,
         min_available_mb=int(settings.get("min_available_mb", MIN_AVAILABLE_MEMORY_MB)),
+        sampling_profiles=tuple(settings.get("sampling_profiles", ())),
+        settings_token=settings_token(root),
     )
 
 
@@ -724,6 +791,7 @@ def run_offline_analysis(
 
     workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
                                   include_review_segments=True)
+    config = replace(config, race_id=workspace.race_id, stage_id=workspace.stage_id)
     summary: dict = {"race_id": workspace.race_id, "cameras": {}}
     free = available_memory_mb()
     memory: dict = {"available_at_start_mb": free, "stage_peaks_mb": {}}
@@ -738,7 +806,8 @@ def run_offline_analysis(
         lower_process_priority()
     limit_opencv_threads(1)
     governor = ResourceGovernor()
-    cameras = config.cameras or workspace.camera_indexes()
+    cameras = config.cameras or tuple(sorted(set(workspace.camera_indexes()) | set(config.finish_lines)
+                                             | {int(p["camera_index"]) for p in config.sampling_profiles}))
     outer_progress = progress
 
     def progress(stage_name: str, done: int, total: int) -> None:
@@ -750,11 +819,17 @@ def run_offline_analysis(
     for camera in cameras:
         line = line_for_camera(config, workspace, camera)
         segments = workspace.archive_segments(camera)
-        if line is None or not segments:
-            summary["cameras"][camera] = {"skipped": "没有终点线或整段录像"}
+        missing = [segment for segment in segments if line_for_segment(config, workspace, segment) is None]
+        if not segments or len(missing) == len(segments):
+            reason = "等待已封存录像" if not segments else "等待实际终点线或不跨改线边界的封存片段"
+            result = {"camera_index": camera, "error": reason, "items": waiting_items(workspace.reads, camera, reason),
+                      "auto_passed": [], "waiting_reason": "recording" if not segments else "finish_line",
+                      "sealed_through_ms": max((segment.end_ms for segment in segments), default=None)}
+            results.append(result)
+            summary["cameras"][camera] = {"skipped": reason}
             continue
         paths = extract_strips(
-            config, segments, line, progress=progress,
+            config, segments, line or {}, progress=progress,
             checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
         )
         summary["cameras"][camera] = {"strips": len(paths)}
@@ -764,6 +839,13 @@ def run_offline_analysis(
             config, workspace, camera, paths, progress=progress,
             checkpoint=lambda: governor.checkpoint(cancelled),
         )
+        result["missing_line_segments"] = [segment.segment.segment_id for segment in missing]
+        result["sealed_through_ms"] = max(segment.end_ms for segment in segments)
+        if missing:
+            result["items"].append(ProblemItem(
+                stable_item_id(KIND_WAITING, camera, "missing_line"), KIND_WAITING, CATEGORY_VIDEO,
+                f"{len(missing)} 个封存片段缺线或跨改线边界，等待分段验证，不能视为已核清", status=STATUS_WAITING,
+                evidence={"segments": result["missing_line_segments"]}))
         results.append(result)
         summary["cameras"][camera] = {
             key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")
@@ -799,6 +881,7 @@ def write_problem_list(
     """Combine chip self checks with the video items and write the list."""
 
     output_dir = config.resolved_output()
+    output_dir.mkdir(parents=True, exist_ok=True)
     roster = {}
     metadata = workspace.metadata()
     if metadata is not None and metadata.race_id == workspace.race_id:
@@ -831,6 +914,7 @@ def write_problem_list(
         "items": [item.to_payload() for item in items],
         "auto_passed": auto_passed,
         "live": config.live,
+        "settings_token": config.settings_token,
     }
     target = output_dir / PROBLEM_LIST_FILENAME
     temporary = target.with_name(target.name + ".tmp")

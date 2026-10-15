@@ -35,7 +35,6 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from .finish_line import FinishLine
 from .event_workspace import (
         EventWorkspaceDescriptor,
         EventWorkspaceError,
@@ -770,10 +769,10 @@ class FinishReviewLaunchDialog(QDialog):
             )
         )
         visual_settings_row.addWidget(self.visual_direction_combo)
-        form.addRow("视频过线辅助", visual_settings_row)
+        form.addRow("旧运动检测区域", visual_settings_row)
         visual_hint = QLabel(
-            "红线是正式终点线，黄线是两侧辅助检测线，蓝线是上下有效范围；"
-            "只生成复核候选，不会写入正式成绩。",
+            "红黄蓝线用于旧运动检测区域，不是自动分析的实际取样线；"
+            "实际终点线请在问题清单的“取样线 / 认车”中配置。",
             self,
         )
         visual_hint.setWordWrap(True)
@@ -1943,18 +1942,6 @@ class FinishReviewLaunchDialog(QDialog):
             self.visual_line_label.setText(
                 f"终点线 {self._visual_finish_line * 100:.1f}%"
             )
-            # Keep ordinary-video fallback aligned with the same red/yellow/blue
-            # calibration instead of maintaining a second coordinate system.
-            line = FinishLine(
-                camera_index,
-                dialog.line_x,
-                dialog.roi_top,
-                dialog.line_x,
-                dialog.roi_bottom,
-                band_width=dialog.gate_width,
-            )
-            self._finish_line_store.set(line)
-            self._finish_line_rois[camera_index] = line.roi
 
     def _selected_recording_source(self) -> str:
         if self.source_type_combo.currentData() == "rtsp":

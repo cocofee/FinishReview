@@ -248,15 +248,17 @@ class AnalysisWorkspace:
         return tuple(sorted({item.camera_index for item in self.archive_segments()}))
 
     def finish_lines(self) -> dict:
-        for name in FINISH_LINE_FILES:
+        result = {}
+        for name in reversed(FINISH_LINE_FILES):
             payload = _read_json(self.root / name)
-            if isinstance(payload, dict) and isinstance(payload.get("finish_lines"), list):
-                return {
+            records = payload.get("finish_lines") if isinstance(payload, dict) else payload
+            if isinstance(records, list):
+                result.update({
                     int(item["camera_index"]): item
-                    for item in payload["finish_lines"]
+                    for item in records
                     if isinstance(item, dict) and "camera_index" in item
-                }
-        return {}
+                })
+        return result
 
     def manual_anchors(self, camera_index: int) -> tuple[ClockAnchor, ...]:
         """Manual clock calibrations recorded by the existing first-rider workflow."""

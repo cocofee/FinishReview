@@ -125,7 +125,7 @@ class LineGeometry:
 
 
 def line_config_digest(config: Mapping[str, Any]) -> str:
-    keys = ("x1", "y1", "x2", "y2", "points", "snap")
+    keys = ("x1", "y1", "x2", "y2", "points", "snap", "revision", "race_id", "stage_id", "session_id", "effective_from_ms")
     payload = json.dumps({key: config.get(key) for key in keys}, sort_keys=True)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
@@ -239,8 +239,11 @@ def sample_video_file(
     capture = _open_capture(path, threads)
     started_wall, started_cpu = time.perf_counter(), time.process_time()
     try:
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise LineSamplingError(f"录像没有可解码的画面：{path}")
+        # Use decoded (orientation-corrected) pixels, not container dimensions.
+        height, width = frame.shape[:2]
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         geometry = LineGeometry.from_config(line_config, width, height, samples=samples)
         if snap:
@@ -248,17 +251,18 @@ def sample_video_file(
             snapped = snap_to_paint(_snap_frames(path, threads, SNAP_FRAMES), geometry)
             geometry = snapped or geometry
             capture = _open_capture(path, threads)
+            ok, frame = capture.read()
         mapx, mapy = geometry.remap_maps()
         columns: list[np.ndarray] = []
         pts: list[float] = []
         while not cancelled():
-            ok, frame = capture.read()
             if not ok or frame is None:
                 break
             pts.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)))
             columns.append(cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR).mean(axis=1).astype(np.uint8))
             if checkpoint is not None:
                 checkpoint()
+            ok, frame = capture.read()
     finally:
         capture.release()
     if not columns:
@@ -275,6 +279,19 @@ def sample_video_file(
     )
 
 
+def _save_geometry_record(path, meta, xs, ys):
+    payload = dict(meta, xs=xs.tolist(), ys=ys.tolist())
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    relative = Path("geometry") / (hashlib.sha256(encoded).hexdigest()[:24] + ".json")
+    target = path.parent / relative
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".tmp")
+        temporary.write_bytes(encoded)
+        temporary.replace(target)
+    return str(relative)
+
+
 def save_strip(path: str | Path, strip: LineStrip, meta: Mapping[str, Any]) -> None:
     """Write one strip atomically (compressed npz plus JSON metadata)."""
 
@@ -289,9 +306,21 @@ def save_strip(path: str | Path, strip: LineStrip, meta: Mapping[str, Any]) -> N
         height=strip.geometry.height,
         line_source=strip.geometry.source,
         snap_offset_px=strip.geometry.snap_offset_px,
+        geometry_digest=hashlib.sha256(strip.geometry.xs.tobytes() + strip.geometry.ys.tobytes()).hexdigest(),
         decode_seconds=round(strip.decode_seconds, 2),
         cpu_seconds=round(strip.cpu_seconds, 2),
     )
+    # Keep the small actual geometry even when the large sampling cache is
+    # replaced. Historical decisions must not lose their snapped line.
+    if path.exists():
+        try:
+            with np.load(path) as old:
+                previous = json.loads(bytes(old["meta"]).decode("utf-8"))
+                if not previous.get("geometry_file"):
+                    _save_geometry_record(path, previous, old["xs"], old["ys"])
+        except (ValueError, KeyError):
+            pass  # An unreadable cache has no recoverable geometry; replace it.
+    payload["geometry_file"] = _save_geometry_record(path, payload, strip.geometry.xs, strip.geometry.ys)
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("wb") as handle:
         np.savez_compressed(

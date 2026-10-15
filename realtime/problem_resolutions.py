@@ -72,6 +72,7 @@ class ProblemResolution:
     calibration_version: int = 0
     resolved_at_ms: int = 0
     revision: int = 1
+    analysis_signature: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -108,6 +109,7 @@ class ProblemResolution:
             calibration_version=int(payload.get("calibration_version", 0)),
             resolved_at_ms=int(payload.get("resolved_at_ms", 0)),
             revision=int(payload.get("revision", 1)),
+            analysis_signature=str(payload.get("analysis_signature", "")),
         )
 
     @property
@@ -164,6 +166,8 @@ class ProblemResolutionStore:
         position: Sequence[float] = (),
         chip_time_ms: Optional[int] = None,
     ) -> ProblemResolution:
+        if item.evidence.get("configuration_stale"):
+            raise ValueError("配置已变更，等待重新分析后再处理")
         previous, stale = self.state(item)
         acknowledge = action == ACTION_SYNCED and previous is not None and not stale and previous.action in (
             ACTION_RECORD_BIB, ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP, ACTION_CHANGE,
@@ -188,6 +192,7 @@ class ProblemResolutionStore:
                 position=tuple(float(value) for value in position),
                 chip_time_ms=item.chip_time_ms if chip_time_ms is None else int(chip_time_ms),
                 calibration_version=int(item.calibration_version),
+                analysis_signature=str(item.evidence.get("analysis_signature", "")),
                 resolved_at_ms=int(time.time() * 1000),
                 revision=(current.revision + 1) if current is not None else 1,
             )
@@ -206,7 +211,11 @@ class ProblemResolutionStore:
         resolution = self.get(item.item_id)
         if resolution is None or resolution.action == "reopen":
             return None, False
-        return resolution, resolution.binding != ProblemBinding.of(item)
+        return resolution, (resolution.binding != ProblemBinding.of(item)
+                            or bool(item.evidence.get("configuration_stale"))
+                            or resolution.calibration_version != item.calibration_version
+                            or dict(resolution.frame) != dict(item.evidence.get("frame") or {})
+                            or resolution.analysis_signature != str(item.evidence.get("analysis_signature", "")))
 
 
 def same_frame_conflicts(

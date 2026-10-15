@@ -91,13 +91,48 @@ class CropPlan:
         return cls(mode, (50,))
 
 
+def probe_model(request: dict) -> dict:
+    """Headless, low-priority trial; failures are explicit, never exclusions."""
+    from dataclasses import asdict
+    from .analysis_settings import CROP_MODES, model_fingerprint
+    from .line_sampling import LineGeometry
+
+    if not request.get("model_path"):
+        return {"state": "not_configured", "message": "模型未配置；降噪未启用，所有候选保留。"}
+    reader = None
+    try:
+        mode = request.get("crop_mode", "up")
+        if mode not in CROP_MODES:
+            raise ValueError("无效取景方式")
+        size = int(request.get("input_size", 640))
+        fingerprint = model_fingerprint(Path(request["model_path"]), size)
+        detector = YoloxDetector(request["model_path"], size)
+        plan = CropPlan.for_mode(mode)
+        reader = FrameReader(request["video_path"], threads=1)
+        frames = reader.frames_at([float(request["position_ms"]) + offset for offset in plan.offsets_ms])
+        if not frames:
+            raise ValueError("试运行没有可用解码帧")
+        height, width = frames[0][0].shape[:2]
+        geometry = LineGeometry.from_config({"points": request["points"]}, width, height, samples=20)
+        points = list(zip(geometry.xs, geometry.ys))
+        verdict = classify_frames(detector, [frame for frame, _pts in frames], points, plan)
+        return {"state": "enabled", "message": f"模型已加载并完成试运行：{mode}，{verdict.label} / {verdict.score:.2f}；仅验证选定画面，不代表全场准确率。",
+                "model_digest": fingerprint, "verdict": asdict(verdict), "pts_ms": [pts for _frame, pts in frames]}
+    except Exception as error:
+        return {"state": "failed", "message": f"模型加载/试运行失败：{error}；降噪未启用，候选保留。"}
+    finally:
+        if reader:
+            reader.close()
+
+
 class YoloxDetector:
     """Raw YOLOX ONNX output decoded with grids and strides."""
 
     def __init__(self, model_path: str | Path, input_size: int = 640):
         cv2.setNumThreads(1)
         self.input_size = int(input_size)
-        self.net = cv2.dnn.readNetFromONNX(str(model_path))
+        # OpenCV's filename overload cannot reliably open Unicode paths on Windows.
+        self.net = cv2.dnn.readNetFromONNX(np.frombuffer(Path(model_path).read_bytes(), dtype=np.uint8))
         grids, strides = [], []
         for stride in (8, 16, 32):
             size = self.input_size // stride

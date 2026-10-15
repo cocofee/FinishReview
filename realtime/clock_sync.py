@@ -88,6 +88,7 @@ class ClockModel:
     session_ids: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
     session_offsets: tuple[tuple[str, float], ...] = ()
+    evidence_signature: str = ""
 
     def __post_init__(self) -> None:
         if int(self.camera_index) <= 0:
@@ -124,6 +125,8 @@ class ClockModel:
         return ChipClockMs(int(round(value)))
 
     def same_fit(self, other: "ClockModel", *, tolerance_ms: int = 5) -> bool:
+        if self.evidence_signature != other.evidence_signature:
+            return False
         if other.camera_index != self.camera_index:
             return False
         if {key: round(value) for key, value in dict(self.session_offsets).items()} != {
@@ -169,6 +172,7 @@ class ClockModel:
             version=int(payload.get("version", 0)),
             created_at_ms=int(payload.get("created_at_ms", 0)),
             source=str(payload.get("source", "auto")),
+            evidence_signature=str(payload.get("evidence_signature", "")),
             session_ids=tuple(str(item) for item in payload.get("session_ids", ())),
             notes=tuple(str(item) for item in payload.get("notes", ())),
             session_offsets=tuple(

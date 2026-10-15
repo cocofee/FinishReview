@@ -55,7 +55,7 @@ class BunchContext:
 
 
 def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) -> BunchContext:
-    from .problem_analysis import config_from_workspace
+    from .problem_analysis import config_from_workspace, line_for_segment
 
     workspace = Path(workspace)
     source = AnalysisWorkspace(workspace)
@@ -91,7 +91,9 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
     if not segments:
         raise ValueError(f"机位 {camera} 的本团原录像缺失；未打开其他时段录像。")
     config = config_from_workspace(workspace)
-    line = dict(config.finish_lines.get(camera) or source.finish_lines().get(camera) or {})
+    anchor = next((segment for segment in segments if segment.segment.segment_id == frame.get("segment_id")), segments[0])
+    line = dict((frame.get("line_config") if camera == frame.get("camera_index") else None)
+                or line_for_segment(config, source, anchor) or {})
     return BunchContext(workspace, item, camera, model, chips, segments, start, end, line)
 
 

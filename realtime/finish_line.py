@@ -77,8 +77,9 @@ class FinishLine:
 class FinishLineStore:
     """Small atomic JSON store, independent from official timing data."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, legacy_path: str | Path | None = None):
         self.path = Path(path)
+        self.legacy_path = Path(legacy_path) if legacy_path else None
         self._lines: dict[int, FinishLine] = {}
         self._rois: dict[int, tuple[float, float, float, float]] = {}
         self.load()
@@ -86,10 +87,11 @@ class FinishLineStore:
     def load(self) -> tuple[FinishLine, ...]:
         self._lines = {}
         self._rois = {}
-        if not self.path.is_file():
+        source = self.path if self.path.is_file() else self.legacy_path
+        if source is None or not source.is_file():
             return ()
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(source.read_text(encoding="utf-8"))
             records = (
                 payload.get("finish_lines", payload)
                 if isinstance(payload, dict)
