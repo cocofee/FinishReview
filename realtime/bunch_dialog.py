@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .bunch_review import BunchContext, BunchReviewStore, align_counts, completion_issue, load_context
+from .bunch_review import BunchContext, BunchReviewStore, align_counts, completion_issue, is_excluded, load_context
 from .chip_history import format_chip_time
 from .line_sampling import load_strip
 
@@ -211,11 +211,16 @@ class CountView(QGraphicsView):
             self.scene().addPath(path, pen)
         for number, mark in marks:
             x, y = mark['x'] * w, mark['y'] * h
-            pen = QPen(QColor('#20ff87'), 3)
+            excluded = is_excluded(mark)
+            color = QColor('#aeb8c4' if excluded else '#20ff87')
+            pen = QPen(color, 3)
             pen.setCosmetic(True)
             self.scene().addEllipse(x - 12, y - 12, 24, 24, pen)
-            label = self.scene().addText(f"{number + 1} {mark.get('bib', '')}")
-            label.setDefaultTextColor(QColor('#20ff87'))
+            if excluded:
+                self.scene().addLine(x - 12, y - 12, x + 12, y + 12, pen)
+            text = f"已排除：{mark['exclusion_reason']}" if excluded else mark.get('bib', '')
+            label = self.scene().addText(f"{number + 1} {text}")
+            label.setDefaultTextColor(color)
             label.setScale(max(w / 1000, 1))
             label.setPos(x + 12, y - 20)
         if self.zoomed:
@@ -278,7 +283,7 @@ class BunchTimeline(QWidget):
         super().__init__()
         self.setFixedHeight(140)
         self.context, self.image, self.marks, self.current = None, None, [], None
-        self.setToolTip('整团过线图：红色为芯片预期时刻，绿色为人工计数；点击跳到原帧')
+        self.setToolTip('整团过线图：红色为芯片预期时刻，绿色为选手计数，灰色为已排除人员；点击跳到原帧')
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -294,8 +299,8 @@ class BunchTimeline(QWidget):
             painter.setPen(QColor('#ba2525'))
             painter.drawLine(x, 37, x, 118)
             painter.drawText(max(0, min(x, self.width() - 38)), 12 + (i % 3) * 12, chip.bib)
-        painter.setPen(QColor('#18834a'))
         for mark in self.marks:
+            painter.setPen(QColor('#8793a1' if is_excluded(mark) else '#18834a'))
             x = xof(mark['recorder_ms'])
             painter.drawLine(x, 47, x, 118)
         if self.current is not None:
@@ -359,13 +364,29 @@ class BunchReviewDialog(QDialog):
         self.bib_input = QLineEdit()
         self.bib_input.setPlaceholderText('看清的号码（可留空）')
         bib_row.addWidget(self.bib_input)
-        apply = QPushButton('记号码')
-        apply.clicked.connect(self.assign_bib)
-        bib_row.addWidget(apply)
+        self.apply_bib = QPushButton('记号码')
+        self.apply_bib.clicked.connect(self.assign_bib)
+        bib_row.addWidget(self.apply_bib)
         side.addLayout(bib_row)
-        remove = QPushButton('删除所选计数')
-        remove.clicked.connect(self.remove_selected)
-        side.addWidget(remove)
+        exclusion_help = QLabel('双击所选记录回看原帧；确认是非选手后再排除。看不清号码的选手请保留待查。')
+        exclusion_help.setWordWrap(True)
+        side.addWidget(exclusion_help)
+        exclusion_row = QHBoxLayout()
+        self.exclusion_reason = QComboBox()
+        self.exclusion_reason.addItems(['行人', '工作人员', '其他无关人员'])
+        exclusion_row.addWidget(self.exclusion_reason)
+        self.exclude_button = QPushButton('确认非选手并排除')
+        self.exclude_button.clicked.connect(self.exclude_selected)
+        exclusion_row.addWidget(self.exclude_button)
+        side.addLayout(exclusion_row)
+        correction_row = QHBoxLayout()
+        self.restore_button = QPushButton('恢复为选手计数')
+        self.restore_button.clicked.connect(self.restore_selected)
+        correction_row.addWidget(self.restore_button)
+        self.remove_button = QPushButton('删除误点计数')
+        self.remove_button.clicked.connect(self.remove_selected)
+        correction_row.addWidget(self.remove_button)
+        side.addLayout(correction_row)
         side.addWidget(QLabel('本团芯片（官方时间）'))
         self.chip_table = QTableWidget(0, 3)
         self.chip_table.setHorizontalHeaderLabels(['号码', '芯片时间', '核对状态'])
@@ -560,6 +581,9 @@ class BunchReviewDialog(QDialog):
             if not same:
                 return
             index = min(same, key=lambda i: (self.marks[i]['x'] - x) ** 2 + (self.marks[i]['y'] - y) ** 2)
+            if is_excluded(self.marks[index]):
+                self.notice.setText('已排除人员保留原帧和原因；如需纠正，请选中后恢复为选手计数。')
+                return
             self.marks.pop(index)
         else:
             if any((self.marks[i]['x'] - x) ** 2 + (self.marks[i]['y'] - y) ** 2 < .02 ** 2 for i in same):
@@ -580,14 +604,18 @@ class BunchReviewDialog(QDialog):
 
     def update_results(self):
         result = align_counts(self.context.chips, self.marks, self.bias.value())
-        self.summary.setText(f'芯片 {len(self.context.chips)} 个 · 人工计数 {len(self.marks)} 人 · '
+        excluded = sum(is_excluded(mark) for mark in self.marks)
+        self.summary.setText(f'芯片 {len(self.context.chips)} 个 · 选手计数 {len(self.marks) - excluded} 人 · '
+                             f'已排除 {excluded} 人 · '
                              f'多出 {len(result["extras"])} 人 · 未对应芯片 {len(result["missing"])} 个')
         selected = self.count_table.currentRow()
         self.count_table.blockSignals(True)
         self.count_table.setRowCount(len(self.marks))
         extras = {e['mark']: e for e in result['extras']}
         for i, mark in enumerate(self.marks):
-            if i in result['pairs']:
+            if is_excluded(mark):
+                status = '已排除：' + mark['exclusion_reason']
+            elif i in result['pairs']:
                 chip = self.context.chips[result['pairs'][i]]
                 status = ('同号芯片 ' if mark.get('bib') else '顺序参考 ') + chip.bib
                 if i in result['ambiguous']:
@@ -597,11 +625,15 @@ class BunchReviewDialog(QDialog):
                 status = ('多出；估算 ' + format_chip_time(extra['chip_time_ms']) if extra['chip_time_ms'] is not None
                           else '多出；缺少前后参考，无法估时')
             for column, value in enumerate((str(i + 1), format_chip_time(mark['recorder_ms']), mark.get('bib', ''), status)):
-                self.count_table.setItem(i, column, QTableWidgetItem(value))
+                cell = QTableWidgetItem(value)
+                if is_excluded(mark):
+                    cell.setForeground(QColor('#687586'))
+                self.count_table.setItem(i, column, cell)
         self.count_table.resizeColumnsToContents()
         self.count_table.blockSignals(False)
         if 0 <= selected < len(self.marks):
             self.count_table.setCurrentCell(selected, 0)
+        self.select_count(self.count_table.currentRow())
         self.chip_table.setRowCount(len(self.context.chips))
         for i, chip in enumerate(self.context.chips):
             status = '未对应，需核查' if i in result['missing'] else '已有计数'
@@ -612,26 +644,48 @@ class BunchReviewDialog(QDialog):
         self.timeline.update()
 
     def select_count(self, row, *_args):
-        if 0 <= row < len(self.marks):
+        valid = 0 <= row < len(self.marks)
+        excluded = valid and is_excluded(self.marks[row])
+        self.bib_input.setEnabled(valid and not excluded)
+        self.apply_bib.setEnabled(valid and not excluded)
+        self.exclude_button.setEnabled(valid and not excluded)
+        self.exclusion_reason.setEnabled(valid and not excluded)
+        self.restore_button.setEnabled(bool(excluded))
+        self.remove_button.setEnabled(valid and not excluded)
+        if valid:
             self.bib_input.setText(self.marks[row].get('bib', ''))
         else:
             self.bib_input.clear()
 
     def assign_bib(self):
         row = self.count_table.currentRow()
-        if not 0 <= row < len(self.marks):
+        if not 0 <= row < len(self.marks) or is_excluded(self.marks[row]):
             self.notice.setText('请先点压线者计数，或选择一条计数。')
             return
         bib = self.bib_input.text().strip()
-        if bib and any(i != row and m.get('bib') == bib for i, m in enumerate(self.marks)):
+        if bib and any(i != row and not is_excluded(m) and m.get('bib') == bib for i, m in enumerate(self.marks)):
             self.notice.setText('这个号码已经填在另一位过线者上，请核对。')
             return
         self.marks[row]['bib'] = bib
         self.changed()
 
+    def exclude_selected(self):
+        row = self.count_table.currentRow()
+        if 0 <= row < len(self.marks) and not is_excluded(self.marks[row]):
+            self.marks[row]['exclusion_reason'] = self.exclusion_reason.currentText()
+            self.changed()
+            self.notice.setText('已按人工确认排除：不计入选手人数和补录建议，原帧及原因保留；可恢复。')
+
+    def restore_selected(self):
+        row = self.count_table.currentRow()
+        if 0 <= row < len(self.marks) and is_excluded(self.marks[row]):
+            self.marks[row].pop('exclusion_reason')
+            self.changed()
+            self.notice.setText('已恢复为选手计数，请重新核对号码及芯片对应关系。')
+
     def remove_selected(self):
         row = self.count_table.currentRow()
-        if 0 <= row < len(self.marks):
+        if 0 <= row < len(self.marks) and not is_excluded(self.marks[row]):
             self.marks.pop(row)
             self.changed()
 

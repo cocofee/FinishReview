@@ -76,6 +76,32 @@ def test_cannot_complete_empty_unviewed_missing_or_duplicate_counts():
     assert '同一号码' in completion_issue(cc, duplicate, align_counts(cc, duplicate), True)
 
 
+def test_excluded_people_do_not_match_chips_or_change_bias_and_keep_original_indices():
+    cc = chips(1000, 2000, 3000)
+    counts = [mark(1420, '101'), dict(mark(1450, '101'), exclusion_reason='行人'),
+              mark(2420, '102'), dict(mark(2450), exclusion_reason='工作人员'), mark(3420, '103')]
+    result = align_counts(cc, counts)
+    assert result['pairs'] == {0: 0, 2: 1, 4: 2}
+    assert result['bias_ms'] == 120 and result['lone_count'] == 3
+    assert result['extras'] == [] and result['missing'] == []
+    assert completion_issue(cc, counts, result, True) == ''
+    counts[2]['exclusion_reason'] = '其他无关人员'
+    result = align_counts(cc, counts)
+    assert result['missing'] == [1] and result['extras'] == []
+    assert '没有对应' in completion_issue(cc, counts, result, True)
+    excluded_only = [dict(mark(1300), exclusion_reason='行人')]
+    assert completion_issue(cc, excluded_only, align_counts(cc, excluded_only), True)
+
+
+def test_excluded_mark_cannot_supply_interpolation_anchor():
+    cc = chips(1000, 3000)
+    counts = [dict(mark(1300, '101'), exclusion_reason='工作人员'), mark(2300, '319'), mark(3300, '102')]
+    result = align_counts(cc, counts)
+    assert result['pairs'] == {2: 1}
+    assert result['missing'] == [0]
+    assert result['extras'] == [{'mark': 1, 'bib': '319', 'chip_time_ms': None}]
+
+
 @pytest.fixture
 def synthetic_bunch(tmp_path):
     videos = tmp_path / 'videos'
@@ -204,6 +230,67 @@ def test_incomplete_group_stays_pending_and_group_has_no_one_click_checked(synth
     panel.refresh()
     assert panel.state(item) == '待处理'
     app.processEvents()
+
+
+def test_exclusion_reason_and_evidence_roundtrip_without_exporting_cached_extras(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
+    counts += [dict(mark(2800, '888'), exclusion_reason='行人'), mark(4000, '550')]
+    store = BunchReviewStore(root / 'finish_problems')
+    record = store.save(context, counts, 18, completed=True, fully_viewed=True)
+    assert [e['bib'] for e in record['extras']] == ['550']
+    restored = BunchReviewStore(root / 'finish_problems')
+    assert restored.get(context)['marks'][4] == counts[4]
+    # Cached suggestions must not override the recorded classification.
+    restored.latest[(item.item_id, context.camera)]['extras'].append(
+        {'mark': 4, 'bib': '888', 'chip_time_ms': T + 2500})
+    rows = restored.manual_entries([item], root)
+    assert len(rows) == 1 and rows[0][0] == '550'
+    assert '81' in rows[0][2]  # original mark index 5, frame 4000 / 50 displayed one-based
+    counts[0]['exclusion_reason'] = '工作人员'
+    with pytest.raises(ValueError, match='没有对应'):
+        store.save(context, counts, 20, completed=True, fully_viewed=True)
+    store.save(context, counts, 20)
+    assert store.manual_entries([item], root) == []
+
+
+def test_dialog_can_exclude_restore_and_reopen_without_changing_other_marks(synthetic_bunch):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
+    counts.insert(1, mark(2800, '101'))
+    BunchReviewStore(root / 'finish_problems').save(context, counts, 4)
+    dialog = BunchReviewDialog(root, item)
+    try:
+        dialog.count_table.setCurrentCell(1, 0)
+        dialog.exclusion_reason.setCurrentText('行人')
+        dialog.exclude_button.click()
+        assert len(dialog.marks) == 5 and dialog.marks[1]['exclusion_reason'] == '行人'
+        assert '选手计数 4 人' in dialog.summary.text() and '已排除 1 人' in dialog.summary.text()
+        assert dialog.count_table.item(1, 3).text() == '已排除：行人'
+        assert not dialog.bib_input.isEnabled() and dialog.restore_button.isEnabled()
+        assert dialog.marks[0] == counts[0] and dialog.marks[2:] == counts[2:]
+        assert dialog.save(False)
+        dialog.restore()
+        dialog.count_table.setCurrentCell(1, 0)
+        assert dialog.marks[1]['exclusion_reason'] == '行人'
+        dialog.restore_button.click()
+        assert 'exclusion_reason' not in dialog.marks[1]
+        assert dialog.bib_input.isEnabled() and not dialog.restore_button.isEnabled()
+        assert '同一号码' in completion_issue(context.chips, dialog.marks,
+                                            align_counts(context.chips, dialog.marks), True)
+        assert dialog.save(False)
+    finally:
+        dialog.close()
+        dialog.worker.requestInterruption()
+        assert dialog.worker.wait(3000)
+        app.processEvents()
+    records = [json.loads(line) for line in (root / 'finish_problems' / 'bunch_reviews.jsonl').read_text(
+        encoding='utf-8').splitlines()]
+    assert any(r['marks'][1].get('exclusion_reason') == '行人' for r in records)
+    assert 'exclusion_reason' not in records[-1]['marks'][1]
 
 
 def test_dialog_reads_counts_saves_reopens_and_releases_worker(synthetic_bunch):

@@ -95,13 +95,20 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
     return BunchContext(workspace, item, camera, model, chips, segments, start, end, line)
 
 
+def is_excluded(mark: dict) -> bool:
+    """Old drafts are rider counts; an explicit reason records manual exclusion."""
+    return bool(mark.get("exclusion_reason", "").strip())
+
+
 def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: int = 0) -> dict:
     """Prototype's plate-first / ordered alignment, with explicit uncertainty.
 
     Extra riders only get a suggested chip time when bracketed by two counted
     riders. At the ends of a bunch there is no invented extrapolation.
     """
-    order = sorted(range(len(marks)), key=lambda i: marks[i]["recorder_ms"])
+    # Keep journal indices: UI and exported evidence refer to the original marks.
+    order = sorted((i for i, mark in enumerate(marks) if not is_excluded(mark)),
+                   key=lambda i: marks[i]["recorder_ms"])
     pairs, used_chips = {}, set()
     for i in order:
         bib = marks[i].get("bib", "").strip()
@@ -165,9 +172,10 @@ def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: in
 def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict, fully_viewed: bool) -> str:
     if not fully_viewed:
         return "请逐帧查看完整团段后，勾选“已看完整团”。"
-    if not marks:
+    active = [mark for mark in marks if not is_excluded(mark)]
+    if not active:
         return "请先在原画面点击每位压线者计数。"
-    bibs = [m.get("bib", "").strip() for m in marks if m.get("bib", "").strip()]
+    bibs = [m.get("bib", "").strip() for m in active if m.get("bib", "").strip()]
     if len(bibs) != len(set(bibs)):
         return "同一号码被填写在多人上，请先核对并修正。"
     if result["missing"]:
@@ -243,7 +251,12 @@ class BunchReviewStore:
                 continue
             if self.get(context) is None:
                 continue  # changed chips, calibration, geometry or evidence: ask again
-            for extra in record["extras"]:
+            # Recompute from the saved evidence so stale cached extras cannot
+            # reintroduce an excluded person or an incomplete group's suggestions.
+            result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
+            if completion_issue(context.chips, record["marks"], result, record.get("fully_viewed", False)):
+                continue
+            for extra in result["extras"]:
                 mark = record["marks"][extra["mark"]]
                 rows.append((extra["bib"], format_chip_time(extra["chip_time_ms"]), _frame_text(mark["frame"]),
                              record["camera"], record["calibration_version"],
