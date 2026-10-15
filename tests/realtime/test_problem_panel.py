@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 from realtime.problem_items import (
     CATEGORY_COVERAGE,
     CATEGORY_VIDEO,
+    KIND_NEAR_CROSSING,
     KIND_NO_CHIP_CROSSING,
     KIND_NOT_ARRIVED,
     KIND_TWO_CHIPS_ONE_CROSSING,
@@ -298,3 +299,60 @@ def test_background_progress_does_not_replace_operator_validation(qapp):
     panel._consume_progress(b'{"stage":"sampling","done":1,"total":2}\n')
     assert panel.hint.text() == "请填写原因"
     assert "1/2" in panel.analysis_status
+
+
+def _near_crossing_item():
+    return ProblemItem(
+        "near:1", KIND_NEAR_CROSSING, CATEGORY_VIDEO,
+        "11:01:28.309 线上另有一处变化，距芯片 366（11:01:27.809）的过线 +500 ms（认车：自行车）",
+        chip_time_ms=T + 500, priority=15,
+        evidence={"frame": dict(FRAME), "recorder_ms": T + 500, "gap_ms": 500,
+                  "near_read": {"bib": "366", "event_id": "e-366", "chip_ms": T},
+                  "members": [{"frame": dict(FRAME), "chip_time_ms": T + 500}]},
+    )
+
+
+def test_near_crossing_records_a_plate_and_exports_its_time_source(qapp, tmp_path):
+    near = _near_crossing_item()
+    _write_list(tmp_path, [near], [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.table.setCurrentCell(0, 0)
+
+    assert [button.property("problemAction") for button in panel.action_buttons] == [
+        "record_bib", "same_crossing", "not_rider", "ride_back", "insufficient",
+    ]
+    assert panel.state(near) == "待处理"
+    panel.bib_input.setText("307")
+    record = next(button for button in panel.action_buttons if button.property("problemAction") == "record_bib")
+    record.click()
+    assert panel.state(near).startswith("待 CycleRace：认号补录")
+
+    assert panel.export() == {"补录清单.csv": 1, "建议删除清单.csv": 0, "建议改号改圈清单.csv": 0}
+    rows = list(csv.DictReader((tmp_path / "finish_problems" / "exports" / "补录清单.csv").open(encoding="utf-8-sig")))
+    assert len(rows) == 1
+    assert rows[0]["号码"] == "307" and "第 813 帧" in rows[0]["证据帧"]
+    assert rows[0]["时间来源"] == "校时换算（视频原帧）"
+    assert "附近可能另有过线" in rows[0]["说明"]
+
+
+def test_excluding_or_confirming_a_crossing_requires_a_written_reason(qapp, tmp_path):
+    near = _near_crossing_item()
+    _write_list(tmp_path, [near], [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.table.setCurrentCell(0, 0)
+
+    same = next(button for button in panel.action_buttons if button.property("problemAction") == "same_crossing")
+    same.click()
+    assert "依据" in panel.hint.text() and panel.state(near) == "待处理"
+
+    for action in ("not_rider", "ride_back", "same_crossing"):
+        with pytest.raises(ValueError, match="依据"):
+            panel.store.resolve(near, action)
+
+    panel.reason_input.setText("同一人后轮，前轮已在同一帧压线")
+    same.click()
+    # Confirming "same crossing" closes the question without inventing a rider.
+    assert panel.state(near).startswith("已处理：确认是同一次过线")
+    assert panel.export() == {"补录清单.csv": 0, "建议删除清单.csv": 0, "建议改号改圈清单.csv": 0}

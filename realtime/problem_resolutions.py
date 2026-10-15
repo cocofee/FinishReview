@@ -25,8 +25,14 @@ from .problem_items import (
     ACTION_DELETE_CHIP,
     ACTION_DELETE_EXTRA_CHIP,
     ACTION_LABELS,
+    ACTION_NOT_RIDER,
     ACTION_RECORD_BIB,
+    ACTION_RIDE_BACK,
+    ACTION_SAME_CROSSING,
     ACTION_SYNCED,
+    KIND_BUNCH,
+    KIND_MANUAL_REVIEW,
+    KIND_OBSTRUCTION,
     KIND_TITLES,
     ProblemItem,
 )
@@ -180,6 +186,10 @@ class ProblemResolutionStore:
             raise ValueError("认号补录需要号码")
         if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP) and not reason.strip():
             raise ValueError("删除需要填写原因")
+        if action in (ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_SAME_CROSSING) and not reason.strip():
+            # A rider may be excluded, but never on "the number is unreadable":
+            # the written reason is what the exclusion stays traceable by.
+            raise ValueError("排除或确认同一次过线需要填写依据，请写明看到的画面")
         if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP):
             if len(item.event_ids) > 1 and len(item.bibs) != len(item.event_ids):
                 raise ValueError("记录与号码对应不明确，请使用成员级处理")
@@ -274,6 +284,16 @@ def _passage_number(event_id: str) -> str:
     return event_id.rsplit("-passage-", 1)[-1] if "-passage-" in event_id else event_id
 
 
+def _manual_time_source(item: ProblemItem) -> str:
+    """Where the suggested chip time comes from; the operator checks it in CycleRace."""
+
+    if item.kind == KIND_MANUAL_REVIEW or item.chip_time_ms is None:
+        return "未换算：按原帧人工判断"
+    if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
+        return "集团内前后过线芯片之间插值"
+    return "校时换算（视频原帧）"
+
+
 def export_lists(
     items: Sequence[ProblemItem],
     store: ProblemResolutionStore,
@@ -305,7 +325,7 @@ def export_lists(
             manual.append((
                 resolution.bib, format_chip_time(resolution.chip_time_ms), _frame_text(resolution.frame),
                 resolution.frame.get("camera_index", ""), resolution.calibration_version,
-                f"{title}；{resolution.reason}".rstrip("；"),
+                f"{title}；{resolution.reason}".rstrip("；"), _manual_time_source(item),
             ))
         elif resolution.action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP):
             if item.evidence.get("batch_members") or len(item.bibs) != len(item.event_ids):
@@ -352,7 +372,7 @@ def export_lists(
             exported.add(key)
     manual.extend(bunches.manual_entries(items, store.journal_path.parent.parent))
     tables = (
-        (EXPORT_MANUAL_ENTRIES, ("号码", "芯片域时间", "证据帧", "机位", "校时版本", "说明"), manual),
+        (EXPORT_MANUAL_ENTRIES, ("号码", "芯片域时间", "证据帧", "机位", "校时版本", "说明", "时间来源"), manual),
         (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因", "事件ID", "记录修订", "批次ID", "证据帧", "校时版本", "证据快照JSON"), deletions),
         (EXPORT_CHANGES, ("原号码", "建议号码或圈数", "通过时间", "CycleRace 记录编号", "问题类型", "原因"), changes),
     )

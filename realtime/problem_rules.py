@@ -3,17 +3,22 @@
 Rules, in order:
 1. an unpaired crossing near a chip-only read is that read arriving late
    (0.8 s; 1.5 s when both sides are isolated);
-2. an extra crossing within 0.8 s of any expected chip time is the same
-   rider (shadows, a second wheel) and is merged;
+2. an extra crossing beside a chip that is already matched to another crossing
+   is only merged when it belongs to the same passage: the same moment or an
+   adjacent frame of the same session. The merged piece stays in that rider's
+   evidence. Anything else becomes one "附近可能另有过线" item per chip, never
+   a silent drop and never a task per fragment (plan step 5);
 3. repeated activity at the same spot within 90 s becomes one "standing" item;
 4. remaining bicycle-like crossings are "crossing without chip";
 5. a chip-only read next to a paired crossing is "two chips, one crossing",
    otherwise "chip without crossing";
-6. 4+ riders within 2 s and long obstructed periods get a manual check.
+6. 4+ riders within 2 s, or a small group where the video shows more crossings
+   than there are chips, and long obstructed periods get a manual check.
 
 Paired riders are auto-passed and listed separately; they are never turned
 into manual confirmations. No rule assigns a crossing to a nearby chip as a
-result; items only describe what the operator should look at.
+result; items only describe what the operator should look at. Chip or video
+counts never decide identity: only the operator reads a number.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from .problem_items import (
     CATEGORY_VIDEO,
     KIND_BUNCH,
     KIND_CHIP_NO_CROSSING,
+    KIND_NEAR_CROSSING,
     KIND_NO_CHIP_CROSSING,
     KIND_NO_VIDEO,
     KIND_OBSTRUCTION,
@@ -61,8 +67,11 @@ STANDING_ROWS = 50
 STANDING_WINDOW_MS = 90_000
 STANDING_MIN = 3
 SIMULTANEOUS_MS = 300
+SAME_CROSSING_MS = 150
+SAME_CROSSING_FRAMES = 2
 BUNCH_GAP_MS = 2_000
 BUNCH_MIN = 4
+SMALL_GROUP_MIN = 3
 BUNCH_MARGIN_MS = 700
 OBSTRUCTION_MERGE_MS = 30_000
 OBSTRUCTION_MIN_MS = 10_000
@@ -110,12 +119,30 @@ class Obstruction:
     end_ms: int
 
 
+@dataclass(frozen=True)
+class NearCrossing:
+    """An extra crossing beside a chip that is already matched elsewhere.
+
+    ``read`` is the nearby chip the operator should compare against; it is a
+    candidate association, never a decision about who crossed.
+    """
+
+    crossing: CrossingRecord
+    read: ChipRead
+    anchor: Optional[CrossingRecord]
+    gap_ms: int
+    verdict: Optional[BikeVerdict] = None
+
+
 @dataclass
 class RuleOutcome:
     items: list[ProblemItem] = field(default_factory=list)
     auto_passed: list[dict] = field(default_factory=list)
     late_pairs: list[tuple[str, int]] = field(default_factory=list)
+    late_pair_frames: list[dict] = field(default_factory=list)
     duplicates: int = 0
+    fragments: list[dict] = field(default_factory=list)
+    near_crossings: list[dict] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
 
 
@@ -128,6 +155,39 @@ def _closed_note(reads: Sequence[ChipRead]) -> tuple[str, str]:
     if not inactive:
         return STATUS_OPEN, ""
     return STATUS_CLOSED_UPSTREAM, "CycleRace 已作废 " + "、".join(read.bib for read in inactive)
+
+
+def same_passage(extra: CrossingRecord, anchor: Optional[CrossingRecord]) -> tuple[bool, str]:
+    """Whether an extra change is part of an already detected crossing.
+
+    Only the geometry the detector itself merges on: the same moment, or an
+    adjacent frame of the same session. Rows along the line are not used, so a
+    second rider is never merged just because the chip time is close; at the
+    same moment one rider cannot be two riders, and the strip already merges
+    pieces within ``same_start_ms``. Everything wider stays a candidate.
+    """
+
+    if anchor is None or extra.session_id != anchor.session_id:
+        return False, ""
+    if abs(extra.recorder_ms - anchor.recorder_ms) <= SAME_CROSSING_MS:
+        return True, "同一时刻的两处变化属于同一次过线"
+    if (extra.video_path == anchor.video_path
+            and abs(extra.frame_index - anchor.frame_index) <= SAME_CROSSING_FRAMES):
+        return True, "相邻帧上的两处变化属于同一次过线（前后轮或影子）"
+    return False, ""
+
+
+def _nearest_expected(
+    crossing: CrossingRecord, expected: Mapping[str, int], window_ms: int,
+) -> Optional[tuple[str, int]]:
+    """Closest already matched chip time, used as a candidate association only."""
+
+    best: Optional[tuple[str, int]] = None
+    for read_id, value in expected.items():
+        gap = int(crossing.recorder_ms - value)
+        if abs(gap) <= window_ms and (best is None or abs(gap) < abs(best[1])):
+            best = (read_id, gap)
+    return best
 
 
 def _crossing_evidence(crossing: CrossingRecord, version: int, verdict: Optional[BikeVerdict] = None) -> dict:
@@ -199,9 +259,12 @@ def build_video_items(
 
     resolved: set[str] = set()
     rest: list[tuple[CrossingRecord, Optional[BikeVerdict]]] = []
+    near_candidates: list[NearCrossing] = []
+    anchor_of: dict[str, CrossingRecord] = {read.read_id: crossing for crossing, read, _residual in matched}
+    read_of: dict[str, ChipRead] = {read.read_id: read for read in [*chip_only, *(item[1] for item in matched)]}
     expected_values = sorted(expected.values())
     for crossing, verdict in sorted(candidates, key=lambda item: item[0].recorder_ms):
-        near = [
+        late = [
             read for read in chip_only
             if read.read_id not in resolved and (
                 abs(crossing.recorder_ms - expected[read.read_id]) <= LATE_PAIR_MS
@@ -211,17 +274,31 @@ def build_video_items(
                 )
             )
         ]
-        if near:
-            read = min(near, key=lambda item: abs(crossing.recorder_ms - expected[item.read_id]))
+        if late:
+            read = min(late, key=lambda item: abs(crossing.recorder_ms - expected[item.read_id]))
             resolved.add(read.read_id)
             residual = int(crossing.recorder_ms - expected[read.read_id])
             outcome.late_pairs.append((read.bib, residual))
+            outcome.late_pair_frames.append(dict(_auto_passed(read, crossing, residual, version, late=True)))
             outcome.auto_passed.append(_auto_passed(read, crossing, residual, version, late=True))
             continue
-        if any(abs(crossing.recorder_ms - value) <= DUPLICATE_MS for value in expected_values):
-            outcome.duplicates += 1
+        neighbor = _nearest_expected(crossing, expected, DUPLICATE_MS)
+        if neighbor is None:
+            rest.append((crossing, verdict))
             continue
-        rest.append((crossing, verdict))
+        read = read_of[neighbor[0]]
+        anchor = anchor_of.get(read.read_id)
+        same, reason = same_passage(crossing, anchor)
+        if same:
+            # Same rider, not a dropped crossing: the piece stays in that
+            # rider's evidence so the merge has a traceable reason.
+            outcome.duplicates += 1
+            outcome.fragments.append({
+                "bib": read.bib, "event_id": read.event_id, "gap_ms": int(neighbor[1]), "reason": reason,
+                "recorder_ms": int(crossing.recorder_ms), "frame": crossing.frame_payload(version),
+            })
+            continue
+        near_candidates.append(NearCrossing(crossing, read, anchor, int(neighbor[1]), verdict))
 
     spots: list[dict] = []
     for crossing, verdict in rest:
@@ -278,17 +355,89 @@ def build_video_items(
         if manual:
             status = STATUS_CLOSED_UPSTREAM
             note = "CycleRace 已补录 " + "、".join(_chip_text(read) for read in manual)
+        evidence = _crossing_evidence(crossing, version, verdict)
+        # Group size is not read from chips: a stretch with several crossings and
+        # fewer chips is kept visible even when no chip is missing entirely.
+        dense_start = crossing.recorder_ms - BUNCH_GAP_MS
+        dense_end = crossing.recorder_ms + BUNCH_GAP_MS
+        dense_video = sum(dense_start <= value <= dense_end for value in crossing_times)
+        dense_chips = sum(dense_start <= value <= dense_end for value in expected_values)
+        dense = dense_video >= SMALL_GROUP_MIN and dense_video > dense_chips
+        if dense:
+            evidence = dict(evidence, dense_window={"video_count": dense_video, "chip_count": dense_chips,
+                                                    "start_ms": int(dense_start), "end_ms": int(dense_end)})
         outcome.items.append(ProblemItem(
             item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
             kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
             detail=(
                 f"{format_chip_time(chip_time)} 有人过线，附近没有芯片读数（认车：{LABEL_TEXT.get(label, label)}）"
                 + (f"；同一时刻线上另有 {len(cluster) - 1} 处变化" if len(cluster) > 1 else "")
+                + (f"；前后 2 秒内共 {dense_video} 处过线、附近只有 {dense_chips} 条芯片，请一并核对"
+                   if dense else "")
             ),
             chip_time_ms=chip_time, bibs=tuple(read.bib for read in manual),
             event_ids=tuple(read.event_id for read in manual),
             status=status, status_note=note, priority=10,
-            evidence=_crossing_evidence(crossing, version, verdict),
+            evidence=evidence, calibration_version=version,
+        ))
+
+    # Extra changes beside a chip time that is already used by another crossing.
+    # They are kept as one traceable question per chip; the nearby chip is an
+    # association for the operator, not a reason to decide who crossed.
+    near_groups: list[list[NearCrossing]] = []
+    for entry in sorted(near_candidates, key=lambda value: value.crossing.recorder_ms):
+        if (near_groups and entry.read.read_id == near_groups[-1][-1].read.read_id
+                and entry.crossing.recorder_ms - near_groups[-1][-1].crossing.recorder_ms <= SIMULTANEOUS_MS):
+            near_groups[-1].append(entry)
+        else:
+            near_groups.append([entry])
+    for group in near_groups:
+        best = min(group, key=lambda value: _evidence_rank((value.crossing, value.verdict)))
+        crossing, verdict, read = best.crossing, best.verdict, best.read
+        chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
+        label = verdict.label if verdict is not None else LABEL_UNCHECKED
+        status, note = STATUS_OPEN, ""
+        if verdict is not None and verdict.decision == DECISION_DISPUTED:
+            status, note = STATUS_DISPUTED, f"有争议：{LABEL_TEXT.get(label, label)}，{verdict.reason}"
+        elif crowded(crossing.recorder_ms):
+            note = "终点线拥挤时段"
+        manual = [
+            entry for entry in manual_entries
+            if entry.active_now and abs(entry.chip_ms - chip_time) <= MANUAL_MATCH_MS
+        ]
+        if manual:
+            status = STATUS_CLOSED_UPSTREAM
+            note = "CycleRace 已补录 " + "、".join(_chip_text(entry) for entry in manual)
+        members = [{
+            "frame": value.crossing.frame_payload(version),
+            "recorder_ms": int(value.crossing.recorder_ms),
+            "chip_time_ms": model.to_chip(value.crossing.recorder_ms, value.crossing.session_id),
+            "gap_to_chip_ms": int(value.gap_ms),
+            "row": int(value.crossing.row),
+            "bike": ({"label": value.verdict.label, "score": round(value.verdict.score, 3),
+                      "decision": value.verdict.decision, "reason": value.verdict.reason}
+                     if value.verdict is not None else None),
+        } for value in sorted(group, key=lambda value: value.crossing.recorder_ms)]
+        outcome.near_crossings.append({
+            "bib": read.bib, "event_id": read.event_id, "gap_ms": int(best.gap_ms),
+            "recorder_ms": int(crossing.recorder_ms), "members": len(group), "bike": members[0]["bike"],
+        })
+        outcome.items.append(ProblemItem(
+            item_id=stable_item_id(KIND_NEAR_CROSSING, camera_index, read.read_id, crossing.key),
+            kind=KIND_NEAR_CROSSING, category=CATEGORY_VIDEO,
+            detail=(
+                f"{format_chip_time(chip_time)} 线上另有一处变化，距芯片 {_chip_text(read)} 的过线 "
+                f"{best.gap_ms:+d} ms（认车：{LABEL_TEXT.get(label, label)}）；"
+                "可能另有一位漏读选手，也可能只是同一人的后轮或影子，请按原帧判断"
+                + (f"；同一芯片附近另有 {len(group) - 1} 处变化，见证据" if len(group) > 1 else "")
+            ),
+            chip_time_ms=chip_time, status=status, status_note=note, priority=15,
+            evidence=dict(
+                _crossing_evidence(crossing, version, verdict),
+                near_read={"bib": read.bib, "event_id": read.event_id, "chip_ms": read.chip_ms,
+                           "expected_recorder_ms": int(expected[read.read_id])},
+                gap_ms=int(best.gap_ms), members=members,
+            ),
             calibration_version=version,
         ))
 
@@ -364,6 +513,9 @@ def build_video_items(
         for item in outcome.items if item.pending
         for read_id in item.event_ids
     }
+    fragments_of: dict[str, list[dict]] = {}
+    for fragment in outcome.fragments:
+        fragments_of.setdefault(fragment["event_id"], []).append(fragment)
     unverified: set[str] = set()
     for crossing, read, residual in matched:
         if read.event_id in open_bibs:
@@ -373,9 +525,12 @@ def build_video_items(
             # no rider is seen, so it is checked with that period instead.
             unverified.add(read.read_id)
             continue
-        outcome.auto_passed.append(_auto_passed(read, crossing, int(residual), version))
+        entry = _auto_passed(read, crossing, int(residual), version)
+        if read.event_id in fragments_of:
+            entry["merged_fragments"] = fragments_of[read.event_id]
+        outcome.auto_passed.append(entry)
 
-    bunches = _bunch_items(camera_index, model, matched, chip_only, rest, version)
+    bunches = _bunch_items(camera_index, model, matched, chip_only, rest, version, near_candidates)
     race_periods = [
         (start, end) for start, end in periods if race_start_ms is None or end >= race_start_ms
     ]
@@ -390,6 +545,8 @@ def build_video_items(
         "excluded": len(excluded),
         "late_pairs": len(outcome.late_pairs),
         "duplicates": outcome.duplicates,
+        "merged_fragments": len(outcome.fragments),
+        "near_crossings": len(outcome.near_crossings),
         "standing": sum(len(spot["members"]) >= STANDING_MIN for spot in spots),
         "before_race": len(before_race),
         "paired_in_crowd": len(unverified),
@@ -416,10 +573,11 @@ def _group_members(items, bunches, crowds, expected) -> list[ProblemItem]:
     groups = []
     for bunch in bunches:
         window = (bunch.evidence["recorder_start_ms"], bunch.evidence["recorder_end_ms"])
-        groups.append((bunch, window, {KIND_TWO_CHIPS_ONE_CROSSING, KIND_CHIP_NO_CROSSING, KIND_NO_CHIP_CROSSING}))
+        groups.append((bunch, window, {KIND_TWO_CHIPS_ONE_CROSSING, KIND_CHIP_NO_CROSSING,
+                                       KIND_NO_CHIP_CROSSING, KIND_NEAR_CROSSING}))
     for crowd in crowds:
         window = (crowd.evidence["recorder_start_ms"] - 5_000, crowd.evidence["recorder_end_ms"] + 5_000)
-        groups.append((crowd, window, {KIND_NO_CHIP_CROSSING, KIND_STANDING}))
+        groups.append((crowd, window, {KIND_NO_CHIP_CROSSING, KIND_NEAR_CROSSING, KIND_STANDING}))
     members: dict[str, list[str]] = {}
     result = []
     for item in items:
@@ -488,7 +646,7 @@ def merge_obstructions(obstructions: Sequence[Obstruction]) -> list[tuple[int, i
     return [(start, end) for start, end, total in periods if total >= OBSTRUCTION_MIN_MS]
 
 
-def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list[ProblemItem]:
+def _bunch_items(camera_index, model, matched, chip_only, rest, version, near=()) -> list[ProblemItem]:
     reads = sorted([m[1] for m in matched] + list(chip_only), key=lambda read: read.chip_ms)
     groups: list[list[ChipRead]] = []
     for read in reads:
@@ -496,17 +654,20 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
             groups[-1].append(read)
         else:
             groups.append([read])
-    records = sorted([m[0] for m in matched] + [crossing for crossing, _verdict in rest], key=lambda c: c.recorder_ms)
+    records = sorted([m[0] for m in matched] + [crossing for crossing, _verdict in rest]
+                     + [value.crossing for value in near], key=lambda c: c.recorder_ms)
     crossings = [record.recorder_ms for record in records]
     items = []
+    windows: list[tuple[int, int]] = []
     for group in groups:
         if len(group) < BUNCH_MIN:
             continue
         start = model.to_recorder(group[0].chip_ms) - BUNCH_MARGIN_MS
         end = model.to_recorder(group[-1].chip_ms) + BUNCH_MARGIN_MS
+        windows.append((start, end))
         video = sum(start <= value <= end for value in crossings)
         evidence = {"camera_index": camera_index, "recorder_start_ms": int(start), "recorder_end_ms": int(end), "video_count": video,
-                    "chip_count": len(group)}
+                    "chip_count": len(group), "source": "chip"}
         evidence.update(_period_anchor(records, start, end, version))
         items.append(ProblemItem(
             item_id=stable_item_id(KIND_BUNCH, camera_index, *(read.read_id for read in group)),
@@ -518,6 +679,42 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
             chip_time_ms=group[0].chip_ms, bibs=tuple(read.bib for read in group),
             event_ids=tuple(read.event_id for read in group), status=STATUS_OPEN, priority=50,
             evidence=evidence, calibration_version=version,
+        ))
+    # The other direction: the video shows a group with fewer chips than riders.
+    # Two or three riders are not a "bunch" by the chip count, and a missed read
+    # there must not wait for a fourth chip (plan step 5).
+    clusters: list[list[CrossingRecord]] = []
+    for record in records:
+        if clusters and record.recorder_ms - clusters[-1][-1].recorder_ms <= BUNCH_GAP_MS:
+            clusters[-1].append(record)
+        else:
+            clusters.append([record])
+    for cluster in clusters:
+        if len(cluster) < SMALL_GROUP_MIN:
+            continue
+        start, end = cluster[0].recorder_ms - BUNCH_MARGIN_MS, cluster[-1].recorder_ms + BUNCH_MARGIN_MS
+        if any(not (end < left or start > right) for left, right in windows):
+            continue  # already covered by the chip-side group
+        window_reads = [read for read in reads if start <= model.to_recorder(read.chip_ms) <= end]
+        if not window_reads or len(cluster) <= len(window_reads):
+            continue
+        first = cluster[0]
+        evidence = {"camera_index": camera_index, "recorder_start_ms": int(start), "recorder_end_ms": int(end),
+                    "video_count": len(cluster), "chip_count": len(window_reads), "source": "video"}
+        evidence.update(_period_anchor(records, start, end, version))
+        items.append(ProblemItem(
+            item_id=stable_item_id(KIND_BUNCH, camera_index, *(record.key for record in cluster)),
+            kind=KIND_BUNCH, category=CATEGORY_VIDEO,
+            detail=(
+                f"{format_chip_time(model.to_chip(first.recorder_ms, first.session_id))} 起 2 秒内自动计数 "
+                f"{len(cluster)} 次过线，只对上 {len(window_reads)} 条芯片（"
+                + "、".join(read.bib for read in window_reads[:20])
+                + ("……" if len(window_reads) > 20 else "")
+                + "）：小组人数不能只按芯片判断，请整团点数"
+            ),
+            chip_time_ms=model.to_chip(first.recorder_ms, first.session_id),
+            bibs=tuple(read.bib for read in window_reads), event_ids=tuple(read.event_id for read in window_reads),
+            status=STATUS_OPEN, priority=48, evidence=evidence, calibration_version=version,
         ))
     return items
 
@@ -587,8 +784,10 @@ def _no_video_items(camera_index, no_video) -> list[ProblemItem]:
 
 __all__ = [
     "CrossingRecord",
+    "NearCrossing",
     "Obstruction",
     "RuleOutcome",
     "build_video_items",
     "merge_obstructions",
+    "same_passage",
 ]

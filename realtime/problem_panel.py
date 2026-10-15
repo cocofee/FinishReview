@@ -46,7 +46,10 @@ from .problem_items import (
     ACTION_DELETE_CHIP,
     ACTION_DELETE_EXTRA_CHIP,
     ACTION_LABELS,
+    ACTION_NOT_RIDER,
     ACTION_RECORD_BIB,
+    ACTION_RIDE_BACK,
+    ACTION_SAME_CROSSING,
     ACTION_SYNCED,
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
@@ -826,6 +829,9 @@ class ProblemListPanel(QFrame):
                 return
         if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP) and not reason:
             self.hint.setText("建议删除需要填写原因。")
+            return
+        if action in (ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_SAME_CROSSING) and not reason:
+            self.hint.setText("排除或确认同一次过线要写明依据；“看不清号码”不能作为排除依据。")
             return
         if action == ACTION_DELETE_EXTRA_CHIP and len(item.bibs) > 1 and bib not in item.bibs:
             self.hint.setText(f"请在号码框填写要删除的芯片号码：{'、'.join(item.bibs)}。")

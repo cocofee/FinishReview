@@ -51,7 +51,7 @@ def test_side_by_side_plate_without_chip_is_never_assigned_to_nearby_chip():
           BunchChip('c', '999', T + 2000, T + 2300)]
     counts = [mark(1420, '348'), mark(1420, '319', .6), mark(1520, '685'), mark(2420, '999')]
     result = align_counts(cc, counts, 120)
-    assert result['extras'] == [{'mark': 1, 'bib': '319', 'chip_time_ms': T + 1000}]
+    assert result['extras'] == [{'mark': 1, 'bib': '319', 'chip_time_ms': T + 1000, 'bracket_ms': 100}]
     assert result['pairs'][0] == 0 and result['pairs'][2] == 1
     untyped = align_counts(cc, [mark(1420), mark(1520), mark(2420)], 120)
     assert set(untyped['ambiguous']) == {0, 1}
@@ -100,7 +100,7 @@ def test_excluded_mark_cannot_supply_interpolation_anchor():
     result = align_counts(cc, counts)
     assert result['pairs'] == {2: 1}
     assert result['missing'] == [0]
-    assert result['extras'] == [{'mark': 1, 'bib': '319', 'chip_time_ms': None}]
+    assert result['extras'] == [{'mark': 1, 'bib': '319', 'chip_time_ms': None, 'bracket_ms': None}]
 
 
 @pytest.fixture
@@ -190,8 +190,11 @@ def test_drafts_roundtrip_and_completed_export_has_multiple_individual_frames(sy
     assert result['补录清单.csv'] == 2
     rows = list(csv.DictReader((root / 'exports' / '补录清单.csv').open(encoding='utf-8-sig')))
     assert {r['号码'] for r in rows} == {'319', '550'}
+    # Two missed riders never share one card or one time.
     assert len({r['证据帧'] for r in rows}) == 2
+    assert len({r['芯片域时间'] for r in rows}) == 2
     assert all('插值估算' in r['说明'] for r in rows)
+    assert all(r['时间来源'].startswith('集团内前后过线芯片之间插值') and '前后参考相隔' in r['时间来源'] for r in rows)
     # A change in the item or clock must never export an old result.
     changed_item = replace(item, bibs=('999', *item.bibs[1:]))
     assert store.manual_entries([changed_item], root) == []

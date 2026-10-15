@@ -273,12 +273,15 @@ def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: in
         before = [(marks[p]["recorder_ms"], chips[q].chip_ms) for p, q in pairs.items() if marks[p]["recorder_ms"] <= t]
         after = [(marks[p]["recorder_ms"], chips[q].chip_ms) for p, q in pairs.items() if marks[p]["recorder_ms"] > t]
         chip_time = None
+        bracket_ms = None
         if before and after:
             va, ca = max(before)
             vb, cb = min(after)
             if cb >= ca:
                 chip_time = round(ca + (t - va) / (vb - va) * (cb - ca))
-        extras.append({"mark": i, "bib": marks[i].get("bib", ""), "chip_time_ms": chip_time})
+                bracket_ms = int(cb - ca)
+        extras.append({"mark": i, "bib": marks[i].get("bib", ""), "chip_time_ms": chip_time,
+                       "bracket_ms": bracket_ms})
     ambiguous = [i for i, q in pairs.items() if not marks[i].get("bib") and any(
         p != q and abs(chip.recorder_ms - chips[q].recorder_ms) <= 150 for p, chip in enumerate(chips)
     )]
@@ -391,7 +394,12 @@ class BunchReviewStore:
                 continue
             for extra in result["extras"]:
                 mark = record["marks"][extra["mark"]]
+                # Every missed rider keeps its own frame, time and bracketing
+                # reference; two riders never share one card or one time.
+                source = "集团内前后过线芯片之间插值"
+                if extra.get("bracket_ms") is not None:
+                    source += f"（前后参考相隔 {extra['bracket_ms']} ms）"
                 rows.append((extra["bib"], format_chip_time(extra["chip_time_ms"]), _frame_text(mark["frame"]),
                              record["camera"], record["calibration_version"],
-                             f"集团人工认号；前后过线插值估算；本团用时 {record['seconds']} 秒"))
+                             f"集团人工认号；前后过线插值估算；本团用时 {record['seconds']} 秒", source))
         return rows

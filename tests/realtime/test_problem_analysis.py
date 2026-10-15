@@ -457,3 +457,39 @@ def test_model_disabled_failure_and_enabled_keep_same_missing_candidate(syntheti
     enabled = analyse_camera(config, workspace, 1, strips, reads=reads)
     assert enabled["bike_status"]["state"] == "enabled"
     assert _kinds(enabled) == _kinds(disabled)
+
+
+def test_near_crossing_candidate_is_published_and_its_closure_keeps_the_history(synthetic_race, tmp_path):
+    from realtime.problem_items import KIND_NEAR_CROSSING, ProblemItem
+
+    _root, workspace, original, _strips = synthetic_race
+    config = replace(original, output_dir=tmp_path, render_cards=False)
+    segment = workspace.archive_segments(1)[0]
+    moment = segment.start_ms + 35_000
+    frame = {"camera_index": 1, "segment_id": segment.segment.segment_id, "video_path": str(segment.path),
+             "frame_index": 700, "position_ms": 35_000, "session_id": segment.session_id, "calibration_version": 3}
+    read = workspace.reads[0]
+    candidate = ProblemItem(
+        "near_crossing:test", KIND_NEAR_CROSSING, "video",
+        f"芯片 {read.bib} 附近 500 ms 处线上另有一处变化", chip_time_ms=read.chip_ms, priority=15,
+        evidence={"frame": frame, "recorder_ms": moment, "gap_ms": 500,
+                  "near_read": {"bib": read.bib, "event_id": read.event_id, "chip_ms": read.chip_ms}},
+    )
+
+    first = json.loads(write_problem_list(
+        config, workspace, [{"camera_index": 1, "items": [candidate], "auto_passed": []}]).read_text(encoding="utf-8"))
+    assert first["summary"]["pending"] == 1 and first["summary"]["candidates_closed"] == 0
+    assert [item["kind"] for item in first["items"] if item["kind"] == KIND_NEAR_CROSSING] == [KIND_NEAR_CROSSING]
+
+    # Next run: the late chip has claimed that crossing, so no candidate is left.
+    late = {"bib": "319", "frame": frame, "chip_time_ms": read.chip_ms, "late_pair": True}
+    second = json.loads(write_problem_list(
+        config, workspace, [{"camera_index": 1, "items": [], "auto_passed": [], "late_pair_frames": [late]}]
+    ).read_text(encoding="utf-8"))
+    assert second["summary"]["pending"] == 0 and second["summary"]["candidates_closed"] == 1
+    closed = [item for item in second["items"] if item["kind"] == KIND_NEAR_CROSSING]
+    assert len(closed) == 1 and closed[0]["status"] == "info"
+    assert "迟到芯片 319 已匹配该过线" in closed[0]["status_note"]
+    assert closed[0]["evidence"]["recorded_history"] is True
+    journal = (config.resolved_output() / "near_crossing_history.jsonl").read_text(encoding="utf-8")
+    assert '"state": "open"' in journal and '"state": "closed"' in journal

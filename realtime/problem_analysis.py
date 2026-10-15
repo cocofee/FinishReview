@@ -702,6 +702,9 @@ def analyse_camera(
         ),
     )
     result["rules"] = dict(outcome.stats, late_pairs=outcome.late_pairs)
+    result["late_pair_frames"] = outcome.late_pair_frames
+    result["fragments"] = outcome.fragments
+    result["near_crossings"] = outcome.near_crossings
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
     result["items"] = list(outcome.items)
     result["auto_passed"] = outcome.auto_passed
@@ -910,7 +913,8 @@ def write_problem_list(
         auto_passed += result.get("auto_passed", [])
         unverifiable += sum(len(item.bibs) for item in result.get("items", []) if item.kind == KIND_NO_VIDEO)
         cameras[str(result["camera_index"])] = {
-            key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")
+            key: value for key, value in result.items()
+            if key not in ("items", "auto_passed", "model", "late_pair_frames", "fragments", "near_crossings")
         }
     members = read_snapshots(workspace.reads, metadata, workspace.latest_event)
     items = [replace(item, evidence=dict(item.evidence, member_evidence_stale=True))
@@ -920,6 +924,17 @@ def write_problem_list(
     auto_passed = unambiguous_auto_passed(items, auto_passed)
     if config.render_cards:
         render_cards(items, output_dir, workspace.root, progress=progress, decode_threads=config.decode_threads)
+    # A candidate that a late chip has now claimed must not vanish without a
+    # trace: the run that closes it reports the discovery history once.
+    from .candidate_history import HISTORY_FILENAME, update_history
+
+    closed_candidates = update_history(
+        output_dir / HISTORY_FILENAME, items,
+        (entry for result in camera_results for entry in result.get("late_pair_frames", ())),
+        now_ms=int(time.time() * 1000), race_id=workspace.race_id, stage_id=workspace.stage_id,
+        analysed_cameras={int(result["camera_index"]) for result in camera_results if not result.get("error")},
+    )
+    items = [*items, *closed_candidates]
     payload = {
         "schema_version": 1,
         "generated_at_ms": int(time.time() * 1000),
@@ -927,7 +942,8 @@ def write_problem_list(
         "stage_id": workspace.stage_id,
         "race_date": workspace.race_date,
         "cameras": cameras,
-        "summary": summarize_items(items, auto_passed, unverifiable),
+        "summary": dict(summarize_items(items, auto_passed, unverifiable),
+                        candidates_closed=len(closed_candidates)),
         "items": [item.to_payload() for item in items],
         "auto_passed": auto_passed,
         "live": config.live,

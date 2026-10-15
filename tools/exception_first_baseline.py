@@ -40,6 +40,9 @@ def synthetic_gaps() -> dict:
     following = build_video_items(camera_index=1, model=model, matched=[(crossing, read, 0)], chip_only=[], no_video=[],
                                   video_only=[replace(crossing, recorder_ms=t + 1500, position_ms=1500,
                                                       frame_index=30, row=300, r0=280, r1=320)])
+    fragment = build_video_items(camera_index=1, model=model, matched=[(crossing, read, 0)], chip_only=[], no_video=[],
+                                 video_only=[replace(crossing, recorder_ms=t + 1040, position_ms=1040,
+                                                     frame_index=20, row=300, r0=280, r1=320)])
     return {
         "scope": "direct synthetic rule calls, not decoded riders",
         "eight_chips_one_crossing": {
@@ -51,8 +54,15 @@ def synthetic_gaps() -> dict:
         },
         "following_crossing_500ms": {
             "main_pending": sum(item.pending for item in following.items),
+            "near_crossing_items": sum(item.kind == "near_crossing" for item in following.items),
             "discarded_as_duplicate": following.duplicates,
             "expected": "retain a traceable candidate; time proximity alone is not exclusion evidence",
+        },
+        "same_passage_fragment": {
+            "main_pending": sum(item.pending for item in fragment.items),
+            "merged_as_fragment": fragment.duplicates,
+            "fragment_reasons": [entry["reason"] for entry in fragment.fragments],
+            "expected": "adjacent-frame pieces of one rider never become a task",
         },
     }
 
