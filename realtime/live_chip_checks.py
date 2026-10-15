@@ -107,5 +107,7 @@ def merge_chip_snapshot(video: dict | None, chips: dict | None) -> dict | None:
     payload["auto_passed"] = unambiguous_auto_passed(items, original_auto)
     payload["summary"] = dict(payload.get("summary", {}), pending=sum(item.pending for item in items),
                               auto_passed=max(0, payload.get("summary", {}).get("auto_passed", len(original_auto))
-                                              - len(original_auto) + len(payload["auto_passed"])))
+                                              - len(original_auto) + len(payload["auto_passed"])),
+                              auto_passed_in_pending_period=sum(1 for item in payload["auto_passed"]
+                                                                if item.get("pending_period")))
     return payload

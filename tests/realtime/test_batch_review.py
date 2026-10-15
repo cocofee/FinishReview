@@ -320,3 +320,41 @@ def test_stale_configuration_cannot_export_member_decisions(tmp_path):
         store.save(changed, [member["event_id"]], "delete", "again")
     resolutions = ProblemResolutionStore(tmp_path / "problem_resolutions.jsonl")
     assert export_lists([changed], resolutions, tmp_path / "out")["建议删除清单.csv"] == 0
+
+
+def test_auto_passed_counts_each_passage_once_and_marks_pending_periods():
+    from realtime.problem_items import CATEGORY_VIDEO, KIND_BUNCH
+    bunch = ProblemItem("bunch:1", KIND_BUNCH, CATEGORY_VIDEO, "2 秒内自动计数 6 次过线，只对上 3 条芯片：请整团点数",
+                        chip_time_ms=T, bibs=("020", "021", "022"),
+                        evidence={"camera_index": 1, "recorder_start_ms": T, "recorder_end_ms": T + 8_000,
+                                  "video_count": 6, "chip_count": 3})
+    entries = [
+        {"bib": "020", "event_id": "e-020", "chip_time_ms": T + 100, "recorder_ms": T + 200,
+         "frame": {"camera_index": 1, "frame_index": 10}},
+        # The same passage delivered twice (a second camera) is one rider.
+        {"bib": "020", "event_id": "e-020", "chip_time_ms": T + 100, "recorder_ms": T + 300,
+         "frame": {"camera_index": 2, "frame_index": 40}},
+        # Outside the period, and another camera's copy of it.
+        {"bib": "090", "event_id": "e-090", "chip_time_ms": T + 60_000, "recorder_ms": T + 60_100,
+         "frame": {"camera_index": 1, "frame_index": 900}},
+    ]
+
+    marked = unambiguous_auto_passed([bunch], entries)
+
+    assert [entry["bib"] for entry in marked] == ["020", "090"]
+    assert marked[0]["pending_period"] == "bunch:1"
+    assert "集团核对" in marked[0]["pending_period_note"] and "整团点数" in marked[0]["pending_period_note"]
+    assert "pending_period" not in marked[1]
+    # Rerunning over already marked entries neither doubles them nor drops the mark.
+    again = unambiguous_auto_passed([bunch], marked)
+    assert again == marked
+    # Once the group is closed, no match is flagged any more.
+    assert "pending_period" not in unambiguous_auto_passed([replace(bunch, status="info")], marked)[0]
+
+
+def test_auto_passed_of_a_closed_batch_member_is_dropped():
+    item = batch()
+    member = item.evidence["batch_members"][0]
+    entries = [{"bib": member["bib"], "event_id": member["event_id"], "chip_time_ms": member["chip_ms"],
+                "recorder_ms": member["chip_ms"], "frame": {"camera_index": 1}}]
+    assert unambiguous_auto_passed([item], entries) == []

@@ -493,3 +493,13 @@ def test_near_crossing_candidate_is_published_and_its_closure_keeps_the_history(
     assert closed[0]["evidence"]["recorded_history"] is True
     journal = (config.resolved_output() / "near_crossing_history.jsonl").read_text(encoding="utf-8")
     assert '"state": "open"' in journal and '"state": "closed"' in journal
+
+
+def test_summary_keeps_matches_inside_pending_periods_separate():
+    from realtime.problem_analysis import summarize_items
+
+    summary = summarize_items([], [{"event_id": "a", "active_now": True},
+                                   {"event_id": "b", "active_now": True, "pending_period": "bunch:1"}], 2)
+
+    assert summary["auto_passed"] == 2 and summary["auto_passed_in_pending_period"] == 1
+    assert summary["unverifiable"] == 2

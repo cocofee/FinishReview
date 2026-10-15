@@ -2284,6 +2284,8 @@ class FinishReviewWindow(PassageReviewSurface):
                                      for item in self.passage_store.events()}) > 1:
             self.event_name_label.setText("请选择赛事")
             self.event_path_label.setText("此目录包含多场赛事")
+        # The workbench top bar names the race it is reporting on.
+        self._event_label = f"{race_name} · {stage_label}" if metadata is not None or event is not None else "未加载赛事"
 
     def _set_problem_list_layout(self, expanded: bool) -> None:
         self._problem_workbench_active = expanded
@@ -3238,7 +3240,7 @@ class FinishReviewWindow(PassageReviewSurface):
         through = [value.get("analyzed_through_ms") for value in live_cameras.values() if value.get("analyzed_through_ms")]
         analyzed = datetime.fromtimestamp(min(through) / 1000).strftime("%H:%M:%S") if through else "等待录像 / 校时"
         self.pipeline_label.setToolTip(panel.chip_status + "\n" + panel.analysis_status
-                                       + "\n" + panel.summary.toolTip())
+                                       + "\n" + panel.health_text() + "\n" + panel.summary.toolTip())
         analysis_state = panel.analysis_status.replace("\n", " ")[:120]
         short_ends = [segment.media_started_at_ms + segment.media_duration_ms for segment in self.timeline_store.segments()
                       if segment.end_reason == "retained_problem_segment" and segment.media_started_at_ms is not None
@@ -3246,10 +3248,16 @@ class FinishReviewWindow(PassageReviewSurface):
         sealed = datetime.fromtimestamp(max(short_ends) / 1000).strftime("%H:%M:%S") if short_ends else "等待首段"
         seconds = max(0, int(time.monotonic() - self._recording_started_at)) if recording else 0
         duration = f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
-        backlog = f" · 待分析约 {max(0, (max(short_ends) - min(through)) // 1000)} 秒" if short_ends and through else ""
+        backlog_seconds = max(0, (max(short_ends) - min(through)) // 1000) if short_ends and through else 0
+        # Top bar (plan step 6): race, receiving, recording, sampling, clock,
+        # analysis, backlog and evidence gaps are named separately, so a failure
+        # never hides behind one blanket "video problem".
         self.pipeline_label.setText(
-            f"{'● 持续录像 ' + duration + '（当前段写入中）' if recording else '录像未启动'} · 封存到 {sealed}  |  "
-            f"{panel.chip_status} | {analysis_state} · 分析到 {analyzed}{backlog}"
+            f"赛事 {getattr(self, '_event_label', '未加载赛事')} ｜ 接入 {panel.chip_status} ｜ "
+            f"{'● 持续录像 ' + duration + '（当前段写入中）' if recording else '录像未启动'} · 封存到 {sealed} ｜ "
+            f"取样 {panel.stage_health.get('取样') or '等待已封存录像'} · "
+            f"校时 {panel.stage_health.get('校时') or '等待自动校时'} ｜ "
+            f"分析 {analysis_state} · 分析到 {analyzed} ｜ 积压 {backlog_seconds} 秒 ｜ {panel.evidence_gap_text()}"
         )
         self._poll_recording_health()
         self._update_runtime_status()

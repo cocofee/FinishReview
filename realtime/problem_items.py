@@ -50,6 +50,63 @@ KIND_NO_VIDEO = "no_video"
 KIND_MANUAL_REVIEW = "manual_review"
 KIND_WAITING = "evidence_pending"
 
+# Operator task classes (plan step 6). Every kind belongs to exactly one, so the
+# counting row can never hide an item behind a fallback: the three classes the
+# operator works through, the chip-record checks that were always in the queue,
+# and the items that only wait for evidence.
+TYPE_MULTI_CHIP = "multi_chip"
+TYPE_BUNCH = "bunch"
+TYPE_MISSED = "missed"
+TYPE_RECORD = "record"
+TYPE_EVIDENCE = "evidence"
+TYPE_OTHER = "other"
+
+TYPE_TITLES = {
+    TYPE_MULTI_CHIP: "多芯片疑点",
+    TYPE_BUNCH: "集团待核",
+    TYPE_MISSED: "漏读疑点",
+    TYPE_RECORD: "记录与圈数",
+    TYPE_EVIDENCE: "待证据",
+    TYPE_OTHER: "其他疑点",
+}
+
+# Counting-row order; the last class only appears when it holds items.
+TYPE_ORDER = (TYPE_MULTI_CHIP, TYPE_BUNCH, TYPE_MISSED, TYPE_RECORD, TYPE_EVIDENCE, TYPE_OTHER)
+
+KIND_TYPES = {
+    KIND_TWO_CHIPS_ONE_CROSSING: TYPE_MULTI_CHIP,
+    KIND_DUPLICATE_READ: TYPE_MULTI_CHIP,
+    KIND_DUPLICATE_MANUAL: TYPE_MULTI_CHIP,
+    KIND_REPEATED_PASSAGE: TYPE_MULTI_CHIP,
+    KIND_BATCH_READS: TYPE_MULTI_CHIP,
+    KIND_TEST_CHIP: TYPE_MULTI_CHIP,
+    KIND_UNKNOWN_BIB: TYPE_MULTI_CHIP,
+    KIND_BUNCH: TYPE_BUNCH,
+    KIND_OBSTRUCTION: TYPE_BUNCH,
+    KIND_STANDING: TYPE_BUNCH,
+    KIND_NO_CHIP_CROSSING: TYPE_MISSED,
+    KIND_NEAR_CROSSING: TYPE_MISSED,
+    KIND_CHIP_NO_CROSSING: TYPE_MISSED,
+    KIND_MANUAL_REVIEW: TYPE_MISSED,
+    KIND_BEFORE_GUN: TYPE_RECORD,
+    KIND_EARLY_READ: TYPE_RECORD,
+    KIND_LAP_REPEAT: TYPE_RECORD,
+    KIND_LAP_REGRESS: TYPE_RECORD,
+    KIND_LAP_TIME: TYPE_RECORD,
+    KIND_LAP_MISSING: TYPE_RECORD,
+    KIND_NOT_ARRIVED: TYPE_RECORD,
+    KIND_SYNC: TYPE_RECORD,
+    KIND_NO_VIDEO: TYPE_EVIDENCE,
+    KIND_WAITING: TYPE_EVIDENCE,
+}
+
+# The class the operator opens first for that type; the panel shows exactly one.
+TYPE_ENTRY_LABELS = {
+    TYPE_MULTI_CHIP: "按成员处理批次",
+    TYPE_BUNCH: "打开集团逐帧核对",
+    TYPE_MISSED: "查看候选证据",
+}
+
 KIND_TITLES = {
     KIND_MANUAL_REVIEW: "人工发现 · 待核实",
     KIND_WAITING: "等待录像 / 校时",
@@ -141,6 +198,12 @@ def stable_item_id(kind: str, *parts: object) -> str:
     return f"{kind}:{digest}"
 
 
+def task_type(kind: str) -> str:
+    """Operator class of a kind; unknown kinds stay visible as 其他疑点."""
+
+    return KIND_TYPES.get(kind, TYPE_OTHER)
+
+
 @dataclass(frozen=True, slots=True)
 class ProblemItem:
     item_id: str
@@ -161,6 +224,10 @@ class ProblemItem:
         if self.evidence.get("batch_members"):
             return "多芯片批次核对" if self.category == CATEGORY_VIDEO else "密集读数，人数待核"
         return KIND_TITLES.get(self.kind, self.kind)
+
+    @property
+    def task_type(self) -> str:
+        return task_type(self.kind)
 
     @property
     def actions(self) -> tuple[str, ...]:
@@ -230,5 +297,5 @@ def sort_items(items) -> list[ProblemItem]:
 
 
 __all__ = [name for name in globals() if name.isupper() or name in {
-    "ProblemItem", "sort_items", "stable_item_id",
+    "ProblemItem", "sort_items", "stable_item_id", "task_type",
 }]

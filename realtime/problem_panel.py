@@ -60,6 +60,14 @@ from .problem_items import (
     KIND_OBSTRUCTION,
     KIND_MANUAL_REVIEW,
     CATEGORY_VIDEO,
+    TYPE_BUNCH,
+    TYPE_ENTRY_LABELS,
+    TYPE_EVIDENCE,
+    TYPE_MISSED,
+    TYPE_MULTI_CHIP,
+    TYPE_ORDER,
+    TYPE_OTHER,
+    TYPE_TITLES,
     ProblemItem,
 )
 from .problem_resolutions import (
@@ -68,6 +76,26 @@ from .problem_resolutions import (
     export_lists,
     same_frame_conflicts,
 )
+
+
+def _progress_group(stage: str) -> str:
+    """Which of sampling / clock / analysis a worker message belongs to."""
+
+    if any(key in stage for key in ("线取样", "提取线", "取样")):
+        return "取样"
+    if "校时" in stage:
+        return "校时"
+    return "分析"
+
+
+def _missed_entry(item: ProblemItem, batch, bunch_parent) -> bool:
+    """A missed-read candidate is entered through its evidence, not through a decision.
+
+    Members handled inside a batch or bunch tool keep that tool as their entry.
+    """
+
+    return (item.task_type == TYPE_MISSED and bool(item.evidence.get("frame"))
+            and item.status != STATUS_WAITING and batch is None and bunch_parent is None)
 
 
 STATE_PENDING = "待处理"
@@ -120,6 +148,10 @@ class ProblemListPanel(QFrame):
         self._shown_frame = None
         self._scope = ("", "")
         self._browsing = False
+        self._type_filter = ""
+        # Receiver, recorder, sampling, clock and analysis fail separately: a
+        # single "video problem" line would hide which of them stopped.
+        self.stage_health: dict[str, str] = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self._live = False
         self._live_paused = False
         self._next_analysis = 0.0
@@ -137,6 +169,33 @@ class ProblemListPanel(QFrame):
         self.summary = QLabel("问题清单：尚未分析录像", self)
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
+        # Counting row (plan step 6): what was matched without the operator, how much
+        # work of each class is open, and what only waits for evidence. Clicking a
+        # class narrows the queue to it; the class entry button then opens its tool.
+        type_row = QHBoxLayout()
+        type_row.setSpacing(4)
+        self.auto_label = QLabel("无需人工处理 —— 人", self)
+        self.auto_label.setWordWrap(True)
+        self.auto_label.setToolTip(
+            "按有效通过事件去重后的自动对应人数。其中仍落在待核集团或遮挡时段内的会另行标出，"
+            "这些选手的对应不作废，但整个集团是否核清不由自动对应决定。"
+        )
+        type_row.addWidget(self.auto_label, 1)
+        layout.addLayout(type_row)
+        # Buttons on their own line: six of them must not be squeezed off a laptop screen.
+        button_row = QHBoxLayout()
+        button_row.setSpacing(4)
+        self.type_buttons: dict[str, QPushButton] = {}
+        for value in TYPE_ORDER:
+            button = QPushButton(TYPE_TITLES[value], self)
+            button.setCheckable(True)
+            button.setToolTip(f"只看{TYPE_TITLES[value]}；再点一次取消，回到全部类型")
+            button.clicked.connect(lambda _checked=False, value=value: self._filter_by_type(value))
+            button.hide()
+            self.type_buttons[value] = button
+            button_row.addWidget(button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
         settings_row = QHBoxLayout()
         self.sampling_button = QPushButton("取样线 / 认车", self)
         self.sampling_button.clicked.connect(self._configure_sampling)
@@ -147,7 +206,7 @@ class ProblemListPanel(QFrame):
         layout.addLayout(settings_row)
         self.queue_filter = QComboBox(self)
         self.queue_filter.addItems(["待处理", "待证据", "暂存", "交接 / 已处理", "全部"])
-        self.queue_filter.currentIndexChanged.connect(self._render)
+        self.queue_filter.currentIndexChanged.connect(self._queue_filter_changed)
         controls.addWidget(self.queue_filter)
         self.show_closed = QCheckBox("显示已处理和已排除", self)
         self.show_closed.toggled.connect(self._render)
@@ -156,13 +215,6 @@ class ProblemListPanel(QFrame):
         self.expand_groups.setToolTip("集团和拥挤时段里的问题归在一条里核对；展开后逐条显示")
         self.expand_groups.toggled.connect(self._render)
         controls.addWidget(self.expand_groups)
-        self.bunch_button = QPushButton("打开集团逐帧核对", self)
-        self.bunch_button.clicked.connect(self._open_bunch)
-        controls.addWidget(self.bunch_button)
-        self.batch_button = QPushButton("按成员处理批次", self)
-        self.batch_button.clicked.connect(self._open_batch)
-        self.batch_button.hide()
-        controls.addWidget(self.batch_button)
         self.analyze_button = QPushButton("分析录像", self)
         self.analyze_button.setToolTip("低优先级后台分析；比赛中只读取已封存短段，不等待五分钟归档")
         self.analyze_button.clicked.connect(self._toggle_analysis)
@@ -229,6 +281,24 @@ class ProblemListPanel(QFrame):
         self.reason_input.textChanged.connect(self._remember_draft)
         detail_layout.addLayout(inputs)
         self.action_row = QVBoxLayout()
+        # The class entry sits above the decisions, so the tool for this problem is
+        # visible where the evidence is; there is no hidden entry to remember.
+        self.batch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MULTI_CHIP], detail)
+        self.batch_button.setStyleSheet("font-weight:600;")
+        self.batch_button.clicked.connect(self._open_batch)
+        self.batch_button.hide()
+        self.action_row.addWidget(self.batch_button)
+        self.bunch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_BUNCH], detail)
+        self.bunch_button.setStyleSheet("font-weight:600;")
+        self.bunch_button.clicked.connect(self._open_bunch)
+        self.bunch_button.hide()
+        self.action_row.addWidget(self.bunch_button)
+        self.missed_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MISSED], detail)
+        self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除")
+        self.missed_button.setStyleSheet("font-weight:600;")
+        self.missed_button.clicked.connect(self._open_missed)
+        self.missed_button.hide()
+        self.action_row.addWidget(self.missed_button)
         self.jump_button = QPushButton("跳到原帧", detail)
         self.jump_button.clicked.connect(self._jump)
         self.action_row.addWidget(self.jump_button)
@@ -299,6 +369,7 @@ class ProblemListPanel(QFrame):
         item = self.current_item()
         self.bunch_button.setEnabled(not self._browsing and not (item and item.evidence.get("superseded")))
         self.batch_button.setEnabled(not self._browsing)
+        self.missed_button.setEnabled(not self._browsing)
         if browsing:
             self.hint.setText("正在浏览其他时间；当前问题与输入已保留。请回到当前问题再提交决定。")
 
@@ -328,6 +399,7 @@ class ProblemListPanel(QFrame):
         self._browsing = False
         self._next_analysis = 0.0
         self._drafts, self._held, self._operator_items = {}, {}, {}
+        self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self._final_analysis_pending = False
         self._finalizing_live = False
         self._last_live_signature = None
@@ -355,6 +427,7 @@ class ProblemListPanel(QFrame):
         self._last_live_signature = None
         self.items, self.rows = [], []
         self._shown_id = None
+        self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self.bib_input.clear()
         self.reason_input.clear()
         self.refresh()
@@ -459,9 +532,15 @@ class ProblemListPanel(QFrame):
             self.items = [replace(item, status=STATUS_WAITING, status_note="取样线或认车配置已变更，等待重新分析。",
                                   evidence=dict(item.evidence, configuration_stale=True))
                           if item.category == CATEGORY_VIDEO and item.kind != KIND_MANUAL_REVIEW else item for item in self.items]
+            self.stage_health["取样"] = "配置已变更，等待重新取样"
+            self.stage_health["校时"] = "配置已变更，等待重新校时"
             self.analysis_details.setText("配置已变更：旧视频结论不可提交，等待重新取样、校时与认车；芯片自检继续。")
         elif token != "invalid":
             cameras = (self.payload or {}).get("cameras", {})
+            missing_lines = sum(len(value.get("missing_line_segments") or ()) for value in cameras.values())
+            self.stage_health["取样"] = (f"{missing_lines} 个片段缺线或跨改线边界" if missing_lines
+                                         else "已按机位配置" if cameras else "等待已封存录像")
+            self.stage_health["校时"] = self.clock_health() or "等待自动校时"
             statuses = []
             for camera, value in cameras.items():
                 detail = value.get('error') or value.get('bike_status', {}).get('message', '')
@@ -563,7 +642,7 @@ class ProblemListPanel(QFrame):
     def _render(self) -> None:
         signature = (tuple((repr(item.to_payload()), self.state(item)) for item in self.items),
                      self.show_closed.isChecked(), self.expand_groups.isChecked(),
-                     self.queue_filter.currentIndex(), tuple(self._held.items()),
+                     self.queue_filter.currentIndex(), self._type_filter, tuple(self._held.items()),
                      repr((self.payload or {}).get("summary")))
         if signature == self._render_signature:
             return
@@ -586,12 +665,12 @@ class ProblemListPanel(QFrame):
                        or (mode == 1 and state == STATE_WAITING) or (mode == 2 and held and pending)
                        or (mode == 3 and not pending and state != STATE_WAITING)
                        or (item.item_id == selected and item.evidence.get("superseded")))
-            if visible:
+            if visible and self._type_matches(item, state):
                 self.rows.append(item)
             if self.expand_groups.isChecked():
                 self.rows += [
                     member for member in members.get(item.item_id, [])
-                    if show_all or self.is_pending_state(self.state(member))
+                    if (show_all or self.is_pending_state(self.state(member))) and self._type_matches(member)
                 ]
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.rows))
@@ -618,9 +697,26 @@ class ProblemListPanel(QFrame):
             self.table.setCurrentCell(0, 0)
         self.table.blockSignals(False)
         self._show(self.table.currentRow())
+        self._refresh_type_row()
         text = self.summary_text()
         self.summary.setText(text)
         self.summary_changed.emit(text)
+
+    def _type_matches(self, item: ProblemItem, state: str = "") -> bool:
+        if not self._type_filter:
+            return True
+        if self._type_filter == TYPE_EVIDENCE:
+            return item.task_type == TYPE_EVIDENCE or (state or self.state(item)) == STATE_WAITING
+        return item.task_type == self._type_filter
+
+    def _refresh_type_row(self) -> None:
+        counts = self.type_counts()
+        self.auto_label.setText(self.auto_passed_text())
+        for value, button in self.type_buttons.items():
+            count = counts[value]
+            button.setText(f"{TYPE_TITLES[value]} {count}")
+            button.setVisible(value != TYPE_OTHER or count > 0)
+            button.setChecked(value == self._type_filter)
 
     def current_item(self) -> Optional[ProblemItem]:
         row = self.table.currentRow()
@@ -658,6 +754,7 @@ class ProblemListPanel(QFrame):
             self.jump_button.setEnabled(False)
             self.reopen_button.setEnabled(False)
             self.bunch_button.hide()
+            self.missed_button.hide()
             self.hold_button.setEnabled(False)
             if changed:
                 self.current_changed.emit(None)
@@ -669,6 +766,8 @@ class ProblemListPanel(QFrame):
         self.batch_button.setVisible(batch is not None)
         self.bunch_button.setVisible(is_bunch)
         self.bunch_button.setEnabled(item.status != STATUS_WAITING)
+        self.missed_button.setVisible(_missed_entry(item, batch, self._bunch_parent(item)))
+        self.missed_button.setEnabled(item.status != STATUS_WAITING)
         self.bib_input.setVisible(not is_bunch and batch is None)
         self.reason_input.setVisible(True)
         state = self.state(item)
@@ -724,6 +823,92 @@ class ProblemListPanel(QFrame):
         if item.evidence.get("batch_members"):
             return item
         return next((i for i in self.items if i.item_id == item.grouped and i.evidence.get("batch_members")), None)
+
+    def _bunch_parent(self, item):
+        """The group item that owns this member, so the group tool stays its entry."""
+
+        if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
+            return item
+        return next((i for i in self.items if i.item_id == item.grouped and i.kind in (KIND_BUNCH, KIND_OBSTRUCTION)), None)
+
+    def _open_missed(self) -> None:
+        item = self.current_item()
+        if item is None or not item.evidence.get("frame"):
+            return
+        self.jump_requested.emit(dict(item.evidence["frame"]))
+        self.hint.setText("已跳到候选过线的原帧：逐帧看这一处变化，认得出号码就补录；看不清就保留待证据，不凭猜测排除。")
+
+    def _filter_by_type(self, value: str) -> None:
+        """The counting row works as the queue filter; there is no separate entry."""
+
+        self._type_filter = "" if self._type_filter == value else value
+        for key, button in self.type_buttons.items():
+            button.setChecked(key == self._type_filter)
+        self.queue_filter.blockSignals(True)
+        self.queue_filter.setCurrentIndex(1 if self._type_filter == TYPE_EVIDENCE else 0)
+        self.queue_filter.blockSignals(False)
+        self._render()
+
+    def _queue_filter_changed(self) -> None:
+        if self._type_filter:
+            self._type_filter = ""
+            for button in self.type_buttons.values():
+                button.setChecked(False)
+        self._render()
+
+    def type_counts(self) -> dict[str, int]:
+        """Open work per class: each item is counted once, in the row the operator works in."""
+
+        counts = dict.fromkeys(TYPE_ORDER, 0)
+        for item in self.items:
+            if item.grouped:
+                continue  # members are handled inside their batch or group
+            state = self.state(item)
+            if state == STATE_WAITING or (item.task_type == TYPE_EVIDENCE
+                                          and not (state.startswith(STATE_RESOLVED) or state.startswith(STATE_HANDOFF)
+                                                   or state in (STATE_UPSTREAM, STATE_EXCLUDED))):
+                counts[TYPE_EVIDENCE] += 1
+            elif self.is_pending_state(state):
+                counts[item.task_type] += 1
+        return counts
+
+    def auto_passed_text(self) -> str:
+        payload = self.payload or {}
+        summary = payload.get("summary", {})
+        passed = payload.get("auto_passed") or ()
+        count = int(summary.get("auto_passed", len(passed)))
+        in_period = (sum(1 for entry in passed if entry.get("pending_period")) if passed
+                     else int(summary.get("auto_passed_in_pending_period", 0)))
+        text = f"无需人工处理 {count} 人"
+        if in_period:
+            text += f"（其中 {in_period} 人落在待核集团/遮挡时段内，不代表该时段已核清）"
+        return text
+
+    def evidence_gap_text(self) -> str:
+        summary = (self.payload or {}).get("summary", {})
+        waiting = self.type_counts()[TYPE_EVIDENCE]
+        unverifiable = int(summary.get("unverifiable", 0))
+        if not waiting and not unverifiable:
+            return "证据缺口 无"
+        return f"证据缺口 {waiting} 条待证据" + (f" · {unverifiable} 人无录像可核" if unverifiable else "")
+
+    def health_text(self) -> str:
+        parts = [f"{name} {self.stage_health.get(name) or '—'}" for name in ("接收", "录制", "取样", "校时", "分析")]
+        return " · ".join(parts)
+
+    def clock_health(self) -> str:
+        """Clock state per camera, kept apart from sampling and analysis failures."""
+
+        texts = []
+        for camera, value in sorted((self.payload or {}).get("cameras", {}).items(), key=lambda pair: str(pair[0])):
+            calibration = value.get("calibration") or {}
+            if not calibration:
+                texts.append(f"机位 {camera} 等待校时")
+                continue
+            note = f"机位 {camera} v{calibration.get('version')}"
+            off = [anchor for anchor in calibration.get("anchors", ()) if not anchor.get("within_tolerance", True)]
+            texts.append(note + (f"，{len(off)} 个人工锚点超差待核对" if off else "，锚点一致"))
+        return "；".join(texts)
 
     def _open_batch(self):
         item = self.current_item()
@@ -924,6 +1109,7 @@ class ProblemListPanel(QFrame):
         self._chip_signature = None
         self._chip_retry_after = 0.0
         self.chip_status = "芯片自检等待记录"
+        self.stage_health["接收"] = self.chip_status
         process, self._chip_process = self._chip_process, None
         if process is not None:
             process.blockSignals(True)
@@ -938,6 +1124,7 @@ class ProblemListPanel(QFrame):
             f"芯片自检{'发现 ' + str(pending) + ' 项疑点' if pending else '正常'}"
             f"（已落盘消息 {counts['journal_messages']} / 有效通过 {counts['effective_passages']}）"
         )
+        self.stage_health["接收"] = self.chip_status
         missing = payload.get("missing_inputs", [])
         self.summary.setToolTip("原始读卡消息数未知；已落盘消息含修订，不等于人数。\n"
                                 + ("未执行的检查，缺少：" + "；".join(missing) if missing else ""))
@@ -949,6 +1136,7 @@ class ProblemListPanel(QFrame):
             signature = input_signature(self.workspace_dir)
         except OSError as error:
             self.chip_status = f"芯片自检读取失败：{error}"
+            self.stage_health["接收"] = self.chip_status
             return
         if not signature:
             return
@@ -958,6 +1146,7 @@ class ProblemListPanel(QFrame):
                 self._chip_signature = cached.get("input_signature")
         if signature != self._chip_signature and not self._chip_timer.isActive():
             self.chip_status = "芯片自检等待更新（上一结果保留）"
+            self.stage_health["接收"] = self.chip_status
             self._chip_timer.start()
 
     def _start_chip_checks(self):
@@ -979,6 +1168,7 @@ class ProblemListPanel(QFrame):
                                      if error == QProcess.FailedToStart else None)
         self._chip_process = process
         self.chip_status = "芯片自检中（视频分析独立运行）"
+        self.stage_health["接收"] = self.chip_status
         process.start()
 
     def _chip_done(self, process, generation, code):
@@ -1005,6 +1195,7 @@ class ProblemListPanel(QFrame):
             self.refresh()
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.chip_status = f"芯片自检失败，保留上一结果：{error}"
+            self.stage_health["接收"] = self.chip_status
             self._chip_retry_after = time.monotonic() + 5
         finally:
             process.deleteLater()
@@ -1014,15 +1205,18 @@ class ProblemListPanel(QFrame):
         if self._live and not recording:
             self._final_analysis_pending = True
         self._live = bool(recording)
+        self.stage_health["录制"] = "● 录像中" if recording else "录像未启动"
         if self.workspace_dir is None:
             return
         if (not recording and self._process is None and not self._final_analysis_pending
                 and self.analysis_status == "等待已封存录像"):
             self.analysis_status = "视频分析等待录像；芯片自检独立运行"
+        self.stage_health["分析"] = self.analysis_status
         if (not recording and not self._final_analysis_pending) or self._live_paused or self._process is not None or time.monotonic() < self._next_analysis:
             return
         if not any((self.workspace_dir / name).exists() for name in ("finish_lines.json", "long_image_lines.json", "finish_problems/analysis_config.json")):
             self.analysis_status = "等待终点线配置（设置中配置终点线）"
+            self.stage_health["分析"] = self.analysis_status
             return
         signature = []
         for name in ("video_timeline.jsonl", "cyclerace_passage_events.jsonl", "finish_lines.json", "long_image_lines.json",
@@ -1037,6 +1231,7 @@ class ProblemListPanel(QFrame):
             signature.append(("settings", settings_token(self.workspace_dir)))
         except (OSError, ValueError) as error:
             self.analysis_status = f"分析配置错误：{error}"
+            self.stage_health["分析"] = self.analysis_status
             return
         if not signature or (signature == self._last_live_signature and not self._final_analysis_pending):
             return
@@ -1097,6 +1292,7 @@ class ProblemListPanel(QFrame):
             self._final_analysis_pending = False
         self.analyze_button.setText("停止分析")
         self.analysis_status = "后台分析中（低优先级）"
+        self.stage_health["分析"] = self.analysis_status
         process.start()
 
     def _analysis_error(self, error):
@@ -1128,6 +1324,8 @@ class ProblemListPanel(QFrame):
                 continue
             total = message.get("total") or 0
             self.analysis_status = f"后台分析：{message.get('stage')} {message.get('done')}/{total}"
+            self.stage_health[_progress_group(str(message.get("stage", "")))] = (
+                f"{message.get('stage')} {message.get('done')}/{total}")
 
     def _analysis_done(self, *_args) -> None:
         self._read_progress()
@@ -1153,6 +1351,7 @@ class ProblemListPanel(QFrame):
             self.analysis_status = "分析失败，已保留上一版清单：" + (error.strip() or "请查看日志")
         else:
             self.analysis_status = "本轮分析完成，等待新短段" if self.payload else "录像分析未完成，请查看日志"
+        self.stage_health["分析"] = self.analysis_status
         self.analysis_finished.emit()
 
 

@@ -10,8 +10,9 @@ from pathlib import Path
 
 from .durable_jsonl import append_jsonl_records, locked_jsonl
 from .problem_items import (CATEGORY_CHIP, CATEGORY_VIDEO, KIND_BATCH_READS, KIND_BUNCH,
-                            KIND_TWO_CHIPS_ONE_CROSSING, STATUS_CLOSED_UPSTREAM, STATUS_OPEN,
-                            ProblemItem, sort_items, stable_item_id)
+                            KIND_OBSTRUCTION, KIND_TWO_CHIPS_ONE_CROSSING, STATUS_CLOSED_UPSTREAM,
+                            STATUS_OPEN, ProblemItem, sort_items, stable_item_id)
+from .problem_rules import BUNCH_MARGIN_MS
 
 MAX_BATCH_SPAN_MS = 1000
 BATCH_DECISIONS = "batch_member_decisions.jsonl"
@@ -138,8 +139,49 @@ def aggregate_batches(items, snapshots, scope, previous=()):
 
 
 def unambiguous_auto_passed(items, auto_passed):
+    """Matches that need no operator - counted once per valid passage, and marked.
+
+    One passage event counted twice (two cameras, or a repeated delivery) is one
+    rider, not two.  A match that falls inside a period still waiting for a
+    whole-group check is kept: riders with their own crossing evidence are not
+    sent back to manual confirmation.  It is only marked, so the count of
+    "no operator needed" never silently covers an unverified group.
+    """
+
     involved = {event_id for item in items if item.evidence.get("batch_members") for event_id in item.event_ids}
-    return [item for item in auto_passed if item.get("event_id") not in involved]
+    periods = [item for item in items
+               if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION) and item.pending
+               and item.evidence.get("recorder_start_ms") is not None]
+    seen: set = set()
+    result = []
+    for entry in auto_passed:
+        if entry.get("event_id") in involved:
+            continue
+        key = entry.get("event_id") or f"{entry.get('bib')}|{entry.get('chip_time_ms')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh = {name: value for name, value in entry.items()
+                 if name not in ("pending_period", "pending_period_note")}
+        period = _covering_period(fresh, periods)
+        result.append(fresh if period is None else dict(
+            fresh, pending_period=period.item_id,
+            pending_period_note=f"{period.title}：{period.detail.split('；')[0]}"))
+    return result
+
+
+def _covering_period(entry, periods):
+    recorder_ms = entry.get("recorder_ms")
+    camera = (entry.get("frame") or {}).get("camera_index")
+    if recorder_ms is None or camera is None:
+        return None
+    for item in periods:
+        if int(item.evidence.get("camera_index", 0) or 0) != int(camera):
+            continue
+        if int(item.evidence["recorder_start_ms"]) - BUNCH_MARGIN_MS <= int(recorder_ms) \
+                <= int(item.evidence.get("recorder_end_ms", item.evidence["recorder_start_ms"])) + BUNCH_MARGIN_MS:
+            return item
+    return None
 
 
 def member_key(batch, member):

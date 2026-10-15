@@ -866,6 +866,9 @@ def run_offline_analysis(
 def summarize_items(items: list[ProblemItem], auto_passed: list[dict], unverifiable: int) -> dict:
     return {
         "auto_passed": sum(1 for item in auto_passed if item.get("active_now", True)),
+        # Matched automatically, but inside a period whose group is still being
+        # checked: counted as no operator needed, and still marked.
+        "auto_passed_in_pending_period": sum(1 for item in auto_passed if item.get("pending_period")),
         "pending": sum(1 for item in items if item.pending),
         "disputed": sum(1 for item in items if item.status == STATUS_DISPUTED and item.pending),
         "grouped": sum(1 for item in items if item.grouped and item.status in ("open", "disputed")),

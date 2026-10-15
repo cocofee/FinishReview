@@ -629,6 +629,9 @@ def _auto_passed(read: ChipRead, crossing: CrossingRecord, residual: int, versio
         "late_pair": late,
         "source": "auto",
         "frame": crossing.frame_payload(version),
+        # Recorder time of the crossing, so a later pass can tell whether this
+        # match sits inside a period that still needs a whole-group check.
+        "recorder_ms": int(crossing.recorder_ms),
         "contact": list(crossing.contact),
     }
 
