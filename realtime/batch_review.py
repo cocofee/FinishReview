@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from .problem_rules import BUNCH_MARGIN_MS
 
 MAX_BATCH_SPAN_MS = 1000
 BATCH_DECISIONS = "batch_member_decisions.jsonl"
+BATCH_IDENTITY_FILENAME = "batch_identity_snapshot.json"
 
 
 def read_snapshots(reads, metadata=None, latest_event=None):
@@ -280,3 +282,38 @@ def previous_items(path, scope):
     if (payload.get("race_id"), payload.get("stage_id", "")) != tuple(scope):
         return []
     return [ProblemItem.from_payload(i) for i in payload.get("items", [])]
+
+
+def identity_chain(ledger, published):
+    """Previous identities for ``aggregate_batches``, the ledger's first.
+
+    The ledger holds the ids an operator is already working on; a list written
+    by a publisher that never saw the ledger may name the same chips with a
+    fresh hash, and that copy is dropped so the operator's id survives.
+    """
+
+    known = [set(entry.event_ids) for entry in ledger]
+    seen = {entry.item_id for entry in ledger}
+    return [*ledger, *(item for item in published
+                       if item.item_id not in seen
+                       and not any(set(item.event_ids) & ids for ids in known))]
+
+
+def save_identity(path, scope, parents, history=()):
+    """Keep every batch id an operator may still be working on.
+
+    A restarted publisher hashes the same chips into a new batch id, while the
+    queue, the drafts and the batch log still name the old one.  The analysis
+    and the workbench write this ledger after every refresh, so a batch keeps
+    one name whichever of them wrote the list last.
+    """
+
+    path = Path(path)
+    current = {item.item_id for item in parents}
+    items = [item.to_payload() for item in parents]
+    items += [item.to_payload() for item in history if item.item_id not in current]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(dict(race_id=scope[0], stage_id=scope[1], items=items),
+                                    ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)

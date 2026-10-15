@@ -295,6 +295,28 @@ def test_panel_identity_survives_late_member_restart_and_source_id_change(qapp, 
     panel.close()
 
 
+def test_a_batch_the_ledger_never_saw_keeps_the_id_the_list_published(qapp, tmp_path):
+    from realtime.batch_review import BATCH_IDENTITY_FILENAME
+
+    directory = tmp_path / "finish_problems"
+    directory.mkdir()
+    values = reads()
+    published = replace(batch(values), item_id="chip_batch:published-elsewhere")
+    (directory / "problem_list.json").write_text(json.dumps(dict(
+        race_id="race", stage_id="stage", items=[published.to_payload()],
+        passage_members=read_snapshots(values))), encoding="utf-8")
+    panel = ProblemListPanel()
+    panel.set_scope(*SCOPE)
+    panel.set_workspace(tmp_path)
+    shown = next(i for i in panel.items if i.evidence.get("batch_members"))
+    # No ledger yet: the queue shows what the list published, not a fresh hash.
+    assert shown.item_id == "chip_batch:published-elsewhere"
+    assert [entry["item_id"] for entry in
+            json.loads((directory / BATCH_IDENTITY_FILENAME).read_text(encoding="utf-8"))["items"]] \
+        == ["chip_batch:published-elsewhere"]
+    panel.close()
+
+
 def test_different_camera_counts_are_not_reduced_to_smaller_count():
     from realtime.problem_items import CATEGORY_VIDEO, KIND_BUNCH
     values = reads()

@@ -36,7 +36,8 @@ from .analysis_resources import (
 from .analysis_workspace import AnalysisWorkspace, ArchiveSegment
 from .analysis_settings import (read_settings, resolved_model_path, settings_token, model_fingerprint,
                                 profile_for_segment, crosses_profile_boundary)
-from .batch_review import aggregate_batches, previous_items, read_snapshots, unambiguous_auto_passed
+from .batch_review import (BATCH_IDENTITY_FILENAME, aggregate_batches, identity_chain, previous_items,
+                           read_snapshots, save_identity, unambiguous_auto_passed)
 from .bike_check import (
     LABEL_PEDESTRIAN,
     LABEL_VEHICLE,
@@ -728,12 +729,24 @@ def analyse_camera(
         # Pair with the full neighbour context, then publish only settled
         # evidence. Cutting pairing inputs at the watermark creates false
         # missing-chip problems for riders straddling that boundary.
-        result["items"] = [item for item in result["items"]
-                           if item.chip_time_ms is not None and model.to_recorder(item.chip_time_ms) <= watermark
-                           and item.evidence.get("recorder_end_ms", watermark) <= watermark]
-        visible_ids = {item.item_id for item in result["items"]}
-        result["items"] = [item for item in result["items"] if not item.grouped or item.grouped in visible_ids]
-        result["items"] += waiting_items(waiting, camera, "等待相邻短段和芯片数据到齐，暂不判定漏读。")
+        settled = [item for item in result["items"]
+                   if item.chip_time_ms is not None and model.to_recorder(item.chip_time_ms) <= watermark
+                   and item.evidence.get("recorder_end_ms", watermark) <= watermark]
+        visible_ids = {item.item_id for item in settled}
+        settled = [item for item in settled if not item.grouped or item.grouped in visible_ids]
+        if config.evidence_delay_ms > 0:
+            settled += waiting_items(waiting, camera, "等待相邻短段和芯片数据到齐，暂不判定漏读。")
+        else:
+            # The settle run after recording stopped (``--finish-live-problems``):
+            # no more video will be written, so a chip the recording never
+            # covered is a coverage gap to report as such, not a wait that the
+            # operator could sit out.  Everything inside the sealed range is
+            # already settled, because the evidence delay is over.
+            shown = {item.item_id for item in settled}
+            settled += [item for item in result["items"] if item.kind == KIND_NO_VIDEO
+                        and item.item_id not in shown]
+            result["waiting_reads"] = 0
+        result["items"] = settled
         result["auto_passed"] = [item for item in result["auto_passed"] if model.to_recorder(item["chip_time_ms"]) <= watermark]
     result["model"] = model
     return result
@@ -923,7 +936,14 @@ def write_problem_list(
     items = [replace(item, evidence=dict(item.evidence, member_evidence_stale=True))
              if item.category == CATEGORY_VIDEO and set(item.event_ids) & changed else item for item in items]
     scope = (workspace.race_id, workspace.stage_id)
-    items = aggregate_batches(items, members, scope, previous_items(output_dir / PROBLEM_LIST_FILENAME, scope))
+    # Identity comes from the ledger the workbench also writes: a batch the
+    # operator is already reading keeps that id, a new list does not rename it.
+    ledger = previous_items(output_dir / BATCH_IDENTITY_FILENAME, scope)
+    listed = previous_items(output_dir / PROBLEM_LIST_FILENAME, scope)
+    chain = identity_chain(ledger, listed)
+    items = aggregate_batches(items, members, scope, chain)
+    save_identity(output_dir / BATCH_IDENTITY_FILENAME, scope,
+                  [item for item in items if item.evidence.get("batch_members")], chain)
     auto_passed = unambiguous_auto_passed(items, auto_passed)
     if config.render_cards:
         render_cards(items, output_dir, workspace.root, progress=progress, decode_threads=config.decode_threads)

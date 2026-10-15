@@ -111,6 +111,50 @@ def test_live_analysis_defers_tail_and_reuses_detection_cache(synthetic_race, mo
     assert len(repeated["auto_passed"]) == len(result["auto_passed"])
 
 
+def test_settle_run_reports_a_chip_outside_the_recording_as_a_coverage_gap(synthetic_race):
+    """After recording stopped nothing arrives, so "waiting" would be a lie.
+
+    During the race a chip beyond the last sealed frame may still get video;
+    at the settle run it never will, and the operator must see it as a
+    recording gap (with its own count) instead of an open wait.
+    """
+
+    from collections import Counter
+
+    from realtime.chip_history import chip_reads
+    from realtime.problem_items import KIND_NO_VIDEO
+
+    _root, workspace, config, strips = synthetic_race
+    after = START + 300_000  # five minutes past the end of the recording
+    before = START - 60_000  # a minute before it started
+    outside = chip_reads([
+        PassageEvent(event_id=f"{RACE}-stage-1-passage-90", race_id=RACE, stage_id="stage-1", group_id="1",
+                     sequence=90, bib="900", passage_time_ms=after - DAY, lap=0, passage_timestamp_ms=after,
+                     received_at_ms=after + 300, group_name="男子组"),
+        PassageEvent(event_id=f"{RACE}-stage-1-passage-91", race_id=RACE, stage_id="stage-1", group_id="1",
+                     sequence=91, bib="901", passage_time_ms=before - DAY, lap=0, passage_timestamp_ms=before,
+                     received_at_ms=before + 300, group_name="男子组"),
+    ])
+    reads = (*workspace.reads, *outside)
+
+    live = analyse_camera(replace(config, live=True), workspace, 1, strips, reads=reads)
+    live_kinds = Counter(item.kind for item in live["items"])
+    assert live["waiting_reads"] == 2 and live_kinds["evidence_pending"] == 2
+    assert live_kinds[KIND_NO_VIDEO] == 1  # the one before the recording, still inside the watermark
+
+    settled = analyse_camera(replace(config, live=True, evidence_delay_ms=0), workspace, 1, strips, reads=reads)
+    settle_kinds = Counter(item.kind for item in settled["items"])
+    # Both gaps are reported once each, and nothing is listed twice.
+    assert settle_kinds[KIND_NO_VIDEO] == 2 and settle_kinds["evidence_pending"] == 0
+    assert len({item.item_id for item in settled["items"]}) == len(settled["items"])
+    assert settled["waiting_reads"] == 0
+    assert settled["analyzed_through_ms"] == live["analyzed_through_ms"] + 10_000
+    # The rest of the race is unaffected: the same riders are matched, plus the
+    # one the live waiting zone was still holding back.
+    assert len(settled["auto_passed"]) == len(live["auto_passed"]) + 1
+    assert {entry["bib"] for entry in live["auto_passed"]} < {entry["bib"] for entry in settled["auto_passed"]}
+
+
 def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_race, tmp_path):
     root, _workspace, _config, _strips = synthetic_race
     for name in ("cyclerace_passage_events.jsonl", "finish_lines.json"):
@@ -493,6 +537,48 @@ def test_near_crossing_candidate_is_published_and_its_closure_keeps_the_history(
     assert closed[0]["evidence"]["recorded_history"] is True
     journal = (config.resolved_output() / "near_crossing_history.jsonl").read_text(encoding="utf-8")
     assert '"state": "open"' in journal and '"state": "closed"' in journal
+
+
+def test_the_publisher_and_the_ledger_name_a_batch_the_same_way(tmp_path):
+    """The list and the workbench's ledger keep one id for the operator's task."""
+    from realtime.batch_review import BATCH_IDENTITY_FILENAME
+    from realtime.chip_history import ChipRead
+
+    values = [ChipRead(f"event-{index}", str(index), f"chip-{index}", "1", "男子组", "",
+                       START + index * 20, index * 20, 0, START + index * 20, 1, 1, True, False)
+              for index in range(8)]
+
+    class _Workspace:
+        race_id, stage_id, race_date = RACE, "stage-1", "2026-09-19"
+
+        def __init__(self):
+            self.reads, self.root = values, tmp_path
+
+        def metadata(self):
+            return None
+
+        def latest_event(self, _event_id):
+            return None
+
+    config = replace(AnalysisConfig(workspace=tmp_path), output_dir=tmp_path / "out", render_cards=False)
+    ledger_path = config.output_dir / BATCH_IDENTITY_FILENAME
+    first = json.loads(write_problem_list(config, _Workspace(), []).read_text(encoding="utf-8"))
+    parent = next(item for item in first["items"] if item["evidence"].get("batch_members"))
+    assert [entry["item_id"] for entry in json.loads(ledger_path.read_text(encoding="utf-8"))["items"]] \
+        == [parent["item_id"]]
+
+    # The queue handed this batch an id of its own (a restarted publisher would
+    # otherwise hash the same chips into a new one and orphan the operator's
+    # drafts).  The next list must keep that id, not mint another.
+    handed_over = "chip_batch:handed-over"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["items"][0]["item_id"] = handed_over
+    ledger_path.write_text(json.dumps(ledger, ensure_ascii=False), encoding="utf-8")
+    second = json.loads(write_problem_list(config, _Workspace(), []).read_text(encoding="utf-8"))
+    kept = next(item for item in second["items"] if item["evidence"].get("batch_members"))
+    assert kept["item_id"] == handed_over
+    assert len(kept["event_ids"]) == len(parent["event_ids"])
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["items"][0]["item_id"] == handed_over
 
 
 def test_summary_keeps_matches_inside_pending_periods_separate():

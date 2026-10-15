@@ -39,7 +39,8 @@ from PyQt5.QtWidgets import (
 from .chip_history import format_chip_time
 from .live_chip_checks import LIVE_CHIP_FILENAME, input_signature, merge_chip_snapshot
 from .analysis_settings import read_settings, settings_token
-from .batch_review import BatchDecisionStore, aggregate_batches, previous_items
+from .batch_review import (BATCH_IDENTITY_FILENAME, BatchDecisionStore, aggregate_batches, identity_chain,
+                           previous_items, save_identity)
 from .problem_analysis import OUTPUT_DIRNAME, PROBLEM_LIST_FILENAME
 from .problem_items import (
     ACTION_CHANGE,
@@ -475,18 +476,16 @@ class ProblemListPanel(QFrame):
                 items = [ProblemItem.from_payload(item) for item in (payload or {}).get("items", [])]
                 if payload and any(i.evidence.get("batch_members") for i in items):
                     scope = (payload.get("race_id", ""), payload.get("stage_id", ""))
-                    identity_path = self.problem_dir / "batch_identity_snapshot.json"
+                    identity_path = self.problem_dir / BATCH_IDENTITY_FILENAME
+                    # The ledger is the identity the operator already holds; a
+                    # batch the list names but the ledger has never seen keeps
+                    # the list's own id instead of a fresh hash.
                     history = previous_items(identity_path, scope)
-                    items = aggregate_batches(items, payload.get("passage_members", {}), scope,
-                                              history)
-                    parents = [i.to_payload() for i in items if i.evidence.get("batch_members")]
-                    current_ids = {i["item_id"] for i in parents}
-                    parents += [i.to_payload() for i in history if i.item_id not in current_ids]
-                    identity_path.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = identity_path.with_suffix(".tmp")
-                    temporary.write_text(json.dumps(dict(race_id=scope[0], stage_id=scope[1], items=parents),
-                                                     ensure_ascii=False), encoding="utf-8")
-                    temporary.replace(identity_path)
+                    chain = identity_chain(history, [item for item in items
+                                                     if item.evidence.get("batch_members")])
+                    items = aggregate_batches(items, payload.get("passage_members", {}), scope, chain)
+                    save_identity(identity_path, scope,
+                                  [item for item in items if item.evidence.get("batch_members")], chain)
                     payload = dict(payload, items=[i.to_payload() for i in items])
                 if snapshots[1] and self._chip_process is None and time.monotonic() >= self._chip_retry_after:
                     self._chip_status_from_payload(snapshots[1])
