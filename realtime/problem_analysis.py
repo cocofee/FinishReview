@@ -36,6 +36,7 @@ from .analysis_resources import (
 from .analysis_workspace import AnalysisWorkspace, ArchiveSegment
 from .analysis_settings import (read_settings, resolved_model_path, settings_token, model_fingerprint,
                                 profile_for_segment, crosses_profile_boundary)
+from .batch_review import aggregate_batches, previous_items, read_snapshots, unambiguous_auto_passed
 from .bike_check import (
     LABEL_PEDESTRIAN,
     LABEL_VEHICLE,
@@ -886,7 +887,18 @@ def write_problem_list(
     metadata = workspace.metadata()
     if metadata is not None and metadata.race_id == workspace.race_id:
         roster = {athlete.bib: metadata.group_label(athlete.group_id) for athlete in metadata.athletes if athlete.bib}
-    items: list[ProblemItem] = list(chip_check_items(workspace.reads, ChipCheckContext(roster=roster)))
+    from .chip_history import group_exclusion
+    current_reads = []
+    changed = set()
+    for read in workspace.reads:
+        event = workspace.latest_event(read.event_id)
+        if read.active_now and event is not None:
+            if (read.bib, read.chip_ms, read.lap) != (event.bib, int(event.timeline_timestamp_ms), event.lap):
+                changed.add(read.event_id)
+            read = replace(read, chip_ms=int(event.timeline_timestamp_ms), lap=event.lap,
+                           group_id=event.group_id, group_name=event.group_name, excluded=group_exclusion(event.group_name))
+        current_reads.append(read)
+    items: list[ProblemItem] = list(chip_check_items(current_reads, ChipCheckContext(roster=roster)))
     if config.live:
         from .problem_items import KIND_NOT_ARRIVED, KIND_LAP_MISSING
         items = [item for item in items if item.kind not in (KIND_NOT_ARRIVED, KIND_LAP_MISSING)]
@@ -900,7 +912,12 @@ def write_problem_list(
         cameras[str(result["camera_index"])] = {
             key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")
         }
-    items = sort_items(items)
+    members = read_snapshots(workspace.reads, metadata, workspace.latest_event)
+    items = [replace(item, evidence=dict(item.evidence, member_evidence_stale=True))
+             if item.category == CATEGORY_VIDEO and set(item.event_ids) & changed else item for item in items]
+    scope = (workspace.race_id, workspace.stage_id)
+    items = aggregate_batches(items, members, scope, previous_items(output_dir / PROBLEM_LIST_FILENAME, scope))
+    auto_passed = unambiguous_auto_passed(items, auto_passed)
     if config.render_cards:
         render_cards(items, output_dir, workspace.root, progress=progress, decode_threads=config.decode_threads)
     payload = {
@@ -915,6 +932,7 @@ def write_problem_list(
         "auto_passed": auto_passed,
         "live": config.live,
         "settings_token": config.settings_token,
+        "passage_members": members,
     }
     target = output_dir / PROBLEM_LIST_FILENAME
     temporary = target.with_name(target.name + ".tmp")

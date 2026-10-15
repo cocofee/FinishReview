@@ -187,9 +187,10 @@ def _batch_items(reads: Sequence[ChipRead], roster: Mapping[str, str]) -> list[P
     flagged only when it is very tight or contains test, spare or unlisted chips.
     """
 
-    ordered = sorted(reads, key=lambda read: read.chip_ms)
+    latest = {read.event_id: read for read in sorted(reads, key=lambda r: (r.latest_revision, r.revision, r.active_now))}
+    ordered = sorted(latest.values(), key=lambda read: read.chip_ms)
     items = []
-    used: set[str] = set()
+    clusters = []
     start = 0
     for end, read in enumerate(ordered):
         while ordered[start].chip_ms < read.chip_ms - BATCH_WINDOW_MS:
@@ -205,15 +206,29 @@ def _batch_items(reads: Sequence[ChipRead], roster: Mapping[str, str]) -> list[P
             flagged = tight
         elif len(window) >= 3 and suspicious:
             flagged = window
-        if not flagged or all(item.read_id in used for item in flagged):
+        if not flagged:
             continue
-        used.update(item.read_id for item in flagged)
+        earlier = {item.event_id for cluster in clusters[:-1] for item in cluster}
+        flagged = [item for item in flagged if item.event_id not in earlier]
+        if not flagged:
+            continue
+        if clusters and {item.event_id for item in clusters[-1]} & {item.event_id for item in flagged}:
+            combined = {item.event_id: item for item in clusters[-1] + flagged}
+            merged = sorted(combined.values(), key=lambda item: item.chip_ms)
+            if merged[-1].chip_ms - merged[0].chip_ms <= BATCH_WINDOW_MS:
+                clusters[-1] = merged
+                continue
+        used = {item.event_id for cluster in clusters for item in cluster}
+        remaining = [item for item in flagged if item.event_id not in used]
+        if len(remaining) >= 2:
+            clusters.append(remaining)
+    for flagged in clusters:
         status, note = _status(flagged, minimum_active=1)
         span = flagged[-1].chip_ms - flagged[0].chip_ms
         items.append(ProblemItem(
             item_id=stable_item_id(KIND_BATCH_READS, *sorted(item.read_id for item in flagged)),
             kind=KIND_BATCH_READS, category=CATEGORY_CHIP,
-            detail=f"{span} ms 内 {len(flagged)} 条读数：" + "、".join(item.bib for item in flagged),
+            detail=f"{span} ms 内 {len(flagged)} 条独立通过记录，人数待视频核实：" + "、".join(item.bib for item in flagged),
             chip_time_ms=flagged[0].chip_ms, bibs=tuple(item.bib for item in flagged),
             event_ids=tuple(item.event_id for item in flagged),
             status=status, status_note=note, priority=60,

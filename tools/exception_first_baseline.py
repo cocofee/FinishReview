@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 from realtime.analysis_workspace import AnalysisWorkspace
+from realtime.batch_review import aggregate_batches, read_snapshots
 from realtime.chip_checks import chip_check_items
 from realtime.chip_history import ChipRead
 from realtime.clock_sync import ClockModel, ClockModelStore
@@ -35,6 +36,7 @@ def synthetic_gaps() -> dict:
     burst = build_video_items(camera_index=1, model=model, matched=[(crossing, reads[0], 0)], chip_only=reads[1:],
                               video_only=[], no_video=[])
     chips = chip_check_items(reads)
+    aggregated = aggregate_batches([*chips, *burst.items], read_snapshots(reads), ("synthetic", "stage"))
     following = build_video_items(camera_index=1, model=model, matched=[(crossing, read, 0)], chip_only=[], no_video=[],
                                   video_only=[replace(crossing, recorder_ms=t + 1500, position_ms=1500,
                                                       frame_index=30, row=300, r0=280, r1=320)])
@@ -43,7 +45,8 @@ def synthetic_gaps() -> dict:
         "eight_chips_one_crossing": {
             "chip_items": dict(Counter(item.kind for item in chips)),
             "video_items": dict(Counter(item.kind for item in burst.items)),
-            "main_pending": sum(item.pending for item in (*chips, *burst.items)),
+            "raw_main_pending": sum(item.pending for item in (*chips, *burst.items)),
+            "main_pending": sum(item.pending for item in aggregated),
             "expected_main_pending": 1,
         },
         "following_crossing_500ms": {

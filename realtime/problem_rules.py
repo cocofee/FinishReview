@@ -512,7 +512,7 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version) -> list
             item_id=stable_item_id(KIND_BUNCH, camera_index, *(read.read_id for read in group)),
             kind=KIND_BUNCH, category=CATEGORY_VIDEO,
             detail=(
-                f"{format_chip_time(group[0].chip_ms)} 起 {len(group)} 人相隔 2 秒以内过线：芯片 {len(group)} 个，"
+                f"{format_chip_time(group[0].chip_ms)} 起 {len(group)} 条芯片通过记录相隔 2 秒以内："
                 f"自动计数 {video} 次" + ("（不一致）" if video != len(group) else "")
             ),
             chip_time_ms=group[0].chip_ms, bibs=tuple(read.bib for read in group),

@@ -39,6 +39,7 @@ from PyQt5.QtWidgets import (
 from .chip_history import format_chip_time
 from .live_chip_checks import LIVE_CHIP_FILENAME, input_signature, merge_chip_snapshot
 from .analysis_settings import read_settings, settings_token
+from .batch_review import BatchDecisionStore, aggregate_batches, previous_items
 from .problem_analysis import OUTPUT_DIRNAME, PROBLEM_LIST_FILENAME
 from .problem_items import (
     ACTION_CHANGE,
@@ -92,6 +93,7 @@ class ProblemListPanel(QFrame):
         self.items: list[ProblemItem] = []
         self.rows: list[ProblemItem] = []
         self.store: Optional[ProblemResolutionStore] = None
+        self.batch_store = None
         self._signature = None
         self._render_signature = None
         self._events_provider: Callable[[], object] = lambda: ()
@@ -154,6 +156,10 @@ class ProblemListPanel(QFrame):
         self.bunch_button = QPushButton("打开集团逐帧核对", self)
         self.bunch_button.clicked.connect(self._open_bunch)
         controls.addWidget(self.bunch_button)
+        self.batch_button = QPushButton("按成员处理批次", self)
+        self.batch_button.clicked.connect(self._open_batch)
+        self.batch_button.hide()
+        controls.addWidget(self.batch_button)
         self.analyze_button = QPushButton("分析录像", self)
         self.analyze_button.setToolTip("低优先级后台分析；比赛中只读取已封存短段，不等待五分钟归档")
         self.analyze_button.clicked.connect(self._toggle_analysis)
@@ -289,6 +295,7 @@ class ProblemListPanel(QFrame):
             button.setEnabled(not self._browsing)
         item = self.current_item()
         self.bunch_button.setEnabled(not self._browsing and not (item and item.evidence.get("superseded")))
+        self.batch_button.setEnabled(not self._browsing)
         if browsing:
             self.hint.setText("正在浏览其他时间；当前问题与输入已保留。请回到当前问题再提交决定。")
 
@@ -390,6 +397,21 @@ class ProblemListPanel(QFrame):
                     payload = dict(payload, settings_stale=True, auto_passed=[],
                                    summary=dict(payload.get("summary", {}), auto_passed=0))
                 items = [ProblemItem.from_payload(item) for item in (payload or {}).get("items", [])]
+                if payload and any(i.evidence.get("batch_members") for i in items):
+                    scope = (payload.get("race_id", ""), payload.get("stage_id", ""))
+                    identity_path = self.problem_dir / "batch_identity_snapshot.json"
+                    history = previous_items(identity_path, scope)
+                    items = aggregate_batches(items, payload.get("passage_members", {}), scope,
+                                              history)
+                    parents = [i.to_payload() for i in items if i.evidence.get("batch_members")]
+                    current_ids = {i["item_id"] for i in parents}
+                    parents += [i.to_payload() for i in history if i.item_id not in current_ids]
+                    identity_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = identity_path.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(dict(race_id=scope[0], stage_id=scope[1], items=parents),
+                                                     ensure_ascii=False), encoding="utf-8")
+                    temporary.replace(identity_path)
+                    payload = dict(payload, items=[i.to_payload() for i in items])
                 if snapshots[1] and self._chip_process is None and time.monotonic() >= self._chip_retry_after:
                     self._chip_status_from_payload(snapshots[1])
             except (OSError, ValueError, KeyError, TypeError) as error:
@@ -399,6 +421,11 @@ class ProblemListPanel(QFrame):
             self._signature = signature
         if self.store is None:
             self.store = ProblemResolutionStore(self.problem_dir / RESOLUTIONS_FILENAME)
+        try:
+            self.batch_store = BatchDecisionStore(self.problem_dir)
+        except (OSError, ValueError) as error:
+            self.batch_store = None
+            self.hint.setText(f"批次日志不可用：{error}")
         ids = {item.item_id for item in self.items}
         self.items += [ProblemItem.from_payload(value) for key, value in self._operator_items.items() if key not in ids]
         try:
@@ -417,6 +444,9 @@ class ProblemListPanel(QFrame):
                                       status_note="后台证据已更新，此旧问题仅保留供查看；请选择清单中的新问题。",
                                       evidence=dict(current.evidence, superseded=True)))
         fresh_ids = {value["item_id"] for value in (self.payload or {}).get("items", [])}
+        self.items = [replace(item, evidence=dict(item.evidence, batch_members=[dict(m, present=False)
+                      for m in item.evidence["batch_members"]]))
+                      if item.evidence.get("batch_members") and item.item_id not in fresh_ids else item for item in self.items]
         self.items = [replace(item, status=STATUS_WAITING, status_note="配置已变更，保留旧建议供追溯；须重新取得适用证据。",
                               evidence=dict(item.evidence, configuration_stale=True))
                       if token and item.item_id in self._operator_items and item.item_id not in fresh_ids
@@ -468,6 +498,16 @@ class ProblemListPanel(QFrame):
             return STATE_EXCLUDED
         if item.status == STATUS_INFO:
             return STATE_INFO
+        if item.evidence.get("batch_members"):
+            if self.batch_store is None:
+                return STATE_WAITING
+            states = [self.batch_store.state(item, m, tuple(self._events_provider())) for m in item.evidence["batch_members"]]
+            pending = sum(s in ("待处理", "需要重查", "暂存", "待证据") for s in states)
+            handoff = states.count("待 CycleRace")
+            done = len(states) - pending - handoff
+            if pending:
+                return f"部分处理：待核 {pending} / 交接 {handoff} / 已处理 {done}" if handoff or done else STATE_PENDING
+            return f"{STATE_HANDOFF}：{handoff} 个成员" if handoff else f"{STATE_RESOLVED}：{done} 个成员"
         if item.status == STATUS_CLOSED_UPSTREAM or (item.pending and self._upstream_closed(item)):
             return STATE_UPSTREAM
         record = self.bunch_store.latest_for(item) if self.bunch_store is not None else None
@@ -491,7 +531,7 @@ class ProblemListPanel(QFrame):
 
     @staticmethod
     def is_pending_state(state: str) -> bool:
-        return state in (STATE_PENDING, STATE_DISPUTED, STATE_STALE)
+        return state in (STATE_PENDING, STATE_DISPUTED, STATE_STALE) or state.startswith("部分处理")
 
     def summary_text(self) -> str:
         if self.payload is None and not self.items:
@@ -600,6 +640,7 @@ class ProblemListPanel(QFrame):
         self.card.clear()
         self.filmstrip.clear()
         if item is None:
+            self.batch_button.hide()
             self.title.setText("选择一条问题查看过线卡片")
             self.detail.setText("")
             self.jump_button.setEnabled(False)
@@ -612,9 +653,11 @@ class ProblemListPanel(QFrame):
         self.hold_button.setEnabled(item.status != STATUS_WAITING)
         self.hold_button.setText("返回待处理" if item.item_id in self._held else "暂存")
         is_bunch = item.kind in (KIND_BUNCH, KIND_OBSTRUCTION)
+        batch = self._batch_parent(item)
+        self.batch_button.setVisible(batch is not None)
         self.bunch_button.setVisible(is_bunch)
         self.bunch_button.setEnabled(item.status != STATUS_WAITING)
-        self.bib_input.setVisible(not is_bunch)
+        self.bib_input.setVisible(not is_bunch and batch is None)
         self.reason_input.setVisible(True)
         state = self.state(item)
         self.title.setText(
@@ -641,6 +684,9 @@ class ProblemListPanel(QFrame):
         self.reopen_button.setEnabled(resolved)
         self.reopen_button.setVisible(resolved)
         actions = (ACTION_SYNCED,) if state.startswith(STATE_HANDOFF) else (() if is_bunch or resolved or item.status == STATUS_WAITING else item.actions)
+        if batch is not None:
+            actions = ()
+            self.reopen_button.hide()
         if item.evidence.get("superseded"):
             actions = ()
             self.hold_button.setEnabled(False)
@@ -661,6 +707,35 @@ class ProblemListPanel(QFrame):
             self._open_bunch()
         else:
             self._resolve("reopen")
+
+    def _batch_parent(self, item):
+        if item.evidence.get("batch_members"):
+            return item
+        return next((i for i in self.items if i.item_id == item.grouped and i.evidence.get("batch_members")), None)
+
+    def _open_batch(self):
+        item = self.current_item()
+        batch = self._batch_parent(item) if item else None
+        if batch is None or self._browsing:
+            return
+        from .batch_dialog import BatchReviewDialog
+
+        def current(identity):
+            self.refresh()
+            return next((i for i in self.items if i.item_id == identity), None)
+
+        try:
+            dialog = BatchReviewDialog(self.problem_dir, batch, current, self._events_provider,
+                                       self.jump_requested.emit, self)
+            dialog.exec_()
+            if dialog.saved:
+                item = dialog.batch
+                self._operator_items[item.item_id] = replace(item, evidence=dict(item.evidence,
+                    operator_scope=self._scope, operator_settings_token=settings_token(self.workspace_dir))).to_payload()
+                self.save_drafts()
+            self.refresh()
+        except (OSError, ValueError, RuntimeError) as error:
+            self.hint.setText(f"批次处理不可用：{error}")
 
     def _open_bunch(self) -> None:
         item = self.current_item()
@@ -709,6 +784,9 @@ class ProblemListPanel(QFrame):
         self.refresh()
         item = self.current_item()
         if item is None or self.store is None:
+            return
+        if self._batch_parent(item) is not None:
+            self.hint.setText("请打开批次并选择具体成员，不能用整项操作代替成员决定。")
             return
         if item.evidence.get("configuration_stale") or item.status == STATUS_WAITING:
             self.hint.setText("证据等待重新分析，不能提交旧结论。")
@@ -766,7 +844,8 @@ class ProblemListPanel(QFrame):
         if self.store is None or self.problem_dir is None:
             return None
         try:
-            counts = export_lists(self.items, self.store, self.problem_dir / "exports")
+            self.refresh()
+            counts = export_lists(self.items, self.store, self.problem_dir / "exports", events=tuple(self._events_provider()))
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"导出失败：{error}")
             return None

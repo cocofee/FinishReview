@@ -153,6 +153,8 @@ class ProblemItem:
 
     @property
     def title(self) -> str:
+        if self.evidence.get("batch_members"):
+            return "多芯片批次核对" if self.category == CATEGORY_VIDEO else "密集读数，人数待核"
         return KIND_TITLES.get(self.kind, self.kind)
 
     @property

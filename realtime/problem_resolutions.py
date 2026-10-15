@@ -168,6 +168,8 @@ class ProblemResolutionStore:
     ) -> ProblemResolution:
         if item.evidence.get("configuration_stale"):
             raise ValueError("配置已变更，等待重新分析后再处理")
+        if item.evidence.get("batch_members"):
+            raise ValueError("批次必须选择成员逐条处理，不能提交整批决定")
         previous, stale = self.state(item)
         acknowledge = action == ACTION_SYNCED and previous is not None and not stale and previous.action in (
             ACTION_RECORD_BIB, ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP, ACTION_CHANGE,
@@ -178,6 +180,13 @@ class ProblemResolutionStore:
             raise ValueError("认号补录需要号码")
         if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP) and not reason.strip():
             raise ValueError("删除需要填写原因")
+        if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP):
+            if len(item.event_ids) > 1 and len(item.bibs) != len(item.event_ids):
+                raise ValueError("记录与号码对应不明确，请使用成员级处理")
+            target = target_bib.strip() or (item.bibs[0] if len(item.event_ids) == 1 and item.bibs else "")
+            if not target or sum(bib == target for bib in item.bibs) != 1:
+                raise ValueError("必须指定本问题中唯一对应的目标记录；不能回退到首条")
+            target_bib = target
         with self._lock:
             current = self._latest.get(item.item_id)
             resolution = ProblemResolution(
@@ -269,6 +278,7 @@ def export_lists(
     items: Sequence[ProblemItem],
     store: ProblemResolutionStore,
     output_dir: str | Path,
+    *, events=(),
 ) -> dict[str, int]:
     """Write 补录 / 建议删除 / 建议改号改圈 CSV lists for CycleRace."""
 
@@ -281,6 +291,9 @@ def export_lists(
     for resolution in sorted(store.resolutions(), key=lambda value: value.chip_time_ms or 0):
         item = by_id.get(resolution.item_id)
         if item is None:
+            continue
+        parent = by_id.get(item.grouped)
+        if parent is not None and parent.evidence.get("batch_members"):
             continue
         if bunches.latest_for(item) is not None:
             continue  # the per-rider bunch review supersedes an old group-level decision
@@ -295,24 +308,43 @@ def export_lists(
                 f"{title}；{resolution.reason}".rstrip("；"),
             ))
         elif resolution.action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP):
-            target = resolution.target_bib or (item.bibs[0] if item.bibs else "")
+            if item.evidence.get("batch_members") or len(item.bibs) != len(item.event_ids):
+                continue
+            target = resolution.target_bib or (item.bibs[0] if len(item.event_ids) == 1 and item.bibs else "")
             event_ids = [
                 event_id for bib, event_id in zip(item.bibs, item.event_ids) if bib == target
-            ] or list(item.event_ids[:1])
+            ]
+            if len(event_ids) != 1:
+                continue
             for event_id in event_ids:
                 deletions.append((
                     target, format_chip_time(item.chip_time_ms), _passage_number(event_id),
-                    title, resolution.reason,
+                    title, resolution.reason, event_id, "", "", _frame_text(resolution.frame), resolution.calibration_version,
+                    json.dumps(resolution.to_payload(), ensure_ascii=False),
                 ))
         elif resolution.action == ACTION_CHANGE:
             changes.append((
                 item.bibs[0] if item.bibs else "", resolution.target_bib, format_chip_time(item.chip_time_ms),
                 "、".join(_passage_number(event_id) for event_id in item.event_ids), title, resolution.reason,
             ))
+    from .batch_review import BatchDecisionStore, member_key
+    batch_store = BatchDecisionStore(store.journal_path.parent)
+    exported = set()
+    for item in items:
+        for member in item.evidence.get("batch_members", []):
+            key = member_key(item, member)
+            if key in exported or batch_store.state(item, member, events) != "待 CycleRace":
+                continue
+            decision = batch_store.latest[key]
+            deletions.append((member["bib"], format_chip_time(member["chip_ms"]), _passage_number(member["event_id"]),
+                              item.title, decision["reason"], member["event_id"], member["revision"], item.item_id,
+                              _frame_text(decision["binding"]["frame"]), item.calibration_version,
+                              json.dumps(decision["binding"], ensure_ascii=False)))
+            exported.add(key)
     manual.extend(bunches.manual_entries(items, store.journal_path.parent.parent))
     tables = (
         (EXPORT_MANUAL_ENTRIES, ("号码", "芯片域时间", "证据帧", "机位", "校时版本", "说明"), manual),
-        (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因"), deletions),
+        (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因", "事件ID", "记录修订", "批次ID", "证据帧", "校时版本", "证据快照JSON"), deletions),
         (EXPORT_CHANGES, ("原号码", "建议号码或圈数", "通过时间", "CycleRace 记录编号", "问题类型", "原因"), changes),
     )
     counts = {}
