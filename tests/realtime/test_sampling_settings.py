@@ -3,6 +3,7 @@ import os
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -15,11 +16,12 @@ from realtime.analysis_settings import AnalysisSettingsStore, CONFIG_PATH, model
 from realtime.analysis_workspace import AnalysisWorkspace
 from realtime.bike_check import BikeVerdict, probe_model
 from realtime.line_sampling import read_strip_meta
+from realtime.passage_receiver import PassageEvent
 from realtime.problem_analysis import AnalysisConfig, config_from_workspace, extract_strips, line_for_segment
 from realtime.problem_items import ProblemItem, CATEGORY_VIDEO, KIND_NO_CHIP_CROSSING, STATUS_WAITING
 from realtime.problem_panel import ProblemListPanel
 from realtime.problem_resolutions import ProblemResolutionStore, export_lists
-from realtime.sampling_dialog import SamplingLineView, SamplingSettingsDialog
+from realtime.sampling_dialog import SamplingLineView, SamplingSettingsDialog, default_segment_index
 from realtime.video_timeline import VideoTimelineStore
 
 
@@ -63,6 +65,57 @@ def sealed(tmp_path):
 def save(store, segment, points=POINTS, **extra):
     return store.save(race_id="race", stage_id="stage", segment=segment, line={"points": points},
                       model_path=extra.get("model_path", ""), crop_mode=extra.get("crop_mode", "up"))
+
+
+@pytest.fixture
+def race_then_test(tmp_path):
+    """One folder holding the race plus a test recording of a later day."""
+
+    (tmp_path / "review_event_scope.json").write_text(json.dumps({"race_id": "race", "stage_id": "stage"}))
+    events = [
+        PassageEvent(event_id=f"race-stage-1-passage-{index}", race_id="race", stage_id="stage", group_id="1",
+                     sequence=index, bib=str(20 + index), chip_id=f"chip-{index}", passage_time_ms=1000 * index,
+                     lap=0, passage_timestamp_ms=T + offset, received_at_ms=T + offset + 300,
+                     group_name="男子组", is_active=True, revision=1)
+        for index, offset in ((1, 0), (2, 60_000))
+    ]
+    (tmp_path / "cyclerace_passage_events.jsonl").write_text(
+        "".join(json.dumps(event.to_payload(), ensure_ascii=False) + "\n" for event in events), encoding="utf-8")
+    for name, start in (("camera_01_20260919_094900_512665_archive_0000.avi", T),
+                        ("camera_01_20260919_095156_902934_archive_0000.avi", T + 400_000),
+                        ("camera_01_20261015_161337_133871_archive_0000.avi", T + 26 * 86_400_000)):
+        path = tmp_path / name
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 10, (320, 180))
+        for _ in range(20):
+            writer.write(np.full((180, 320, 3), 80, np.uint8))
+        writer.release()
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl").add_completed_segment(
+            source_id="cam", camera_index=1, video_path=path, media_started_at_ms=start,
+            media_duration_ms=300_000, clock_source="videopipe_system_clock", timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="")
+    return tmp_path
+
+
+def test_default_segment_is_the_race_end_not_the_newest_recording():
+    segments = [SimpleNamespace(start_ms=T, end_ms=T + 300_000),
+                SimpleNamespace(start_ms=T + 600_000, end_ms=T + 900_000),
+                SimpleNamespace(start_ms=T + 3 * 86_400_000, end_ms=T + 3 * 86_400_000 + 300_000)]
+    assert default_segment_index(segments, T + 800_000) == 1
+    assert default_segment_index(segments, T + 1_000_000) == 1
+    assert default_segment_index(segments, T - 60_000) == 2
+    assert default_segment_index(segments, None) == 2
+    assert default_segment_index([], T) == -1
+
+
+def test_dialog_opens_on_the_race_recording_when_a_later_test_shares_the_folder(qapp, race_then_test):
+    dialog = SamplingSettingsDialog(race_then_test)
+    pump(qapp, lambda: dialog.worker is None)
+    assert [item.path.name for item in dialog.segments] == [
+        "camera_01_20260919_094900_512665_archive_0000.avi",
+        "camera_01_20260919_095156_902934_archive_0000.avi"]
+    assert dialog._selected == 0
+    assert "20260919_094900_512665" in dialog.segment_combo.currentText()
+    dialog.reject()
 
 
 def test_polyline_roundtrip_keeps_legacy_and_session_boundaries(sealed):

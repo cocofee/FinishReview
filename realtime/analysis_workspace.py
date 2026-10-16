@@ -42,6 +42,22 @@ SCOPE_FILE = "review_event_scope.json"
 FINISH_LINE_FILES = ("finish_lines.json", "long_image_lines.json")
 _ARCHIVE_SUFFIX_RE = re.compile(r"_archive_\d+$", re.IGNORECASE)
 _VIDEO_SUFFIXES = {".mkv", ".mp4", ".mov", ".avi", ".ts"}
+RACE_CLOCK_MARGIN_MS = 3 * 60 * 60 * 1000
+
+
+def race_clock_window(reads) -> Optional[tuple[int, int]]:
+    """The clock span this race can occupy, from its own chip reads only.
+
+    A workspace folder often holds recordings of several visits (the race and
+    a later test in the same room). Only the race clock, widened generously,
+    tells them apart; without any chip read there is nothing to compare, and
+    the caller keeps everything.
+    """
+
+    times = [int(read.chip_ms) for read in reads if int(read.chip_ms) > 0]
+    if not times:
+        return None
+    return min(times) - RACE_CLOCK_MARGIN_MS, max(times) + RACE_CLOCK_MARGIN_MS
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,12 +200,18 @@ class AnalysisWorkspace:
         return self._timeline
 
     def archive_segments(self, camera_index: Optional[int] = None) -> tuple[ArchiveSegment, ...]:
-        """Closed long-form recordings of this race, oldest first."""
+        """Closed long-form recordings of this race, oldest first.
+
+        A recording outside the race clock window belongs to another visit of
+        the same folder and stays out: analysing it would invent riders this
+        race never had.
+        """
 
         segments = []
         if not (self.root / TIMELINE_JOURNAL).is_file():
             return ()
         store = self.timeline()
+        window = race_clock_window(self.reads)
         problem_sessions = {
             (segment.camera_index, re.sub(r"_review_\d+$", "", Path(segment.video_path).stem))
             for segment in store.segments() if segment.end_reason == "retained_problem_segment"
@@ -242,6 +264,13 @@ class AnalysisWorkspace:
                     selected.append(replace(item, excluded_ranges=tuple(overlap)))
             segments = selected
         segments.sort(key=lambda item: (item.camera_index, item.start_ms))
+        if window is not None:
+            inside = [item for item in segments
+                      if item.end_ms > window[0] and item.start_ms < window[1]]
+            # A clock that disagrees with the recorder for a whole day would
+            # empty the race; an empty race is worse than a doubtful one.
+            if inside:
+                segments = inside
         return tuple(segments)
 
     def camera_indexes(self) -> tuple[int, ...]:

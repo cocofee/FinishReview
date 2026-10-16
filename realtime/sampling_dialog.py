@@ -20,6 +20,24 @@ from .line_sampling import LineGeometry
 from .problem_analysis import config_from_workspace, line_for_segment
 
 
+def default_segment_index(segments, race_end_ms) -> int:
+    """The recording that covers the race's own end, never merely the newest.
+
+    A folder can hold a later test recording; the operator would then draw the
+    real finish line on a picture of the wrong day. Fall back to the newest
+    segment when the race clock is unknown or nothing matches it.
+    """
+
+    if race_end_ms is not None:
+        for index in range(len(segments) - 1, -1, -1):
+            if segments[index].start_ms <= int(race_end_ms) <= segments[index].end_ms:
+                return index
+        for index in range(len(segments) - 1, -1, -1):
+            if segments[index].start_ms <= int(race_end_ms):
+                return index
+    return len(segments) - 1
+
+
 class SamplingLineView(QGraphicsView):
     changed = pyqtSignal()
 
@@ -238,13 +256,25 @@ class SamplingSettingsDialog(QDialog):
         self.segment_combo.currentIndexChanged.connect(self._select)
         self._model_changed()
         if self.segments:
-            self.segment_combo.setCurrentIndex(len(self.segments) - 1)
+            self.segment_combo.setCurrentIndex(default_segment_index(self.segments, self.race_end_ms()))
             if self.worker is None:
                 self._select(self.segment_combo.currentIndex())
         else:
             self.notice.setText("等待已封存录像：请先录制并等待首个短段封存，不需要停止录像。")
             self.buttons.button(QDialogButtonBox.Save).setEnabled(False)
             self.probe_button.setEnabled(False)
+
+    def race_end_ms(self):
+        """The last chip read this race itself produced, if any."""
+
+        for reads in (
+            [read for read in self.source.reads if not read.excluded and not read.manual_entry],
+            self.source.reads,
+        ):
+            times = [int(read.chip_ms) for read in reads if int(read.chip_ms) > 0]
+            if times:
+                return max(times)
+        return None
 
     def _geometry_changed(self):
         self.geometry_label.setText(f"节点 {len(self.view.points)} · 解码画面 {self.view.width_px} × {self.view.height_px}")

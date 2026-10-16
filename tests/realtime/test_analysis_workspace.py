@@ -101,3 +101,49 @@ def test_finish_lines_fall_back_to_long_image_lines(tmp_path):
 
     assert AnalysisWorkspace(root).finish_lines()[1]["x2"] == 0.21
     assert session_id_for_path(root / "camera_01_x_archive_0012.mkv") == "camera_01_x"
+
+
+def _archived(root, name, start, duration=300_000, camera=1):
+    path = root / "videos" / name
+    path.write_bytes(b"\0")
+    VideoTimelineStore(root / "video_timeline.jsonl").add_completed_segment(
+        source_id=f"camera_0{camera}_review", camera_index=camera, video_path=path,
+        media_started_at_ms=start, media_duration_ms=duration,
+        clock_source="videopipe_system_clock", timing_error_ms=3_000,
+        end_reason="continuous_archive_fallback", race_id="",
+    )
+
+
+def test_archive_segments_leave_out_another_visit_of_the_same_folder(tmp_path):
+    """The race folder also held an indoor test a month later (real case)."""
+
+    root = tmp_path / "race"
+    (root / "videos").mkdir(parents=True)
+    t = DAY + 36_000_000
+    _write_events(root, [_event("main", 1, t), _event("main", 2, t + 3_600_000)])
+    _archived(root, "camera_01_20260919_094900_000000_archive_0000.mkv", t - 300_000)
+    _archived(root, "camera_01_20260919_101635_000000_archive_0000.mkv", t + 3_600_000)
+    _archived(root, "camera_01_20261015_161337_133871_archive_0000.mkv", t + 26 * 3_600_000)
+
+    names = [item.path.name for item in AnalysisWorkspace(root).archive_segments(1)]
+
+    assert names == ["camera_01_20260919_094900_000000_archive_0000.mkv",
+                     "camera_01_20260919_101635_000000_archive_0000.mkv"]
+
+
+def test_archive_segments_keep_a_night_race_and_a_folder_without_chips(tmp_path):
+    root = tmp_path / "race"
+    (root / "videos").mkdir(parents=True)
+    late = DAY + 23 * 3_600_000 + 1_800_000
+    _write_events(root, [_event("main", 1, late), _event("main", 2, late + 3_600_000)])
+    _archived(root, "camera_01_20260919_235000_000000_archive_0000.mkv", late - 600_000)
+    _archived(root, "camera_01_20260920_003000_000000_archive_0000.mkv", late + 3_600_000)
+    assert len(AnalysisWorkspace(root).archive_segments(1)) == 2
+
+    quiet = tmp_path / "quiet"
+    (quiet / "videos").mkdir(parents=True)
+    (quiet / "review_event_scope.json").write_text('{"race_id": "main", "stage_id": "stage-1"}')
+    _archived(quiet, "camera_01_20260919_235000_000000_archive_0000.mkv", DAY + 36_000_000)
+    (quiet / "cyclerace_passage_events.jsonl").write_text("", encoding="utf-8")
+
+    assert len(AnalysisWorkspace(quiet).archive_segments(1)) == 1
