@@ -96,7 +96,9 @@
 <body>
 <h1>终点复核 · 简化界面草案</h1>
 <p class="note">草案可以直接点：画面里点一下就是一个人，下面的按钮随点数改说法；上面四个页签是四类疑点。<br>集团不再另开窗口 —— 整团的芯片刻度就在画面上一条细条里，点人数还是在这张画面上点。
-   <b>请把浏览器窗口拉宽（全屏最好）</b>，布局是按 1920×780 的笔记本屏幕画的。</p>
+   <b>请把浏览器窗口拉宽（全屏最好）</b>，布局是按 1920×780 的笔记本屏幕画的。<br>
+   <span class="dim">已经改到软件里的：四类清单、一行一个记号、顶部两行、<b>T</b> = 待确认（留在清单里灰字）、放大后点画面记人、回车确认、↑↓ 换疑点、集团在主界面直接点人数确认。
+   还没做的：画面上方那条整团芯片刻度细条；集团要填号码、排除某人的细活仍在工具窗里做。</span></p>
 
 <div class="tabs" id="tabs">
   <button class="tab on" data-kind="multi">多芯片</button>
@@ -118,16 +120,18 @@
     </div>
     <div class="body">
       <div class="queue">
-        <header><b>疑点</b> · 第 12 条 / 共 42</header>
+        <header><b>疑点</b> 多芯片 15 · 集团 18 · 无芯片 9 · 待确认 3
+          <span style="float:right">待处理 ▾</span></header>
         <div class="rows" id="rows-1">
-          <div class="row on" data-kind="group"><span class="t">10:30:39</span><span class="k group">集团</span><span class="n">120 · 375 · 381 …</span></div>
+          <div class="row on" data-kind="group"><span class="t">10:30:39</span><span class="k group">集团</span><span class="n">9 芯片</span></div>
           <div class="row" data-kind="multi"><span class="t">10:30:40</span><span class="k multi">多芯片</span><span class="n">375</span></div>
           <div class="row" data-kind="multi"><span class="t">10:30:41</span><span class="k multi">多芯片</span><span class="n">436</span></div>
           <div class="row" data-kind="miss"><span class="t">10:31:50</span><span class="k miss">无芯片</span><span class="n">—</span></div>
           <div class="row" data-kind="multi"><span class="t">10:31:57</span><span class="k multi">多芯片</span><span class="n">438</span></div>
-          <div class="row" data-kind="group"><span class="t">10:33:12</span><span class="k group">集团</span><span class="n">6 人</span></div>
+          <div class="row" data-kind="group"><span class="t">10:33:12</span><span class="k group">集团</span><span class="n">6 芯片</span></div>
           <div class="row" data-kind="miss"><span class="t">10:34:17</span><span class="k miss">无芯片</span><span class="n">—</span></div>
           <div class="row" data-kind="group"><span class="t">10:33:31</span><span class="k group">集团</span><span class="n dim">5 人</span></div>
+          <div class="row" data-kind="todo"><span class="t">10:34:02</span><span class="k todo">待确认</span><span class="n dim">遮挡</span></div>
           <div class="row" data-kind="todo"><span class="t">10:31:11</span><span class="k todo">待确认</span><span class="n">遮挡</span></div>
           <div class="row" data-kind="todo"><span class="t">10:32:05</span><span class="k todo">待确认</span><span class="n">路人</span></div>
         </div>

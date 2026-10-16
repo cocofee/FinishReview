@@ -307,6 +307,64 @@ def test_workspace_switch_does_not_keep_previous_problem_or_draft(qapp, tmp_path
     assert panel.bib_input.text() == "307"
 
 
+def test_the_picture_counts_people_and_the_count_survives_a_restart(qapp, tmp_path):
+    _write_list(tmp_path, _items(), [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.table.setCurrentCell(0, 0)
+    drawn = []
+    panel.marks_changed.connect(drawn.append)
+
+    panel.add_mark(0.25, 0.70, T)
+    panel.add_mark(0.31, 0.68, T + 60)
+    panel.add_mark(1.40, 0.68, T + 90)  # beside the picture, not on a person
+    assert [mark["x"] for mark in panel.current_marks()] == [0.25, 0.31]
+    assert panel.current_marks()[0]["recorder_ms"] == T
+    assert panel.marks_label.text() == "已点 2 人" and drawn[-1] == tuple(panel.current_marks())
+
+    panel.undo_mark()
+    assert len(panel.current_marks()) == 1 and panel.marks_label.text() == "已点 1 人"
+    panel.clear_marks()
+    assert not panel.current_marks()
+
+    panel.add_mark(0.4, 0.6, T + 200)
+    panel.save_drafts()
+    restored = ProblemListPanel()
+    restored.set_workspace(tmp_path)
+    restored.table.setCurrentCell(0, 0)
+    assert restored.current_marks() == panel.current_marks()
+    # Nothing was decided by pointing at people.
+    assert restored.state(restored.current_item()) == "待处理"
+
+
+def test_enter_settles_the_counted_crossing_by_its_class(qapp, tmp_path):
+    _write_list(tmp_path, _items(), [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.set_browsing(False)
+    panel.table.setCurrentCell(next(i for i, item in enumerate(panel.rows)
+                                    if item.item_id == "two:1"), 0)
+
+    panel.add_mark(0.2, 0.5, T)
+    panel.add_mark(0.6, 0.5, T)
+    two = panel.current_item()
+    panel._confirm_pending()
+    # Two people on one crossing with two chips are two riders side by side.
+    assert panel.state(two).startswith("已处理：确认是并排两人")
+    assert panel.store.get("two:1").reason == "画面点出 2 人"
+
+    panel.table.setCurrentCell(next(i for i, item in enumerate(panel.rows)
+                                    if item.item_id == "no_chip:1"), 0)
+    panel.add_mark(0.2, 0.5, T)
+    panel._confirm_pending()
+    # A rider without a chip still needs the plate read; the count is not a number.
+    assert panel.store.get("no_chip:1") is None and "号码" in panel.hint.text()
+    panel.bib_input.setText("307")
+    panel._confirm_pending()
+    assert panel.store.get("no_chip:1").bib == "307"
+    assert panel.store.get("no_chip:1").reason == "画面点出 1 人"
+
+
 def test_background_progress_does_not_replace_operator_validation(qapp):
     panel = ProblemListPanel()
     panel.hint.setText("请填写原因")

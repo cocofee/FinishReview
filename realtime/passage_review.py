@@ -430,6 +430,9 @@ class EvidenceImageView(QGraphicsView):
     maximize_requested = pyqtSignal()
     activated = pyqtSignal()
     marker_position_selected = pyqtSignal(float, float)
+    # Counting a crossing: one click lands on one person, position only — the moment
+    # comes from whoever knows which frame is on screen.
+    count_mark_selected = pyqtSignal(float, float)
     marker_confirm_requested = pyqtSignal()
     marker_cancel_requested = pyqtSignal()
     marker_delete_requested = pyqtSignal()
@@ -477,6 +480,7 @@ class EvidenceImageView(QGraphicsView):
         self._detail_source_span_width = 0
         self._fit_mode = True
         self._marker_mode = False
+        self._count_mode = False
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
@@ -824,7 +828,7 @@ class EvidenceImageView(QGraphicsView):
     def set_marker_mode(self, enabled: bool) -> None:
         self._marker_mode = bool(enabled) and self.has_frame
         self.viewport().setCursor(
-            Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
+            Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
         self.setToolTip(
             "单击放置判读线；Shift + 左键拖动判读线；"
@@ -832,6 +836,20 @@ class EvidenceImageView(QGraphicsView):
             if self._marker_mode
             else ""
         )
+
+    def set_count_mode(self, enabled: bool) -> None:
+        """A click counts a person instead of placing the identity line.
+
+        The frame is what the operator is looking at; counting must not make them
+        reach for another window, so the picture itself takes the click.
+        """
+
+        self._count_mode = bool(enabled) and self.has_frame
+        self.viewport().setCursor(
+            Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
+        )
+        if self._count_mode and not self._marker_mode:
+            self.setToolTip("单击画面里的一位过线者就是一个人；左右方向键逐帧")
 
     def set_marker(
         self,
@@ -1006,7 +1024,13 @@ class EvidenceImageView(QGraphicsView):
                 self.setFocus(Qt.MouseFocusReason)
                 event.accept()
                 return
-            if was_click and self._marker_mode and self.has_frame:
+            if was_click and self._count_mode and self.has_frame:
+                # Which frame is on screen is the surface's business, not the view's;
+                # the view reports the person's place and nothing else.  A click in
+                # the black beside the picture counts nothing.
+                if self._scene.sceneRect().contains(self.mapToScene(event.pos())):
+                    self.count_mark_selected.emit(*self._normalized_position(event.pos()))
+            elif was_click and self._marker_mode and self.has_frame:
                 self._select_marker_position(event.pos())
                 self.setFocus(Qt.MouseFocusReason)
             event.accept()
@@ -1017,14 +1041,18 @@ class EvidenceImageView(QGraphicsView):
         self._video_scrubbing = False
         super().mouseReleaseEvent(event)
 
+    def _normalized_position(self, viewport_position: QPoint) -> tuple[float, float]:
+        """Where in the source frame a click landed, in fractions of width and height."""
+
+        scene_position = self.mapToScene(viewport_position)
+        return (scene_position.x() / max(1, self._source_width),
+                scene_position.y() / max(1, self._source_height))
+
     def _select_marker_position(self, viewport_position: QPoint) -> None:
         scene_position = self.mapToScene(viewport_position)
         if not self._scene.sceneRect().contains(scene_position):
             return
-        self.marker_position_selected.emit(
-            scene_position.x() / max(1, self._source_width),
-            scene_position.y() / max(1, self._source_height),
-        )
+        self.marker_position_selected.emit(*self._normalized_position(viewport_position))
 
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self.has_frame and not self._marker_mode:

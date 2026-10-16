@@ -52,6 +52,7 @@ from .problem_items import (
     ACTION_RECORD_BIB,
     ACTION_RIDE_BACK,
     ACTION_SAME_CROSSING,
+    ACTION_SIDE_BY_SIDE,
     ACTION_SYNCED,
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
@@ -136,6 +137,12 @@ class ProblemListPanel(QFrame):
     # The workbench listens: the picture takes the room of everything else, and
     # gives it back when the queue returns.
     big_view_changed = pyqtSignal(bool)
+    # The people counted on the picture: the workbench draws them on the frame.
+    marks_changed = pyqtSignal(object)
+    # While the enlarged picture is up it takes the clicks; the operator is counting.
+    count_mode_changed = pyqtSignal(bool)
+    # Stepping the picture frame by frame, from the panel's own keys.
+    frame_step_requested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -165,6 +172,10 @@ class ProblemListPanel(QFrame):
         self.bunch_store = None
         self._drafts = {}
         self._held = {}
+        # The people pointed at on the picture, per problem.  They are the count and
+        # the positions; the moments inside them align the count with the chips.
+        self._marks: dict[str, list] = {}
+        self._shown_since = time.monotonic()
         self._operator_items = {}
         self._shown_id = None
         self._shown_frame = None
@@ -341,6 +352,24 @@ class ProblemListPanel(QFrame):
         self.jump_button.setToolTip("跳到原帧；按 F 把画面放大到整个工作区（再按 F 或 Esc 收回）")
         self.jump_button.clicked.connect(self._jump)
         self.action_row.addWidget(self.jump_button)
+        # Counting is shown, not typed: how many people are pointed at, and the two
+        # ways to take one back.  They sit with the steps through the queue, and only
+        # the enlarged picture shows them — that is where pointing happens.
+        self.marks_label = QLabel("已点 0 人", self.decision_box)
+        self.marks_label.setStyleSheet("font-weight: 600;")
+        self.marks_label.setToolTip("画面里点几位就是几个人；左右方向键逐帧")
+        self.marks_label.hide()
+        self.action_row.addWidget(self.marks_label)
+        self.undo_button = QPushButton("撤销", self.decision_box)
+        self.undo_button.setToolTip("去掉最后点的那一个人（退格键）")
+        self.undo_button.clicked.connect(self.undo_mark)
+        self.undo_button.hide()
+        self.action_row.addWidget(self.undo_button)
+        self.clear_button = QPushButton("清空", self.decision_box)
+        self.clear_button.setToolTip("把这一条点过的人全部去掉")
+        self.clear_button.clicked.connect(self.clear_marks)
+        self.clear_button.hide()
+        self.action_row.addWidget(self.clear_button)
         # The two steps through the queue travel with the picture: with the list out of
         # sight the operator still moves problem by problem without leaving the frame.
         self.prev_button = QPushButton("↑ 上一个疑点", self.decision_box)
@@ -413,6 +442,7 @@ class ProblemListPanel(QFrame):
             path = self.problem_dir / "operator_drafts.json"
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps({"drafts": self._drafts, "held": self._held,
+                                             "marks": self._marks,
                                              "items": self._operator_items}, ensure_ascii=False),
                                  encoding="utf-8")
             temporary.replace(path)
@@ -468,6 +498,7 @@ class ProblemListPanel(QFrame):
         self.items, self.rows = [], []
         self.bib_input.clear()
         self.reason_input.clear()
+        self._sync_marks()
         self._pending_action = ""
         self.table.blockSignals(True)
         self.table.setRowCount(0)
@@ -475,7 +506,7 @@ class ProblemListPanel(QFrame):
         self._live = False
         self._browsing = False
         self._next_analysis = 0.0
-        self._drafts, self._held, self._operator_items = {}, {}, {}
+        self._drafts, self._held, self._marks, self._operator_items = {}, {}, {}, {}
         self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self._final_analysis_pending = False
         self._finalizing_live = False
@@ -483,6 +514,7 @@ class ProblemListPanel(QFrame):
         try:
             state = json.loads((self.problem_dir / "operator_drafts.json").read_text(encoding="utf-8"))
             self._drafts, self._held = state.get("drafts", {}), state.get("held", {})
+            self._marks = state.get("marks", {})
             self._operator_items = state.get("items", {})
         except (OSError, ValueError):
             pass
@@ -507,6 +539,7 @@ class ProblemListPanel(QFrame):
         self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self.bib_input.clear()
         self.reason_input.clear()
+        self._sync_marks()
         self._pending_action = ""
         self.refresh()
         if self.current_item() is None:
@@ -627,12 +660,25 @@ class ProblemListPanel(QFrame):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
                 statuses.append(f"机位 {camera}：{detail}")
             self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
+        self._load_bunch_store()
+        self._render()
+
+    def _bunch_signature(self) -> tuple:
+        """What the group journal says about the rows: a saved count changes a row."""
+
+        if self.bunch_store is None:
+            return ()
+        return tuple(sorted((item_id, int(record.get("counted_riders") or 0), bool(record.get("completed")))
+                            for (item_id, _camera), record in self.bunch_store.latest.items()))
+
+    def _load_bunch_store(self) -> None:
+        """Re-read the group journal, so a count saved here shows on the row at once."""
+
         from .bunch_review import BunchReviewStore
         try:
             self.bunch_store = BunchReviewStore(self.problem_dir)
         except (OSError, ValueError) as error:
             self.hint.setText(f"集团核对记录读取失败：{error}")
-        self._render()
 
     def _upstream_closed(self, item: ProblemItem) -> bool:
         """Every chip record of the item was voided or deleted upstream since."""
@@ -718,7 +764,7 @@ class ProblemListPanel(QFrame):
     def _render(self) -> None:
         signature = (tuple((repr(item.to_payload()), self.state(item)) for item in self.items),
                      self.queue_filter.currentIndex(), self._class_filter, tuple(self._held.items()),
-                     repr((self.payload or {}).get("summary")))
+                     self._bunch_signature(), repr((self.payload or {}).get("summary")))
         if signature == self._render_signature:
             return
         self._render_signature = signature
@@ -779,7 +825,7 @@ class ProblemListPanel(QFrame):
         cls = problem_class(item)
         if cls == TYPE_BUNCH:
             record = self.bunch_store.latest_for(item) if self.bunch_store is not None else None
-            counted = int((record or {}).get("counted_riders") or 0)
+            counted = int((record or {}).get("counted_riders") or 0) or len(self._marks.get(item.item_id, ()))
             if counted:
                 return f"{counted} 人"
             chips = int(item.evidence.get("chip_count") or len(item.bibs) or 0)
@@ -795,7 +841,8 @@ class ProblemListPanel(QFrame):
 
         if state in (STATE_DISPUTED, STATE_STALE):
             return QColor("#b54747")
-        if not self.is_pending_state(state) or item.item_id in self._held or self._in_progress(item):
+        if (not self.is_pending_state(state) or item.item_id in self._held
+                or self._in_progress(item) or self._marks.get(item.item_id)):
             return QColor("#8a8f98")
         return None
 
@@ -829,7 +876,15 @@ class ProblemListPanel(QFrame):
         if not changed and frame != self._shown_frame:
             self._browsing = True
         self._shown_frame = frame
+        self._shown_since = time.monotonic()
+        if changed and item is not None and item.item_id not in self._marks:
+            # A group that was counted before shows its own people again: the record
+            # is the draft, so reopening never starts from zero.
+            record = self.bunch_store.latest_for(item) if self.bunch_store is not None else None
+            if record is not None and record.get("marks"):
+                self._marks[item.item_id] = [dict(mark) for mark in record["marks"]]
         self._sync_step_buttons()
+        self._sync_marks()
         if changed:
             self._shown_id = identity
             bib, reason = self._drafts.get(identity, ("", ""))
@@ -993,6 +1048,14 @@ class ProblemListPanel(QFrame):
             # With the list out of sight, the arrows walk the queue instead of it.
             self._step(-1 if key == Qt.Key_Up else 1)
             return True
+        if self._big_view and key in (Qt.Key_Left, Qt.Key_Right):
+            # The frames step from here too, so the operator never has to give the
+            # keyboard away by clicking the picture first.
+            self.frame_step_requested.emit(-1 if key == Qt.Key_Left else 1)
+            return True
+        if key == Qt.Key_Backspace:
+            self.undo_mark()
+            return True
         if Qt.Key_1 <= key <= Qt.Key_9:
             self._click_action(key - Qt.Key_1 + 1)
             return True
@@ -1016,14 +1079,137 @@ class ProblemListPanel(QFrame):
             button.setVisible(self._big_view)
             button.setEnabled(enabled)
 
+    # ----- counting people on the picture -------------------------------
+    def current_marks(self) -> list:
+        item = self.current_item()
+        return list(self._marks.get(item.item_id, ())) if item is not None else []
+
+    def add_mark(self, x: float, y: float, recorder_ms: int) -> None:
+        """One click on the picture is one person at the moment the frame shows.
+
+        The position is kept as a fraction of the frame, so the mark stays on the
+        same person whatever the window is resized or zoomed to; the moment is what
+        the chips are compared against.
+        """
+
+        item = self.current_item()
+        if item is None or not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            return
+        marks = self._marks.setdefault(item.item_id, [])
+        marks.append({"x": round(float(x), 4), "y": round(float(y), 4), "recorder_ms": int(recorder_ms),
+                      "bib": "", "exclusion_reason": ""})
+        self.save_drafts()
+        self._sync_marks()
+        self.hint.setText(f"已点 {len(marks)} 人：点错按「撤销」；左右方向键逐帧，回车确认。")
+
+    def undo_mark(self) -> None:
+        item = self.current_item()
+        marks = self._marks.get(item.item_id, []) if item is not None else []
+        if not marks:
+            return
+        marks.pop()
+        self.save_drafts()
+        self._sync_marks()
+        self.hint.setText(f"已去掉一个，现点着 {len(marks)} 人。")
+
+    def clear_marks(self) -> None:
+        item = self.current_item()
+        if item is None or not self._marks.pop(item.item_id, None):
+            return
+        self.save_drafts()
+        self._sync_marks()
+        self.hint.setText("已清空这一条的计数。")
+
+    def _sync_marks(self) -> None:
+        """Show the count beside the picture and hand it to whoever draws it."""
+
+        marks = self.current_marks()
+        self.marks_label.setText(f"已点 {len(marks)} 人")
+        show = self._big_view and self.current_item() is not None
+        for widget in (self.marks_label, self.undo_button, self.clear_button):
+            widget.setVisible(show)
+        self.undo_button.setEnabled(bool(marks))
+        self.clear_button.setEnabled(bool(marks))
+        self.marks_changed.emit(tuple(marks))
+
     def _confirm_pending(self) -> None:
         """Enter confirms the decision whose standing reason is already in the field."""
 
         if not self._pending_action:
+            if self.current_marks():
+                # People counted on the picture and nothing else chosen: for the class
+                # that is settled by counting, the count itself is the claim.
+                self._confirm_count()
+                return
             self.hint.setText("回车确认要先选一项处理：按数字键，依据会自动填好。")
             return
         action, self._pending_action = self._pending_action, ""
         self._resolve(action)
+
+    def _confirm_count(self) -> None:
+        """Turn the counted people into the decision of this problem's class."""
+
+        item = self.current_item()
+        if item is None:
+            return
+        counted = len(self.current_marks())
+        if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
+            self._confirm_bunch_count(item, counted)
+            return
+        if problem_class(item) == TYPE_MULTI_CHIP:
+            # One person on one crossing with two chips is one vehicle carrying two
+            # chips; two people are two riders crossing side by side.
+            self._resolve(ACTION_DELETE_EXTRA_CHIP if counted == 1 else ACTION_SIDE_BY_SIDE)
+            return
+        if problem_class(item) == TYPE_MISSED:
+            self.hint.setText("画面有人但没有芯片：请填号码牌上的号码补录。")
+            self._resolve(ACTION_RECORD_BIB)
+            return
+        self._hold()
+
+    def _confirm_bunch_count(self, item: ProblemItem, counted: int) -> None:
+        """Close the group on the counted people, or keep the count as progress."""
+
+        if self.workspace_dir is None or self.bunch_store is None:
+            return
+        from .bunch_review import load_context
+        marks = [dict(mark) for mark in self._marks.get(item.item_id, [])]
+        try:
+            context = load_context(self.workspace_dir, item)
+        except (ValueError, OSError) as error:
+            self.hint.setText(f"本条集团打不开：{error}")
+            return
+        seconds = max(0.0, time.monotonic() - self._shown_since)
+        completed = False
+        try:
+            record = self.bunch_store.save(context, marks, seconds, completed=True, fully_viewed=True)
+            completed = bool(record.get("completed"))
+        except (ValueError, OSError) as error:
+            # The group cannot be closed on this count; the count is still worth
+            # keeping, and the reason is the operator's next step.
+            try:
+                self.bunch_store.save(context, marks, seconds, completed=False, fully_viewed=True)
+            except (ValueError, OSError) as saving:
+                self.hint.setText(f"集团计数未保存：{saving}")
+                return
+            self.hint.setText(f"{error} 已先记住这 {counted} 人。")
+        else:
+            self.hint.setText(f"集团 {counted} 人已核对。")
+        if completed:
+            # The group is closed and its people live in the record now; an unfinished
+            # one keeps its count in hand, ready for the next rider pointed at.
+            self._marks.pop(item.item_id, None)
+        self._pending_action = ""
+        self.save_drafts()
+        self._load_bunch_store()
+        self._render()
+        (self.setFocus if self._big_view else self.table.setFocus)()
+
+    @property
+    def big_view(self) -> bool:
+        """True while the picture, not the queue, is the surface being worked on."""
+
+        return self._big_view
 
     def toggle_big_view(self) -> None:
         """Enlarge the crossing in place, decisions and all, on one screen.
@@ -1047,6 +1233,9 @@ class ProblemListPanel(QFrame):
         self.big_keys.setVisible(self._big_view)
         self._reflow_decisions()
         self._sync_step_buttons()
+        self._sync_marks()
+        # The picture counts people while it is the big one, and only then.
+        self.count_mode_changed.emit(self._big_view)
         if self._big_view:
             self.detail_layout.removeWidget(self.decision_box)
             # The box lands at the right of the row under the frame: name and key
@@ -1072,7 +1261,8 @@ class ProblemListPanel(QFrame):
         target = self.action_line if self._big_view else self.action_row
         if target is self.action_target:
             return
-        widgets = [self.prev_button, self.next_button] + list(self.action_buttons) + [
+        widgets = [self.marks_label, self.prev_button, self.next_button, self.undo_button,
+                   self.clear_button] + list(self.action_buttons) + [
             self.batch_button, self.bunch_button, self.missed_button, self.jump_button,
             self.reopen_button,
         ]
@@ -1269,6 +1459,12 @@ class ProblemListPanel(QFrame):
             return
         bib = self.bib_input.text().strip()
         reason = self.reason_input.text().strip()
+        counted = len(self.current_marks())
+        if counted:
+            # The count is what the operator saw on the frame: it becomes the reason
+            # when they wrote none, and rides along when they did.
+            note = f"画面点出 {counted} 人"
+            reason = f"{reason}；{note}" if reason else note
         standing = ACTION_REASON_PRESETS.get(self._pending_action)
         if standing and action != self._pending_action and reason == standing:
             # A key other than the one that filled the field means the operator
@@ -1318,6 +1514,8 @@ class ProblemListPanel(QFrame):
             return
         self.bib_input.clear()
         self.reason_input.clear()
+        self._marks.pop(item.item_id, None)
+        self._sync_marks()
         self._pending_action = ""
         self._held.pop(item.item_id, None)
         self._operator_items[item.item_id] = replace(item, evidence=dict(item.evidence, operator_scope=self._scope,

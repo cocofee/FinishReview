@@ -236,6 +236,44 @@ def test_incomplete_group_stays_pending_and_group_has_no_one_click_checked(synth
     app.processEvents()
 
 
+def test_the_group_is_counted_and_closed_on_the_problem_itself(synthetic_bunch):
+    """Pointing at the riders on the frame is the whole group tool, kept inline."""
+
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    directory = root / 'finish_problems'
+    directory.mkdir()
+    (directory / 'problem_list.json').write_text(json.dumps({
+        'items': [item.to_payload()], 'summary': {}, 'auto_passed': []}), encoding='utf-8')
+    panel = ProblemListPanel()
+    panel.set_workspace(root)
+    panel.table.setCurrentCell(0, 0)
+    context = load_context(root, item)
+
+    # Three of the four chips counted: the count is kept, the group stays open.
+    for chip in context.chips[:3]:
+        panel.add_mark(0.3, 0.6, chip.recorder_ms)
+    panel._confirm_pending()
+    record = BunchReviewStore(directory).latest_for(item)
+    assert record['counted_riders'] == 3 and not record['completed']
+    assert '仍有芯片没有对应的计数' in panel.hint.text()
+    panel.refresh()
+    assert panel.state(item) == '待处理'
+    # The work the operator did is on the row, so the queue never looks untouched.
+    row = next(index for index, entry in enumerate(panel.rows) if entry.item_id == item.item_id)
+    assert panel.table.item(row, 2).text() == '3 人'
+    assert panel.table.item(row, 2).foreground().color().name() == '#8a8f98'
+
+    # The last rider makes the count complete; the same key closes the group.
+    panel.add_mark(0.7, 0.6, context.chips[3].recorder_ms)
+    panel._confirm_pending()
+    record = BunchReviewStore(directory).latest_for(item)
+    assert record['counted_riders'] == 4 and record['completed']
+    assert panel.state(item).startswith('已处理：集团人工核对')
+    assert not panel.current_marks()
+    app.processEvents()
+
+
 def test_exclusion_reason_and_evidence_roundtrip_without_exporting_cached_extras(synthetic_bunch):
     root, item, _events = synthetic_bunch
     context = load_context(root, item)

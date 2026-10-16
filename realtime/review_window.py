@@ -2365,6 +2365,9 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.jump_requested.connect(self._open_problem_frame)
         self.problem_panel.current_changed.connect(self._problem_selection_changed)
         self.problem_panel.big_view_changed.connect(self._problem_big_view_changed)
+        self.problem_panel.marks_changed.connect(self._problem_marks_changed)
+        self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
+        self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
         self.return_problem_button = QPushButton("回到当前问题", self)
         self.return_problem_button.clicked.connect(self._return_to_problem)
@@ -2398,6 +2401,60 @@ class FinishReviewWindow(PassageReviewSurface):
         if getattr(self, "_problem_workbench_active", False):
             self.preview_panel.setVisible(not big)
         QTimer.singleShot(0, self._fit_visible_evidence_views)
+        self._problem_count_mode_changed(big)
+
+    def _problem_pane(self):
+        """The pane the operator judges on: the problem's own camera, else the regular one."""
+
+        item = self.problem_panel.current_item()
+        if item is None:
+            return self.regular_pane
+        camera = int(item.evidence.get("frame", {}).get("camera_index")
+                     or item.evidence.get("camera_index") or 1)
+        return self._camera_one_pane() if camera <= 1 else self._pane_for_camera(camera)
+
+    def _problem_count_mode_changed(self, counting: bool) -> None:
+        """While the picture is the big one, a click on it counts a person."""
+
+        pane = self._problem_pane()
+        if pane is not None:
+            pane.video_view.set_count_mode(
+                bool(counting) and getattr(self, "_problem_workbench_active", False)
+            )
+
+    def _problem_count_clicked(self, x_normalized: float, y_normalized: float) -> None:
+        """One click on the picture is one person, at the moment that frame shows."""
+
+        pane = self._problem_pane()
+        origin = pane.location.segment.media_started_at_ms if pane is not None and pane.location else None
+        if origin is None:
+            return
+        self.problem_panel.add_mark(x_normalized, y_normalized,
+                                    int(origin) + int(pane._current_position_ms))
+        # The click must not take the keyboard with it: the decisions are keys.
+        self.problem_panel.setFocus()
+
+    def _problem_marks_changed(self, _marks) -> None:
+        """Redraw the counted people on the frame that is being judged."""
+
+        pane = self._problem_pane()
+        if pane is not None:
+            pane.video_view.set_history_markers(self._continuous_marker_overlays(pane))
+
+    def _continuous_marker_overlays(self, pane):
+        """The counted people ride along with the crossing markers of the same frame."""
+
+        overlays = list(super()._continuous_marker_overlays(pane))
+        overlays.extend(self._problem_count_overlays(pane))
+        return tuple(overlays)
+
+    def _problem_count_overlays(self, pane):
+        """Numbered marks for the people counted on the problem being judged."""
+
+        if not getattr(self, "_problem_workbench_active", False) or pane is not self._problem_pane():
+            return ()
+        return tuple((float(mark["x"]), float(mark["y"]), str(index + 1), True, False)
+                     for index, mark in enumerate(self.problem_panel.current_marks()))
 
     def _problem_browse_started(self):
         if getattr(self, "_problem_workbench_active", False):
@@ -2531,6 +2588,9 @@ class FinishReviewWindow(PassageReviewSurface):
             # operator looking at the right picture while every button stays greyed.
             self.problem_panel.set_browsing(False)
             self.problem_panel.hint.setText(f"已定位原录像第 {index + 1} 帧，请逐帧核对号码后处理。")
+        # The problem's pane is the one that takes the counting clicks from here on.
+        self._problem_count_mode_changed(self.problem_panel.big_view)
+        self._problem_marks_changed(None)
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label
@@ -2563,6 +2623,12 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         pane.delete_requested.connect(
             lambda _pane: QTimer.singleShot(0, self._update_operator_controls)
+        )
+        # Counting a crossing: the picture reports where the click landed, this
+        # window knows which frame it landed on, and the panel keeps the count.
+        pane.video_view.count_mark_selected.connect(self._problem_count_clicked)
+        pane.video_view.set_count_mode(
+            getattr(self, "_problem_workbench_active", False) and self.problem_panel.big_view
         )
 
     def start_receiver(self) -> None:

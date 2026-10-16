@@ -412,6 +412,70 @@ def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path
         window.close()
 
 
+def test_clicking_the_enlarged_picture_counts_one_person_per_click(qapp, tmp_path):
+    """The operator's counting: point at a rider on the frame, that is one person."""
+
+    import json
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtGui import QImage
+    from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        video = tmp_path / "original.mkv"
+        video.write_bytes(b"video")
+        start = 1_789_600_000_000
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": frame})
+        path = tmp_path / "finish_problems/problem_list.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
+        window.problem_panel.refresh()
+        window.problem_panel.table.setCurrentCell(0, 0)
+        window._open_problem_frame(frame)
+        qapp.processEvents()
+
+        pane = window.regular_pane
+        view = pane.video_view
+        view.set_frame(QImage(640, 480, QImage.Format_RGB32), source_width=640, source_height=480)
+        qapp.processEvents()
+        window.problem_panel.toggle_big_view()  # F: the picture takes the clicks
+        qapp.processEvents()
+        assert pane.video_view._count_mode
+
+        target = view.viewport().rect().center()
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
+        qapp.processEvents()
+        marks = window.problem_panel.current_marks()
+        assert len(marks) == 1
+        assert 0.0 <= marks[0]["x"] <= 1.0 and 0.0 <= marks[0]["y"] <= 1.0
+        # The moment is the frame's own: this crossing sits at its recorded second.
+        assert marks[0]["recorder_ms"] == start + int(pane._current_position_ms)
+        # The counted person is drawn on the frame as number one.
+        drawn = [overlay for overlay in window._continuous_marker_overlays(pane) if overlay[2] == "1"]
+        assert drawn and abs(drawn[0][0] - marks[0]["x"]) < 0.01
+
+        window.problem_panel.undo_mark()
+        qapp.processEvents()
+        assert not window.problem_panel.current_marks()
+        # With the queue back, the picture stops counting: it is not the big one.
+        window.problem_panel.toggle_big_view()
+        qapp.processEvents()
+        assert not pane.video_view._count_mode
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
+        qapp.processEvents()
+        assert not window.problem_panel.current_marks()
+    finally:
+        window.close()
+
+
 def test_the_problem_frame_counts_by_clock_across_the_archive(qapp, tmp_path):
     """Judging a rebound two-minute archive is still judging this crossing."""
 
