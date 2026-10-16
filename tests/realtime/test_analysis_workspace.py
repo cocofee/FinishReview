@@ -1,6 +1,10 @@
 import json
+from dataclasses import replace
+
+import pytest
 
 from realtime.analysis_workspace import AnalysisWorkspace, session_id_for_path
+from realtime.passage_evidence import VideoClockCalibrationStore
 from realtime.passage_receiver import PassageEvent
 from realtime.video_timeline import VideoTimelineStore
 
@@ -147,3 +151,95 @@ def test_archive_segments_keep_a_night_race_and_a_folder_without_chips(tmp_path)
     (quiet / "cyclerace_passage_events.jsonl").write_text("", encoding="utf-8")
 
     assert len(AnalysisWorkspace(quiet).archive_segments(1)) == 1
+
+
+SESSION = "camera_01_20260919_100000_000000"
+
+
+def _record_anchor(root, event, *, offset_ms=1_250, session=SESSION, camera=1, **provenance):
+    return VideoClockCalibrationStore(root / "video_clock_calibrations.jsonl").record(
+        camera_index=camera,
+        session_key=f"camera_01_review|{root / 'videos'}|{session}",
+        offset_ms=offset_ms,
+        anchor_event_id=event.event_id,
+        anchor_bib=event.bib,
+        calibrated_at_ms=DAY,
+        **provenance,
+    )
+
+
+def _provenance(event, **overrides):
+    fields = {
+        "anchor_event_revision": event.revision,
+        "anchor_chip_time_ms": event.timeline_timestamp_ms,
+        "anchor_frame": {"segment_id": "segment-1", "position_ms": 3_700},
+        "anchor_race_id": event.race_id,
+        "anchor_stage_id": event.stage_id,
+    }
+    fields.update(overrides)
+    return fields
+
+
+def test_manual_anchors_use_the_recorded_originals(tmp_path):
+    root = tmp_path / "race"
+    root.mkdir()
+    t = DAY + 10 * 3_600_000
+    first = _event("main", 1, t)
+    _write_events(root, [first])
+    _record_anchor(root, first, offset_ms=-1_300, **_provenance(first))
+
+    anchor, = AnalysisWorkspace(root).manual_anchors(1)
+
+    assert anchor.chip_ms == t and anchor.offset_ms == -1_300
+    assert anchor.label == first.bib and anchor.reference == SESSION
+    assert anchor.kind == "manual_calibration"
+
+
+def test_manual_anchors_accept_a_legacy_record_on_its_current_event(tmp_path):
+    root = tmp_path / "race"
+    root.mkdir()
+    t = DAY + 10 * 3_600_000
+    first = _event("main", 1, t)
+    _write_events(root, [first])
+    _record_anchor(root, first)  # no provenance: the shape older records have
+
+    anchor, = AnalysisWorkspace(root).manual_anchors(1)
+
+    assert anchor.chip_ms == t and anchor.reference == SESSION
+
+
+@pytest.mark.parametrize("change", ["revision", "time", "race", "stage", "inactive"])
+def test_manual_anchors_reject_an_anchor_that_no_longer_stands(tmp_path, change):
+    root = tmp_path / change
+    root.mkdir()
+    t = DAY + 10 * 3_600_000
+    first = _event("main", 1, t)
+    events = [first]
+    provenance = _provenance(first)
+    if change == "revision":  # CycleRace revised the exact anchor event
+        events.append(_event("main", 1, t, revision=2))
+    elif change == "time":  # the stored original chip time moved
+        provenance["anchor_chip_time_ms"] = t - 5_000
+    elif change == "race":  # the record belongs to another race (reused folder)
+        provenance["anchor_race_id"] = "other-race"
+    elif change == "stage":
+        provenance["anchor_stage_id"] = "stage-9"
+    elif change == "inactive":  # the event was voided
+        events = [replace(first, is_active=False)]
+    _write_events(root, events)
+    (root / "review_event_scope.json").write_text(
+        json.dumps({"schema_version": 1, "race_id": "main", "stage_id": "stage-1"}),
+        encoding="utf-8",
+    )
+    _record_anchor(root, first, **_provenance(first, **provenance))
+    # The legacy record on the same anchor would still stand: provenance is
+    # what makes the difference, so both records exist side by side.
+    _record_anchor(root, first, session="camera_01_20260919_100100_000000")
+
+    workspace = AnalysisWorkspace(root)
+
+    anchors = workspace.manual_anchors(1)
+    if change == "inactive":
+        assert anchors == ()
+    else:
+        assert [anchor.reference for anchor in anchors] == ["camera_01_20260919_100100_000000"]

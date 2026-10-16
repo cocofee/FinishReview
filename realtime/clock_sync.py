@@ -9,6 +9,14 @@ A coarse histogram search finds the offset without any manual anchor. The fine
 fit uses isolated riders only (no other chip within five seconds) and rejects
 outliers. Manual anchors remain a cross-check: they are compared with the
 automatic model and never silently replace it.
+
+The automatic search needs at least two kept isolated riders before it can
+model anything, which leaves the first minutes of a race unpaired. A first
+rider the operator confirmed on the very recording under analysis may start
+pairing on its own: ``manual_anchor_model`` turns that one anchor into a fixed
+offset for its own recording session (never for another session or camera).
+One point cannot show drift, so the slope stays zero until the automatic fit
+has enough isolated riders.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ FIT_FLOOR_MS = 80.0
 FIT_MAD_FACTOR = 2.5
 MIN_DRIFT_SUPPORT = 8
 MANUAL_ANCHOR_TOLERANCE_MS = 300
+MANUAL_ANCHOR_SOURCE = "manual_anchor"
 SESSION_DEVIATION_MS = 100
 _MS_PER_HOUR = 3_600_000
 
@@ -106,6 +115,16 @@ class ClockModel:
     def slope_ms_per_hour(self) -> float:
         return float(self.slope) * _MS_PER_HOUR
 
+    @property
+    def source_text(self) -> str:
+        """A short label for displays: where this calibration came from."""
+
+        if self.source == MANUAL_ANCHOR_SOURCE:
+            return "人工首人锚点"
+        if self.source == "auto":
+            return "自动校时"
+        return str(self.source)
+
     def offset_at(self, chip_ms: int, session_id: str = "") -> int:
         """Recorder minus chip at a chip-domain time (optionally per session)."""
 
@@ -125,9 +144,22 @@ class ClockModel:
         return ChipClockMs(int(round(value)))
 
     def same_fit(self, other: "ClockModel", *, tolerance_ms: int = 5) -> bool:
+        """Whether ``other`` describes the same fit from the same source.
+
+        Two numerically equal fits must not collapse into one journal version
+        when they come from different sources (an automatic fit versus an
+        operator's first-rider anchor) or serve different recording sessions:
+        the source text and the sessions a model claims are part of the model,
+        and reusing the wrong one would silently attribute the calibration.
+        """
+
         if self.evidence_signature != other.evidence_signature:
             return False
         if other.camera_index != self.camera_index:
+            return False
+        if str(other.source) != str(self.source):
+            return False
+        if frozenset(self.session_ids) != frozenset(other.session_ids):
             return False
         if {key: round(value) for key, value in dict(self.session_offsets).items()} != {
             key: round(value) for key, value in dict(other.session_offsets).items()
@@ -493,6 +525,65 @@ def calibrate_camera(
     )
 
 
+def manual_anchor_model(
+    anchors: Iterable[ClockAnchor],
+    *,
+    camera_index: int,
+    sessions: Iterable[str],
+) -> Optional[ClockModel]:
+    """A fixed-offset model started by operator-confirmed first riders.
+
+    Used when the automatic fit cannot start yet (fewer than two kept isolated
+    riders). Only anchors of this camera whose ``reference`` is one of
+    ``sessions`` — the recording sessions actually being analysed — count, so a
+    calibration of another camera, another recording or another race can never
+    start pairing here. Each confirmed session keeps its own offset (the extra
+    ones as session shifts), and the slope stays zero: a single point cannot
+    show drift, and the automatic fit refines it only once enough isolated
+    riders support it.
+    """
+
+    wanted = {str(value) for value in sessions if str(value)}
+    usable = sorted(
+        (
+            anchor
+            for anchor in anchors
+            if int(anchor.camera_index) == int(camera_index) and str(anchor.reference) in wanted
+        ),
+        key=lambda anchor: (int(anchor.chip_ms), str(anchor.reference)),
+    )
+    if not usable:
+        return None
+    primary = usable[0]
+    session_offsets = tuple(
+        (str(anchor.reference), float(int(anchor.offset_ms) - int(primary.offset_ms)))
+        for anchor in usable[1:]
+        if str(anchor.reference) != str(primary.reference)
+    )
+    note = (
+        f"人工首人锚点 {primary.label or '-'} 以固定偏移 {int(primary.offset_ms):+d} ms 启动配对"
+        f"（{len(usable)} 个支持，一个点不能估计漂移）；待可靠独立过线足够后由自动校时细化，"
+        "与自动校时冲突时会提示核对"
+    )
+    return ClockModel(
+        camera_index=int(camera_index),
+        intercept_ms=float(int(primary.offset_ms)),
+        slope=0.0,
+        reference_ms=int(primary.chip_ms),
+        valid_from_ms=int(primary.chip_ms),
+        valid_to_ms=int(primary.chip_ms),
+        support=len(usable),
+        candidates=len(usable),
+        residual_mad_ms=0.0,
+        coarse_offset_ms=int(primary.offset_ms),
+        coarse_support=0,
+        source=MANUAL_ANCHOR_SOURCE,
+        session_ids=tuple(sorted({str(anchor.reference) for anchor in usable})),
+        notes=(note,),
+        session_offsets=session_offsets,
+    )
+
+
 def check_anchors(
     model: ClockModel,
     anchors: Iterable[ClockAnchor],
@@ -503,14 +594,17 @@ def check_anchors(
     """Compare operator anchors with the automatic model.
 
     ``bias_ms`` removes a known systematic difference between the operator's
-    frame choice and the automatic crossing definition before comparison.
+    frame choice and the automatic crossing definition before comparison. An
+    anchor whose ``reference`` names a recording session is compared with that
+    session's own offset, so a measured session shift is not mistaken for an
+    operator mistake.
     """
 
     checks = []
     for anchor in anchors:
         if anchor.camera_index != model.camera_index:
             continue
-        auto = model.offset_at(anchor.chip_ms) - int(bias_ms)
+        auto = model.offset_at(anchor.chip_ms, str(anchor.reference)) - int(bias_ms)
         difference = int(anchor.offset_ms) - auto
         ok = abs(difference) <= int(tolerance_ms)
         source = "人工校时" if anchor.kind == "manual_calibration" else "人工确认"
@@ -602,10 +696,12 @@ __all__ = [
     "ClockModelStore",
     "ClockSyncError",
     "CoarseOffset",
+    "MANUAL_ANCHOR_SOURCE",
     "MANUAL_ANCHOR_TOLERANCE_MS",
     "calibrate_camera",
     "check_anchors",
     "coarse_offset",
     "isolated_pairs",
+    "manual_anchor_model",
     "robust_line_fit",
 ]

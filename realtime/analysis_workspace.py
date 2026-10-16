@@ -290,7 +290,16 @@ class AnalysisWorkspace:
         return result
 
     def manual_anchors(self, camera_index: int) -> tuple[ClockAnchor, ...]:
-        """Manual clock calibrations recorded by the existing first-rider workflow."""
+        """Manual clock calibrations recorded by the existing first-rider workflow.
+
+        A record only counts while its exact anchor event still stands: the
+        same event id, still active and not deleted, of the recorded race and
+        stage. A record carrying provenance is only used while the event
+        revision and original chip time are unchanged — the stored originals
+        are compared against the latest event instead of being reconstituted
+        from it. Legacy records without provenance fall back to the current
+        active event, the way they were recorded.
+        """
 
         path = self.root / CALIBRATION_JOURNAL
         if not path.is_file():
@@ -301,12 +310,33 @@ class AnalysisWorkspace:
             if calibration.camera_index != int(camera_index):
                 continue
             event = self.latest_event(calibration.anchor_event_id)
-            if event is None or event.timeline_timestamp_ms <= 0:
+            if event is None or not event.is_active or event.timeline_timestamp_ms <= 0:
                 continue
+            if event.event_id in self.deleted_event_ids:
+                continue
+            if calibration.anchor_race_id and calibration.anchor_race_id != event.race_id:
+                continue
+            if calibration.anchor_stage_id and calibration.anchor_stage_id != event.stage_id:
+                continue
+            if (
+                calibration.anchor_event_revision is not None
+                and int(calibration.anchor_event_revision) != int(event.revision)
+            ):
+                continue
+            if (
+                calibration.anchor_chip_time_ms is not None
+                and int(calibration.anchor_chip_time_ms) != int(event.timeline_timestamp_ms)
+            ):
+                continue
+            chip_ms = (
+                int(calibration.anchor_chip_time_ms)
+                if calibration.anchor_chip_time_ms is not None
+                else int(event.timeline_timestamp_ms)
+            )
             anchors.append(
                 ClockAnchor(
                     camera_index=int(camera_index),
-                    chip_ms=int(event.timeline_timestamp_ms),
+                    chip_ms=chip_ms,
                     offset_ms=int(calibration.offset_ms),
                     kind="manual_calibration",
                     label=calibration.anchor_bib,

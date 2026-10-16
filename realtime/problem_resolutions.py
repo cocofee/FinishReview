@@ -22,6 +22,7 @@ from .chip_history import format_chip_time
 from .durable_jsonl import append_jsonl_records
 from .problem_items import (
     ACTION_CHANGE,
+    ACTION_CONFIRM_CROSSING,
     ACTION_DELETE_CHIP,
     ACTION_DELETE_EXTRA_CHIP,
     ACTION_LABELS,
@@ -79,6 +80,7 @@ class ProblemResolution:
     resolved_at_ms: int = 0
     revision: int = 1
     analysis_signature: str = ""
+    source_frame: Optional[Mapping[str, Any]] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -116,6 +118,7 @@ class ProblemResolution:
             resolved_at_ms=int(payload.get("resolved_at_ms", 0)),
             revision=int(payload.get("revision", 1)),
             analysis_signature=str(payload.get("analysis_signature", "")),
+            source_frame=None if payload.get("source_frame") is None else dict(payload["source_frame"]),
         )
 
     @property
@@ -171,6 +174,7 @@ class ProblemResolutionStore:
         reason: str = "",
         position: Sequence[float] = (),
         chip_time_ms: Optional[int] = None,
+        frame: Optional[Mapping[str, Any]] = None,
     ) -> ProblemResolution:
         if item.evidence.get("configuration_stale"):
             raise ValueError("配置已变更，等待重新分析后再处理")
@@ -184,6 +188,8 @@ class ProblemResolutionStore:
             raise ValueError(f"action {action} is not available for {item.kind}")
         if action == ACTION_RECORD_BIB and not bib.strip():
             raise ValueError("认号补录需要号码")
+        if action == ACTION_CONFIRM_CROSSING and not item.evidence.get("frame"):
+            raise ValueError("确认过线需要保存对应原帧")
         if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP) and not reason.strip():
             raise ValueError("删除需要填写原因")
         if action in (ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_SAME_CROSSING) and not reason.strip():
@@ -207,7 +213,8 @@ class ProblemResolutionStore:
                 bib=bib.strip(),
                 target_bib=target_bib.strip(),
                 reason=reason.strip(),
-                frame=dict(item.evidence.get("frame") or {}),
+                frame=dict(frame if frame is not None else item.evidence.get("frame") or {}),
+                source_frame=dict(item.evidence.get("frame") or {}) if frame is not None else None,
                 position=tuple(float(value) for value in position),
                 chip_time_ms=item.chip_time_ms if chip_time_ms is None else int(chip_time_ms),
                 calibration_version=int(item.calibration_version),
@@ -233,7 +240,8 @@ class ProblemResolutionStore:
         return resolution, (resolution.binding != ProblemBinding.of(item)
                             or bool(item.evidence.get("configuration_stale"))
                             or resolution.calibration_version != item.calibration_version
-                            or dict(resolution.frame) != dict(item.evidence.get("frame") or {})
+                            or dict(resolution.source_frame if resolution.source_frame is not None else resolution.frame)
+                            != dict(item.evidence.get("frame") or {})
                             or resolution.analysis_signature != str(item.evidence.get("analysis_signature", "")))
 
 

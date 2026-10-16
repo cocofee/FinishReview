@@ -14,6 +14,7 @@ from realtime.clock_sync import (
     check_anchors,
     coarse_offset,
     isolated_pairs,
+    manual_anchor_model,
     robust_line_fit,
 )
 
@@ -188,3 +189,91 @@ def test_calibration_without_isolated_riders_fails_with_reason():
 
     assert result.model is None
     assert result.warnings
+
+
+def test_manual_anchor_model_fixes_one_offset_without_inventing_drift():
+    anchors = [
+        ClockAnchor(2, START, 500, "manual_calibration", "9", "s1"),            # other camera
+        ClockAnchor(1, START + 10_000, 1_200, "manual_calibration", "7", "other"),  # other recording
+        ClockAnchor(1, START, -1_950, "manual_calibration", "4", "s1"),
+    ]
+
+    model = manual_anchor_model(anchors, camera_index=1, sessions=("s1",))
+
+    assert model is not None
+    assert model.source == "manual_anchor" and model.source_text == "人工首人锚点"
+    assert model.slope == 0.0 and model.support == 1 and model.candidates == 1
+    assert model.session_ids == ("s1",)
+    assert model.notes
+    for chip in (START - HOUR, START, START + HOUR):
+        assert model.offset_at(chip) == -1_950
+        assert model.to_recorder(chip) == chip - 1_950
+        assert model.to_chip(chip - 1_950) == chip
+    assert manual_anchor_model(anchors, camera_index=1, sessions=("s2",)) is None
+    assert manual_anchor_model([], camera_index=1, sessions=("s1",)) is None
+
+
+def test_manual_anchor_model_keeps_each_confirmed_session_on_its_own_offset():
+    anchors = [
+        ClockAnchor(1, START + HOUR, 1_450, "manual_calibration", "2", "s2"),
+        ClockAnchor(1, START, 1_200, "manual_calibration", "1", "s1"),
+    ]
+
+    model = manual_anchor_model(anchors, camera_index=1, sessions=("s1", "s2", "s3"))
+
+    assert model.session_ids == ("s1", "s2") and model.support == 2
+    assert model.offset_at(START) == 1_200
+    assert model.offset_at(START, "s1") == 1_200
+    assert model.offset_at(START + HOUR, "s2") == 1_450
+    assert model.offset_at(START + HOUR) == 1_200  # no session named: the primary offset
+    assert dict(model.session_offsets) == {"s2": 250.0}
+    # s3 has no anchor, so the model never claims it.
+    assert model.session_ids.count("s3") == 0
+
+
+def test_anchor_check_compares_on_the_anchors_recording_session():
+    model = ClockModel(
+        camera_index=1, intercept_ms=-1_950.0, slope=0.0, reference_ms=START,
+        valid_from_ms=START, valid_to_ms=START + HOUR, support=30, candidates=34,
+        residual_mad_ms=27.0, coarse_offset_ms=-1_950, coarse_support=244,
+        session_offsets=(("second", 400.0),),
+    )
+    chip = START + 30_000
+    on_session = ClockAnchor(1, chip, -1_550, "manual_calibration", "7", "second")
+    unknown = ClockAnchor(1, chip, -1_550, "manual_calibration", "7", "")
+
+    session_check, unknown_check = check_anchors(model, [on_session, unknown])
+
+    assert session_check.difference_ms == 0 and session_check.within_tolerance
+    assert unknown_check.difference_ms == 400 and not unknown_check.within_tolerance
+
+
+def test_same_fit_keeps_source_and_session_set_apart(tmp_path):
+    store = ClockModelStore(tmp_path / "video_clock_models.jsonl")
+    auto = ClockModel(
+        camera_index=1, intercept_ms=-1_950.0, slope=-889 / HOUR, reference_ms=START,
+        valid_from_ms=START, valid_to_ms=START + HOUR, support=30, candidates=34,
+        residual_mad_ms=27.0, coarse_offset_ms=-1_950, coarse_support=244,
+        source="auto", session_ids=("s1", "s2"),
+    )
+    manual = replace(
+        auto, source="manual_anchor", session_ids=("s1",), support=1,
+        residual_mad_ms=0.0, coarse_support=0,
+    )
+
+    # Equal numbers, different source or session set: not the same fit.
+    assert not auto.same_fit(manual) and not manual.same_fit(auto)
+    assert not auto.same_fit(replace(auto, source="other"))
+    assert not auto.same_fit(replace(auto, session_ids=("s1",)))
+    assert auto.same_fit(replace(auto, session_ids=("s2", "s1")))  # order does not matter
+    assert auto.same_fit(replace(auto, support=7, notes=("支持数不同不影响拟合",)))
+
+    first = store.publish(auto)
+    second = store.publish(manual)
+    third = store.publish(auto)
+    assert (first.version, second.version, third.version) == (1, 2, 3)
+    assert (first.source, second.source, third.source) == ("auto", "manual_anchor", "auto")
+    reopened = ClockModelStore(tmp_path / "video_clock_models.jsonl")
+    assert reopened.get(1, 2).source == "manual_anchor" and reopened.get(1, 2).support == 1
+    assert reopened.get(1, 1).source == "auto"
+    assert reopened.latest(1) == third

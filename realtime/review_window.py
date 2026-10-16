@@ -2326,6 +2326,9 @@ class FinishReviewWindow(PassageReviewSurface):
         self.return_problem_button.setVisible(expanded)
         self.manual_problem_button.setVisible(expanded)
         self.pipeline_label.setVisible(expanded)
+        self.crossing_cards.setVisible(expanded)
+        self._set_recording_rail_visible(not expanded or self.recording_rail_button.isChecked())
+        self._problem_count_mode_changed(expanded)
         self._update_operator_controls()
 
     def _uses_popup_judging(self):
@@ -2376,9 +2379,36 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
+        self.problem_panel.summary_changed.connect(lambda _text: self._refresh_crossing_cards())
+        self._normal_crossing_cards = {}
+        self._opened_normal_crossing = ""
+        # The raw recording is offered once, before any card exists; whether the
+        # operator keeps it on screen afterwards is their own choice.
+        self._rail_suggested = False
+        from .crossing_widgets import CrossingCardRail
+        self.crossing_cards = CrossingCardRail(self)
+        self.crossing_cards.item_selected.connect(self._select_crossing_card)
+        self.preview_panel.layout().addWidget(self.crossing_cards)
+        self.recording_rail_button = QPushButton("查找原录像", self.crossing_cards)
+        self.recording_rail_button.setCheckable(True)
+        self.recording_rail_button.toggled.connect(self._set_recording_rail_visible)
+        self.crossing_cards.toolbar.addWidget(self.recording_rail_button)
+        self._creating_manual_crossing = False
+        self.calibrate_crossing_button = QPushButton("以当前帧校时", self.crossing_cards)
+        self.calibrate_crossing_button.setToolTip("先找到一位身份明确的选手压线原帧，再选择其有效芯片记录建立校时")
+        self.calibrate_crossing_button.clicked.connect(self._calibrate_crossing_frame)
+        self.crossing_cards.toolbar.addWidget(self.calibrate_crossing_button)
+        self.group_start_button = QPushButton("回到团首", self)
+        self.group_start_button.clicked.connect(self._open_group_start)
+        self.problem_panel.big_bar.insertWidget(0, self.group_start_button)
+        self.group_start_button.hide()
+        self.group_confirm_button = QPushButton("确认本团人数", self)
+        self.group_confirm_button.clicked.connect(self.problem_panel._confirm_pending)
+        self.problem_panel.big_bar.insertWidget(1, self.group_confirm_button)
+        self.group_confirm_button.hide()
         self.return_problem_button = QPushButton("回到当前问题", self)
         self.return_problem_button.clicked.connect(self._return_to_problem)
-        self.manual_problem_button = QPushButton("＋ 人工问题", self)
+        self.manual_problem_button = QPushButton("＋ 补记过线", self)
         self.manual_problem_button.clicked.connect(self._add_manual_problem)
         rail = self.video_filmstrip.full_race
         rail.toolbar.insertWidget(3, self.return_problem_button)
@@ -2394,8 +2424,16 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.set_workspace(self.output_dir)
 
     def _problem_selection_changed(self, item):
+        self._opened_normal_crossing = ""
+        if hasattr(self, "group_start_button"):
+            group = item is not None and item.kind in ("bunch_check", "obstruction")
+            self.group_start_button.setVisible(group)
+            self.group_confirm_button.setVisible(group)
         if getattr(self, "_problem_workbench_active", False):
-            self._return_to_problem()
+            if not getattr(self, "_creating_manual_crossing", False):
+                self._return_to_problem()
+            self._refresh_crossing_cards()
+            self._problem_count_mode_changed(True)
 
     def _problem_big_view_changed(self, big: bool) -> None:
         """Give the enlarged picture the room of the rail, and fit the frame to it.
@@ -2408,7 +2446,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if getattr(self, "_problem_workbench_active", False):
             self.preview_panel.setVisible(not big)
         QTimer.singleShot(0, self._fit_visible_evidence_views)
-        self._problem_count_mode_changed(big)
+        self._problem_count_mode_changed(True)
 
     def keyPressEvent(self, event) -> None:
         """F enlarges the picture from whatever corner of the workbench holds the keys.
@@ -2421,8 +2459,7 @@ class FinishReviewWindow(PassageReviewSurface):
 
         if (event.key() == Qt.Key_F
                 and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
-                and getattr(self, "_problem_workbench_active", False)
-                and self.problem_panel.current_item() is not None):
+                and getattr(self, "_problem_workbench_active", False)):
             self.problem_panel.toggle_big_view()
             event.accept()
             return
@@ -2438,32 +2475,73 @@ class FinishReviewWindow(PassageReviewSurface):
                      or item.evidence.get("camera_index") or 1)
         return self._camera_one_pane() if camera <= 1 else self._pane_for_camera(camera)
 
-    def _problem_count_mode_changed(self, counting: bool) -> None:
-        """While the picture is the big one, a click on it counts a person.
+    def _problem_count_mode_changed(self, _counting: bool) -> None:
+        """Every decoded regular-camera picture can record a crossing, large or small."""
 
-        A problem without a frame has nothing to count on: what the pane would show
-        belongs to another crossing, so the picture stays out of the counting.
-        """
+        active = getattr(self, "_problem_workbench_active", False)
+        for pane in self.evidence_panes:
+            pane.video_view.set_count_mode(active and pane.source_kind == "regular"
+                                           and pane.location is not None and pane._current_frame_index >= 0)
 
-        pane = self._problem_pane()
-        item = self.problem_panel.current_item()
-        has_frame = bool(item is not None and item.evidence.get("frame"))
-        if pane is not None:
-            pane.video_view.set_count_mode(
-                bool(counting) and has_frame
-                and getattr(self, "_problem_workbench_active", False)
-            )
-
-    def _problem_count_clicked(self, x_normalized: float, y_normalized: float) -> None:
-        """One click on the picture is one person, at the moment that frame shows."""
-
-        pane = self._problem_pane()
-        origin = pane.location.segment.media_started_at_ms if pane is not None and pane.location else None
+    def _frame_for_problem_count(self, pane):
+        if (pane is None or pane.location is None or pane._current_frame_index < 0
+                or not pane.video_view.has_frame):
+            return None
+        origin = pane.location.segment.media_started_at_ms
         if origin is None:
+            return None
+        return {"camera_index": pane.camera_index, "segment_id": pane.location.segment.segment_id,
+                "video_path": str(pane.location.video_path), "frame_index": pane._current_frame_index,
+                "position_ms": pane._current_position_ms,
+                "recorder_ms": int(origin) + int(pane._current_position_ms)}
+
+    def _problem_count_clicked(self, x_normalized: float, y_normalized: float, pane=None) -> None:
+        """A click records the displayed frame; an unreported crossing starts its own item."""
+
+        if not getattr(self, "_problem_workbench_active", False):
             return
-        self.problem_panel.add_mark(x_normalized, y_normalized,
-                                    int(origin) + int(pane._current_position_ms))
-        # The click must not take the keyboard with it: the decisions are keys.
+        pane = pane or self._problem_pane()
+        frame = self._frame_for_problem_count(pane)
+        if frame is None:
+            return
+        item = self.problem_panel.current_item()
+        context = self.problem_panel._inline_context()
+        normal = self._normal_crossing_cards.get(self._opened_normal_crossing)
+        if normal is not None and self._shows_the_problem_frame(pane, frame["position_ms"], normal.evidence["frame"]):
+            self.problem_panel.hint.setText("此单人过线已自动对应；发现其他人时，可点「＋ 补记过线」另记原帧。")
+            return
+        item_frame = (item.evidence.get("frame") or {}) if item is not None else {}
+        if context is not None and pane.camera_index != context.camera:
+            self.problem_panel.hint.setText(f"本团按机位 {context.camera} 点数；其他机位可回看，避免同一人重复计数。")
+            return
+        own = bool(item and item_frame and (
+            (int(item_frame.get("camera_index", 1)) == pane.camera_index
+             and self._shows_the_problem_frame(pane, frame["position_ms"], item_frame))
+            or (context is not None and pane.camera_index == context.camera
+                and context.start_ms <= frame["recorder_ms"] <= context.end_ms)))
+        settled = item is not None and self.problem_panel.state(item).startswith(("已处理", "待 CycleRace"))
+        if settled and own:
+            self.problem_panel.hint.setText("此过线已处理；如需修改，请先重新处理。")
+            return
+        if not own or item.status in ("waiting", "excluded", "info", "closed_upstream"):
+            try:
+                self._creating_manual_crossing = True
+                location = self._persist_filmstrip_location(pane.location)
+                pane.location = location
+                frame["segment_id"], frame["video_path"] = location.segment.segment_id, str(location.video_path)
+                item = self.problem_panel.add_manual_problem(
+                    frame, recorder_ms=frame["recorder_ms"], thumbnail=pane.video_view._pixmap_item.pixmap())
+            except (OSError, ValueError, RuntimeError) as error:
+                self.problem_panel.hint.setText(f"过线未保存：{error}")
+                return
+            finally:
+                self._creating_manual_crossing = False
+        if item is None:
+            return
+        self.problem_panel.set_browsing(False)
+        self.problem_panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
+        self._problem_count_mode_changed(True)
+        self._refresh_crossing_cards()
         self.problem_panel.setFocus()
 
     def _problem_marks_changed(self, _marks) -> None:
@@ -2485,24 +2563,43 @@ class FinishReviewWindow(PassageReviewSurface):
 
         if not getattr(self, "_problem_workbench_active", False) or pane is not self._problem_pane():
             return ()
-        return tuple((float(mark["x"]), float(mark["y"]), str(index + 1), True, False)
-                     for index, mark in enumerate(self.problem_panel.current_marks()))
+        frame = self._frame_for_problem_count(pane)
+        if frame is None:
+            return ()
+        from .bunch_review import is_excluded, mark_on_frame
+        return tuple((float(mark["x"]), float(mark["y"]),
+                      f"{index + 1}" + (f" {mark['bib']}" if mark.get("bib") else "")
+                      + (f" 已排除：{mark['exclusion_reason']}" if is_excluded(mark) else ""),
+                      True, False)
+                     for index, mark in enumerate(self.problem_panel.current_marks())
+                     if mark_on_frame(mark, frame, frame["recorder_ms"]))
 
     def _problem_browse_started(self):
         if getattr(self, "_problem_workbench_active", False):
             self.problem_panel.set_browsing(True)
 
     def _return_to_problem(self):
+        self._opened_normal_crossing = ""
         item = self.problem_panel.current_item()
         self.video_filmstrip.full_race.follow_button.setChecked(False)
         if item is not None and item.evidence.get("frame"):
             self.problem_panel.set_browsing(True)
             self._open_problem_frame(dict(item.evidence["frame"]))
-        else:
+        elif item is not None:
             self._set_sync_playing(False, seek_final=False)
             for pane in self.evidence_panes:
                 pane.clear_passage("此问题暂无原帧；请查看右侧芯片信息")
             self.problem_panel.set_browsing(False)
+        else:
+            self.problem_panel.set_browsing(False)
+            if not any(pane.video_view.has_frame for pane in self.evidence_panes):
+                recent = [entry for entry in (self.problem_panel.payload or {}).get("auto_passed", []) if entry.get("frame")]
+                if recent:
+                    latest = max(recent, key=lambda entry: entry.get("recorder_ms", entry.get("chip_time_ms", 0)))
+                    self._open_problem_frame(dict(latest["frame"]))
+                else:
+                    for pane in self.evidence_panes:
+                        pane.clear_passage(self.problem_panel.queue_text() + "；可从原录像打开画面校时或补记")
 
     def _on_preview_frame_ready(self, pane, image, position_ms, frame_index):
         super()._on_preview_frame_ready(pane, image, position_ms, frame_index)
@@ -2515,8 +2612,26 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         item = self.problem_panel.current_item()
         frame = item.evidence.get("frame", {}) if item else {}
+        actual = self._frame_for_problem_count(pane)
+        if actual:
+            self.problem_panel.record_viewed_frame(actual, actual["recorder_ms"])
+        normal = self._normal_crossing_cards.get(self._opened_normal_crossing)
+        if normal is not None:
+            self.problem_panel.set_browsing(True)
+            self.problem_panel.hint.setText(f"{normal.bibs[0] or '该选手'} 已自动对应；这是复查，不会新建待处理。")
+            normal_frame = normal.evidence["frame"]
+            if (pane.camera_index == int(normal_frame.get("camera_index", 1))
+                    and frame_index == normal_frame.get("frame_index")
+                    and pane.location.segment.segment_id == normal_frame.get("segment_id")):
+                self.crossing_cards.set_preview(normal.item_id, pane.video_view._pixmap_item.pixmap())
+            self._problem_count_mode_changed(True)
+            return
         if frame:
-            self.problem_panel.set_browsing(not self._shows_the_problem_frame(pane, position_ms, frame))
+            context = self.problem_panel._inline_context()
+            within_group = (actual is not None and context is not None and pane.camera_index == context.camera
+                            and context.start_ms <= actual["recorder_ms"] <= context.end_ms)
+            self.problem_panel.set_browsing(not (within_group or self._shows_the_problem_frame(pane, position_ms, frame)))
+        self._problem_count_mode_changed(True)
 
     def _shows_the_problem_frame(self, pane, position_ms: int, frame: dict) -> bool:
         """Whether what is on the screen is this problem's own frame.
@@ -2545,23 +2660,149 @@ class FinishReviewWindow(PassageReviewSurface):
         return super()._open_race_filmstrip_frame(frame)
 
     def _add_manual_problem(self):
+        self._opened_normal_crossing = ""
         pane = self._active_playback_pane()
-        if pane.location is None or pane._current_frame_index < 0 or not pane.video_view.has_frame:
-            self.problem_panel.hint.setText("请先从时间胶卷打开一张可用原帧。")
-            return
-        self._set_sync_playing(False, seek_final=False)
-        location, index, position = pane.location, pane._current_frame_index, pane._current_position_ms
-        reason, ok = QInputDialog.getText(self, "添加人工问题", "发现了什么问题？（必填，芯片状态仍待核实）")
-        if not ok or not reason.strip():
+        frame = self._frame_for_problem_count(pane)
+        if frame is None:
+            self.problem_panel.hint.setText("请先从原录像打开一张可用画面，再点选手补记过线。")
             return
         try:
-            location = self._persist_filmstrip_location(location)
-            self.problem_panel.add_manual_problem({
-                "camera_index": pane.camera_index, "segment_id": location.segment.segment_id,
-                "video_path": str(location.video_path), "frame_index": index, "position_ms": position,
-            }, reason)
+            self._creating_manual_crossing = True
+            location = self._persist_filmstrip_location(pane.location)
+            pane.location = location
+            frame["segment_id"], frame["video_path"] = location.segment.segment_id, str(location.video_path)
+            self.problem_panel.add_manual_problem(
+                frame, recorder_ms=frame["recorder_ms"], thumbnail=pane.video_view._pixmap_item.pixmap())
+            self.problem_panel.hint.setText("过线原帧已记住；点选手计数，号码可以稍后再填。")
         except (OSError, ValueError, RuntimeError) as error:
-            self.problem_panel.hint.setText(f"人工问题未保存：{error}")
+            self.problem_panel.hint.setText(f"过线未保存：{error}")
+        finally:
+            self._creating_manual_crossing = False
+        self._problem_count_mode_changed(True)
+
+    def _open_group_start(self):
+        context = self.problem_panel._inline_context()
+        if context is None:
+            return
+        segment = next((source for source in context.segments
+                        if source.start_ms <= context.start_ms <= source.end_ms), None)
+        if segment is None:
+            self.problem_panel.hint.setText("团首录像存在缺口，请检查证据。")
+            return
+        position = context.start_ms - segment.start_ms
+        self._open_problem_frame({"camera_index": context.camera, "segment_id": segment.segment.segment_id,
+                                  "video_path": str(segment.path), "position_ms": position})
+
+    def _calibrate_crossing_frame(self):
+        pane = self._active_playback_pane()
+        frame = self._frame_for_problem_count(pane)
+        if frame is None:
+            self.problem_panel.hint.setText("先从原录像打开首位身份明确的选手压线画面。")
+            self.recording_rail_button.setChecked(True)
+            return
+        from .analysis_workspace import AnalysisWorkspace
+        metadata = self._current_metadata()
+        try:
+            workspace = AnalysisWorkspace(self.output_dir,
+                                          race_id=metadata.race_id if metadata else "",
+                                          stage_id=metadata.stage_id if metadata else "")
+        except (OSError, ValueError) as error:
+            self.problem_panel.hint.setText(f"等待本场有效芯片记录：{error}")
+            return
+        eligible = {read.event_id for read in workspace.reads
+                    if read.active_now and not read.excluded and not read.manual_entry
+                    and read.bib and read.chip_ms == read.latest_chip_ms}
+        events = [event for event in self.passage_store.events() if event.event_id in eligible
+                  and event.is_active and event.bib and event.timeline_timestamp_ms > 0
+                  and (event.race_id, event.stage_id) == (workspace.race_id, workspace.stage_id)]
+        events.sort(key=lambda event: event.timeline_timestamp_ms)
+        if not events:
+            self.problem_panel.hint.setText("等待本场有效芯片记录；画面可以先补记过线。")
+            return
+        labels = [f"{event.bib} · {datetime.fromtimestamp(event.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]} · {event.event_id}"
+                  for event in events]
+        label, ok = QInputDialog.getItem(self, "以当前帧校时", "当前画面压线的是哪位选手？", labels, 0, False)
+        if not ok or label not in labels:
+            return
+        event = events[labels.index(label)]
+        current = self.passage_store.get(event.event_id)
+        if current != event or not current.is_active:
+            self.problem_panel.hint.setText("所选芯片记录已变化，请重新选择压线选手校时。")
+            return
+        try:
+            location = self._persist_filmstrip_location(pane.location)
+            frame["segment_id"], frame["video_path"] = location.segment.segment_id, str(location.video_path)
+            session_key = self._recording_session_key(location)
+            offset = frame["recorder_ms"] - int(event.timeline_timestamp_ms)
+            self.calibration_store.record(camera_index=pane.camera_index, session_key=session_key,
+                                          offset_ms=offset, anchor_event_id=event.event_id, anchor_bib=event.bib,
+                                          calibrated_at_ms=int(time.time() * 1000),
+                                          anchor_event_revision=event.revision,
+                                          anchor_chip_time_ms=event.timeline_timestamp_ms,
+                                          anchor_race_id=event.race_id, anchor_stage_id=event.stage_id,
+                                          anchor_frame=frame)
+            self._continuous_clock_offsets[(pane.camera_index, session_key)] = offset
+            self._continuous_calibration_revision += 1
+            self._lookup_cache.clear()
+        except (OSError, ValueError, RuntimeError) as error:
+            self.problem_panel.hint.setText(f"校时未保存：{error}")
+            return
+        self.problem_panel._last_live_signature = None
+        self.problem_panel._next_analysis = 0
+        if not self.problem_panel._live_paused and self.problem_panel._process is None:
+            self.problem_panel._start_analysis()
+        self.problem_panel.hint.setText(f"已按 {event.bib} 建立初始校时 {offset:+d} ms；后续独立过线继续检查漂移。")
+
+    def _set_recording_rail_visible(self, visible):
+        workbench = getattr(self, "_problem_workbench_active", False)
+        self.video_filmstrip.setVisible(bool(visible) or not workbench)
+        self.crossing_cards.setVisible(workbench)
+
+    def _refresh_crossing_cards(self):
+        if not hasattr(self, "crossing_cards"):
+            return
+        panel = self.problem_panel
+        from .problem_items import CATEGORY_VIDEO, KIND_MANUAL_REVIEW, STATUS_INFO, ProblemItem, stable_item_id
+        current = panel.current_item()
+        normal = {}
+        for passed in (panel.payload or {}).get("auto_passed", []):
+            frame = passed.get("frame") or {}
+            if not frame or not passed.get("active_now", True):
+                continue
+            key = stable_item_id("passed", passed.get("event_id"), frame.get("camera_index"),
+                                 frame.get("segment_id"), frame.get("frame_index"))
+            evidence = dict(passed, auto_passed=True)
+            normal[key] = ProblemItem(key, KIND_MANUAL_REVIEW, CATEGORY_VIDEO, "正常单人已自动对应，可打开原帧复查",
+                                      chip_time_ms=passed.get("chip_time_ms"), bibs=(passed.get("bib", ""),),
+                                      status=STATUS_INFO, status_note="已自动对应", evidence=evidence)
+        self._normal_crossing_cards = normal
+        if self._opened_normal_crossing not in normal:
+            self._opened_normal_crossing = ""
+        selected = self._opened_normal_crossing or (current.item_id if current else "")
+        self.crossing_cards.set_items([*panel.rows, *normal.values()], panel.problem_dir, selected)
+        if not self._rail_suggested:
+            # Before any candidate is available the raw recording stays reachable:
+            # the first calibration and a crossing the analysis never reported.
+            self._rail_suggested = True
+            if not panel.rows and not normal:
+                self.recording_rail_button.setChecked(True)
+        self._set_recording_rail_visible(self.recording_rail_button.isChecked())
+
+    def _select_crossing_card(self, item_id):
+        normal = self._normal_crossing_cards.get(item_id)
+        if normal is not None:
+            self._opened_normal_crossing = item_id
+            self._open_problem_frame(dict(normal.evidence["frame"]))
+            self.problem_panel.set_browsing(True)
+            self.problem_panel.hint.setText(f"{normal.bibs[0]} 已自动对应，正在复查原帧。")
+            self.crossing_cards.set_selected(item_id)
+            return
+        self._opened_normal_crossing = ""
+        for row, item in enumerate(self.problem_panel.rows):
+            if item.item_id == item_id:
+                self.problem_panel.table.setCurrentCell(row, 0)
+                self._return_to_problem()
+                break
 
     def _open_problem_list(self) -> None:
         expanded = self.problem_list_button.isChecked()
@@ -2608,7 +2849,8 @@ class FinishReviewWindow(PassageReviewSurface):
         if segment is None or not path.is_file():
             self.problem_panel.hint.setText("原录像缺失或不在本赛事的录像索引中，未跳转其他录像。")
             return
-        position, index = int(frame.get("position_ms", 0)), int(frame.get("frame_index", 0))
+        position = int(frame.get("position_ms", 0))
+        index = None if frame.get("frame_index") is None else int(frame["frame_index"])
         location = PassageVideoLocation(segment, path, position, position, 0,
                                         segment.timing_error_ms, "located")
         self._set_sync_playing(False, seek_final=False)
@@ -2619,9 +2861,10 @@ class FinishReviewWindow(PassageReviewSurface):
             # browsing elsewhere and may be decided on: F would otherwise leave the
             # operator looking at the right picture while every button stays greyed.
             self.problem_panel.set_browsing(False)
-            self.problem_panel.hint.setText(f"已定位原录像第 {index + 1} 帧，请逐帧核对号码后处理。")
+            target = f"第 {index + 1} 帧" if index is not None else f"片内 {position / 1000:.2f} 秒"
+            self.problem_panel.hint.setText(f"已定位原录像{target}，请逐帧核对后处理。")
         # The problem's pane is the one that takes the counting clicks from here on.
-        self._problem_count_mode_changed(self.problem_panel.big_view)
+        self._problem_count_mode_changed(True)
         self._problem_marks_changed(None)
 
     def _init_operator_controls(self) -> None:
@@ -2658,10 +2901,10 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         # Counting a crossing: the picture reports where the click landed, this
         # window knows which frame it landed on, and the panel keeps the count.
-        pane.video_view.count_mark_selected.connect(self._problem_count_clicked)
-        pane.video_view.set_count_mode(
-            getattr(self, "_problem_workbench_active", False) and self.problem_panel.big_view
+        pane.video_view.count_mark_selected.connect(
+            lambda x, y, pane=pane: self._problem_count_clicked(x, y, pane)
         )
+        self._problem_count_mode_changed(True)
 
     def start_receiver(self) -> None:
         if self.timing_provider == "racetiger":

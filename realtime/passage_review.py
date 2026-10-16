@@ -2140,8 +2140,13 @@ class PassageEvidencePane(QFrame):
         else:
             self._worker.seek(target_ms)
 
-    def seek_media_frame(self, position_ms: int, frame_index: int) -> None:
-        """Seek a retained original frame without millisecond rounding loss."""
+    def seek_media_frame(self, position_ms: int, frame_index: Optional[int]) -> None:
+        """Seek a retained original frame without millisecond rounding loss.
+
+        ``frame_index=None`` asks for a time-only seek: the pane goes to
+        ``position_ms`` and never invents a frame number, whether the metadata
+        has already arrived or is still on its way.
+        """
         worker = self._worker
         if worker is None:
             return
@@ -2151,8 +2156,10 @@ class PassageEvidencePane(QFrame):
         self._reset_video_scrub()
         if self._fps <= 0:
             self.timeline.setProperty("initial_position_ms", int(position_ms))
-            self.timeline.setProperty("initial_frame_index", int(frame_index))
-        elif hasattr(worker, "seek_frame"):
+            self.timeline.setProperty(
+                "initial_frame_index", None if frame_index is None else int(frame_index)
+            )
+        elif frame_index is not None and hasattr(worker, "seek_frame"):
             worker.seek_frame(int(frame_index))
         else:
             worker.seek(int(position_ms))
@@ -7264,9 +7271,15 @@ class PassageReviewSurface(QDialog):
         )))
 
     def _seek_retained_camera_frame(
-        self, location: PassageVideoLocation, position_ms: int, frame_index: int, camera_index: int = 1,
+        self, location: PassageVideoLocation, position_ms: int,
+        frame_index: Optional[int] = None, camera_index: int = 1,
     ) -> bool:
-        """Open a pinned image's source independently of the overview window."""
+        """Open a pinned image's source independently of the overview window.
+
+        ``frame_index=None`` means the caller only knows the media time (a
+        group start has no captured frame number): the pane then seeks by
+        milliseconds instead of an invented frame.
+        """
         try:
             location = self._persist_filmstrip_location(location)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
@@ -8138,6 +8151,10 @@ class PassageReviewSurface(QDialog):
             - int(event.timeline_timestamp_ms)
         )
         self._continuous_clock_offsets[key] = offset_ms
+        anchor_frame = {
+            "segment_id": str(location.segment.segment_id),
+            "position_ms": int(position_ms),
+        }
         try:
             self.calibration_store.record(
                 camera_index=location.segment.camera_index,
@@ -8146,6 +8163,11 @@ class PassageReviewSurface(QDialog):
                 anchor_event_id=event.event_id,
                 anchor_bib=event.bib.strip() or "未知",
                 calibrated_at_ms=int(calibrated_at_ms),
+                anchor_event_revision=int(event.revision),
+                anchor_chip_time_ms=int(event.timeline_timestamp_ms),
+                anchor_frame=anchor_frame,
+                anchor_race_id=event.race_id,
+                anchor_stage_id=event.stage_id,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             logger.warning("failed to persist camera calibration: %s", error)

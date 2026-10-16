@@ -41,7 +41,7 @@ from realtime.race_metadata import (
     RaceMetadataStore,
 )
 from realtime.review_clip import PassageReviewBindingStore
-from realtime.video_timeline import VideoTimelineStore
+from realtime.video_timeline import PassageVideoLocation, VideoTimelineStore
 from realtime.video_passage_detector import VideoPassageCandidate
 
 
@@ -300,6 +300,58 @@ def test_retained_image_exact_frame_seek_waits_for_metadata(qapp, tmp_path, fake
     assert exact == [1]
     pane.seek_media_frame(66, 2)
     assert exact == [1, 2]
+    dialog.close()
+
+
+def test_retained_image_time_only_seek_waits_for_metadata(qapp, tmp_path, fake_playback):
+    """A missing frame number means media time, never an invented frame 0."""
+
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01", camera_index=1,
+                 started_at_ms=10_000, ended_at_ms=20_000)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    dialog = PassageReviewDialog(passages, timeline)
+    qapp.processEvents()
+    pane = dialog._camera_one_pane()
+    worker = pane._worker
+    exact = []
+    worker.seek_frame = exact.append
+    pane._fps = 0
+    pane.seek_media_frame(33, None)
+    assert not exact
+    seam = len(worker.seek_calls)
+    worker.metadata_ready.emit(10000, 29.97, 2560, 1920, 300)
+    assert worker.seek_calls[seam:] == [33]
+    pane.seek_media_frame(66, None)
+    assert worker.seek_calls[seam:] == [33, 66]
+    assert exact == []
+    dialog.close()
+
+
+def test_retained_seek_hands_a_missing_frame_to_the_pane(qapp, tmp_path, fake_playback):
+    """_seek_retained_camera_frame forwards None so the pane seeks by time."""
+
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    segment = _add_segment(timeline, tmp_path / "camera_01.mkv", source_id="camera_01",
+                           camera_index=1, started_at_ms=10_000, ended_at_ms=20_000)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event())
+    dialog = PassageReviewDialog(passages, timeline)
+    qapp.processEvents()
+    pane = dialog._camera_one_pane()
+    calls = []
+    pane.seek_media_frame = lambda position_ms, frame_index: calls.append(
+        (position_ms, frame_index)
+    )
+    location = PassageVideoLocation(
+        segment, tmp_path / "camera_01.mkv", 4_200, 4_200, 0,
+        segment.timing_error_ms, "located",
+    )
+
+    assert dialog._seek_retained_camera_frame(location, 4_200, None)
+
+    assert calls == [(4_200, None)]
     dialog.close()
 
 
@@ -3261,7 +3313,17 @@ def test_first_confirmation_calibrates_in_default_review_and_survives_reopen(
         QTest.mouseClick(pane.video_view.viewport(), Qt.LeftButton,
                          pos=pane.video_view.viewport().rect().center())
         assert dialog._confirm_pending_marker(pane)
-        assert VideoClockCalibrationStore(calibration_path).calibrations()[0].offset_ms == -1_300
+        first_record, = VideoClockCalibrationStore(calibration_path).calibrations()
+        assert first_record.offset_ms == -1_300
+        # The first-rider record keeps the anchor event's originals, so a
+        # later revision, edit or scope change of that event cannot silently
+        # keep the offset.
+        assert first_record.anchor_event_revision == first.revision
+        assert first_record.anchor_chip_time_ms == first.timeline_timestamp_ms
+        assert first_record.anchor_race_id == first.race_id
+        assert first_record.anchor_stage_id == first.stage_id
+        assert first_record.anchor_frame["segment_id"]
+        assert first_record.anchor_frame["position_ms"] == 3_700
         assert dialog.batch_context_label.text() == "机位1 已校准 -1300 ms"
         dialog._select_event(second.event_id, locate_target=True)
         assert pane._target_position_ms == 28_700

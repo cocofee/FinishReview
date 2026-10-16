@@ -4,7 +4,9 @@ Stages, each cached on disk so an interrupted run resumes:
 
 1. line sampling per recording file (``strips/``);
 2. crossing detection per camera session (``crossings_camera<N>.json``);
-3. automatic calibration, versioned in the workspace's clock-model journal;
+3. calibration, versioned in the workspace's clock-model journal: the
+   automatic fit, or an operator-confirmed first rider of the analysed
+   recording when the automatic fit cannot start yet;
 4. order-preserving pairing of crossings with chip reads;
 5. bicycle check of unpaired crossings (optional YOLOX model);
 6. merge rules, problem items, crossing cards (``problem_list.json``).
@@ -21,7 +23,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
@@ -50,7 +52,18 @@ from .bike_check import (
 )
 from .chip_checks import ChipCheckContext, chip_check_items
 from .chip_history import ChipRead, calibration_chip_times, format_chip_time
-from .clock_sync import CLOCK_MODEL_FILENAME, ClockCrossing, ClockModelStore, calibrate_camera, check_anchors
+from .clock_sync import (
+    CLOCK_MODEL_FILENAME,
+    MANUAL_ANCHOR_TOLERANCE_MS,
+    AnchorCheck,
+    ClockAnchor,
+    ClockCrossing,
+    ClockModel,
+    ClockModelStore,
+    calibrate_camera,
+    check_anchors,
+    manual_anchor_model,
+)
 from .crossing_cards import render_cards
 from .crossing_detection import DetectionParams, DetectionResult, LineCrossing, detect_crossings, frame_interval_ms
 from .crossing_pairing import pair_crossings
@@ -539,6 +552,106 @@ def calibrate_evidence_clock(crossings, reads, *, camera_index):
     return valid[0]
 
 
+def anchor_chip_record_stands(anchor: ClockAnchor, reads: Iterable[ChipRead]) -> bool:
+    """Whether the chip record behind one manual anchor still stands.
+
+    The calibration journal stores only the passage id, bib and offset: no
+    revision and no original chip time, so a later revision of the time cannot
+    be proven here. What the pipeline itself can check is that a read for this
+    bib and chip time is still live (not voided, deleted or replaced) and is a
+    real chip read, not a manual entry. A read keeps the first active
+    revision's timestamp, so a time revision shows up as a mismatch.
+    """
+
+    return any(
+        read.active_now and not read.excluded and not read.manual_entry
+        and str(read.bib) == str(anchor.label) and int(read.chip_ms) == int(anchor.chip_ms)
+        for read in reads
+    )
+
+
+def manual_anchors_for_run(
+    workspace: AnalysisWorkspace,
+    camera: int,
+    reads: Iterable[ChipRead],
+    sessions: set[str],
+) -> tuple[tuple[ClockAnchor, ...], tuple[ClockAnchor, ...], tuple[ClockAnchor, ...]]:
+    """Split this camera's manual calibrations for one analysis run.
+
+    Returns ``(usable, other_sessions, changed)``: only anchors confirmed on
+    one of this run's own recording sessions, with a chip record that still
+    stands, may start pairing. Anchors of other recordings or races and stale
+    ones are returned so the run can say why they were not used.
+    """
+
+    usable, other_sessions, changed = [], [], []
+    for anchor in workspace.manual_anchors(camera):
+        if str(anchor.reference) not in sessions:
+            other_sessions.append(anchor)
+        elif not anchor_chip_record_stands(anchor, reads):
+            changed.append(anchor)
+        else:
+            usable.append(anchor)
+    return tuple(usable), tuple(other_sessions), tuple(changed)
+
+
+@dataclass(frozen=True, slots=True)
+class _CalibrationChoice:
+    """Which model starts pairing, and what the operator must see about it."""
+
+    model: Optional[ClockModel]
+    checks: tuple[AnchorCheck, ...] = ()
+    warnings: tuple[str, ...] = ()
+    manual: bool = False
+    paired_sessions: frozenset[str] = frozenset()
+
+
+def choose_calibration_model(
+    auto_model: Optional[ClockModel],
+    anchors: tuple[ClockAnchor, ...],
+    *,
+    camera_index: int,
+    sessions: set[str],
+) -> _CalibrationChoice:
+    """Pick the model that starts pairing and expose manual-anchor conflicts.
+
+    The automatic model is used while it agrees with the operator's manual
+    first-rider anchors (within the conventional tolerance). When it disagrees,
+    the confirmed fixed offset stays in force for its own recording sessions
+    and the conflict is reported instead of silently replacing the operator's
+    calibration; without any automatic model, a manual anchor starts pairing on
+    its own. A manual start serves only the sessions an anchor names.
+    """
+
+    if auto_model is not None:
+        checks = check_anchors(auto_model, anchors)
+        conflicts = [check for check in checks if not check.within_tolerance]
+        if conflicts:
+            worst = max(conflicts, key=lambda check: abs(int(check.difference_ms)))
+            manual = manual_anchor_model(anchors, camera_index=camera_index, sessions=sessions)
+            if manual is None:
+                warning = (
+                    f"自动校时与人工首人锚点 {worst.anchor.label or '-'} 相差 {worst.difference_ms:+d} ms，"
+                    f"超过 {MANUAL_ANCHOR_TOLERANCE_MS} ms，且没有可用的人工固定偏移，请核对"
+                )
+                return _CalibrationChoice(auto_model, checks, (warning,))
+            warning = (
+                f"自动校时与人工首人锚点 {worst.anchor.label or '-'} 相差 {worst.difference_ms:+d} ms，"
+                f"超过 {MANUAL_ANCHOR_TOLERANCE_MS} ms；本次仍按人工锚点固定偏移配对，未采用自动模型，请核对"
+            )
+            return _CalibrationChoice(manual, checks, (warning,), True, frozenset(manual.session_ids))
+        return _CalibrationChoice(auto_model, checks)
+    manual = manual_anchor_model(anchors, camera_index=camera_index, sessions=sessions)
+    if manual is None:
+        return _CalibrationChoice(None)
+    warning = f"自动校时未就绪：{manual.notes[0]}"
+    return _CalibrationChoice(manual, (), (warning,), True, frozenset(manual.session_ids))
+
+
+WAITING_TAIL_REASON = "等待相邻短段和芯片数据到齐，暂不判定漏读。"
+WAITING_UNCALIBRATED_REASON = "没有自动校时或人工首人锚点，该录像会话的芯片暂不配对，等待核对"
+
+
 def analyse_camera(
     config: AnalysisConfig,
     workspace: AnalysisWorkspace,
@@ -575,60 +688,56 @@ def analyse_camera(
         reads,
         camera_index=camera,
     )
+    sessions = {item.session_id for item in crossings if item.session_id}
+    anchors, other_recording_anchors, changed_anchors = manual_anchors_for_run(
+        workspace, camera, reads, sessions,
+    )
+    choice = choose_calibration_model(
+        calibration.model, anchors, camera_index=camera, sessions=sessions,
+    )
+    warnings = [*calibration.warnings, *choice.warnings]
     result: dict = {
         "camera_index": camera,
         "files": len(files),
         "crossings": len(crossings),
         "coverage": [list(item) for item in coverage],
-        "calibration_warnings": list(calibration.warnings),
+        "calibration_warnings": warnings,
         "items": [],
         "auto_passed": [],
         "bike_status": {"state": "not_configured" if not config.model_path else "waiting_calibration",
                         "message": "认车未配置，降噪未启用" if not config.model_path else "认车等待校时及候选",
                         "crop_mode": config.crop_modes.get(camera, "up")},
     }
-    if calibration.model is None:
-        result["error"] = "自动校时失败：" + "；".join(calibration.warnings)
+    if choice.model is None:
+        # The whole camera waits, as before, but say why an operator anchor could
+        # not start it: another recording's anchor must never unlock this one.
+        if other_recording_anchors:
+            warnings.append(
+                f"另有 {len(other_recording_anchors)} 个人工校时锚点属于其他录像会话，不能用于本次配对"
+            )
+        if changed_anchors:
+            warnings.append(
+                f"{len(changed_anchors)} 个人工校时锚点对应的芯片记录已作废、替换或已变更，不能用于本次配对"
+            )
+        result["calibration_warnings"] = warnings
+        result["error"] = "自动校时失败：" + "；".join(warnings)
         if config.live:
             result["items"] = waiting_items(reads, camera, result["error"])
         return result
     store = ClockModelStore(config.clock_model_path or output_dir / CLOCK_MODEL_FILENAME)
     line_signature = hashlib.sha256(json.dumps(sorted({(item.meta.get("line_digest", ""), item.meta.get("geometry_digest", ""))
                                                        for item in files})).encode()).hexdigest()
-    model = store.publish(replace(calibration.model, evidence_signature=line_signature))
+    model = store.publish(replace(choice.model, evidence_signature=line_signature))
     if coverage:
         result["analyzed_through_ms"] = max(end for _start, end, _session in coverage)
-    if config.live and coverage:
-        # The latest seconds still need neighbouring video and delayed chip
-        # delivery. They are not evidence of a missing rider or a missing read.
-        watermark = max(end for _start, end, _session in coverage) - config.evidence_delay_ms
-        result["analyzed_through_ms"] = watermark
-        result["waiting_reads"] = sum(model.to_recorder(read.chip_ms) > watermark for read in reads)
-        waiting = tuple(read for read in reads if model.to_recorder(read.chip_ms) > watermark)
-    sessions = set(model.session_ids)
-    anchors = [anchor for anchor in workspace.manual_anchors(camera) if anchor.reference in sessions]
-    result["calibration"] = {
-        "version": model.version,
-        "slope_ms_per_hour": round(model.slope_ms_per_hour, 1),
-        "offset_start_ms": model.offset_at(model.valid_from_ms),
-        "offset_end_ms": model.offset_at(model.valid_to_ms),
-        "isolated": model.candidates,
-        "kept": model.support,
-        "residual_mad_ms": round(model.residual_mad_ms, 1),
-        "coarse_offset_ms": model.coarse_offset_ms,
-        "coarse_distinct": bool(calibration.coarse and calibration.coarse.distinct),
-        "session_offsets_ms": {key: value for key, value in model.session_offsets},
-        "anchors": [
-            {"bib": check.anchor.label, "difference_ms": check.difference_ms,
-             "within_tolerance": check.within_tolerance, "message": check.message}
-            for check in check_anchors(model, anchors)
-        ],
-    }
-
+    # A manual start serves only the sessions an operator anchor names; every
+    # other recording session waits for its own anchor or the automatic fit.
+    served_sessions = choice.paired_sessions if choice.manual else None
     pairing_reads = [read for read in reads if not read.excluded and not read.manual_entry]
     manual_entries = [read for read in reads if read.manual_entry and not read.excluded]
     by_session: dict[str, list[ChipRead]] = {}
     no_video: list[ChipRead] = []
+    uncalibrated: list[ChipRead] = []
     expected_ms: dict[str, int] = {}
     for read in pairing_reads:
         expected = model.to_recorder(read.chip_ms)
@@ -639,11 +748,15 @@ def analyse_camera(
         )
         if session is None:
             no_video.append(read)
+        elif served_sessions is not None and session not in served_sessions:
+            uncalibrated.append(read)
         else:
             by_session.setdefault(session, []).append(read)
             expected_ms[read.read_id] = int(model.to_recorder(read.chip_ms, session))
     matched, video_only, chip_only = [], [], []
     for session in {item[2] for item in coverage}:
+        if served_sessions is not None and session not in served_sessions:
+            continue
         session_crossings = [item for item in crossings if item.session_id == session]
         session_reads = by_session.get(session, [])
         pairing = pair_crossings(
@@ -653,6 +766,15 @@ def analyse_camera(
         matched += pairing.matched
         video_only += pairing.video_only
         chip_only += pairing.chip_only
+    uncalibrated_sessions = sorted({
+        name for _start, _end, name in coverage
+        if name and served_sessions is not None and name not in served_sessions
+    })
+    if uncalibrated:
+        warnings.append(
+            f"录像会话 {'、'.join(uncalibrated_sessions)} 没有自动校时或人工首人锚点，"
+            f"其中的 {len(uncalibrated)} 条芯片暂不配对，请先确认该会话的首位选手"
+        )
     residuals = np.asarray([item[2] for item in matched], dtype=np.float64)
     result["pairing"] = {
         "chips_with_video": len(matched) + len(chip_only),
@@ -661,9 +783,65 @@ def analyse_camera(
         "video_only": len(video_only),
         "video_only_in_obstruction": sum(item.in_obstruction for item in video_only),
         "no_video": len(no_video),
+        "uncalibrated": len(uncalibrated),
         "residual_median_ms": round(float(np.median(residuals)), 1) if residuals.size else None,
         "residual_p90_abs_ms": round(float(np.percentile(np.abs(residuals), 90)), 1) if residuals.size else None,
     }
+
+    def anchor_entries() -> list[dict]:
+        if choice.manual and not choice.checks:
+            return [
+                {"bib": anchor.label, "difference_ms": None, "within_tolerance": True,
+                 "message": f"人工首人锚点固定偏移 {int(anchor.offset_ms):+d} ms（尚无自动校时可比）"}
+                for anchor in anchors
+            ]
+        entries = []
+        for check in choice.checks:
+            if choice.manual and not check.within_tolerance:
+                # The operator's offset is the one in force here; check_anchors'
+                # own wording is for runs where the automatic model wins.
+                message = (
+                    f"人工首人锚点 {check.anchor.label or '-'} 与自动校时相差 {check.difference_ms:+d} ms，"
+                    f"超过 {MANUAL_ANCHOR_TOLERANCE_MS} ms；本次仍按人工偏移配对，请核对"
+                )
+            else:
+                message = check.message
+            entries.append({"bib": check.anchor.label, "difference_ms": check.difference_ms,
+                            "within_tolerance": check.within_tolerance, "message": message})
+        return entries
+
+    conflicts = [check for check in choice.checks if not check.within_tolerance]
+    result["calibration"] = {
+        "version": model.version,
+        "source": str(model.source),
+        "source_text": model.source_text,
+        "slope_ms_per_hour": round(model.slope_ms_per_hour, 1),
+        "offset_start_ms": model.offset_at(model.valid_from_ms),
+        "offset_end_ms": model.offset_at(model.valid_to_ms),
+        "isolated": model.candidates,
+        "kept": model.support,
+        "residual_mad_ms": round(model.residual_mad_ms, 1),
+        "coarse_offset_ms": model.coarse_offset_ms,
+        "coarse_distinct": bool(calibration.coarse and calibration.coarse.distinct),
+        "session_offsets_ms": {key: value for key, value in model.session_offsets},
+        "manual_conflict": bool(conflicts),
+        "manual_conflict_ms": max((abs(int(check.difference_ms)) for check in conflicts), default=None),
+        "anchors": anchor_entries(),
+    }
+    if choice.manual:
+        result["calibration"]["manual_anchor_ms"] = int(round(model.intercept_ms))
+        result["calibration"]["paired_sessions"] = sorted(choice.paired_sessions)
+    if config.live and coverage:
+        # The latest seconds still need neighbouring video and delayed chip
+        # delivery. They are not evidence of a missing rider or a missing read.
+        watermark = max(end for _start, end, _session in coverage) - config.evidence_delay_ms
+        result["analyzed_through_ms"] = watermark
+        uncalibrated_ids = {read.read_id for read in uncalibrated}
+        waiting = tuple(
+            read for read in reads
+            if read.read_id not in uncalibrated_ids and model.to_recorder(read.chip_ms) > watermark
+        )
+        result["waiting_reads"] = len(waiting)
 
     # The same crowded periods the list reports, so a disputed crossing and
     # its period item agree.
@@ -735,7 +913,7 @@ def analyse_camera(
         visible_ids = {item.item_id for item in settled}
         settled = [item for item in settled if not item.grouped or item.grouped in visible_ids]
         if config.evidence_delay_ms > 0:
-            settled += waiting_items(waiting, camera, "等待相邻短段和芯片数据到齐，暂不判定漏读。")
+            settled += waiting_items(waiting, camera, WAITING_TAIL_REASON)
         else:
             # The settle run after recording stopped (``--finish-live-problems``):
             # no more video will be written, so a chip the recording never
@@ -748,6 +926,16 @@ def analyse_camera(
             result["waiting_reads"] = 0
         result["items"] = settled
         result["auto_passed"] = [item for item in result["auto_passed"] if model.to_recorder(item["chip_time_ms"]) <= watermark]
+    if uncalibrated:
+        # Chips of a recording session without any calibration are never paired
+        # with a borrowed offset; they stay visible as waiting, also in a
+        # settle run, until that session gets its own anchor or automatic fit.
+        reason = WAITING_UNCALIBRATED_REASON
+        if uncalibrated_sessions:
+            reason += f"（录像会话 {'、'.join(uncalibrated_sessions)}）"
+        result["items"] = [*result["items"], *waiting_items(uncalibrated, camera, reason)]
+        if config.live and coverage:
+            result["waiting_reads"] = int(result.get("waiting_reads") or 0) + len(uncalibrated)
     result["model"] = model
     return result
 

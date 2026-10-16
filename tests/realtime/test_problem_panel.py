@@ -357,12 +357,46 @@ def test_enter_settles_the_counted_crossing_by_its_class(qapp, tmp_path):
                                     if item.item_id == "no_chip:1"), 0)
     panel.add_mark(0.2, 0.5, T)
     panel._confirm_pending()
-    # A rider without a chip still needs the plate read; the count is not a number.
-    assert panel.store.get("no_chip:1") is None and "号码" in panel.hint.text()
+    # Crossing evidence can be confirmed now, while the identity remains pending.
+    assert panel.store.get("no_chip:1").action == "confirm_crossing"
+    assert panel.state(panel.current_item()) == "待处理"
+    assert panel.current_marks() and panel.export()["补录清单.csv"] == 0
     panel.bib_input.setText("307")
     panel._confirm_pending()
     assert panel.store.get("no_chip:1").bib == "307"
     assert panel.store.get("no_chip:1").reason == "画面点出 1 人"
+
+
+def test_counting_several_people_keeps_each_crossing_of_its_own(qapp, tmp_path):
+    """Two riders on one frame are two crossings; naming one cannot close the other."""
+
+    _write_list(tmp_path, _items(), [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.table.setCurrentCell(_row_of(panel, "no_chip:1"), 0)
+    panel.add_mark(0.2, 0.5, T)
+    panel.add_mark(0.6, 0.5, T)
+    panel._confirm_pending()
+
+    manual = json.loads((tmp_path / "finish_problems" / "manual_problems.json").read_text(encoding="utf-8"))
+    assert len(manual) == 2 and all(value["kind"] == "manual_review" for value in manual)
+    assert all(value["evidence"]["frame"] == FRAME for value in manual)
+    # Each person is pending on their own, and the old question is only a reference.
+    assert sum(1 for item in panel.rows if item.kind == "manual_review") == 2
+    assert "no_chip:1" not in [item.item_id for item in panel.rows]
+    assert panel.store.get("no_chip:1") is None
+    assert panel.export()["补录清单.csv"] == 0
+
+    # Naming one rider leaves the other crossing waiting for its own number.
+    first = next(item for item in panel.rows if item.kind == "manual_review")
+    panel.table.setCurrentCell(_row_of(panel, first.item_id), 0)
+    panel.bib_input.setText("307")
+    panel._confirm_pending()
+    assert panel.store.get(first.item_id).bib == "307"
+    assert panel.export()["补录清单.csv"] == 1
+    other = next(item for item in panel.rows if item.kind == "manual_review")
+    assert other.item_id != first.item_id
+    assert panel.state(other) == "待处理"
 
 
 def test_background_progress_does_not_replace_operator_validation(qapp):
@@ -392,7 +426,7 @@ def test_near_crossing_records_a_plate_and_exports_its_time_source(qapp, tmp_pat
     panel.table.setCurrentCell(0, 0)
 
     assert [button.property("problemAction") for button in panel.action_buttons] == [
-        "record_bib", "same_crossing", "not_rider", "ride_back", "insufficient",
+        "record_bib", "same_crossing", "not_rider", "ride_back", "insufficient", "confirm_crossing",
     ]
     assert panel.state(near) == "待处理"
     panel.bib_input.setText("307")

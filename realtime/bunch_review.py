@@ -18,10 +18,60 @@ import numpy as np
 from .analysis_workspace import AnalysisWorkspace
 from .clock_sync import CLOCK_MODEL_FILENAME, ClockModel, ClockModelStore
 from .durable_jsonl import append_jsonl_records
-from .problem_items import ProblemItem
+from .problem_items import (
+    ACTION_DELETE_CHIP,
+    ACTION_DELETE_EXTRA_CHIP,
+    ACTION_INSUFFICIENT,
+    ACTION_KEEP,
+    ACTION_NOT_RIDER,
+    ACTION_RECORD_BIB,
+    ACTION_RIDE_BACK,
+    ACTION_SAME_CROSSING,
+    ACTION_SIDE_BY_SIDE,
+    KIND_CHIP_NO_CROSSING,
+    KIND_NEAR_CROSSING,
+    KIND_NO_CHIP_CROSSING,
+    KIND_TWO_CHIPS_ONE_CROSSING,
+    STATUS_CLOSED_UPSTREAM,
+    STATUS_EXCLUDED,
+    STATUS_INFO,
+    ProblemItem,
+)
 
 
 JOURNAL_NAME = "bunch_reviews.jsonl"
+PROBLEM_LIST_NAME = "finish_problems/problem_list.json"
+
+# A counted person is on the frame when the camera and the moment agree; a
+# retained copy of the same actual frame (extra metadata, a rebuilt stamp) also
+# counts. Neighboring frames are 50 ms apart, so the moment stays unambiguous.
+MARK_TIME_TOLERANCE_MS = 20
+
+# The doubts a group's children can carry, and the operator's own answers to
+# them. Only the answers below close one: equal totals never can, and "confirm
+# the crossing, number later" leaves the question open on purpose.
+CHILD_ANSWERS = {
+    KIND_TWO_CHIPS_ONE_CROSSING: (ACTION_DELETE_EXTRA_CHIP, ACTION_SIDE_BY_SIDE),
+    KIND_CHIP_NO_CROSSING: (ACTION_DELETE_CHIP, ACTION_KEEP, ACTION_INSUFFICIENT),
+    KIND_NO_CHIP_CROSSING: (ACTION_RECORD_BIB, ACTION_NOT_RIDER, ACTION_RIDE_BACK),
+    KIND_NEAR_CROSSING: (ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK,
+                         ACTION_INSUFFICIENT),
+}
+RESOLVED_STATUSES = (STATUS_CLOSED_UPSTREAM, STATUS_EXCLUDED, STATUS_INFO)
+
+
+def load_child_items(workspace: Path, group_id: str) -> list[dict]:
+    """The group's current children, straight from the problem list.
+
+    A draft or a saved record keeps its own signature, so the child list is
+    read when a decision needs it: a child added, answered or re-analysed later
+    must never be hidden by an earlier copy of the context.
+    """
+
+    path = Path(workspace) / PROBLEM_LIST_NAME
+    payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return [child for child in payload.get("items", [])
+            if child.get("evidence", {}).get("group") == group_id]
 
 
 @dataclass(frozen=True)
@@ -51,10 +101,9 @@ class BunchContext:
 
     @cached_property
     def child_items(self):
-        path = self.workspace / "finish_problems/problem_list.json"
-        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        return [child for child in payload.get("items", [])
-                if child.get("evidence", {}).get("group") == self.item.item_id]
+        """Navigation hints for this context; decisions read the list fresh."""
+
+        return load_child_items(self.workspace, self.item.item_id)
 
     @property
     def signature(self) -> str:
@@ -212,9 +261,147 @@ def pending_member_decisions(context):
                for member in batch.evidence["batch_members"])
 
 
+def counted_person_on_child_frame(child, marks) -> bool:
+    """A person was counted on the child's own frame; the crossing is accounted.
+
+    The number may stay unread: one counted person at that moment is the
+    operator's answer that the line change was a rider, not a total that happens
+    to match. The frame comparison tolerates the extra metadata and retained
+    copies that saved marks carry.
+    """
+
+    frame = child.evidence.get("frame") or {}
+    stamp = child.evidence.get("recorder_ms")
+    if stamp is None:
+        stamp = child.evidence.get("expected_recorder_ms")
+    if stamp is None:
+        return False
+    return any(not is_excluded(mark) and mark_on_frame(mark, frame, int(stamp)) for mark in marks)
+
+
+def chip_answered_by_count(context, child, marks, result) -> bool:
+    """The chip's own number was read off a counted person in this group.
+
+    Only the number read on the rider himself answers "chip without a crossing":
+    a time-order match to a bibbless count is a reference, not an identification,
+    so it never stands in for the answer.
+    """
+
+    positions = {chip.event_id: index for index, chip in enumerate(context.chips)}
+    target = next((positions[event_id] for event_id in child.event_ids if event_id in positions), None)
+    if target is None:
+        return False
+    for mark_index, chip_index in result["pairs"].items():
+        if chip_index != target or mark_index >= len(marks):
+            continue
+        mark = marks[mark_index]
+        if not is_excluded(mark) and mark.get("bib", "").strip():
+            return True
+    return False
+
+
+def group_member_states(context) -> dict[str, str]:
+    """The member flow's verified state for each chip record of this group.
+
+    The per-chip keep/delete decisions live in the batch journal, bound to the
+    group's own evidence; a changed record reads as "需要重查" and never answers.
+    """
+
+    from .batch_review import BatchDecisionStore
+
+    try:
+        batch = group_member_batch(context)
+        store = BatchDecisionStore(context.workspace / "finish_problems")
+        return {member["event_id"]: store.state(batch, member) for member in batch.evidence["batch_members"]}
+    except (KeyError, OSError, ValueError):
+        return {}
+
+
+def chip_answered_by_members(child, states) -> bool:
+    """The operator's own per-chip answers for the chips this doubt is about.
+
+    A chip kept verified or already suggested for deletion answers the doubt; a
+    hold, an undecided record or a re-check state does not, and a decision whose
+    binding no longer matches the record never stands in for the answer.
+    """
+
+    answers = {states.get(event_id) for event_id in child.event_ids}
+    if child.kind == KIND_TWO_CHIPS_ONE_CROSSING:
+        # One chip of the pair being deleted settles the crossing; two separate
+        # riders need both records kept, nothing looser.
+        return "待 CycleRace" in answers or answers == {"已确认有效"}
+    return not answers.isdisjoint({"已确认有效", "待 CycleRace"})
+
+
+def unresolved_crossing_conflicts(context, marks, result):
+    """Explicit child doubts cannot disappear just because the totals happen to match.
+
+    A double chip on one crossing is answered on the child itself or per member
+    chip, never by the count: two physical chips are not two wrong records by
+    themselves. A chip whose crossing was not seen needs its number read on a
+    counted person, or the chip kept/deleted in the member flow, and a crossing
+    with no chip is answered by a counted person on its own frame. Children are
+    read from the current problem list, so a conflict that appeared after the
+    draft was opened still blocks.
+    """
+
+    from .problem_resolutions import ProblemResolutionStore
+
+    store = ProblemResolutionStore(context.workspace / "finish_problems/problem_resolutions.jsonl")
+    member_states = None
+    conflicts = []
+    for value in load_child_items(context.workspace, context.item.item_id):
+        child = ProblemItem.from_payload(value)
+        answers = CHILD_ANSWERS.get(child.kind)
+        if answers is None or child.status in RESOLVED_STATUSES:
+            continue
+        decision, stale = store.state(child)
+        if decision is not None and not stale and decision.action in answers:
+            continue
+        if child.kind in (KIND_CHIP_NO_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING):
+            if child.kind == KIND_CHIP_NO_CROSSING and chip_answered_by_count(context, child, marks, result):
+                continue
+            if member_states is None:
+                member_states = group_member_states(context)
+            if member_states and chip_answered_by_members(child, member_states):
+                continue
+        elif counted_person_on_child_frame(child, marks):
+            continue
+        conflicts.append(child)
+    return conflicts
+
+
 def is_excluded(mark: dict) -> bool:
     """Old drafts are rider counts; an explicit reason records manual exclusion."""
     return bool(mark.get("exclusion_reason", "").strip())
+
+
+def mark_on_frame(mark, frame, recorder_ms):
+    """A counted person belongs to one decoded frame, including rebound archives.
+
+    The stored reference is a retained copy: it may carry extra metadata, and
+    only the camera, the moment and the actual frame identify it. Two references
+    are the same frame when the camera and the moment agree, or when they name
+    the same decoded frame exactly — a rebuilt stamp on one copy cannot detach
+    the mark from the frame it was counted on.
+    """
+
+    ref = mark.get("frame") or {}
+    if (ref.get("camera_index") is not None and frame.get("camera_index") is not None
+            and int(ref["camera_index"]) != int(frame["camera_index"])):
+        return False
+    left, right = ref.get("frame_index"), frame.get("frame_index")
+    if (ref.get("segment_id") and ref.get("segment_id") == frame.get("segment_id")
+            and left is not None and right is not None and int(left) == int(right)):
+        return True
+    stamped = mark.get("recorder_ms")
+    if stamped is None or recorder_ms is None:
+        return False
+    return abs(int(stamped) - int(recorder_ms)) <= MARK_TIME_TOLERANCE_MS
+
+
+def rider_count(marks):
+    return sum(not is_excluded(mark) for mark in marks)
 
 
 def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: int = 0) -> dict:
@@ -344,6 +531,8 @@ class BunchReviewStore:
                 raise ValueError("仍有未查看范围，不能只查看局部候选就关闭整团。")
             if pending_member_decisions(context):
                 raise ValueError("仍有成员建议待交接、暂存或需重查，整团不能确认完成。")
+            if unresolved_crossing_conflicts(context, marks, result):
+                raise ValueError("仍有未核清的过线疑点；人数相等不能代替核对双芯片或漏读，请处理相关疑点或认号。")
             issue = completion_issue(context.chips, marks, result, fully_viewed)
             if issue:
                 raise ValueError(issue)
@@ -390,7 +579,8 @@ class BunchReviewStore:
             # Recompute from the saved evidence so stale cached extras cannot
             # reintroduce an excluded person or an incomplete group's suggestions.
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
-            if completion_issue(context.chips, record["marks"], result, record.get("fully_viewed", False)):
+            if (unresolved_crossing_conflicts(context, record["marks"], result)
+                    or completion_issue(context.chips, record["marks"], result, record.get("fully_viewed", False))):
                 continue
             for extra in result["extras"]:
                 mark = record["marks"][extra["mark"]]

@@ -395,8 +395,10 @@ def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path
         # frame is fitted to the room it just gained.
         assert not window.preview_panel.isVisibleTo(window)
         assert window.regular_pane.height() > before
-        # Enlarging put this problem's own frame on screen, so nothing is being
-        # browsed and the decisions stay live instead of greyed with a way back.
+        # Enlarging preserves a manually browsed frame; it must not seek away
+        # from the evidence the operator was inspecting.
+        assert window.problem_panel._browsing
+        window._return_to_problem()
         assert not window.problem_panel._browsing
         qapp.processEvents()
         assert fits
@@ -444,7 +446,7 @@ def test_clicking_the_enlarged_picture_counts_one_person_per_click(qapp, tmp_pat
 
         pane = window.regular_pane
         view = pane.video_view
-        view.set_frame(QImage(640, 480, QImage.Format_RGB32), source_width=640, source_height=480)
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         qapp.processEvents()
         window.problem_panel.toggle_big_view()  # F: the picture takes the clicks
         qapp.processEvents()
@@ -465,13 +467,120 @@ def test_clicking_the_enlarged_picture_counts_one_person_per_click(qapp, tmp_pat
         window.problem_panel.undo_mark()
         qapp.processEvents()
         assert not window.problem_panel.current_marks()
-        # With the queue back, the picture stops counting: it is not the big one.
+        # Counting is available on the ordinary picture too; F is optional.
         window.problem_panel.toggle_big_view()
         qapp.processEvents()
-        assert not pane.video_view._count_mode
+        assert pane.video_view._count_mode
+        target = view.viewport().rect().center()
         QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
         qapp.processEvents()
+        assert len(window.problem_panel.current_marks()) == 1
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
+        assert not window._problem_count_overlays(pane)
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert len(window._problem_count_overlays(pane)) == 1
+    finally:
+        window.close()
+
+
+def test_a_normal_single_is_a_card_that_is_reviewed_not_counted(qapp, tmp_path):
+    """Normal riders get a card to reopen, and never become a manual task."""
+
+    import json
+    from PyQt5.QtGui import QImage
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        video = tmp_path / "original.mkv"
+        video.write_bytes(b"video")
+        start = 1_789_600_000_000
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        passed = {"bib": "057", "event_id": "e-057", "chip_time_ms": start + 1900, "active_now": True,
+                  "recorder_ms": start + 2000, "source": "auto", "frame": frame}
+        path = tmp_path / "finish_problems/problem_list.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"items": [], "summary": {"auto_passed": 1}, "auto_passed": [passed]}),
+                        encoding="utf-8")
+        window.problem_panel.refresh()
+        window._refresh_crossing_cards()
+        qapp.processEvents()
+
+        card_id = next(iter(window._normal_crossing_cards))
+        assert window.crossing_cards.list.count() == 1
+        assert "已自动对应" in window.crossing_cards.list.item(0).text()
+        assert not window.problem_panel.rows  # a normal rider is nobody's task
+
+        # Opening the card shows the original frame and says whose crossing it is.
+        window._select_crossing_card(card_id)
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+        assert window._opened_normal_crossing == card_id
+        assert "057" in window.problem_panel.hint.text()
+
+        # Clicking that crossing is a review, not a count: nothing is invented.
+        window._problem_count_clicked(0.5, 0.5, pane)
+        assert "已自动对应" in window.problem_panel.hint.text()
         assert not window.problem_panel.current_marks()
+        assert not window.problem_panel.rows
+    finally:
+        window.close()
+
+
+def test_the_first_rider_calibration_keeps_the_original_chip_record(qapp, tmp_path, monkeypatch):
+    """Calibrating from the current frame stores the exact record it was made on."""
+
+    from datetime import datetime
+    from PyQt5.QtGui import QImage
+    from PyQt5.QtWidgets import QInputDialog
+    from realtime.passage_evidence import VideoClockCalibrationStore
+    from realtime.video_timeline import PassageVideoLocation
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        video = tmp_path / "original.mkv"
+        video.write_bytes(b"video")
+        start = 1_789_600_000_000
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        event = _event(event_id="race-1-stage-1-passage-15", bib="15",
+                       passage_timestamp_ms=start + 1900, received_at_ms=start + 2000)
+        window.passage_store.append(event)
+        window.problem_panel._live_paused = True  # calibrating must not spawn the analysis worker
+
+        pane = window.regular_pane
+        location = PassageVideoLocation(segment, video, 2000, 2000, 0, 0, "located")
+        assert window._seek_retained_camera_frame(location, 2000, 50, 1)
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        stored = window.passage_store.get(event.event_id)
+        label = (f"{stored.bib} · "
+                 f"{datetime.fromtimestamp(stored.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]}"
+                 f" · {stored.event_id}")
+        monkeypatch.setattr(QInputDialog, "getItem", lambda *args, **kwargs: (label, True))
+        window._calibrate_crossing_frame()
+
+        journal = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl",
+                                             recover_incomplete_tail=False)
+        calibration = journal.calibrations()[-1]
+        assert calibration.anchor_event_id == stored.event_id
+        assert calibration.anchor_event_revision == stored.revision
+        assert calibration.anchor_chip_time_ms == stored.timeline_timestamp_ms
+        assert calibration.anchor_race_id == "race-1" and calibration.anchor_stage_id == "stage-1"
+        assert calibration.anchor_frame["frame_index"] == 50
+        assert calibration.offset_ms == 2000 + start - stored.timeline_timestamp_ms
+        # The official chip time is untouched: only the video offset was learned.
+        assert window.passage_store.get(event.event_id).timeline_timestamp_ms == event.timeline_timestamp_ms
     finally:
         window.close()
 

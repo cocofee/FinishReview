@@ -44,6 +44,7 @@ from .batch_review import (BATCH_IDENTITY_FILENAME, BatchDecisionStore, aggregat
 from .problem_analysis import OUTPUT_DIRNAME, PROBLEM_LIST_FILENAME
 from .problem_items import (
     ACTION_CHANGE,
+    ACTION_CONFIRM_CROSSING,
     ACTION_DELETE_CHIP,
     ACTION_DELETE_EXTRA_CHIP,
     ACTION_LABELS,
@@ -175,6 +176,11 @@ class ProblemListPanel(QFrame):
         # The people pointed at on the picture, per problem.  They are the count and
         # the positions; the moments inside them align the count with the chips.
         self._marks: dict[str, list] = {}
+        self._viewed: dict[str, dict] = {}
+        self._group_context = None
+        self._group_context_id = None
+        self._group_context_error = ""
+        self._editing_mark = -1
         self._shown_since = time.monotonic()
         self._operator_items = {}
         self._shown_id = None
@@ -403,6 +409,18 @@ class ProblemListPanel(QFrame):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
+        from .crossing_widgets import CrossingReviewControls
+        self.crossing_controls = CrossingReviewControls(self)
+        self.crossing_controls.mark_selected.connect(self._select_mark)
+        self.crossing_controls.bib_assigned.connect(self._assign_mark_bib)
+        self.crossing_controls.exclusion_changed.connect(self._exclude_mark)
+        self.crossing_controls.mark_removed.connect(self._remove_mark)
+        self.crossing_controls.member_decision.connect(self._decide_member)
+        self.crossing_controls.conflict_selected.connect(self._show_conflict)
+        self.crossing_controls.conflict_decided.connect(self._decide_conflict)
+        self.crossing_controls.fully_viewed_changed.connect(self._set_fully_viewed)
+        self.crossing_controls.hide()
+        layout.addWidget(self.crossing_controls)
         # The line the big view hands the decisions to; hidden until then.  The keys
         # have their own label here so the hint below stays free for what just
         # happened to the row.
@@ -442,7 +460,7 @@ class ProblemListPanel(QFrame):
             path = self.problem_dir / "operator_drafts.json"
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps({"drafts": self._drafts, "held": self._held,
-                                             "marks": self._marks,
+                                             "marks": self._marks, "viewed": self._viewed,
                                              "items": self._operator_items}, ensure_ascii=False),
                                  encoding="utf-8")
             temporary.replace(path)
@@ -506,7 +524,8 @@ class ProblemListPanel(QFrame):
         self._live = False
         self._browsing = False
         self._next_analysis = 0.0
-        self._drafts, self._held, self._marks, self._operator_items = {}, {}, {}, {}
+        self._drafts, self._held, self._marks, self._operator_items, self._viewed = {}, {}, {}, {}, {}
+        self._group_context, self._group_context_id = None, None
         self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self._final_analysis_pending = False
         self._finalizing_live = False
@@ -515,6 +534,7 @@ class ProblemListPanel(QFrame):
             state = json.loads((self.problem_dir / "operator_drafts.json").read_text(encoding="utf-8"))
             self._drafts, self._held = state.get("drafts", {}), state.get("held", {})
             self._marks = state.get("marks", {})
+            self._viewed = state.get("viewed", {})
             self._operator_items = state.get("items", {})
         except (OSError, ValueError):
             pass
@@ -530,6 +550,7 @@ class ProblemListPanel(QFrame):
         self.stop_chip_checks()
         self.save_drafts()
         self._scope = scope
+        self._group_context, self._group_context_id = None, None
         self.payload = None
         self._signature = None
         self._render_signature = None
@@ -552,7 +573,10 @@ class ProblemListPanel(QFrame):
         if self.problem_dir is None:
             return
         current = self.current_item()
-        self.items = [item for item in self.items if not item.evidence.get("superseded") or item == current]
+        self.items = [replace(item, evidence={key: value for key, value in item.evidence.items()
+                                             if key not in ("group", "split_children")})
+                      if item.evidence.get("split_children") else item
+                      for item in self.items if not item.evidence.get("superseded") or item == current]
         paths = [self.problem_dir / name for name in (PROBLEM_LIST_FILENAME, LIVE_CHIP_FILENAME)]
         signature = []
         for path in paths:
@@ -660,6 +684,18 @@ class ProblemListPanel(QFrame):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
                 statuses.append(f"机位 {camera}：{detail}")
             self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
+        # A manual count of several people becomes one independent crossing per
+        # mark. Hide its unchanged source so recognising one never settles the rest.
+        split = {}
+        for child in self.items:
+            source = child.evidence.get("split_source")
+            if source:
+                split.setdefault(source["item_id"], []).append(child)
+        for index, item in enumerate(self.items):
+            children = split.get(item.item_id, ())
+            if children and item.to_payload() == children[0].evidence["split_source"]:
+                self.items[index] = replace(item, evidence=dict(item.evidence, group=children[0].item_id,
+                                                               split_children=[child.item_id for child in children]))
         self._load_bunch_store()
         self._render()
 
@@ -727,6 +763,11 @@ class ProblemListPanel(QFrame):
                     return STATE_PENDING
             except (ValueError, OSError):
                 return STATE_STALE
+            if record.get("completed"):
+                from .bunch_review import align_counts, unresolved_crossing_conflicts
+                if unresolved_crossing_conflicts(context, record.get("marks", []),
+                                                  align_counts(context.chips, record.get("marks", []))):
+                    return STATE_PENDING
             current = {event.event_id: event for event in self._events_provider()}
             for chip in record.get("chips", []):
                 event = current.get(chip["event_id"])
@@ -737,6 +778,8 @@ class ProblemListPanel(QFrame):
         if self.store is not None:
             resolution, stale = self.store.state(item)
             if resolution is not None:
+                if not stale and resolution.action == ACTION_CONFIRM_CROSSING:
+                    return STATE_PENDING
                 if not stale and resolution.action in (ACTION_RECORD_BIB, ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP, ACTION_CHANGE):
                     return f"{STATE_HANDOFF}：{resolution.label}"
                 return STATE_STALE if stale else f"{STATE_RESOLVED}：{resolution.label}"
@@ -764,7 +807,8 @@ class ProblemListPanel(QFrame):
     def _render(self) -> None:
         signature = (tuple((repr(item.to_payload()), self.state(item)) for item in self.items),
                      self.queue_filter.currentIndex(), self._class_filter, tuple(self._held.items()),
-                     self._bunch_signature(), repr((self.payload or {}).get("summary")))
+                     self._bunch_signature(), repr((self.payload or {}).get("summary")),
+                     repr((self.payload or {}).get("cameras")), repr(self._marks))
         if signature == self._render_signature:
             return
         self._render_signature = signature
@@ -825,7 +869,8 @@ class ProblemListPanel(QFrame):
         cls = problem_class(item)
         if cls == TYPE_BUNCH:
             record = self.bunch_store.latest_for(item) if self.bunch_store is not None else None
-            counted = int((record or {}).get("counted_riders") or 0) or len(self._marks.get(item.item_id, ()))
+            from .bunch_review import rider_count
+            counted = rider_count(self._marks[item.item_id]) if item.item_id in self._marks else int((record or {}).get("counted_riders") or 0)
             if counted:
                 return f"{counted} 人"
             chips = int(item.evidence.get("chip_count") or len(item.bibs) or 0)
@@ -834,6 +879,9 @@ class ProblemListPanel(QFrame):
             return SHORT_NOTES.get(item.kind, "—")
         if item.bibs:
             return "、".join(item.bibs[:4]) + ("…" if len(item.bibs) > 4 else "")
+        decision, stale = self.store.state(item) if self.store is not None else (None, False)
+        if decision is not None and not stale and decision.action == ACTION_CONFIRM_CROSSING:
+            return "已过线·待认号"
         return "—"
 
     def _row_colour(self, item: ProblemItem, state: str) -> Optional[QColor]:
@@ -884,9 +932,10 @@ class ProblemListPanel(QFrame):
             if record is not None and record.get("marks"):
                 self._marks[item.item_id] = [dict(mark) for mark in record["marks"]]
         self._sync_step_buttons()
-        self._sync_marks()
         if changed:
             self._shown_id = identity
+            self._group_context, self._group_context_id = None, None
+            self._editing_mark = -1
             bib, reason = self._drafts.get(identity, ("", ""))
             self.bib_input.blockSignals(True)
             self.reason_input.blockSignals(True)
@@ -901,6 +950,7 @@ class ProblemListPanel(QFrame):
         for button in self.action_buttons:
             self.action_target.removeWidget(button)
             button.deleteLater()
+        self._sync_marks()
         self.action_buttons = []
         self.card.clear()
         self.filmstrip.clear()
@@ -909,8 +959,9 @@ class ProblemListPanel(QFrame):
                 # Nothing left to enlarge: the emptied queue takes its panes back.
                 self.toggle_big_view()
             self.batch_button.hide()
-            self.title.setText("选择一条问题查看过线卡片")
-            self.detail.setText("")
+            self.decision_box.hide()
+            self.title.setText(self.queue_text())
+            self.detail.setText("正常单人自动对应；从过线卡片打开疑点，或从录像直接点人补记。")
             self.jump_button.setEnabled(False)
             self.reopen_button.setEnabled(False)
             self.bunch_button.hide()
@@ -919,6 +970,7 @@ class ProblemListPanel(QFrame):
             if changed:
                 self.current_changed.emit(None)
             return
+        self.decision_box.show()
         self.hold_button.setEnabled(item.status != STATUS_WAITING)
         self.hold_button.setText("返回待处理" if item.item_id in self._held else "待确认")
         is_bunch = item.kind in (KIND_BUNCH, KIND_OBSTRUCTION)
@@ -1048,7 +1100,7 @@ class ProblemListPanel(QFrame):
             # With the list out of sight, the arrows walk the queue instead of it.
             self._step(-1 if key == Qt.Key_Up else 1)
             return True
-        if self._big_view and key in (Qt.Key_Left, Qt.Key_Right):
+        if key in (Qt.Key_Left, Qt.Key_Right):
             # The frames step from here too, so the operator never has to give the
             # keyboard away by clicking the picture first.
             self.frame_step_requested.emit(-1 if key == Qt.Key_Left else 1)
@@ -1084,7 +1136,7 @@ class ProblemListPanel(QFrame):
         item = self.current_item()
         return list(self._marks.get(item.item_id, ())) if item is not None else []
 
-    def add_mark(self, x: float, y: float, recorder_ms: int) -> None:
+    def add_mark(self, x: float, y: float, recorder_ms: int, frame=None) -> None:
         """One click on the picture is one person at the moment the frame shows.
 
         The position is kept as a fraction of the frame, so the mark stays on the
@@ -1093,14 +1145,22 @@ class ProblemListPanel(QFrame):
         """
 
         item = self.current_item()
-        if item is None or not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        if (item is None or item.evidence.get("configuration_stale") or item.evidence.get("superseded")
+                or item.status == STATUS_WAITING or not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0)):
             return
+        from .bunch_review import mark_on_frame, rider_count
+        ref = dict(frame or item.evidence.get("frame") or {})
         marks = self._marks.setdefault(item.item_id, [])
+        if any(mark_on_frame(mark, ref, recorder_ms)
+               and (mark["x"] - x) ** 2 + (mark["y"] - y) ** 2 < .02 ** 2 for mark in marks):
+            self.hint.setText("这个位置已计过数；并排选手请分别点各自前轮。")
+            return
         marks.append({"x": round(float(x), 4), "y": round(float(y), 4), "recorder_ms": int(recorder_ms),
-                      "bib": "", "exclusion_reason": ""})
-        self.save_drafts()
-        self._sync_marks()
-        self.hint.setText(f"已点 {len(marks)} 人：点错按「撤销」；左右方向键逐帧，回车确认。")
+                      "bib": "", "exclusion_reason": "", "frame": ref})
+        self._editing_mark = len(marks) - 1
+        self._marks_updated()
+        self.crossing_controls.select_mark(self._editing_mark)
+        self.hint.setText(f"已点 {rider_count(marks)} 人：点错按「撤销」；左右方向键逐帧，回车确认。")
 
     def undo_mark(self) -> None:
         item = self.current_item()
@@ -1108,29 +1168,270 @@ class ProblemListPanel(QFrame):
         if not marks:
             return
         marks.pop()
-        self.save_drafts()
-        self._sync_marks()
-        self.hint.setText(f"已去掉一个，现点着 {len(marks)} 人。")
+        self._editing_mark = len(marks) - 1
+        self._marks_updated()
+        self.hint.setText(f"已撤销最后一个标记，剩余 {len(marks)} 个标记。")
 
     def clear_marks(self) -> None:
         item = self.current_item()
         if item is None or not self._marks.pop(item.item_id, None):
             return
-        self.save_drafts()
-        self._sync_marks()
+        self._editing_mark = -1
+        self._marks_updated()
         self.hint.setText("已清空这一条的计数。")
 
     def _sync_marks(self) -> None:
         """Show the count beside the picture and hand it to whoever draws it."""
 
+        from .bunch_review import rider_count
         marks = self.current_marks()
-        self.marks_label.setText(f"已点 {len(marks)} 人")
-        show = self._big_view and self.current_item() is not None
+        self.marks_label.setText(f"已点 {rider_count(marks)} 人")
+        show = self.current_item() is not None and bool(self.current_item().evidence.get("frame"))
         for widget in (self.marks_label, self.undo_button, self.clear_button):
             widget.setVisible(show)
         self.undo_button.setEnabled(bool(marks))
         self.clear_button.setEnabled(bool(marks))
+        self._sync_crossing_controls()
         self.marks_changed.emit(tuple(marks))
+
+    def _inline_context(self):
+        item = self.current_item()
+        if item is None or item.kind not in (KIND_BUNCH, KIND_OBSTRUCTION) or self.workspace_dir is None:
+            return None
+        key = repr(item.to_payload())
+        if key != self._group_context_id:
+            from .bunch_review import load_context
+            self._group_context, self._group_context_error = None, ""
+            self._group_context_id = key
+            try:
+                self._group_context = load_context(self.workspace_dir, item)
+            except (OSError, ValueError) as error:
+                self._group_context_error = str(error)
+        return self._group_context
+
+    def _view_state(self, context):
+        key = f"{context.item.item_id}|{context.camera}"
+        state = self._viewed.get(key)
+        if state is None or state.get("signature") != context.signature:
+            record = self.bunch_store.get(context) if self.bunch_store else None
+            state = {"signature": context.signature, "ranges": (record or {}).get("viewed_ranges", []),
+                     "fully_viewed": False}
+            self._viewed[key] = state
+        return state
+
+    def record_viewed_frame(self, frame, recorder_ms):
+        context = self._inline_context()
+        if context is None or int(frame.get("camera_index", 0)) != context.camera:
+            return
+        if not context.start_ms - 50 <= recorder_ms <= context.end_ms + 50:
+            return
+        if str(frame.get("segment_id")) not in {s.segment.segment_id for s in context.segments}:
+            return
+        from .bunch_review import add_viewed
+        state = self._view_state(context)
+        state["ranges"] = add_viewed(state["ranges"], recorder_ms, context.start_ms, context.end_ms)
+        self._draft_timer.start()
+        self._sync_crossing_controls()
+
+    def _sync_crossing_controls(self):
+        if not hasattr(self, "crossing_controls"):
+            return
+        item, marks = self.current_item(), self.current_marks()
+        self.crossing_controls.setVisible(bool(item and (marks or item.evidence.get("batch_members")
+                                                        or item.kind in (KIND_BUNCH, KIND_OBSTRUCTION))))
+        if item is None:
+            return
+        members, complete, viewed, notice, conflicts = [], False, False, "", ()
+        context = self._inline_context()
+        if context is not None:
+            from .bunch_review import (align_counts, group_member_batch,
+                                       unresolved_crossing_conflicts, uncovered_intervals)
+            state = self._view_state(context)
+            missing = uncovered_intervals(context.start_ms, context.end_ms, state["ranges"], tolerance=100)
+            complete = not missing and not context.gaps
+            viewed = complete and state.get("fully_viewed", False)
+            result = align_counts(context.chips, marks)
+            notice = (f"未查看 {sum(b-a for a,b in missing)/1000:.1f} 秒 · "
+                      f"未对应记录 {len(result['missing'])} · 多出 {len(result['extras'])} 人")
+            if context.gaps:
+                notice += f" · 录像缺口 {len(context.gaps)} 处"
+            try:
+                conflicts = tuple(unresolved_crossing_conflicts(context, marks, result))
+            except (OSError, ValueError) as error:
+                conflicts = ()
+                notice += f" · 疑点读取失败：{error}"
+            if conflicts:
+                complete = False
+                notice += f" · 未核清疑点 {len(conflicts)}"
+            batch = group_member_batch(context)
+        else:
+            batch = self._batch_parent(item)
+            notice = self._group_context_error if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION) else ""
+        if batch is not None:
+            events = tuple(self._events_provider())
+            members = [dict(member, state=self.batch_store.state(batch, member, events) if self.batch_store else "待证据")
+                       for member in batch.evidence.get("batch_members", [])]
+        self.crossing_controls.set_review(marks, members, conflicts, can_complete=complete,
+                                          fully_viewed=viewed, show_fully_viewed=context is not None,
+                                          notice=notice)
+
+    def _marks_updated(self):
+        context = self._inline_context()
+        if context is not None:
+            self._view_state(context)["fully_viewed"] = False
+        self.save_drafts()
+        self._sync_marks()
+        # The row and its card show progress without requiring a separate Save.
+        row = self.table.currentRow()
+        item = self.current_item()
+        if item is not None and row >= 0:
+            self.table.item(row, 2).setText(self.short_note(item))
+            for column in range(self.table.columnCount()):
+                self.table.item(row, column).setForeground(QColor("#8a8f98"))
+
+    def _select_mark(self, index):
+        marks = self.current_marks()
+        if not 0 <= index < len(marks):
+            return
+        self._editing_mark = index
+        frame = marks[index].get("frame")
+        if frame:
+            self.jump_requested.emit(dict(frame))
+
+    def _assign_mark_bib(self, index, bib):
+        marks = self.current_marks()
+        if not 0 <= index < len(marks):
+            return
+        from .bunch_review import is_excluded
+        bib = bib.strip()
+        if is_excluded(marks[index]):
+            return
+        if bib and any(i != index and not is_excluded(mark) and mark.get("bib") == bib
+                       for i, mark in enumerate(marks)):
+            self.hint.setText("这个号码已记在另一人身上，请先核对。")
+            return
+        marks[index]["bib"] = bib
+        self._marks_updated()
+        self.hint.setText("号码已记住；普通计数不必逐人认号。")
+
+    def _exclude_mark(self, index, reason):
+        marks = self.current_marks()
+        if not 0 <= index < len(marks):
+            return
+        marks[index]["exclusion_reason"] = reason.strip()
+        self._marks_updated()
+        self.hint.setText("已记为非选手，证据保留。" if reason else "已恢复为选手计数。")
+
+    def _remove_mark(self, index):
+        item = self.current_item()
+        if item is None or not 0 <= index < len(self.current_marks()):
+            return
+        self._marks[item.item_id].pop(index)
+        self._marks_updated()
+
+    def _set_fully_viewed(self, checked):
+        context = self._inline_context()
+        if context is not None:
+            self._view_state(context)["fully_viewed"] = bool(checked)
+            self.save_drafts()
+
+    def _decide_member(self, event_id, action):
+        self.refresh()
+        item = self.current_item()
+        if item is None or self.batch_store is None or self._browsing:
+            return
+        context = self._inline_context()
+        if context is not None:
+            from .bunch_review import group_member_batch, load_context
+            try:
+                current = load_context(self.workspace_dir, item)
+                if current.signature != context.signature:
+                    raise ValueError("集团证据已变化，请重新打开核对")
+                batch = group_member_batch(current)
+            except (ValueError, OSError) as error:
+                self.hint.setText(str(error))
+                return
+        else:
+            batch = self._batch_parent(item)
+        if batch is None:
+            return
+        reason = self.reason_input.text().strip() or (
+            "原帧已核对：此记录对应有效过线" if action == "keep" else "原帧已核对：一人携带多芯片，建议作废所选记录")
+        try:
+            self.batch_store.save(batch, [event_id], action, reason, tuple(self._events_provider()))
+        except (OSError, ValueError, RuntimeError) as error:
+            self.hint.setText(f"成员决定未保存：{error}")
+            return
+        self._render_signature = None
+        self._render()
+        self.hint.setText("已保存所选记录；其他成员不受影响。")
+
+    def _conflict_item(self, item_id: str):
+        """The group's own child doubt, read fresh so an answered one is gone."""
+
+        context = self._inline_context()
+        if context is None or self.workspace_dir is None:
+            return None
+        from .bunch_review import load_child_items
+        value = next((child for child in load_child_items(self.workspace_dir, context.item.item_id)
+                      if child.get("item_id") == item_id), None)
+        return None if value is None else ProblemItem.from_payload(value)
+
+    def _show_conflict(self, item_id):
+        child = self._conflict_item(item_id)
+        frame = (child.evidence.get("frame") or {}) if child is not None else {}
+        if not frame:
+            self.hint.setText("这条疑点没有原帧；请查看它的文字说明。")
+            return
+        self.jump_requested.emit(dict(frame))
+        self.hint.setText(f"已跳到疑点原帧：{child.title}。看清后回到画面下选择处理。")
+
+    def _decide_conflict(self, item_id, action):
+        """Answer one child doubt of the group by what its own frame shows."""
+
+        self.refresh()
+        item = self.current_item()
+        if item is None or self.store is None:
+            return
+        context = self._inline_context()
+        child = self._conflict_item(item_id)
+        if context is None or child is None:
+            self.hint.setText("这条疑点已变化；请重新查看后再处理。")
+            return
+        if action == "keep":
+            # Keeping a record is the member flow's own answer, bound to the exact
+            # event; it decides nothing else about the crossing.
+            from .bunch_review import group_member_batch
+            event_id = child.event_ids[0] if child.event_ids else ""
+            batch = group_member_batch(context)
+            known = {member["event_id"] for member in batch.evidence.get("batch_members", [])}
+            if not event_id or event_id not in known or self.batch_store is None:
+                self.hint.setText("这条记录不在本团的成员清单里，不能在这里保留。")
+                return
+            try:
+                self.batch_store.save(batch, [event_id], "keep",
+                                      self.reason_input.text().strip() or "原帧已核对：此记录对应有效过线",
+                                      tuple(self._events_provider()))
+            except (OSError, ValueError, RuntimeError) as error:
+                self.hint.setText(f"疑点处理未保存：{error}")
+                return
+            self.hint.setText("已保留这条芯片记录；集团的过线疑点随之核清。")
+            self._render_signature = None
+            self._render()
+            return
+        reason = self.reason_input.text().strip() or ACTION_REASON_PRESETS.get(action, "")
+        if action in (ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_SAME_CROSSING) and not reason:
+            self.hint.setText("排除或确认同一次过线需要写明依据；可先在原因框填写。")
+            return
+        try:
+            self.store.resolve(child, action, reason=reason,
+                               position=tuple(child.evidence.get("position", ())))
+        except (OSError, RuntimeError, ValueError) as error:
+            self.hint.setText(f"疑点处理未保存：{error}")
+            return
+        self.hint.setText("已按原帧证据处理这条疑点；其余疑点和人数保持不变。")
+        self._render_signature = None
+        self._render()
 
     def _confirm_pending(self) -> None:
         """Enter confirms the decision whose standing reason is already in the field."""
@@ -1152,9 +1453,22 @@ class ProblemListPanel(QFrame):
         item = self.current_item()
         if item is None:
             return
-        counted = len(self.current_marks())
+        from .bunch_review import rider_count
+        counted = rider_count(self.current_marks())
         if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
             self._confirm_bunch_count(item, counted)
+            return
+        if len(self.current_marks()) > 1 and ACTION_CONFIRM_CROSSING in item.actions:
+            self._split_counted_crossings(item)
+            return
+        if not counted:
+            reasons = list(dict.fromkeys(mark.get("exclusion_reason", "") for mark in self.current_marks()
+                                         if mark.get("exclusion_reason")))
+            self.reason_input.setText("；".join(reasons))
+            self._resolve(ACTION_NOT_RIDER)
+            return
+        if item.evidence.get("batch_members"):
+            self.hint.setText(f"已点 {counted} 人；请在画面下选择具体记录，再确认有效或建议作废。")
             return
         if problem_class(item) == TYPE_MULTI_CHIP:
             # One person on one crossing with two chips is one vehicle carrying two
@@ -1162,10 +1476,63 @@ class ProblemListPanel(QFrame):
             self._resolve(ACTION_DELETE_EXTRA_CHIP if counted == 1 else ACTION_SIDE_BY_SIDE)
             return
         if problem_class(item) == TYPE_MISSED:
-            self.hint.setText("画面有人但没有芯片：请填号码牌上的号码补录。")
-            self._resolve(ACTION_RECORD_BIB)
+            if ACTION_CONFIRM_CROSSING not in item.actions:
+                self.hint.setText("本条已有芯片记录，请选择确认有效或证据不足；另一个漏读者可从原帧补记过线。")
+                return
+            if counted > 1:
+                self._split_counted_crossings(item)
+                return
+            bib = self.bib_input.text().strip()
+            if not bib and counted == 1:
+                bib = next((mark.get("bib", "") for mark in self.current_marks() if not mark.get("exclusion_reason")), "")
+                self.bib_input.setText(bib)
+            if bib:
+                self._resolve(ACTION_RECORD_BIB)
+            else:
+                self._resolve(ACTION_CONFIRM_CROSSING)
             return
         self._hold()
+
+    def _split_counted_crossings(self, item: ProblemItem) -> None:
+        """Keep independently counted people as independently identifiable crossings."""
+
+        from .problem_items import stable_item_id
+        marks = self.current_marks()
+        path = self.problem_dir / "manual_problems.json"
+        try:
+            children = []
+            for mark in marks:
+                frame = dict(mark.get("frame") or item.evidence.get("frame") or {})
+                if not frame:
+                    raise ValueError("每位过线者都需要对应原帧")
+                key = stable_item_id("manual", item.item_id, mark["recorder_ms"], mark["x"], mark["y"])
+                children.append(ProblemItem(key, KIND_MANUAL_REVIEW, CATEGORY_VIDEO,
+                                            "人工点出的过线者；芯片状态待核实",
+                                            evidence={"frame": frame, "recorder_ms": mark["recorder_ms"],
+                                                      "operator_scope": self._scope,
+                                                      "position": [mark["x"], mark["y"]],
+                                                      **({"card": item.evidence["card"]} if item.evidence.get("card") else {}),
+                                                      "split_source": item.to_payload()}))
+            existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+            ids = {value["item_id"] for value in existing}
+            existing.extend(child.to_payload() for child in children if child.item_id not in ids)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(path)
+            self._operator_items[item.item_id] = item.to_payload()
+            for child, mark in zip(children, marks):
+                self._marks[child.item_id] = [dict(mark)]
+                self._drafts[child.item_id] = [mark.get("bib", ""), ""]
+                self.store.resolve(child, ACTION_NOT_RIDER if mark.get("exclusion_reason") else ACTION_CONFIRM_CROSSING,
+                                   reason=mark.get("exclusion_reason") or "人工逐人确认过线",
+                                   position=(mark["x"], mark["y"]))
+            self._marks.pop(item.item_id, None)
+            self.save_drafts()
+            self.refresh()
+            self.hint.setText(f"已分别保存 {len(children)} 位过线者；未认号者各自保留在待处理里。")
+        except (OSError, ValueError, RuntimeError) as error:
+            self.save_drafts()
+            self.hint.setText(f"逐人过线未全部保存，现有点数已保留：{error}")
 
     def _confirm_bunch_count(self, item: ProblemItem, counted: int) -> None:
         """Close the group on the counted people, or keep the count as progress."""
@@ -1179,16 +1546,26 @@ class ProblemListPanel(QFrame):
         except (ValueError, OSError) as error:
             self.hint.setText(f"本条集团打不开：{error}")
             return
+        cached = self._inline_context()
+        if cached is not None and cached.signature != context.signature:
+            self.hint.setText("集团证据已变化，点数已保留；请重新打开核对。")
+            self._group_context_id = None
+            return
         seconds = max(0.0, time.monotonic() - self._shown_since)
+        view_state = self._view_state(context)
         completed = False
         try:
-            record = self.bunch_store.save(context, marks, seconds, completed=True, fully_viewed=True)
+            record = self.bunch_store.save(context, marks, seconds, completed=True,
+                                           fully_viewed=view_state.get("fully_viewed", False),
+                                           viewed_ranges=view_state["ranges"])
             completed = bool(record.get("completed"))
         except (ValueError, OSError) as error:
             # The group cannot be closed on this count; the count is still worth
             # keeping, and the reason is the operator's next step.
             try:
-                self.bunch_store.save(context, marks, seconds, completed=False, fully_viewed=True)
+                self.bunch_store.save(context, marks, seconds, completed=False,
+                                      fully_viewed=view_state.get("fully_viewed", False),
+                                      viewed_ranges=view_state["ranges"])
             except (ValueError, OSError) as saving:
                 self.hint.setText(f"集团计数未保存：{saving}")
                 return
@@ -1221,12 +1598,10 @@ class ProblemListPanel(QFrame):
         """
 
         item = self.current_item()
-        if item is None:
-            return
         # A problem with no frame still opens: the operator pressed F to work on
         # this problem, so the key must answer.  The big screen says why it is empty
         # instead of leaving a dead press (operator: "F does not work").
-        frame = dict(item.evidence.get("frame") or {})
+        frame = dict(item.evidence.get("frame") or {}) if item is not None else {}
         self._big_view = not self._big_view
         self.table.setVisible(not self._big_view)
         self.detail_scroll.setVisible(not self._big_view)
@@ -1245,11 +1620,11 @@ class ProblemListPanel(QFrame):
             # The box lands at the right of the row under the frame: name and key
             # guide on the left, the decisions themselves beside them.
             self.big_bar.addWidget(self.decision_box)
-            self.big_title.setText(f"{item.title} · {self.state(item)}")
-            self.decision_box.show()
-            if frame:
+            self.big_title.setText(f"{item.title} · {self.state(item)}" if item is not None else "录像判读 · 点人即可补记过线")
+            self.decision_box.setVisible(item is not None)
+            if frame and not self._browsing:
                 self.jump_requested.emit(frame)
-            else:
+            elif item is not None and not frame:
                 self.big_title.setText(
                     f"{item.title} · 此疑点没有原帧（录像里没有对应画面）：按芯片信息处理"
                 )
@@ -1338,7 +1713,20 @@ class ProblemListPanel(QFrame):
             return "尚未分析录像"
         counts = self.class_counts()
         parts = [f"{CLASS_TITLES[value]} {counts[value]}" for value in CLASS_ORDER if counts[value]]
-        return "疑点 " + " · ".join(parts) if parts else "疑点 已清空"
+        if parts:
+            return "疑点 " + " · ".join(parts)
+        cameras = (self.payload or {}).get("cameras", {})
+        if (self.payload or {}).get("settings_stale"):
+            return "配置已变更，等待重新分析"
+        through = [value["analyzed_through_ms"] for value in cameras.values()
+                   if value.get("analyzed_through_ms") and not value.get("error")]
+        if any(value.get("error") for value in cameras.values()):
+            return "部分机位等待录像或校时" if through else "等待录像 / 首人校时"
+        if through:
+            return f"已分析到 {format_chip_time(min(through)).split('.')[0]} · 当前无待处理疑点"
+        if not cameras:
+            return "芯片自检已更新 · 视频尚未分析"
+        return "等待录像 / 首人校时"
 
     def auto_passed_text(self) -> str:
         payload = self.payload or {}
@@ -1373,9 +1761,12 @@ class ProblemListPanel(QFrame):
             if not calibration:
                 texts.append(f"机位 {camera} 等待校时")
                 continue
-            note = f"机位 {camera} v{calibration.get('version')}"
+            source = calibration.get("source_text", "自动校时")
+            note = f"机位 {camera} {source} v{calibration.get('version')}"
             off = [anchor for anchor in calibration.get("anchors", ()) if not anchor.get("within_tolerance", True)]
-            texts.append(note + (f"，{len(off)} 个人工锚点超差待核对" if off else "，锚点一致"))
+            suffix = f"，{len(off)} 个人工锚点超差待核对" if off else (
+                "，等待后续独立过线检查漂移" if calibration.get("source") == "manual_anchor" else "，锚点一致")
+            texts.append(note + suffix)
         return "；".join(texts)
 
     def _open_batch(self):
@@ -1468,7 +1859,13 @@ class ProblemListPanel(QFrame):
             return
         bib = self.bib_input.text().strip()
         reason = self.reason_input.text().strip()
-        counted = len(self.current_marks())
+        from .bunch_review import rider_count
+        marks = self.current_marks()
+        counted = rider_count(marks)
+        counted_mark = next((mark for mark in marks if not mark.get("exclusion_reason")), None) if counted == 1 else None
+        evidence_frame = (counted_mark or {}).get("frame")
+        position = ((counted_mark["x"], counted_mark["y"]) if counted_mark is not None
+                    else tuple(item.evidence.get("position", ())))
         if counted:
             # The count is what the operator saw on the frame: it becomes the reason
             # when they wrote none, and rides along when they did.
@@ -1483,12 +1880,15 @@ class ProblemListPanel(QFrame):
             reason = ""
             self.reason_input.clear()
             self._pending_action = ""
+        if action in (ACTION_RECORD_BIB, ACTION_CONFIRM_CROSSING) and len(marks) > 1:
+            self._split_counted_crossings(item)
+            return
         if action == ACTION_RECORD_BIB:
             if not bib:
                 self.hint.setText("认号补录需要先填写号码牌上的号码。")
                 return
-            frame = item.evidence.get("frame") or {}
-            conflicts = same_frame_conflicts(frame, (), bib, self._claims(item.item_id)) if frame else []
+            frame = evidence_frame or item.evidence.get("frame") or {}
+            conflicts = same_frame_conflicts(frame, position, bib, self._claims(item.item_id)) if frame else []
             if conflicts and QMessageBox.question(
                 self, "同一帧已有其他号码",
                 f"这一帧同一次过线已对应 {'、'.join(conflicts)}。\n确认补录 {bib} 前请再看号码牌，是否继续？",
@@ -1517,20 +1917,24 @@ class ProblemListPanel(QFrame):
                 bib=bib if action == ACTION_RECORD_BIB else "",
                 target_bib=bib if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP, ACTION_CHANGE) else "",
                 reason=reason,
+                position=position,
+                frame=evidence_frame,
             )
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"处理未保存：{error}")
             return
         self.bib_input.clear()
         self.reason_input.clear()
-        self._marks.pop(item.item_id, None)
+        if action != ACTION_CONFIRM_CROSSING:
+            self._marks.pop(item.item_id, None)
         self._sync_marks()
         self._pending_action = ""
         self._held.pop(item.item_id, None)
         self._operator_items[item.item_id] = replace(item, evidence=dict(item.evidence, operator_scope=self._scope,
                                                                        operator_settings_token=operator_token)).to_payload()
         self.save_drafts()
-        self.hint.setText(f"已记录：{ACTION_LABELS.get(action, '重新处理')}。")
+        self.hint.setText("已确认过线，原帧和点数已保存；留在待处理里稍后认号。" if action == ACTION_CONFIRM_CROSSING
+                          else f"已记录：{ACTION_LABELS.get(action, '重新处理')}。")
         self._render()
         # The list drops the decided row and lands back on the oldest one; keep the
         # queue under the fingers so the next row is one Down away.  In the big view
@@ -1733,11 +2137,20 @@ class ProblemListPanel(QFrame):
         self._final_analysis_pending = False
         self._start_analysis()
 
-    def add_manual_problem(self, frame, reason):
-        if not reason.strip() or self.problem_dir is None:
+    def add_manual_problem(self, frame, reason="人工确认过线", *, recorder_ms=None, thumbnail=None):
+        if not reason.strip() or not frame or self.problem_dir is None:
             return None
+        evidence = {"frame": dict(frame), "operator_scope": self._scope}
+        if recorder_ms is not None:
+            evidence["recorder_ms"] = int(recorder_ms)
         item = ProblemItem("manual:" + uuid.uuid4().hex, KIND_MANUAL_REVIEW, CATEGORY_VIDEO,
-                           reason.strip() + "；芯片状态待核实", evidence={"frame": dict(frame), "operator_scope": self._scope})
+                           reason.strip() + "；芯片状态待核实", evidence=evidence)
+        if thumbnail is not None and not thumbnail.isNull():
+            from .crossing_cards import safe_name
+            card = self.problem_dir / "cards" / f"{safe_name(item.item_id)}.jpg"
+            card.parent.mkdir(parents=True, exist_ok=True)
+            if thumbnail.scaled(360, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation).save(str(card), "JPG", 85):
+                evidence["card"] = f"cards/{card.name}"
         path = self.problem_dir / "manual_problems.json"
         items = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
         items.append(item.to_payload())
@@ -1745,6 +2158,10 @@ class ProblemListPanel(QFrame):
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
         temporary.replace(path)
+        self._class_filter = ""
+        self.queue_filter.blockSignals(True)
+        self.queue_filter.setCurrentIndex(0)
+        self.queue_filter.blockSignals(False)
         self.refresh()
         for row, value in enumerate(self.rows):
             if value.item_id == item.item_id:

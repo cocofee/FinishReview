@@ -589,3 +589,184 @@ def test_summary_keeps_matches_inside_pending_periods_separate():
 
     assert summary["auto_passed"] == 2 and summary["auto_passed_in_pending_period"] == 1
     assert summary["unverifiable"] == 2
+
+
+# The operator's first-rider calibration ("以此人校时") must start the backend
+# even before the automatic fit has any two isolated riders to fit on.
+
+SESSION = "camera_01_20260919_100000_000000"
+
+
+def _isolated_race(tmp_path, synthetic_race):
+    """A per-test copy of the synthetic race, so calibration anchors stay local."""
+
+    root, _workspace, config, strips = synthetic_race
+    workspace_root = tmp_path / "race"
+    workspace_root.mkdir()
+    for name in ("cyclerace_passage_events.jsonl", "finish_lines.json"):
+        (workspace_root / name).write_bytes((root / name).read_bytes())
+    workspace = AnalysisWorkspace(workspace_root)
+    config = replace(config, workspace=workspace_root, output_dir=tmp_path / "out")
+    return workspace_root, workspace, config, strips
+
+
+def _record_first_rider(root, read, *, session_id=SESSION, offset_ms=OFFSET, bib=None, camera_index=1):
+    """What the operator's first-rider confirmation writes into the journal."""
+
+    from realtime.passage_evidence import VideoClockCalibrationStore
+
+    VideoClockCalibrationStore(root / "video_clock_calibrations.jsonl").record(
+        camera_index=camera_index,
+        session_key=f"camera_01_review|{root / 'videos'}|{session_id}",
+        offset_ms=int(offset_ms), anchor_event_id=read.event_id,
+        anchor_bib=str(bib if bib is not None else read.bib), calibrated_at_ms=int(read.chip_ms) + 1_000,
+    )
+
+
+def _blank_strip(path, start_ms):
+    """One sealed recording session whose line nothing ever crosses."""
+
+    from realtime.line_sampling import LineGeometry, LineStrip, save_strip
+
+    pts = np.arange(0.0, 60_000.0, 50.0)
+    geometry = LineGeometry.from_points(
+        [[0.5 * WIDTH, 0.1 * HEIGHT], [0.5 * WIDTH, 0.9 * HEIGHT]], WIDTH, HEIGHT, samples=120,
+    )
+    strip = LineStrip(strip=np.zeros((geometry.samples, pts.size, 3), np.uint8), pts_ms=pts,
+                      geometry=geometry, video_path="", fps=float(FPS))
+    save_strip(path, strip, {
+        "line_digest": "blank-line", "line_config": {"camera_index": 1}, "samples": 120,
+        "segment_id": "blank-segment", "session_id": "camera_01_20260919_235959_000000",
+        "camera_index": 1, "media_started_at_ms": int(start_ms), "media_duration_ms": int(pts[-1]),
+        "video_size": 0, "excluded_ranges": [],
+    })
+    return path
+
+
+def test_first_rider_anchor_starts_pairing_before_any_automatic_fit(synthetic_race, tmp_path):
+    from realtime.clock_sync import ClockModelStore
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first)
+
+    result = analyse_camera(config, workspace, 1, strips, reads=(first,))
+
+    assert "error" not in result
+    calibration = result["calibration"]
+    assert calibration["source"] == "manual_anchor" and calibration["source_text"] == "人工首人锚点"
+    assert calibration["slope_ms_per_hour"] == 0.0  # one point, no invented drift
+    assert calibration["kept"] == 1 and calibration["paired_sessions"] == [SESSION]
+    entry, = calibration["anchors"]
+    assert entry["within_tolerance"] and "尚无自动校时可比" in entry["message"]
+    assert result["pairing"]["auto_paired"] == 1
+    assert [value["bib"] for value in result["auto_passed"]] == [first.bib]
+    assert any("人工首人锚点" in text for text in result["calibration_warnings"])
+    model = ClockModelStore(config.resolved_output() / "video_clock_models.jsonl").latest(1)
+    assert model.source == "manual_anchor" and model.slope == 0.0 and model.support == 1
+
+
+def test_without_a_usable_anchor_the_camera_still_waits(synthetic_race, tmp_path):
+    from realtime.problem_items import KIND_WAITING
+
+    _root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+
+    result = analyse_camera(replace(config, live=True), workspace, 1, strips, reads=(first,))
+
+    assert result.get("calibration") is None and "自动校时失败" in result["error"]
+    assert [item.kind for item in result["items"]] == [KIND_WAITING]
+    assert not (config.resolved_output() / "video_clock_models.jsonl").exists()
+
+
+def test_an_anchor_of_another_recording_session_cannot_start_pairing(synthetic_race, tmp_path):
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first, session_id="camera_01_20260919_235959_000000")
+
+    result = analyse_camera(config, workspace, 1, strips, reads=(first,))
+
+    assert result.get("calibration") is None
+    assert any("其他录像会话" in text for text in result["calibration_warnings"])
+    assert not (config.resolved_output() / "video_clock_models.jsonl").exists()
+
+
+def test_a_changed_chip_record_cannot_start_pairing(synthetic_race, tmp_path):
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first, bib="999")  # the confirmed bib no longer stands
+
+    result = analyse_camera(config, workspace, 1, strips, reads=(first,))
+
+    assert result.get("calibration") is None
+    assert any("已作废、替换或已变更" in text for text in result["calibration_warnings"])
+
+
+def test_a_voided_or_revised_chip_record_cannot_start_pairing(synthetic_race, tmp_path):
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first)
+
+    for stale in (replace(first, active_now=False), replace(first, chip_ms=first.chip_ms + 5_000)):
+        result = analyse_camera(config, workspace, 1, strips, reads=(stale,))
+        assert result.get("calibration") is None
+        assert any("已作废、替换或已变更" in text for text in result["calibration_warnings"])
+
+
+def test_a_conflicting_automatic_model_does_not_replace_the_manual_anchor(synthetic_race, tmp_path):
+    from realtime.clock_sync import ClockModelStore
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    _record_first_rider(root, workspace.reads[0], offset_ms=OFFSET + 345)
+
+    result = analyse_camera(config, workspace, 1, strips)
+
+    calibration = result["calibration"]
+    assert calibration["source"] == "manual_anchor" and calibration["slope_ms_per_hour"] == 0.0
+    assert calibration["manual_conflict"] is True and calibration["manual_conflict_ms"] > 300
+    entry, = calibration["anchors"]
+    assert not entry["within_tolerance"] and entry["difference_ms"] > 300
+    assert any("未采用自动模型" in text for text in result["calibration_warnings"])
+    # Pairing still follows the operator's offset, not the automatic fit.
+    assert result["pairing"]["auto_paired"] == len(CROSSINGS_S)
+    assert -400 < result["pairing"]["residual_median_ms"] < -300
+    model = ClockModelStore(config.resolved_output() / "video_clock_models.jsonl").latest(1)
+    assert model.source == "manual_anchor" and model.slope == 0.0
+
+
+def test_an_anchor_within_tolerance_keeps_the_automatic_model(synthetic_race, tmp_path):
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    _record_first_rider(root, workspace.reads[0], offset_ms=OFFSET + 100)
+
+    result = analyse_camera(config, workspace, 1, strips)
+
+    calibration = result["calibration"]
+    assert calibration["source"] == "auto" and calibration["manual_conflict"] is False
+    assert "paired_sessions" not in calibration
+    entry, = calibration["anchors"]
+    assert entry["within_tolerance"] and "一致" in entry["message"]
+    assert result["pairing"]["auto_paired"] == len(CROSSINGS_S)
+    assert _kinds(result) == []
+
+
+def test_an_anchor_serves_only_its_own_recording_session(synthetic_race, tmp_path):
+    from realtime.problem_items import KIND_WAITING
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first)
+    far_start = START + 24 * 3_600_000
+    blank = _blank_strip(tmp_path / "camera_01_20260919_235959_000000.npz", far_start)
+    straggler = replace(first, event_id="late-passage", bib="777",
+                        chip_ms=far_start + 40_000 - OFFSET, received_at_ms=far_start + 40_000)
+
+    result = analyse_camera(replace(config, live=True), workspace, 1, [*strips, blank],
+                            reads=(first, straggler))
+
+    assert result["calibration"]["paired_sessions"] == [SESSION]
+    assert [value["bib"] for value in result["auto_passed"]] == [first.bib]
+    assert result["pairing"]["auto_paired"] == 1 and result["pairing"]["uncalibrated"] == 1
+    waiting, = [item for item in result["items"] if item.kind == KIND_WAITING]
+    assert waiting.bibs == ("777",) and "235959" in waiting.detail
+    assert result["waiting_reads"] == 1
+    assert any("没有自动校时或人工首人锚点" in text for text in result["calibration_warnings"])

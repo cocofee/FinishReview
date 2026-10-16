@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -279,7 +279,15 @@ class ContinuousMarkerStore:
 
 @dataclass(frozen=True, slots=True)
 class VideoClockCalibration:
-    """One camera/session offset calibrated from a known passage."""
+    """One camera/session offset calibrated from a known passage.
+
+    The ``anchor_*`` provenance fields (revision, original chip time, frame
+    and race/stage scope) were added while the workflow was already in use:
+    they are optional, so journal lines written before still load unchanged,
+    but a record without them cannot claim the stricter checks in
+    :meth:`AnalysisWorkspace.manual_anchors` — it falls back to the current
+    active event, the way it was recorded.
+    """
 
     camera_index: int
     session_key: str
@@ -289,6 +297,11 @@ class VideoClockCalibration:
     calibrated_at_ms: int
     revision: int = 1
     schema_version: int = SCHEMA_VERSION
+    anchor_event_revision: Optional[int] = None
+    anchor_chip_time_ms: Optional[int] = None
+    anchor_frame: dict = field(default_factory=dict)
+    anchor_race_id: str = ""
+    anchor_stage_id: str = ""
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -305,11 +318,20 @@ class VideoClockCalibration:
             raise ValueError("calibrated_at_ms must be non-negative")
         if self.revision <= 0:
             raise ValueError("revision must be positive")
+        if self.anchor_event_revision is not None and int(self.anchor_event_revision) <= 0:
+            raise ValueError("anchor_event_revision must be positive when provided")
+        if self.anchor_chip_time_ms is not None and int(self.anchor_chip_time_ms) < 0:
+            raise ValueError("anchor_chip_time_ms must be non-negative when provided")
+        if not isinstance(self.anchor_frame, dict):
+            raise ValueError("anchor_frame must be a JSON object")
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "VideoClockCalibration":
         if not isinstance(payload, Mapping):
             raise ValueError("video clock calibration must be a JSON object")
+        event_revision = payload.get("anchor_event_revision")
+        chip_time_ms = payload.get("anchor_chip_time_ms")
+        frame = payload.get("anchor_frame")
         return cls(
             schema_version=int(payload.get("schema_version", 0)),
             camera_index=int(payload.get("camera_index", 0)),
@@ -319,6 +341,11 @@ class VideoClockCalibration:
             anchor_bib=str(payload.get("anchor_bib", "")),
             calibrated_at_ms=int(payload.get("calibrated_at_ms", -1)),
             revision=int(payload.get("revision", 0)),
+            anchor_event_revision=None if event_revision is None else int(event_revision),
+            anchor_chip_time_ms=None if chip_time_ms is None else int(chip_time_ms),
+            anchor_frame=dict(frame) if isinstance(frame, Mapping) else {},
+            anchor_race_id=str(payload.get("anchor_race_id", "")),
+            anchor_stage_id=str(payload.get("anchor_stage_id", "")),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -445,7 +472,20 @@ class VideoClockCalibrationStore:
         anchor_event_id: str,
         anchor_bib: str,
         calibrated_at_ms: int,
+        anchor_event_revision: Optional[int] = None,
+        anchor_chip_time_ms: Optional[int] = None,
+        anchor_frame: Optional[Mapping[str, Any]] = None,
+        anchor_race_id: str = "",
+        anchor_stage_id: str = "",
     ) -> VideoClockCalibration:
+        """Append a calibration, optionally with the anchor's provenance.
+
+        The optional ``anchor_*`` fields record the anchor event as it was at
+        confirmation time (revision, original chip time, frame, race/stage):
+        callers that cannot provide them stay compatible, and the reader
+        treats such records as legacy.
+        """
+
         with self._lock:
             key = (int(camera_index), str(session_key))
             current = self._latest.get(key)
@@ -457,6 +497,15 @@ class VideoClockCalibrationStore:
                 anchor_bib=str(anchor_bib),
                 calibrated_at_ms=int(calibrated_at_ms),
                 revision=1 if current is None else current.revision + 1,
+                anchor_event_revision=(
+                    None if anchor_event_revision is None else int(anchor_event_revision)
+                ),
+                anchor_chip_time_ms=(
+                    None if anchor_chip_time_ms is None else int(anchor_chip_time_ms)
+                ),
+                anchor_frame=dict(anchor_frame) if anchor_frame is not None else {},
+                anchor_race_id=str(anchor_race_id or ""),
+                anchor_stage_id=str(anchor_stage_id or ""),
             )
             self._append(calibration)
             return calibration

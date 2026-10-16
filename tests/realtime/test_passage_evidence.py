@@ -10,6 +10,7 @@ from realtime.passage_evidence import (
     HIGH_SPEED_SOURCE,
     REGULAR_SOURCE,
     PassageEvidenceAssociationStore,
+    VideoClockCalibrationStore,
 )
 
 
@@ -146,3 +147,93 @@ def test_confirmation_is_bound_to_passage_revision_across_restart(tmp_path, sour
     assert reopened.get_for_event(replace(event, revision=4, passage_time_ms=600), source) is None
     assert reopened.get_for_event(replace(event, bib="16"), source) is None
     assert reopened.get_for_event(replace(event, is_active=False), source) is None
+
+
+SESSION_KEY = "camera_01_review|/videos/session-1"
+
+
+def _calibration_params(**overrides):
+    params = {
+        "camera_index": 1,
+        "session_key": SESSION_KEY,
+        "offset_ms": 1_250,
+        "anchor_event_id": "passage-1",
+        "anchor_bib": "23",
+        "calibrated_at_ms": 5_000,
+    }
+    params.update(overrides)
+    return params
+
+
+def test_video_clock_calibration_round_trips_anchor_provenance(tmp_path):
+    journal_path = tmp_path / "video_clock_calibrations.jsonl"
+    store = VideoClockCalibrationStore(journal_path)
+    frame = {
+        "segment_id": "segment-9",
+        "frame_index": 42,
+        "position_ms": 3_200,
+        "marker_x_normalized": 0.4,
+        "marker_y_normalized": 0.6,
+    }
+
+    recorded = store.record(
+        **_calibration_params(
+            anchor_event_revision=3,
+            anchor_chip_time_ms=1_789_747_200_000,
+            anchor_frame=frame,
+            anchor_race_id="race-9",
+            anchor_stage_id="stage-2",
+        )
+    )
+
+    stored, = VideoClockCalibrationStore(journal_path).calibrations()
+    assert stored == recorded
+    assert stored.anchor_event_revision == 3
+    assert stored.anchor_chip_time_ms == 1_789_747_200_000
+    assert stored.anchor_frame == frame
+    assert stored.anchor_race_id == "race-9"
+    assert stored.anchor_stage_id == "stage-2"
+
+
+def test_legacy_video_clock_calibration_lines_load_without_provenance(tmp_path):
+    journal_path = tmp_path / "video_clock_calibrations.jsonl"
+    base = {
+        "camera_index": 1,
+        "session_key": SESSION_KEY,
+        "anchor_event_id": "passage-1",
+        "anchor_bib": "23",
+        "calibrated_at_ms": 5_000,
+        "schema_version": 1,
+    }
+    lines = [
+        {**base, "offset_ms": -1_300, "revision": 1},  # shape written before the fields existed
+        {
+            **base, "offset_ms": -900, "revision": 2,  # explicit nulls from a newer writer
+            "anchor_event_revision": None, "anchor_chip_time_ms": None,
+            "anchor_frame": None, "anchor_race_id": "", "anchor_stage_id": "",
+        },
+    ]
+    journal_path.write_text(
+        "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines),
+        encoding="utf-8",
+    )
+
+    stored = VideoClockCalibrationStore(journal_path).get(1, SESSION_KEY)
+
+    assert stored is not None and stored.revision == 2 and stored.offset_ms == -900
+    assert stored.anchor_event_revision is None and stored.anchor_chip_time_ms is None
+    assert stored.anchor_frame == {}
+    assert stored.anchor_race_id == "" and stored.anchor_stage_id == ""
+    assert stored.to_payload()["anchor_frame"] == {}
+
+
+@pytest.mark.parametrize("overrides", [
+    {"anchor_event_revision": 0},
+    {"anchor_chip_time_ms": -1},
+    {"anchor_frame": "not-an-object"},
+])
+def test_video_clock_calibration_rejects_invalid_provenance(tmp_path, overrides):
+    store = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl")
+
+    with pytest.raises(ValueError):
+        store.record(**_calibration_params(**overrides))
