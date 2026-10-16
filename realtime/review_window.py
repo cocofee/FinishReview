@@ -432,6 +432,9 @@ class _CompactStatusIndicator(QFrame):
             raise ValueError(f"unsupported status state: {state}")
         self._state = state
         self.setText(value)
+        # The strip is an alarm row, not a nameplate: a device that is merely
+        # idle, connected or working stays out of the operator's way.
+        self.setVisible(state == "error")
 
     def styleSheet(self) -> str:
         return self._status_style
@@ -2380,7 +2383,7 @@ class FinishReviewWindow(PassageReviewSurface):
         rail.follow_button.show()
         rail.navigation_started.connect(self._problem_browse_started)
         rail.follow_button.toggled.connect(lambda enabled: self._problem_browse_started() if enabled else None)
-        self.pipeline_label = QLabel("录像未启动 · 等待已封存短段 · 只处理问题，不逐人确认", self)
+        self.pipeline_label = QLabel("录像未启动 · 封存到 等待首段 ｜ 分析到 等待录像 / 校时 ｜ 积压 0 秒", self)
         self.pipeline_label.setWordWrap(True)
         self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
         self.layout().insertWidget(1, self.pipeline_label)
@@ -3346,7 +3349,11 @@ class FinishReviewWindow(PassageReviewSurface):
         analyzed = datetime.fromtimestamp(min(through) / 1000).strftime("%H:%M:%S") if through else "等待录像 / 校时"
         self.pipeline_label.setToolTip(panel.chip_status + "\n" + panel.analysis_status
                                        + "\n" + panel.health_text() + "\n" + panel.summary.toolTip())
-        analysis_state = panel.analysis_status.replace("\n", " ")[:120]
+        analysis_state = panel.analysis_status.replace("\n", " ")
+        # Routine progress already reads as "分析到 HH:MM:SS" below; only a
+        # stopped or failed analysis adds a note here, and only its first clause.
+        healthy = any(word in analysis_state for word in ("等待", "空闲", "后台分析中", "本轮分析完成"))
+        analysis_note = "" if healthy else analysis_state.split("；")[0].split("，")[0].split("：")[0]
         short_ends = [segment.media_started_at_ms + segment.media_duration_ms for segment in self.timeline_store.segments()
                       if segment.end_reason == "retained_problem_segment" and segment.media_started_at_ms is not None
                       and segment.media_duration_ms is not None and (not panel._scope[0] or segment.race_id == panel._scope[0])]
@@ -3354,15 +3361,17 @@ class FinishReviewWindow(PassageReviewSurface):
         seconds = max(0, int(time.monotonic() - self._recording_started_at)) if recording else 0
         duration = f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
         backlog_seconds = max(0, (max(short_ends) - min(through)) // 1000) if short_ends and through else 0
-        # Top bar (plan step 6): race, receiving, recording, sampling, clock,
-        # analysis, backlog and evidence gaps are named separately, so a failure
-        # never hides behind one blanket "video problem".
+        # One short line, not a sentence: is the recording running, how fresh the
+        # sealed evidence is, whether the chip check has something to report, and
+        # what is still to look at.  Race, sampling, clock and the per-camera wording
+        # are a hover away and in the header above — the operator works from the
+        # queue and the picture, not from this bar.
+        chip_note = panel.chip_status.split("（")[0] if "发现" in panel.chip_status else ""
         self.pipeline_label.setText(
-            f"赛事 {getattr(self, '_event_label', '未加载赛事')} ｜ 接入 {panel.chip_status} ｜ "
-            f"{'● 持续录像 ' + duration + '（当前段写入中）' if recording else '录像未启动'} · 封存到 {sealed} ｜ "
-            f"取样 {panel.stage_health.get('取样') or '等待已封存录像'} · "
-            f"校时 {panel.stage_health.get('校时') or '等待自动校时'} ｜ "
-            f"分析 {analysis_state} · 分析到 {analyzed} ｜ 积压 {backlog_seconds} 秒 ｜ {panel.evidence_gap_text()}"
+            f"{'● 录像 ' + duration if recording else '录像未启动'} · 封存到 {sealed}"
+            + (f" ｜ {chip_note}" if chip_note else "")
+            + (f" ｜ 分析 {analysis_note}" if analysis_note else "")
+            + f" ｜ 分析到 {analyzed} ｜ 积压 {backlog_seconds} 秒 ｜ {panel.evidence_gap_text()}"
         )
         self._poll_recording_health()
         self._update_runtime_status()
@@ -4314,6 +4323,19 @@ class FinishReviewWindow(PassageReviewSurface):
                 {name: getattr(self, name) for name in STATUS_WIDGET_NAMES},
             )
         self._status_presenter.render(snapshot)
+        # The whole row disappears while every device behaves, so the operator
+        # never has to read the same four "待机" chips again.
+        self.runtime_status_strip.setVisible(
+            any(
+                not chip.isHidden()
+                for chip in (
+                    self.receiver_status_label,
+                    self.camera_status_label,
+                    self.high_speed_status_label,
+                    self.video_assist_status_label,
+                )
+            )
+        )
         self._update_event_header()
         self._update_operator_controls()
 

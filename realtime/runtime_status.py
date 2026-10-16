@@ -143,7 +143,9 @@ class RuntimeStatusPresenter:
             camera_tooltip = f"已配置 {len(configured_sources)} 个普通机位，开始录像后验证画面"
         else:
             camera_text, camera_color = "录像设备: 未配置", "#b54747"
-            camera_state = "error"
+            # Nothing configured is a setup question, not a failure the strip
+            # should keep shouting about.
+            camera_state = "waiting"
             camera_tooltip = "请打开设备设置并选择USB/Type-C摄像头"
         self.widgets['camera_status_label'].setStatus(camera_text, camera_state)
         self.widgets['camera_status_label'].setToolTip(camera_tooltip)
@@ -168,7 +170,9 @@ class RuntimeStatusPresenter:
             video_tip = snapshot.visual_status or "实时视觉检测失败"
         elif snapshot.video_scan_active:
             video_text = f"视频辅助: {anomaly_count} 个异常" if anomaly_count else "视频辅助: 扫描中"
-            video_state = "error" if anomaly_count else "busy"
+            # Candidates land in the problem queue, so scanning and finding are
+            # not alarms: the queue is where the operator reads them.
+            video_state = "busy"
             configured_lines = snapshot.finish_line_count
             video_tip = (
                 f"已配置 {configured_lines} 个机位终点线；只提示异常批次"
@@ -182,7 +186,9 @@ class RuntimeStatusPresenter:
             video_tip = "普通录像运行时辅助扫描器未启动"
         self.widgets['video_assist_status_label'].setStatus(video_text, video_state)
         self.widgets['video_assist_status_label'].setToolTip(video_tip)
-        self.widgets['video_assist_status_label'].setVisible(snapshot.video_assist_enabled)
+        self.widgets['video_assist_status_label'].setVisible(
+            snapshot.video_assist_enabled and video_state == "error"
+        )
         if 'archive_scan_button' in self.widgets:
             archive_mode = snapshot.workspace_mode == "archive" and not recording_active
             archive_scan_available = archive_mode and snapshot.video_assist_enabled
@@ -309,9 +315,12 @@ class RuntimeStatusPresenter:
                     "当前协议没有持续心跳，不能判断发送端是否在线。"
                 )
         else:
+            reviewing_history = snapshot.workspace_mode == "archive" and not recording_active
             self.widgets['receiver_status_label'].setStatus(
                 "CycleRace: 异常" if snapshot.receiver_error else "CycleRace: 未监听",
-                "error",
+                # While reviewing history the live timing source is not needed,
+                # so its absence is a state, not a fault.
+                "waiting" if reviewing_history and not snapshot.receiver_error else "error",
             )
             self.widgets['receiver_status_label'].setStyleSheet("color: #b54747;")
             self.widgets['receiver_status_label'].setToolTip(
@@ -364,7 +373,7 @@ class RuntimeStatusPresenter:
         high_speed_remote = snapshot.high_speed_remote
         if high_speed_root is None:
             self.widgets['high_speed_status_label'].setStatus(
-                "高速摄像: 未配置共享目录", "error"
+                "高速摄像: 未配置共享目录", "waiting"
             )
             self.widgets['high_speed_status_label'].setStyleSheet("color: #b54747;")
         elif high_speed_result.status == "checking":

@@ -1853,6 +1853,9 @@ def test_auto_recording_failure_does_not_drop_live_passage(qapp, tmp_path):
     assert window._runtime_error == "camera unavailable"
     assert window.camera_status_label.text() == "录像设备: 自动启动失败"
     assert window.camera_status_label.toolTip() == "camera unavailable"
+    # A device that is in trouble is exactly what the strip exists for.
+    assert not window.camera_status_label.isHidden()
+    assert not window.runtime_status_strip.isHidden()
     window.close()
 
 
@@ -4115,7 +4118,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
         window.event_path_label.geometry().right()
         < window.beijing_clock_label.geometry().left()
     )
-    assert window.runtime_status_strip.geometry().top() > window.event_name_label.geometry().top()
+    assert window.runtime_status_strip.isHidden()
 
     window.start_recording()
     assert window.recorder.is_running
