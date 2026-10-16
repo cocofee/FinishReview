@@ -1221,8 +1221,12 @@ class ProblemListPanel(QFrame):
         """
 
         item = self.current_item()
-        if not self._big_view and (item is None or not item.evidence.get("frame")):
+        if item is None:
             return
+        # A problem with no frame still opens: the operator pressed F to work on
+        # this problem, so the key must answer.  The big screen says why it is empty
+        # instead of leaving a dead press (operator: "F does not work").
+        frame = dict(item.evidence.get("frame") or {})
         self._big_view = not self._big_view
         self.table.setVisible(not self._big_view)
         self.detail_scroll.setVisible(not self._big_view)
@@ -1243,7 +1247,12 @@ class ProblemListPanel(QFrame):
             self.big_bar.addWidget(self.decision_box)
             self.big_title.setText(f"{item.title} · {self.state(item)}")
             self.decision_box.show()
-            self.jump_requested.emit(dict(item.evidence["frame"]))
+            if frame:
+                self.jump_requested.emit(frame)
+            else:
+                self.big_title.setText(
+                    f"{item.title} · 此疑点没有原帧（录像里没有对应画面）：按芯片信息处理"
+                )
             # The queue is gone from the screen, so the panel keeps the keys.
             self.setFocus()
         else:

@@ -500,12 +500,17 @@ def test_f_enlarges_the_picture_with_the_decisions_traveling_along(qapp, tmp_pat
     QTest.keyClick(panel, Qt.Key_Escape)
     assert panel.table.isVisibleTo(panel)
 
-    # A row with no frame has nothing to enlarge, so F leaves the queue alone.
+    # A row with no frame still opens on F: the press must never look dead, and the
+    # big screen says why it has no picture instead of jumping to one that is not this
+    # crossing's.
     batch_row = next(index for index, item in enumerate(panel.rows) if item.evidence.get("batch_members"))
     assert not panel.rows[batch_row].evidence.get("frame")
     panel.table.setCurrentCell(batch_row, 0)
     QTest.keyClick(panel, Qt.Key_F)
-    assert len(jumps) == 2 and panel.table.isVisibleTo(panel)
+    assert len(jumps) == 2 and not panel.table.isVisibleTo(panel)
+    assert "没有原帧" in panel.big_title.text()
+    QTest.keyClick(panel, Qt.Key_F)
+    assert panel.table.isVisibleTo(panel)
 
     # Enter with nothing standing says what it is for instead of guessing.
     panel.hint.clear()

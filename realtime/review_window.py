@@ -2439,12 +2439,19 @@ class FinishReviewWindow(PassageReviewSurface):
         return self._camera_one_pane() if camera <= 1 else self._pane_for_camera(camera)
 
     def _problem_count_mode_changed(self, counting: bool) -> None:
-        """While the picture is the big one, a click on it counts a person."""
+        """While the picture is the big one, a click on it counts a person.
+
+        A problem without a frame has nothing to count on: what the pane would show
+        belongs to another crossing, so the picture stays out of the counting.
+        """
 
         pane = self._problem_pane()
+        item = self.problem_panel.current_item()
+        has_frame = bool(item is not None and item.evidence.get("frame"))
         if pane is not None:
             pane.video_view.set_count_mode(
-                bool(counting) and getattr(self, "_problem_workbench_active", False)
+                bool(counting) and has_frame
+                and getattr(self, "_problem_workbench_active", False)
             )
 
     def _problem_count_clicked(self, x_normalized: float, y_normalized: float) -> None:
