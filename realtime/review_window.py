@@ -2295,6 +2295,10 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _set_problem_list_layout(self, expanded: bool) -> None:
         self._problem_workbench_active = expanded
+        # Workbench: F belongs to the problem's own picture.  The time rail would
+        # otherwise swallow the press for its own judging window (operator: "F does
+        # not work"), and the press has to land wherever the hands are.
+        self.video_filmstrip.full_race.set_enlarge_key_enabled(not expanded)
         self.setMinimumHeight(700 if expanded else 760)
         self.passages_button.setChecked(not expanded)
         self.problem_panel.card.setVisible(not expanded)
@@ -2405,6 +2409,24 @@ class FinishReviewWindow(PassageReviewSurface):
             self.preview_panel.setVisible(not big)
         QTimer.singleShot(0, self._fit_visible_evidence_views)
         self._problem_count_mode_changed(big)
+
+    def keyPressEvent(self, event) -> None:
+        """F enlarges the picture from whatever corner of the workbench holds the keys.
+
+        The queue and the panes answer F themselves.  A button in the top bar or in
+        the time rail leaves it unhandled, and a press that disappears there reads to
+        the operator as "F does not work" - so the window picks it up.  A field that
+        takes typing keeps the letter, as it must.
+        """
+
+        if (event.key() == Qt.Key_F
+                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
+                and getattr(self, "_problem_workbench_active", False)
+                and self.problem_panel.current_item() is not None):
+            self.problem_panel.toggle_big_view()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _problem_pane(self):
         """The pane the operator judges on: the problem's own camera, else the regular one."""

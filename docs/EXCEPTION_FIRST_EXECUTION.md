@@ -561,6 +561,14 @@ $env:QT_QPA_PLATFORM = 'offscreen'
   （`test_review_window.py`）；数字键的两段式（第一次填依据、`回车`落盘、落盘依据就是该短语、换键
   清掉未确认短语）；批次工具的两段式（未确认不保存、确认后按预设依据落盘）。原有的"必须写依据、
   看不清号码不算依据"规则测试全部保留通过。
+- **F 落在哪里都要管用**（第三轮现场反馈："我按F不管用"）：问题出在按键的落点，不在开关。清单表格、
+  面板、画面本身都答 `F`，但**底部时间胶卷的 `F` 快捷方式（`RaceFilmstripPanel`）会先把键吃掉**去开它
+  自己的判读窗——程序刚打开时焦点正好落在胶卷的按钮上，于是这一按什么也看不见；顶栏按钮（刷新、开始
+  录像）则根本没人处理 `F`。现在：工作台期间胶卷让出这个键（`set_enlarge_key_enabled`），窗口本身也
+  兜住这个键（`FinishReviewWindow.keyPressEvent`），所以清单、画面、顶栏、胶卷上按 `F` 都一样放大、
+  再按收回；只有在号码/依据输入框里 `F` 仍是打字的字母（那里必须能打字）。测试见
+  `test_f_enlarges_the_picture_wherever_the_hands_are` 与
+  `test_the_rail_gives_f_away_when_the_problem_workbench_holds_it`。
 - 仍未做：以上都是离屏测试与代码审查，操作员在真实小屏上的观感、放大后是否真的够看、两段式会不会
   误按，都还没有现场确认。
 

@@ -863,6 +863,18 @@ def test_f_shortcut_opens_selected_original_frame(qapp, tmp_path, manual_worker)
     panel.close()
 
 
+def test_the_rail_gives_f_away_when_the_problem_workbench_holds_it(qapp):
+    """F is the operator's enlarge key; only one place may answer it."""
+
+    panel = RaceFilmstripPanel()
+    assert panel._maximize_shortcut.isEnabled()
+    panel.set_enlarge_key_enabled(False)
+    assert not panel._maximize_shortcut.isEnabled()
+    panel.set_enlarge_key_enabled(True)
+    assert panel._maximize_shortcut.isEnabled()
+    panel.close()
+
+
 @pytest.mark.parametrize("cancel", [None, "page", "invalid_tile", "clear", "failure"])
 def test_f_waits_for_original_frame_and_cancels_stale_requests(qapp, tmp_path, manual_worker, cancel):
     recording = source(tmp_path / "first", duration=60000)

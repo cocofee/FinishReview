@@ -540,6 +540,16 @@ class RaceFilmstripPanel(QWidget):
         self._maximize_shortcut.activated.connect(self._maximize_active_frame)
         self._update_inspection_controls()
 
+    def set_enlarge_key_enabled(self, enabled: bool) -> None:
+        """Whether F here opens the judging window for the active picture.
+
+        In the problem workbench F enlarges the problem's own picture in place, so
+        the rail gives the key away while the queue is on screen; elsewhere the rail
+        keeps its old habit.
+        """
+
+        self._maximize_shortcut.setEnabled(bool(enabled))
+
     def _maximize_active_frame(self):
         if self._pending is not None:
             self._pending_judgment = self._pending
