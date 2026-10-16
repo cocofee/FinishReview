@@ -380,3 +380,24 @@ def test_auto_passed_of_a_closed_batch_member_is_dropped():
     entries = [{"bib": member["bib"], "event_id": member["event_id"], "chip_time_ms": member["chip_ms"],
                 "recorder_ms": member["chip_ms"], "frame": {"camera_index": 1}}]
     assert unambiguous_auto_passed([item], entries) == []
+
+
+def test_the_batch_dialog_offers_the_standing_reason_before_it_asks_for_one(qapp, tmp_path):
+    """Look at the frame, tick the member, press once to fill, once to decide."""
+
+    from realtime.batch_dialog import BATCH_ACTION_REASONS
+
+    item = batch()
+    current = [item]
+    dialog = BatchReviewDialog(tmp_path, item, lambda _id: current[0], lambda: [], lambda frame: None)
+    dialog.table.item(0, 0).setCheckState(Qt.Checked)
+
+    dialog._save("delete")
+    assert not dialog.saved and "依据已填" in dialog.notice.text()
+    assert dialog.reason.text() == BATCH_ACTION_REASONS["delete"]
+
+    dialog._save("delete")
+    assert dialog.saved
+    assert dialog.store.state(item, dialog.members[0]) == "待 CycleRace"
+    assert dialog.store.latest[member_key(item, dialog.members[0])]["reason"] == BATCH_ACTION_REASONS["delete"]
+    dialog.close()

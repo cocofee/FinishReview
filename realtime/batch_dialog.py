@@ -7,6 +7,15 @@ from PyQt5.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit, QPushButto
 from .batch_review import BatchDecisionStore, member_binding
 from .chip_history import format_chip_time
 
+# What the standing reason claims about the frame, per member decision; the
+# operator confirms it with a second press and can edit it before that.
+BATCH_ACTION_REASONS = {
+    "delete": "同一车两块芯片，同一帧压线，建议作废多余记录",
+    "keep": "原帧两车分别过线，两条芯片记录各自有效",
+    "hold": "原帧看不清，留待现场确认",
+    "reopen": "上游记录已变化，重新核对后再判",
+}
+
 
 class BatchReviewDialog(QDialog):
     def __init__(self, directory, batch, current, events, jump, parent=None):
@@ -96,6 +105,13 @@ class BatchReviewDialog(QDialog):
 
     def _save(self, action):
         selected = [m for row, m in enumerate(self.members) if self.table.item(row, 0).checkState() == Qt.Checked]
+        if selected and not self.reason.text().strip() and action in BATCH_ACTION_REASONS:
+            # Same bargain as the problem list: look at the frame, confirm the
+            # standing reason with a second press, rewrite it if you saw otherwise.
+            preset = BATCH_ACTION_REASONS[action]
+            self.reason.setText(preset)
+            self.notice.setText(f"依据已填「{preset}」；再点一次同一个按钮就是确认，改成你看到的情形也可以。")
+            return
         try:
             current = self.current(self.batch.item_id)
             if current is None:

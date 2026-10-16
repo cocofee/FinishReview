@@ -48,6 +48,7 @@ from .problem_items import (
     ACTION_DELETE_EXTRA_CHIP,
     ACTION_LABELS,
     ACTION_NOT_RIDER,
+    ACTION_REASON_PRESETS,
     ACTION_RECORD_BIB,
     ACTION_RIDE_BACK,
     ACTION_SAME_CROSSING,
@@ -150,6 +151,8 @@ class ProblemListPanel(QFrame):
         self._scope = ("", "")
         self._browsing = False
         self._type_filter = ""
+        # The big view stands the queue and the decisions aside; see _toggle_big_view.
+        self._big_view = False
         # Receiver, recorder, sampling, clock and analysis fail separately: a
         # single "video problem" line would hide which of them stopped.
         self.stage_health: dict[str, str] = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
@@ -246,6 +249,7 @@ class ProblemListPanel(QFrame):
         # one key has to work the same wherever the focus sits inside the panel.
         self.table.installEventFilter(self)
         detail_scroll = QScrollArea(splitter)
+        self.detail_scroll = detail_scroll
         detail_scroll.setWidgetResizable(True)
         detail_scroll.setMinimumWidth(260)
         detail = QWidget()
@@ -289,23 +293,24 @@ class ProblemListPanel(QFrame):
         # visible where the evidence is; there is no hidden entry to remember.
         self.batch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MULTI_CHIP], detail)
         self.batch_button.setStyleSheet("font-weight:600;")
-        self.batch_button.setToolTip("打开这条批次，按成员逐条处理（回车）")
+        self.batch_button.setToolTip("打开这条批次，按成员逐条处理；回车是放大看原帧，不会打开它")
         self.batch_button.clicked.connect(self._open_batch)
         self.batch_button.hide()
         self.action_row.addWidget(self.batch_button)
         self.bunch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_BUNCH], detail)
         self.bunch_button.setStyleSheet("font-weight:600;")
-        self.bunch_button.setToolTip("打开这条集团和遮挡时段，逐帧核对整团人数（回车）")
+        self.bunch_button.setToolTip("打开这条集团和遮挡时段，逐帧核对整团人数；回车是放大看原帧，不会打开它")
         self.bunch_button.clicked.connect(self._open_bunch)
         self.bunch_button.hide()
         self.action_row.addWidget(self.bunch_button)
         self.missed_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MISSED], detail)
-        self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除（回车）")
+        self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除")
         self.missed_button.setStyleSheet("font-weight:600;")
         self.missed_button.clicked.connect(self._open_missed)
         self.missed_button.hide()
         self.action_row.addWidget(self.missed_button)
         self.jump_button = QPushButton("跳到原帧", detail)
+        self.jump_button.setToolTip("跳到原帧；回车把画面放大到整个工作区（再按回车或 Esc 收回）")
         self.jump_button.clicked.connect(self._jump)
         self.action_row.addWidget(self.jump_button)
         self.action_buttons: list[QPushButton] = []
@@ -855,6 +860,9 @@ class ProblemListPanel(QFrame):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self._activate_current()
             return
+        if event.key() == Qt.Key_Escape and self._big_view:
+            self._toggle_big_view()
+            return
         if Qt.Key_1 <= event.key() <= Qt.Key_9:
             self._click_action(event.key() - Qt.Key_1 + 1)
             return
@@ -869,21 +877,50 @@ class ProblemListPanel(QFrame):
         return super().eventFilter(watched, event)
 
     def _activate_current(self) -> None:
-        """Enter opens the tool this row is worked in, and its frame when it has none."""
+        """Enter puts the picture first; the row's tool keeps its own button."""
 
-        if self.current_item() is None:
+        item = self.current_item()
+        if item is None:
             return
-        if self.batch_button.isVisibleTo(self):
+        if item.evidence.get("frame"):
+            self._toggle_big_view()
+        elif self.batch_button.isVisibleTo(self):
             self._open_batch()
         elif self.bunch_button.isVisibleTo(self):
             self._open_bunch()
         elif self.missed_button.isVisibleTo(self):
             self._open_missed()
-        elif self.jump_button.isEnabled():
-            self._jump()
         else:
-            self.hint.setText("这条问题没有工具也没有原帧：用数字键或右侧按钮直接处理。")
-        self.table.setFocus()
+            self.hint.setText("这条问题没有原帧也没有工具：用数字键或右侧按钮直接处理。")
+
+    def _toggle_big_view(self) -> None:
+        """Enlarge the crossing in place: no second window over a small screen.
+
+        The frame is what the operator judges from, and on a laptop the queue and
+        the detail pane take most of the width.  The pane keeps its place in the
+        window; only the panes either side of it step aside, so looking stays one
+        key and coming back is the same key (or Esc).
+        """
+
+        item = self.current_item()
+        if not self._big_view and (item is None or not item.evidence.get("frame")):
+            return
+        self._big_view = not self._big_view
+        self.table.setVisible(not self._big_view)
+        self.detail_scroll.setVisible(not self._big_view)
+        if self._big_view:
+            self.jump_requested.emit(dict(item.evidence["frame"]))
+            self.hint.setText("已放大原帧：逐帧看这一处，再按回车或 Esc 回到清单处理。")
+        else:
+            self.table.setFocus()
+            self.hint.setText("已回到清单：1–9 是这条的处理按钮，回车再看一次原帧。")
+
+    def hideEvent(self, event) -> None:
+        # Leaving the workbench must not leave the queue hidden behind a stale
+        # big view, so the panes come back before the panel goes away.
+        if self._big_view:
+            self._toggle_big_view()
+        super().hideEvent(event)
 
     def _click_action(self, number: int) -> None:
         """Digits press the decision buttons of the row on screen, in the order shown."""
@@ -1067,11 +1104,13 @@ class ProblemListPanel(QFrame):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             ) != QMessageBox.Yes:
                 return
-        if action in (ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP) and not reason:
-            self.hint.setText("建议删除需要填写原因。")
-            return
-        if action in (ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_SAME_CROSSING) and not reason:
-            self.hint.setText("排除或确认同一次过线要写明依据；“看不清号码”不能作为排除依据。")
+        if action in ACTION_REASON_PRESETS and not reason:
+            # The frame is what was looked at; the standing reason says which claim
+            # that look makes.  It lands in the field to confirm or rewrite, so the
+            # decision still carries a reason without anyone typing one out.
+            preset = ACTION_REASON_PRESETS[action]
+            self.reason_input.setText(preset)
+            self.hint.setText(f"依据已填「{preset}」；再按一次同一个键就是确认，改成你看到的情形也可以。")
             return
         if action == ACTION_DELETE_EXTRA_CHIP and len(item.bibs) > 1 and bib not in item.bibs:
             self.hint.setText(f"请在号码框填写要删除的芯片号码：{'、'.join(item.bibs)}。")

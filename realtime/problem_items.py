@@ -163,6 +163,17 @@ ACTION_LABELS = {
     ACTION_CHECKED: "已核对",
 }
 
+# Standing reasons for the decisions that must carry one: the operator looks at
+# the frame and confirms what it shows instead of typing it out, and the field
+# stays editable for anything the frame shows differently.
+ACTION_REASON_PRESETS = {
+    ACTION_NOT_RIDER: "原帧是行人或工作人员，不是选手过线",
+    ACTION_RIDE_BACK: "原帧该选手往回骑或推车，不是正常过线",
+    ACTION_SAME_CROSSING: "原帧是同一人的后轮或影子，前轮已在同一帧压线",
+    ACTION_DELETE_CHIP: "同一车两块芯片，同一帧压线",
+    ACTION_DELETE_EXTRA_CHIP: "同一车两块芯片，同一帧压线",
+}
+
 KIND_ACTIONS = {
     KIND_MANUAL_REVIEW: (ACTION_RECORD_BIB, ACTION_NOT_RIDER, ACTION_CHECKED),
     KIND_WAITING: (),

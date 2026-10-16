@@ -21,6 +21,7 @@ from realtime.problem_items import (
     KIND_NOT_ARRIVED,
     KIND_TWO_CHIPS_ONE_CROSSING,
     KIND_UNKNOWN_BIB,
+    ACTION_REASON_PRESETS,
     STATUS_CLOSED_UPSTREAM,
     STATUS_EXCLUDED,
     STATUS_INFO,
@@ -108,7 +109,9 @@ def test_panel_lists_problems_resolves_and_exports(qapp, tmp_path, monkeypatch):
     delete = next(button for button in panel.action_buttons if button.property("problemAction") == "delete_extra_chip")
     panel.bib_input.setText("020")
     delete.click()
-    assert "原因" in panel.hint.text()
+    # An empty reason is offered as the standing phrase, not demanded as typing.
+    assert "依据已填" in panel.hint.text() and panel.reason_input.text()
+    assert panel.state(panel.current_item()).startswith("待处理")
     panel.bib_input.setText("020")
     panel.reason_input.setText("一人带两块芯片")
     delete.click()
@@ -390,8 +393,8 @@ def _row_of(panel, item_id):
     return next(index for index, item in enumerate(panel.rows) if item.item_id == item_id)
 
 
-def test_enter_opens_the_tool_of_the_row_on_screen(qapp, tmp_path, monkeypatch):
-    """The queue is worked one row after another, in time order, mouse untouched."""
+def test_enter_enlarges_the_frame_before_it_decides(qapp, tmp_path, monkeypatch):
+    """One key to a bigger picture and the same key back; no window on window."""
 
     _write_list(tmp_path, _keyboard_items(), [])
     panel = ProblemListPanel()
@@ -401,27 +404,33 @@ def test_enter_opens_the_tool_of_the_row_on_screen(qapp, tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(panel, "_open_batch", lambda: calls.append("batch"))
     monkeypatch.setattr(panel, "_open_bunch", lambda: calls.append("bunch"))
-    monkeypatch.setattr(panel, "_open_missed", lambda: calls.append("missed"))
-    batch_row = next(index for index, item in enumerate(panel.rows) if item.evidence.get("batch_members"))
 
-    for row, expected in ((_row_of(panel, "near:1"), "missed"), (batch_row, "batch"),
-                          (_row_of(panel, "bunch:1"), "bunch")):
-        panel.table.setCurrentCell(row, 0)
-        before = len(calls)
-        QTest.keyClick(panel.table, Qt.Key_Return)  # the table itself holds the focus
-        assert calls[before:] == [expected]
-        before = len(calls)
-        QTest.keyClick(panel, Qt.Key_Return)  # a button or the panel holds it
-        assert calls[before:] == [expected]
+    panel.table.setCurrentCell(_row_of(panel, "near:1"), 0)
+    QTest.keyClick(panel.table, Qt.Key_Return)  # the table itself holds the focus
+    assert jumps == [FRAME] and calls == []
+    assert not panel.table.isVisibleTo(panel) and not panel.detail_scroll.isVisibleTo(panel)
+    QTest.keyClick(panel, Qt.Key_Return)  # a button or the panel holds it
+    assert len(jumps) == 1 and calls == []
+    assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isVisibleTo(panel)
 
-    # A row without a tool is looked at, and one without a frame says so.
-    panel.table.setCurrentCell(_row_of(panel, "unknown:1"), 0)
+    # Esc is the same way back, so the picture never traps the queue.
     QTest.keyClick(panel.table, Qt.Key_Return)
-    assert jumps[-1] == FRAME
+    assert not panel.table.isVisibleTo(panel)
+    QTest.keyClick(panel, Qt.Key_Escape)
+    assert panel.table.isVisibleTo(panel) and len(jumps) == 2
+
+    # A row with no frame has nothing to enlarge, so its tool opens instead.
+    batch_row = next(index for index, item in enumerate(panel.rows) if item.evidence.get("batch_members"))
+    assert not panel.rows[batch_row].evidence.get("frame")
+    panel.table.setCurrentCell(batch_row, 0)
+    QTest.keyClick(panel.table, Qt.Key_Return)
+    assert calls == ["batch"] and len(jumps) == 2
+
+    # A row with neither frame nor tool says so instead of doing nothing.
     panel.table.setCurrentCell(_row_of(panel, "unknown:2"), 0)
     panel.hint.clear()
     QTest.keyClick(panel.table, Qt.Key_Return)
-    assert "没有工具也没有原帧" in panel.hint.text() and len(jumps) == 1
+    assert "没有原帧也没有工具" in panel.hint.text()
 
 
 def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
@@ -434,8 +443,12 @@ def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
     assert [button.property("problemAction") for button in panel.action_buttons][:2] == ["record_bib",
                                                                                          "same_crossing"]
 
+    # The reason is confirmed, not typed: one press fills the standing phrase,
+    # the same press again decides, and the phrase is what gets recorded.
+    near = panel.current_item()
     QTest.keyClick(panel, Qt.Key_2)
-    assert "依据" in panel.hint.text() and not panel.store.resolutions()
+    assert panel.reason_input.text() == ACTION_REASON_PRESETS["same_crossing"]
+    assert "依据已填" in panel.hint.text() and not panel.store.resolutions()
     QTest.keyClick(panel, Qt.Key_1)
     assert "号码" in panel.hint.text()
 
@@ -444,7 +457,6 @@ def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
     QTest.keyClick(panel, Qt.Key_9)
     assert panel.hint.text() == ""
 
-    near = panel.current_item()
-    panel.reason_input.setText("同一人后轮，前轮已在同一帧压线")
     QTest.keyClick(panel, Qt.Key_2)
     assert panel.state(near).startswith("已处理：确认是同一次过线")
+    assert panel.store.resolutions()[0].reason == ACTION_REASON_PRESETS["same_crossing"]
