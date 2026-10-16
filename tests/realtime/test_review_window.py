@@ -353,6 +353,49 @@ def test_workbench_is_default_and_incoming_passages_do_not_take_over(qapp, tmp_p
     window.close()
 
 
+def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path):
+    """The operator's own key, kept as it was: the picture grows where the work is."""
+
+    import json
+    from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        video = tmp_path / "original.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=1_789_600_000_000, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": frame})
+        path = tmp_path / "finish_problems/problem_list.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
+        window.problem_panel.refresh()
+        window.problem_panel.table.setCurrentCell(0, 0)
+        qapp.processEvents()
+
+        # What the pane's F shortcut leads to: no second window while judging.
+        window._toggle_maximized_pane(window.regular_pane)
+        qapp.processEvents()
+        assert window._maximized_window is None
+        assert window.problem_panel._big_view
+        assert not window.problem_panel.table.isVisibleTo(window.problem_panel)
+        assert window.problem_panel.decision_box.parentWidget() is window.problem_panel
+
+        window._toggle_maximized_pane(window.regular_pane)
+        qapp.processEvents()
+        assert not window.problem_panel._big_view
+        assert window.problem_panel.table.isVisibleTo(window.problem_panel)
+        assert window.problem_panel.decision_box.parentWidget() is not window.problem_panel
+    finally:
+        window.close()
+
+
 def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
     window = _window(tmp_path, workbench=True)
     window.resize(1280, 720)

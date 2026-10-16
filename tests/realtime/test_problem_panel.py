@@ -393,44 +393,55 @@ def _row_of(panel, item_id):
     return next(index for index, item in enumerate(panel.rows) if item.item_id == item_id)
 
 
-def test_enter_enlarges_the_frame_before_it_decides(qapp, tmp_path, monkeypatch):
-    """One key to a bigger picture and the same key back; no window on window."""
+def test_f_enlarges_the_picture_with_the_decisions_traveling_along(qapp, tmp_path):
+    """F is the key the operators already use; the decisions come with the picture."""
 
     _write_list(tmp_path, _keyboard_items(), [])
     panel = ProblemListPanel()
     jumps = []
     panel.jump_requested.connect(jumps.append)
     panel.set_workspace(tmp_path)
-    calls = []
-    monkeypatch.setattr(panel, "_open_batch", lambda: calls.append("batch"))
-    monkeypatch.setattr(panel, "_open_bunch", lambda: calls.append("bunch"))
+    near = panel.rows[_row_of(panel, "near:1")]
 
+    head = panel.decision_box.parentWidget()
     panel.table.setCurrentCell(_row_of(panel, "near:1"), 0)
-    QTest.keyClick(panel.table, Qt.Key_Return)  # the table itself holds the focus
-    assert jumps == [FRAME] and calls == []
+    QTest.keyClick(panel, Qt.Key_F)
+    assert jumps == [FRAME]
     assert not panel.table.isVisibleTo(panel) and not panel.detail_scroll.isVisibleTo(panel)
-    QTest.keyClick(panel, Qt.Key_Return)  # a button or the panel holds it
-    assert len(jumps) == 1 and calls == []
-    assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isVisibleTo(panel)
+    # The box stays on screen, now under the picture rather than beside it.
+    assert panel.decision_box.parentWidget() is panel and panel.big_title.text()
+    assert panel.decision_box.isVisibleTo(panel)
 
-    # Esc is the same way back, so the picture never traps the queue.
-    QTest.keyClick(panel.table, Qt.Key_Return)
-    assert not panel.table.isVisibleTo(panel)
+    # Looking and deciding happen in the same view: pick a decision, confirm it.
+    QTest.keyClick(panel, Qt.Key_2)
+    assert panel.reason_input.text() == ACTION_REASON_PRESETS["same_crossing"]
+    QTest.keyClick(panel, Qt.Key_Return)
+    assert panel.state(near).startswith("已处理：确认是同一次过线")
+    assert not panel.table.isVisibleTo(panel)  # deciding keeps the picture up
+
+    # The same key is the way back, and the box returns to its place with it.
+    QTest.keyClick(panel, Qt.Key_F)
+    assert panel.table.isVisibleTo(panel) and panel.decision_box.parentWidget() is head
+    assert panel.detail_layout.indexOf(panel.decision_box) >= 0
+
+    # Esc is the same way back, so a quick look never traps the queue.
+    panel.table.setCurrentCell(_row_of(panel, "unknown:1"), 0)
+    QTest.keyClick(panel, Qt.Key_F)
+    assert len(jumps) == 2 and not panel.table.isVisibleTo(panel)
     QTest.keyClick(panel, Qt.Key_Escape)
-    assert panel.table.isVisibleTo(panel) and len(jumps) == 2
+    assert panel.table.isVisibleTo(panel)
 
-    # A row with no frame has nothing to enlarge, so its tool opens instead.
+    # A row with no frame has nothing to enlarge, so F leaves the queue alone.
     batch_row = next(index for index, item in enumerate(panel.rows) if item.evidence.get("batch_members"))
     assert not panel.rows[batch_row].evidence.get("frame")
     panel.table.setCurrentCell(batch_row, 0)
-    QTest.keyClick(panel.table, Qt.Key_Return)
-    assert calls == ["batch"] and len(jumps) == 2
+    QTest.keyClick(panel, Qt.Key_F)
+    assert len(jumps) == 2 and panel.table.isVisibleTo(panel)
 
-    # A row with neither frame nor tool says so instead of doing nothing.
-    panel.table.setCurrentCell(_row_of(panel, "unknown:2"), 0)
+    # Enter with nothing standing says what it is for instead of guessing.
     panel.hint.clear()
-    QTest.keyClick(panel.table, Qt.Key_Return)
-    assert "没有原帧也没有工具" in panel.hint.text()
+    QTest.keyClick(panel, Qt.Key_Return)
+    assert "回车确认" in panel.hint.text()
 
 
 def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
@@ -444,13 +455,15 @@ def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
                                                                                          "same_crossing"]
 
     # The reason is confirmed, not typed: one press fills the standing phrase,
-    # the same press again decides, and the phrase is what gets recorded.
+    # Enter decides, and the phrase is what gets recorded.
     near = panel.current_item()
     QTest.keyClick(panel, Qt.Key_2)
     assert panel.reason_input.text() == ACTION_REASON_PRESETS["same_crossing"]
     assert "依据已填" in panel.hint.text() and not panel.store.resolutions()
+
+    # Changing the decision drops the untouched phrase instead of deciding under it.
     QTest.keyClick(panel, Qt.Key_1)
-    assert "号码" in panel.hint.text()
+    assert panel.reason_input.text() == "" and "号码" in panel.hint.text()
 
     # A digit with no button behind it decides nothing.
     panel.hint.clear()
@@ -458,5 +471,6 @@ def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
     assert panel.hint.text() == ""
 
     QTest.keyClick(panel, Qt.Key_2)
+    QTest.keyClick(panel, Qt.Key_Return)
     assert panel.state(near).startswith("已处理：确认是同一次过线")
     assert panel.store.resolutions()[0].reason == ACTION_REASON_PRESETS["same_crossing"]

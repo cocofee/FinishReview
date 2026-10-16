@@ -9289,6 +9289,14 @@ class PassageReviewSurface(QDialog):
         QTimer.singleShot(0, self._fit_visible_evidence_views)
 
     def _toggle_maximized_pane(self, pane: PassageEvidencePane) -> None:
+        if getattr(self, "_problem_workbench_active", False) and not self._uses_popup_judging():
+            # In the problem workbench the picture grows in place: the queue and the
+            # decisions come along with it, so a small screen never gets a second
+            # window to manage while looking at one crossing.
+            panel = getattr(self, "problem_panel", None)
+            if panel is not None:
+                panel.toggle_big_view()
+                return
         if self._maximized_pane is pane and len(self._maximized_hosted_panes) == 1:
             self._restore_maximized_pane()
             return

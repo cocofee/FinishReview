@@ -151,8 +151,11 @@ class ProblemListPanel(QFrame):
         self._scope = ("", "")
         self._browsing = False
         self._type_filter = ""
-        # The big view stands the queue and the decisions aside; see _toggle_big_view.
+        # The big view gives the picture the room of the queue; see toggle_big_view.
         self._big_view = False
+        # The action whose standing reason is already in the field, waiting for a
+        # second press of the same key or Enter to be committed; see _resolve.
+        self._pending_action = ""
         # Receiver, recorder, sampling, clock and analysis fail separately: a
         # single "video problem" line would hide which of them stopped.
         self.stage_health: dict[str, str] = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
@@ -166,6 +169,9 @@ class ProblemListPanel(QFrame):
         self._draft_timer.setSingleShot(True)
         self._draft_timer.setInterval(400)
         self._draft_timer.timeout.connect(self.save_drafts)
+        # The panel itself can hold the focus: in the big view the queue is out of
+        # sight and the keys still have to reach the panel from anywhere over it.
+        self.setFocusPolicy(Qt.StrongFocus)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(4)
@@ -276,57 +282,69 @@ class ProblemListPanel(QFrame):
         self.filmstrip.setToolTip("前后各约 1 秒，每 0.25 秒一张")
         images.addWidget(self.filmstrip, 1)
         detail_layout.addLayout(images)
-        inputs = QVBoxLayout()
-        self.bib_input = QLineEdit(detail)
+        # The decisions live in one movable box: when the picture takes the whole
+        # area the box travels with it, so the operator looks and decides in the
+        # same view instead of walking back to the list between the two.
+        self.decision_box = QWidget(detail)
+        self.decision_layout = QVBoxLayout(self.decision_box)
+        self.decision_layout.setContentsMargins(0, 0, 0, 0)
+        self.bib_input = QLineEdit(self.decision_box)
         self.bib_input.setPlaceholderText("号码（补录 / 要删除 / 改成）")
-        inputs.addWidget(self.bib_input)
-        self.reason_input = QLineEdit(detail)
+        self.decision_layout.addWidget(self.bib_input)
+        self.reason_input = QLineEdit(self.decision_box)
         self.reason_input.setPlaceholderText("原因")
         reason_row = QHBoxLayout()
         reason_row.addWidget(self.reason_input, 1)
-        inputs.addLayout(reason_row)
+        self.decision_layout.addLayout(reason_row)
         self.bib_input.textChanged.connect(self._remember_draft)
         self.reason_input.textChanged.connect(self._remember_draft)
-        detail_layout.addLayout(inputs)
         self.action_row = QVBoxLayout()
         # The class entry sits above the decisions, so the tool for this problem is
         # visible where the evidence is; there is no hidden entry to remember.
-        self.batch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MULTI_CHIP], detail)
+        self.batch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MULTI_CHIP], self.decision_box)
         self.batch_button.setStyleSheet("font-weight:600;")
-        self.batch_button.setToolTip("打开这条批次，按成员逐条处理；回车是放大看原帧，不会打开它")
+        self.batch_button.setToolTip("打开这条批次，按成员逐条处理；回车只管确认依据，不会打开它")
         self.batch_button.clicked.connect(self._open_batch)
         self.batch_button.hide()
         self.action_row.addWidget(self.batch_button)
-        self.bunch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_BUNCH], detail)
+        self.bunch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_BUNCH], self.decision_box)
         self.bunch_button.setStyleSheet("font-weight:600;")
-        self.bunch_button.setToolTip("打开这条集团和遮挡时段，逐帧核对整团人数；回车是放大看原帧，不会打开它")
+        self.bunch_button.setToolTip("打开这条集团和遮挡时段，逐帧核对整团人数；回车只管确认依据，不会打开它")
         self.bunch_button.clicked.connect(self._open_bunch)
         self.bunch_button.hide()
         self.action_row.addWidget(self.bunch_button)
-        self.missed_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MISSED], detail)
+        self.missed_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MISSED], self.decision_box)
         self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除")
         self.missed_button.setStyleSheet("font-weight:600;")
         self.missed_button.clicked.connect(self._open_missed)
         self.missed_button.hide()
         self.action_row.addWidget(self.missed_button)
-        self.jump_button = QPushButton("跳到原帧", detail)
-        self.jump_button.setToolTip("跳到原帧；回车把画面放大到整个工作区（再按回车或 Esc 收回）")
+        self.jump_button = QPushButton("跳到原帧", self.decision_box)
+        self.jump_button.setToolTip("跳到原帧；按 F 把画面放大到整个工作区（再按 F 或 Esc 收回）")
         self.jump_button.clicked.connect(self._jump)
         self.action_row.addWidget(self.jump_button)
         self.action_buttons: list[QPushButton] = []
-        self.reopen_button = QPushButton("重新处理", detail)
+        self.reopen_button = QPushButton("重新处理", self.decision_box)
         self.reopen_button.clicked.connect(self._reopen)
         self.action_row.addWidget(self.reopen_button)
-        self.hold_button = QPushButton("暂存", detail)
+        self.hold_button = QPushButton("暂存", self.decision_box)
         self.hold_button.setToolTip("填写原因后暂存，不标记为已解决；可从暂存清单恢复")
         self.hold_button.clicked.connect(self._hold)
         reason_row.addWidget(self.hold_button)
         self.action_row.addStretch(1)
-        detail_layout.addLayout(self.action_row)
+        self.decision_layout.addLayout(self.action_row)
+        self.detail_layout = detail_layout
+        detail_layout.addWidget(self.decision_box)
         detail_layout.addStretch(1)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
+        # The line the big view hands the decisions to; empty until then.
+        self.big_title = QLabel("", self)
+        self.big_title.setStyleSheet("font-weight: 600;")
+        self.big_bar = QHBoxLayout()
+        self.big_bar.addWidget(self.big_title)
+        layout.addLayout(self.big_bar)
         self.hint = QLabel("", self)
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color: #667085; font-size: 9pt;")
@@ -403,6 +421,7 @@ class ProblemListPanel(QFrame):
         self.items, self.rows = [], []
         self.bib_input.clear()
         self.reason_input.clear()
+        self._pending_action = ""
         self.table.blockSignals(True)
         self.table.setRowCount(0)
         self.table.blockSignals(False)
@@ -441,6 +460,7 @@ class ProblemListPanel(QFrame):
         self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self.bib_input.clear()
         self.reason_input.clear()
+        self._pending_action = ""
         self.refresh()
         if self.current_item() is None:
             self.current_changed.emit(None)
@@ -750,6 +770,9 @@ class ProblemListPanel(QFrame):
             self.bib_input.blockSignals(False)
             self.reason_input.blockSignals(False)
             self._browsing = False
+            # A standing reason belongs to the row that was on screen; another row
+            # starts the two-stage bargain over instead of inheriting the claim.
+            self._pending_action = ""
         for button in self.action_buttons:
             self.action_row.removeWidget(button)
             button.deleteLater()
@@ -757,6 +780,9 @@ class ProblemListPanel(QFrame):
         self.card.clear()
         self.filmstrip.clear()
         if item is None:
+            if self._big_view:
+                # Nothing left to enlarge: the emptied queue takes its panes back.
+                self.toggle_big_view()
             self.batch_button.hide()
             self.title.setText("选择一条问题查看过线卡片")
             self.detail.setText("")
@@ -780,9 +806,12 @@ class ProblemListPanel(QFrame):
         self.bib_input.setVisible(not is_bunch and batch is None)
         self.reason_input.setVisible(True)
         state = self.state(item)
-        self.title.setText(
+        headline = (
             f"{item.title} · {format_chip_time(item.chip_time_ms) if item.chip_time_ms else '--'} · {state}"
         )
+        self.title.setText(headline)
+        # The big view shows the same row without the list; keep it named there too.
+        self.big_title.setText(headline)
         detail = item.detail + (f"\n{item.status_note}" if item.status_note else "")
         bike = item.evidence.get("bike")
         if bike:
@@ -857,49 +886,55 @@ class ProblemListPanel(QFrame):
         everything else — a button, the panel itself — reaches this handler.
         """
 
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            self._activate_current()
-            return
-        if event.key() == Qt.Key_Escape and self._big_view:
-            self._toggle_big_view()
-            return
-        if Qt.Key_1 <= event.key() <= Qt.Key_9:
-            self._click_action(event.key() - Qt.Key_1 + 1)
-            return
-        super().keyPressEvent(event)
+        if not self._queue_key(event):
+            super().keyPressEvent(event)
 
     def eventFilter(self, watched, event):
-        # The table answers Enter with its own activation and never lets it out.
+        # The table answers printable keys with its own search and Enter with its own
+        # activation, so the queue's keys are routed before it can take them.
         if (watched is self.table and event.type() == QEvent.KeyPress
-                and event.key() in (Qt.Key_Return, Qt.Key_Enter)):
-            self._activate_current()
+                and self._queue_key(event)):
             return True
         return super().eventFilter(watched, event)
 
-    def _activate_current(self) -> None:
-        """Enter puts the picture first; the row's tool keeps its own button."""
+    def _queue_key(self, event) -> bool:
+        """Answer the keys that work the queue; True when this press is one of them."""
 
-        item = self.current_item()
-        if item is None:
+        if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return False
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self._confirm_pending()
+            return True
+        if key == Qt.Key_F:
+            # Enlarging has always been F; the queue keeps the key and only changes
+            # where the room comes from — the panes either side, not a second window.
+            self.toggle_big_view()
+            return True
+        if key == Qt.Key_Escape and self._big_view:
+            self.toggle_big_view()
+            return True
+        if Qt.Key_1 <= key <= Qt.Key_9:
+            self._click_action(key - Qt.Key_1 + 1)
+            return True
+        return False
+
+    def _confirm_pending(self) -> None:
+        """Enter confirms the decision whose standing reason is already in the field."""
+
+        if not self._pending_action:
+            self.hint.setText("回车确认已填依据的处理；先用数字键选一项，依据会自动填好。")
             return
-        if item.evidence.get("frame"):
-            self._toggle_big_view()
-        elif self.batch_button.isVisibleTo(self):
-            self._open_batch()
-        elif self.bunch_button.isVisibleTo(self):
-            self._open_bunch()
-        elif self.missed_button.isVisibleTo(self):
-            self._open_missed()
-        else:
-            self.hint.setText("这条问题没有原帧也没有工具：用数字键或右侧按钮直接处理。")
+        action, self._pending_action = self._pending_action, ""
+        self._resolve(action)
 
-    def _toggle_big_view(self) -> None:
-        """Enlarge the crossing in place: no second window over a small screen.
+    def toggle_big_view(self) -> None:
+        """Enlarge the crossing in place, decisions and all, on one screen.
 
         The frame is what the operator judges from, and on a laptop the queue and
         the detail pane take most of the width.  The pane keeps its place in the
-        window; only the panes either side of it step aside, so looking stays one
-        key and coming back is the same key (or Esc).
+        window; only the panes either side step aside, and the decision box moves
+        down with the picture, so looking and deciding never need two windows.
         """
 
         item = self.current_item()
@@ -909,17 +944,26 @@ class ProblemListPanel(QFrame):
         self.table.setVisible(not self._big_view)
         self.detail_scroll.setVisible(not self._big_view)
         if self._big_view:
+            self.detail_layout.removeWidget(self.decision_box)
+            self.big_bar.addWidget(self.decision_box)
+            self.big_title.setText(f"{item.title} · {self.state(item)}")
+            self.decision_box.show()
             self.jump_requested.emit(dict(item.evidence["frame"]))
-            self.hint.setText("已放大原帧：逐帧看这一处，再按回车或 Esc 回到清单处理。")
+            # The queue is gone from the screen, so the panel keeps the keys.
+            self.setFocus()
+            self.hint.setText("已放大原帧：1–9 直接处理这条，回车确认依据，F 或 Esc 回到清单。")
         else:
+            self.big_bar.removeWidget(self.decision_box)
+            # Back where it lives, above the trailing stretch of the detail pane.
+            self.detail_layout.insertWidget(self.detail_layout.count() - 1, self.decision_box)
             self.table.setFocus()
-            self.hint.setText("已回到清单：1–9 是这条的处理按钮，回车再看一次原帧。")
+            self.hint.setText("已回到清单：1–9 是这条的处理按钮，回车确认依据，F 再看大图。")
 
     def hideEvent(self, event) -> None:
         # Leaving the workbench must not leave the queue hidden behind a stale
-        # big view, so the panes come back before the panel goes away.
+        # big view, so the panes and the decisions come back before it goes away.
         if self._big_view:
-            self._toggle_big_view()
+            self.toggle_big_view()
         super().hideEvent(event)
 
     def _click_action(self, number: int) -> None:
@@ -1092,6 +1136,15 @@ class ProblemListPanel(QFrame):
             return
         bib = self.bib_input.text().strip()
         reason = self.reason_input.text().strip()
+        standing = ACTION_REASON_PRESETS.get(self._pending_action)
+        if standing and action != self._pending_action and reason == standing:
+            # A key other than the one that filled the field means the operator
+            # changed their mind: drop the untouched standing reason rather than
+            # let it ride along with a decision they did not make.  This comes before
+            # the per-action checks so the field never claims what they did not pick.
+            reason = ""
+            self.reason_input.clear()
+            self._pending_action = ""
         if action == ACTION_RECORD_BIB:
             if not bib:
                 self.hint.setText("认号补录需要先填写号码牌上的号码。")
@@ -1109,6 +1162,7 @@ class ProblemListPanel(QFrame):
             # that look makes.  It lands in the field to confirm or rewrite, so the
             # decision still carries a reason without anyone typing one out.
             preset = ACTION_REASON_PRESETS[action]
+            self._pending_action = action
             self.reason_input.setText(preset)
             self.hint.setText(f"依据已填「{preset}」；再按一次同一个键就是确认，改成你看到的情形也可以。")
             return
@@ -1131,6 +1185,7 @@ class ProblemListPanel(QFrame):
             return
         self.bib_input.clear()
         self.reason_input.clear()
+        self._pending_action = ""
         self._held.pop(item.item_id, None)
         self._operator_items[item.item_id] = replace(item, evidence=dict(item.evidence, operator_scope=self._scope,
                                                                        operator_settings_token=operator_token)).to_payload()
@@ -1138,8 +1193,9 @@ class ProblemListPanel(QFrame):
         self.hint.setText(f"已记录：{ACTION_LABELS.get(action, '重新处理')}。")
         self._render()
         # The list drops the decided row and lands back on the oldest one; keep the
-        # queue under the fingers so the next row is one Down away.
-        self.table.setFocus()
+        # queue under the fingers so the next row is one Down away.  In the big view
+        # the queue is hidden, so the keys stay with the panel that is on screen.
+        (self.setFocus if self._big_view else self.table.setFocus)()
 
     def export(self) -> Optional[dict]:
         if self.store is None or self.problem_dir is None:
