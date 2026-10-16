@@ -41,6 +41,7 @@ from .problem_items import (
 
 JOURNAL_NAME = "bunch_reviews.jsonl"
 PROBLEM_LIST_NAME = "finish_problems/problem_list.json"
+CROSSINGS_NAME = "finish_problems/crossings_camera{}.json"
 
 # A counted person is on the frame when the camera and the moment agree; a
 # retained copy of the same actual frame (extra metadata, a rebuilt stamp) also
@@ -74,6 +75,37 @@ def load_child_items(workspace: Path, group_id: str) -> list[dict]:
             if child.get("evidence", {}).get("group") == group_id]
 
 
+# The detection run writes one file per camera; it is the only place that keeps
+# every person seen on the line, so both reviews read it back. Parsing is worth
+# a cache: the file holds a whole session and every opened problem asks again.
+_DETECTIONS: dict[tuple, list[dict] | None] = {}
+
+
+def detected_crossings(workspace: Path, camera: int) -> list[dict] | None:
+    """Every rider-like crossing the analysis detected on this camera's line.
+
+    ``None`` means this workspace has no detection output at all (a group that
+    was never analysed, or a file that can no longer be read) — different from
+    an empty list, which is a line where nobody came over.
+    """
+
+    path = Path(workspace) / CROSSINGS_NAME.format(int(camera))
+    try:
+        stamp = (str(path), path.stat().st_mtime_ns, path.stat().st_size)
+    except OSError:
+        return None
+    if stamp not in _DETECTIONS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            crossings: list[dict] | None = [entry for entry in payload["crossings"] if isinstance(entry, dict)]
+        except (OSError, ValueError, TypeError, KeyError):
+            crossings = None
+        if len(_DETECTIONS) > 4:
+            _DETECTIONS.clear()
+        _DETECTIONS[stamp] = crossings
+    return _DETECTIONS[stamp]
+
+
 @dataclass(frozen=True)
 class BunchChip:
     event_id: str
@@ -104,6 +136,29 @@ class BunchContext:
         """Navigation hints for this context; decisions read the list fresh."""
 
         return load_child_items(self.workspace, self.item.item_id)
+
+    @property
+    def detected(self) -> list[dict]:
+        """The people detection found inside this group's own period.
+
+        Detection is the only record of everyone the camera saw on the line:
+        the chips only account for the riders wearing one, and the operator's
+        counts only for the ones they clicked. Each entry keeps the moment and
+        whether the view was blocked when it happened. Read fresh — a running
+        analysis may be writing this file while the list is already open.
+        """
+
+        people = []
+        for entry in detected_crossings(self.workspace, self.camera) or []:
+            try:
+                recorder_ms = int(entry["recorder_ms"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if self.start_ms <= recorder_ms <= self.end_ms:
+                people.append({"recorder_ms": recorder_ms,
+                               "in_obstruction": bool(entry.get("in_obstruction"))})
+        people.sort(key=lambda entry: entry["recorder_ms"])
+        return people
 
     @property
     def signature(self) -> str:
@@ -476,15 +531,22 @@ def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: in
             "bias_ms": bias, "lone_count": len(lone), "ambiguous": ambiguous}
 
 
-def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict, fully_viewed: bool) -> str:
-    if not fully_viewed:
-        return "请逐帧查看完整团段后，勾选“已看完整团”。"
+def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) -> str:
+    """What still stands between this count and a closed group.
+
+    数到的人数就是判据：画面点到的人和芯片记录一一对上（多少对多少，不看前后
+    顺序），这一团就成立。剩下要填的是为了把漏读的人交给 CycleRace——多出来
+    的那位必须有号码，才补得进去。
+    """
+
     active = [mark for mark in marks if not is_excluded(mark)]
     if not active:
         return "请先在原画面点击每位压线者计数。"
     bibs = [m.get("bib", "").strip() for m in active if m.get("bib", "").strip()]
     if len(bibs) != len(set(bibs)):
         return "同一号码被填写在多人上，请先核对并修正。"
+    if len(active) == len(chips):
+        return ""  # 总数已对上；逐人时间对应只作参考，不另设完成门槛。
     if result["missing"]:
         return "仍有芯片没有对应的计数，请补查原帧；无法确认时保存进度，保留待处理。"
     if any(not e["bib"] or e["chip_time_ms"] is None for e in result["extras"]):
@@ -527,13 +589,9 @@ class BunchReviewStore:
         if completed:
             if context.gaps:
                 raise ValueError("原录像存在缺口，不能确认本团已完整核对。")
-            if viewed_ranges is not None and uncovered_intervals(context.start_ms, context.end_ms, viewed_ranges, tolerance=100):
-                raise ValueError("仍有未查看范围，不能只查看局部候选就关闭整团。")
-            if pending_member_decisions(context):
-                raise ValueError("仍有成员建议待交接、暂存或需重查，整团不能确认完成。")
-            if unresolved_crossing_conflicts(context, marks, result):
-                raise ValueError("仍有未核清的过线疑点；人数相等不能代替核对双芯片或漏读，请处理相关疑点或认号。")
-            issue = completion_issue(context.chips, marks, result, fully_viewed)
+            # 人数对上就是对的：孩子疑点（双芯片、漏读）各自是表里的一行，
+            # 由操作员在那一行上判，不再拦住这一团的确认。
+            issue = completion_issue(context.chips, marks, result)
             if issue:
                 raise ValueError(issue)
         record = {"schema_version": 1, "item_id": context.item.item_id, "signature": context.signature,
@@ -579,9 +637,10 @@ class BunchReviewStore:
             # Recompute from the saved evidence so stale cached extras cannot
             # reintroduce an excluded person or an incomplete group's suggestions.
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
-            if (unresolved_crossing_conflicts(context, record["marks"], result)
-                    or completion_issue(context.chips, record["marks"], result, record.get("fully_viewed", False))):
+            if completion_issue(context.chips, record["marks"], result):
                 continue
+            if rider_count(record["marks"]) == len(context.chips):
+                continue  # 数量相等的集团只完成点数，不把暂未对上的时间参考导出成漏读。
             for extra in result["extras"]:
                 mark = record["marks"][extra["mark"]]
                 # Every missed rider keeps its own frame, time and bracketing

@@ -58,6 +58,7 @@ from realtime.review_window import (
     FinishReviewWindow,
 )
 from realtime.video_timeline import DEFAULT_CLOCK_SOURCE, VideoTimelineStore
+from realtime.workspace_context import save_workspace_mode
 
 
 @pytest.fixture(scope="module")
@@ -390,7 +391,8 @@ def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path
         assert window._maximized_window is None
         assert window.problem_panel._big_view
         assert not window.problem_panel.table.isVisibleTo(window.problem_panel)
-        assert window.problem_panel.decision_box.parentWidget() is window.problem_panel
+        # 判读那一栏留在画面旁边：顺序与芯片时间合在一张表，卡片图片让开。
+        assert window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         # The time rail stands aside so the 4:3 crossing can actually grow, and the
         # frame is fitted to the room it just gained.
         assert not window.preview_panel.isVisibleTo(window)
@@ -407,7 +409,7 @@ def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path
         qapp.processEvents()
         assert not window.problem_panel._big_view
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
-        assert window.problem_panel.decision_box.parentWidget() is not window.problem_panel
+        assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.preview_panel.isVisibleTo(window)
         assert window.regular_pane.height() == before
     finally:
@@ -483,11 +485,66 @@ def test_clicking_the_enlarged_picture_counts_one_person_per_click(qapp, tmp_pat
         window.close()
 
 
-def test_a_normal_single_is_a_card_that_is_reviewed_not_counted(qapp, tmp_path):
-    """Normal riders get a card to reopen, and never become a manual task."""
+def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path):
+    import json
+
+    from PyQt5.QtGui import QImage
+    from realtime.problem_items import CATEGORY_VIDEO, KIND_NO_CHIP_CROSSING, ProblemItem
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        video = tmp_path / "original.mkv"
+        video.write_bytes(b"video")
+        start = 1_789_600_000_000
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        early = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        late = dict(early, position_ms=3000, frame_index=75)
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": early})
+        path = tmp_path / "finish_problems/problem_list.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
+        panel = window.problem_panel
+        panel.refresh()
+        window._open_problem_frame(early)
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+        panel.toggle_big_view()
+        panel.add_mark(.3, .5, start + 3000, late)
+        panel.add_mark(.4, .5, start + 2000, early)
+        panel.add_mark(.6, .5, start + 2000, early)
+
+        assert [panel.count_table.item(row, 0).text() for row in range(3)] == ["1 同时", "1 同时", "3"]
+        overlays = window._problem_count_overlays(pane)
+        assert [(overlay[0], overlay[2]) for overlay in overlays] == [(.4, "1 同时"), (.6, "1 同时")]
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 3000, 75)
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["3"]
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
+        assert not window._problem_count_overlays(pane)
+
+        panel._exclude_mark(1, "工作人员")
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["排除 已排除：工作人员", "1"]
+        assert [panel.count_table.item(row, 0).text() for row in range(3)] == ["排除", "1", "2"]
+        assert [mark["recorder_ms"] for mark in panel.current_marks()] == [start + 3000, start + 2000, start + 2000]
+    finally:
+        window.close()
+
+
+def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_path):
+    """正常单人只留一行过线记录：翻出来是复查原帧，永远不会变成待处理。"""
 
     import json
     from PyQt5.QtGui import QImage
+
+    from realtime.problem_items import KIND_AUTO_PASSED
 
     window = _window(tmp_path, workbench=True)
     try:
@@ -513,24 +570,24 @@ def test_a_normal_single_is_a_card_that_is_reviewed_not_counted(qapp, tmp_path):
         window._refresh_crossing_cards()
         qapp.processEvents()
 
-        card_id = next(iter(window._normal_crossing_cards))
-        assert window.crossing_cards.list.count() == 1
-        assert "已自动对应" in window.crossing_cards.list.item(0).text()
-        assert not window.problem_panel.rows  # a normal rider is nobody's task
+        assert not window.problem_panel.rows  # 待处理里没有他：芯片已经答过
+        window.problem_panel.queue_filter.setCurrentIndex(3)  # 「全部」按时间列出整场
+        auto = [item for item in window.problem_panel.rows if item.kind == KIND_AUTO_PASSED]
+        assert len(auto) == 1
+        qapp.processEvents()
 
-        # Opening the card shows the original frame and says whose crossing it is.
-        window._select_crossing_card(card_id)
+        # 点开这一行就是打开那条过线的原帧，并且说明这是复查。
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         qapp.processEvents()
-        assert window._opened_normal_crossing == card_id
+        assert window._opened_normal_crossing == auto[0].item_id
         assert "057" in window.problem_panel.hint.text()
 
-        # Clicking that crossing is a review, not a count: nothing is invented.
+        # 点画面是复查，不是计数：什么新问题都不会冒出来。
         window._problem_count_clicked(0.5, 0.5, pane)
         assert "已自动对应" in window.problem_panel.hint.text()
         assert not window.problem_panel.current_marks()
-        assert not window.problem_panel.rows
+        assert [item.item_id for item in window.problem_panel.rows] == [auto[0].item_id]
     finally:
         window.close()
 
@@ -918,7 +975,8 @@ def test_problem_list_toggle_restores_layout_without_filtering_passages(qapp, tm
             assert window.review_content_splitter.widget(1) is window.preview_panel
             assert window.problem_panel.splitter.widget(1) is window.evidence_splitter
             assert window.table.isHidden()
-            assert window.problem_panel.bunch_button.text() == "打开集团逐帧核对"
+            # 集团不再另开窗口：判读栏下面那条刻度就是集团核对。
+            assert window.problem_panel.timeline.parent() is window.problem_panel
             window._on_clock_tick()
             assert [event.event_id for event in window._visible_events] == ["visible"]
             window.problem_list_button.click()
@@ -1646,7 +1704,8 @@ def test_opening_saved_event_isolates_live_data_and_returns_to_current_event(
     assert len(window.timeline_store.segments()) == 1
     assert window._receiver is receiver
     assert receiver.is_running and not receiver.stopped
-    assert not window.record_button.isEnabled()
+    assert window.record_button.isEnabled()
+    assert window.record_button.text() == "返回现场"
     assert saved_settings == []
 
     live_event = _event(event_id="live-passage", race_id=live_metadata.race_id)
@@ -1688,6 +1747,186 @@ def test_opening_saved_event_isolates_live_data_and_returns_to_current_event(
     assert window.record_button.isEnabled()
     assert saved_settings == []
     window.close()
+
+
+def _archived_field_event(root, name="古浪公路赛", race_id="race-gulang"):
+    """A finished race opened from disk, as the field finds it before a start."""
+
+    event_dir = root / name
+    event_dir.mkdir(parents=True)
+    PassageEventStore(event_dir / "cyclerace_passage_events.jsonl").append(
+        _event(event_id="yesterday-read", race_id=race_id)
+    )
+    RaceMetadataStore(event_dir / "cyclerace_race_metadata.json").store(
+        RaceMetadata(race_id=race_id, stage_id="stage-1", revision=1, emitted_at_ms=1,
+                     race_name=name, stage_name="终点")
+    )
+    save_workspace_mode(root, event_dir, "archive")
+    return event_dir
+
+
+def test_returning_to_the_field_needs_no_timing_data_and_starts_recording(qapp, tmp_path):
+    root = tmp_path / "events"
+    event_dir = _archived_field_event(root)
+    window = _window(root)
+    try:
+        assert window._workspace_mode == "archive"
+        assert window.record_button.text() == "返回现场"
+
+        # 计时设备空闲：收件箱还没有本次赛事的任何正式信息。
+        assert window._receiver_metadata_store.current() is None
+        assert window._received_event_candidates() == ()
+        assert window._return_to_live_event()
+
+        assert window._workspace_mode == "live"
+        assert window.output_dir == event_dir.resolve()
+        assert window._current_metadata().race_id == "race-gulang"
+        assert window.record_button.text() == "开始录像"
+
+        window.start_recording()
+
+        assert window._recording_any_active()
+        panel = window.video_filmstrip.full_race
+        assert panel.scope_combo.currentData() == "current"
+        assert panel._recording_start_ms is not None
+        assert window.passage_store.journal_path.parent == event_dir.resolve()
+    finally:
+        window.stop_recording()
+        window.close()
+
+
+def test_returning_to_the_field_without_any_race_uses_an_isolated_folder(qapp, tmp_path):
+    root = tmp_path / "events"
+    history = root / "旧赛事"
+    history.mkdir(parents=True)
+    passages_path = history / "cyclerace_passage_events.jsonl"
+    passages = PassageEventStore(passages_path)
+    # 两个赛段混在同一个旧目录里：没有唯一赛事可以当作本次现场赛事。
+    passages.append(_event(event_id="old-1", race_id="race-old"))
+    passages.append(_event(event_id="old-2", race_id="race-other"))
+    before = passages_path.read_bytes()
+    save_workspace_mode(root, history, "archive")
+
+    window = _window(root)
+    try:
+        assert window._workspace_mode == "archive"
+        assert window._current_metadata() is None
+
+        assert window._return_to_live_event()
+
+        assert window._workspace_mode == "live"
+        assert window.output_dir.parent == root.resolve()
+        assert window.output_dir != history.resolve()
+        window.start_recording()
+        assert window.passage_store.journal_path.parent == window.output_dir
+        assert passages_path.read_bytes() == before
+        field_dir = window.output_dir
+    finally:
+        window.stop_recording()
+        window.close()
+    # 显式返回现场后重启仍停在这一处待机，不被旧目录的历史推断拉回历史查看。
+    restored = _window(root)
+    try:
+        assert restored._workspace_mode == "live"
+        assert restored.output_dir == field_dir
+    finally:
+        restored.close()
+
+
+def test_clearing_the_race_data_removes_test_readings_and_keeps_settings(qapp, tmp_path, monkeypatch):
+    root = tmp_path / "events"
+    window = _window(root)
+    monkeypatch.setattr(QMessageBox, "warning",
+                        lambda _parent, title, message: pytest.fail(f"清空时不应弹出警告：{title} {message}"))
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    try:
+        metadata = RaceMetadata(race_id="race-live", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                                race_name="本场比赛", stage_name="终点")
+        assert window._activate_cyclerace_workspace(metadata)
+        event_dir = window.output_dir
+        window.passage_store.append(_event(event_id="test-read", race_id="race-live"))
+        window._receiver_passage_store.append(_event(event_id="test-inbox", race_id="race-live"))
+        window.set_finish_line_roi(2, (0.2, 0.1, 0.4, 0.9))
+        problems = event_dir / "finish_problems"
+        problems.mkdir(exist_ok=True)
+        (problems / "analysis_config.json").write_text('{"profiles": []}', encoding="utf-8")
+        (problems / "problem_list.json").write_text('{"items": []}', encoding="utf-8")
+        (problems / "operator_drafts.json").write_text('{"marks": {}}', encoding="utf-8")
+        video = event_dir / "videos" / "test_000.mkv"
+        video.parent.mkdir()
+        video.write_bytes(b"test video")
+        window.timeline_store.add_completed_segment(
+            source_id="camera_01_review", camera_index=1, video_path=video,
+            media_started_at_ms=1000, media_duration_ms=2000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+            end_reason="test", race_id="race-live",
+        )
+
+        window.problem_panel.clear_data_button.click()
+
+        assert window.passage_store.events(include_inactive=True) == ()
+        assert window._receiver_passage_store.events(include_inactive=True) == ()
+        assert not (event_dir / "video_timeline.jsonl").exists()
+        assert not video.exists()
+        assert not (problems / "problem_list.json").exists()
+        assert not (problems / "operator_drafts.json").exists()
+        assert (problems / "analysis_config.json").is_file()
+        assert (event_dir / "motion_finish_lines.json").is_file()
+        assert (event_dir / "cyclerace_race_metadata.json").is_file()
+        assert window._finish_line_rois[2] == pytest.approx((0.2, 0.1, 0.4, 0.9))
+        assert window._workspace_mode == "live"
+        assert window.record_button.text() == "开始录像"
+        # 草稿计时器不能在删除后把清掉的点数写回磁盘。
+        qapp.processEvents()
+        assert not (problems / "operator_drafts.json").exists()
+        # 清空之后到来的读数就是正式比赛数据。
+        window.passage_store.append(_event(event_id="race-read", race_id="race-live"))
+        assert window.passage_store.get("race-read") is not None
+    finally:
+        window.close()
+
+
+def test_clearing_race_data_is_blocked_while_recording_or_in_history(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path)
+    window.passage_store.append(_event(event_id="test-read"))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning",
+                        lambda _parent, title, message: warnings.append((title, message)))
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *_args, **_kwargs: pytest.fail("受保护的清空不应开始询问"))
+    try:
+        window.start_recording()
+        window._clear_event_data()
+        assert warnings[-1][0] == "无法清空数据"
+        assert "请先停止普通录像" in warnings[-1][1]
+        assert window.passage_store.get("test-read") is not None
+        window.stop_recording()
+
+        window._workspace_mode = "archive"
+        window._clear_event_data()
+        assert warnings[-1][0] == "无法清空数据"
+        assert warnings[-1][1].startswith("正在查看历史赛事")
+        assert window.passage_store.get("test-read") is not None
+    finally:
+        window.close()
+
+
+def test_changing_the_recording_root_returns_to_the_field(qapp, tmp_path):
+    root = tmp_path / "events"
+    _archived_field_event(root)
+    window = _window(root)
+    try:
+        assert window._workspace_mode == "archive"
+        assert window.record_button.text() == "返回现场"
+
+        target = tmp_path / "new-root"
+        assert window._apply_settings(replace(window._current_settings(), output_dir=target))
+
+        assert window.workspace_root == target.resolve()
+        assert window._workspace_mode == "live"
+        assert window.record_button.text() == "开始录像"
+    finally:
+        window.close()
 
 
 def test_opening_saved_event_is_blocked_while_recording(
@@ -4437,7 +4676,16 @@ def test_stale_queued_video_candidates_do_not_enter_new_workspace(qapp, tmp_path
 def test_video_anomaly_queue_accumulates_and_can_be_closed_as_verified(
     qapp,
     tmp_path,
+    monkeypatch,
 ):
+    opened = []
+
+    class _PlaybackDialog(QDialog):
+        def __init__(self, video_path, parent, **kwargs):
+            super().__init__(parent)
+            opened.append((video_path, kwargs))
+
+    monkeypatch.setattr(review_window_module, "VideoPlaybackDialog", _PlaybackDialog)
     window = _window(tmp_path)
     video_path = tmp_path / "camera_01.ts"
     video_path.write_bytes(b"video")
@@ -4475,6 +4723,7 @@ def test_video_anomaly_queue_accumulates_and_can_be_closed_as_verified(
     assert open_button is not None
     open_button.click()
     assert requested == [item]
+    assert opened[0][0] == video_path and opened[0][1]["target_position_ms"] == 200
     window.video_review_done_button.click()
     assert window.video_review_status(candidate.candidate_id) == "verified"
     assert window.video_reconciliation() == ()

@@ -6,12 +6,13 @@ import cv2
 import numpy as np
 import pytest
 from PyQt5.QtCore import QEventLoop, QPoint, Qt
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
 from realtime.bunch_dialog import BunchDecoder, BunchReviewDialog, CountView
 from realtime.bunch_review import (
-    BunchChip, BunchReviewStore, align_counts, completion_issue, load_context,
+    BunchChip, BunchReviewStore, align_counts, completion_issue, detected_crossings, load_context,
     add_viewed, uncovered_intervals, review_candidates, group_member_batch,
     mark_on_frame, unresolved_crossing_conflicts,
 )
@@ -47,7 +48,7 @@ def test_typed_plate_has_priority_and_two_missing_riders_get_individual_times():
     assert result['pairs'] == {0: 0, 2: 1, 4: 2}
     assert [(e['bib'], e['chip_time_ms']) for e in result['extras']] == [('319', T + 1500), ('550', T + 2500)]
     assert not result['missing']
-    assert not completion_issue(cc, counts, result, True)
+    assert not completion_issue(cc, counts, result)
 
 
 def test_side_by_side_plate_without_chip_is_never_assigned_to_nearby_chip():
@@ -68,17 +69,16 @@ def test_bias_uses_three_isolated_riders_and_no_extrapolation_at_bunch_edge():
     assert result['bias_ms'] == 120 and result['lone_count'] == 3
     result = align_counts(cc, [mark(500, '319'), *counts], 0)
     assert result['extras'][0]['chip_time_ms'] is None
-    assert '前后' in completion_issue(cc, [mark(500, '319'), *counts], result, True)
+    assert '前后' in completion_issue(cc, [mark(500, '319'), *counts], result)
 
 
-def test_cannot_complete_empty_unviewed_missing_or_duplicate_counts():
+def test_cannot_complete_empty_missing_or_duplicate_counts():
     cc = chips(1000, 2000)
     counts = [mark(1300, '101')]
-    assert '完整' in completion_issue(cc, counts, align_counts(cc, counts), False)
-    assert '没有对应' in completion_issue(cc, counts, align_counts(cc, counts), True)
-    assert '先' in completion_issue(cc, [], align_counts(cc, []), True)
+    assert '没有对应' in completion_issue(cc, counts, align_counts(cc, counts))
+    assert '先' in completion_issue(cc, [], align_counts(cc, []))
     duplicate = [mark(1300, '101'), mark(2300, '101')]
-    assert '同一号码' in completion_issue(cc, duplicate, align_counts(cc, duplicate), True)
+    assert '同一号码' in completion_issue(cc, duplicate, align_counts(cc, duplicate))
 
 
 def test_excluded_people_do_not_match_chips_or_change_bias_and_keep_original_indices():
@@ -89,13 +89,13 @@ def test_excluded_people_do_not_match_chips_or_change_bias_and_keep_original_ind
     assert result['pairs'] == {0: 0, 2: 1, 4: 2}
     assert result['bias_ms'] == 120 and result['lone_count'] == 3
     assert result['extras'] == [] and result['missing'] == []
-    assert completion_issue(cc, counts, result, True) == ''
+    assert completion_issue(cc, counts, result) == ''
     counts[2]['exclusion_reason'] = '其他无关人员'
     result = align_counts(cc, counts)
     assert result['missing'] == [1] and result['extras'] == []
-    assert '没有对应' in completion_issue(cc, counts, result, True)
+    assert '没有对应' in completion_issue(cc, counts, result)
     excluded_only = [dict(mark(1300), exclusion_reason='行人')]
-    assert completion_issue(cc, excluded_only, align_counts(cc, excluded_only), True)
+    assert completion_issue(cc, excluded_only, align_counts(cc, excluded_only))
 
 
 def test_excluded_mark_cannot_supply_interpolation_anchor():
@@ -105,6 +105,47 @@ def test_excluded_mark_cannot_supply_interpolation_anchor():
     assert result['pairs'] == {2: 1}
     assert result['missing'] == [0]
     assert result['extras'] == [{'mark': 1, 'bib': '319', 'chip_time_ms': None, 'bracket_ms': None}]
+
+
+def _detections(root, camera, crossings):
+    directory = root / 'finish_problems'
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f'crossings_camera{camera}.json').write_text(
+        json.dumps({'schema_version': 1, 'camera_index': camera, 'crossings': crossings}), encoding='utf-8')
+
+
+def test_the_group_keeps_only_the_people_detected_inside_it(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    middle = (context.start_ms + context.end_ms) // 2
+    _detections(root, 1, [
+        {'recorder_ms': context.start_ms - 1, 'frame_index': 1},
+        {'recorder_ms': context.start_ms, 'frame_index': 2, 'in_obstruction': True},
+        {'recorder_ms': middle, 'frame_index': 3},
+        {'recorder_ms': context.end_ms, 'frame_index': 4},
+        {'recorder_ms': context.end_ms + 1, 'frame_index': 5},
+        {'frame_index': 6},          # 缺时刻的记录不能猜一个时间塞进来
+        'not-a-record',
+    ])
+
+    # 检测出的就是画面里的每一个人，不区分有没有芯片；本团之外的不算。
+    assert context.detected == [{'recorder_ms': context.start_ms, 'in_obstruction': True},
+                                {'recorder_ms': middle, 'in_obstruction': False},
+                                {'recorder_ms': context.end_ms, 'in_obstruction': False}]
+
+
+def test_a_missing_or_broken_detection_file_is_not_read_as_nobody_crossed(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    assert detected_crossings(root, 1) is None
+    assert load_context(root, item).detected == []
+    _detections(root, 2, [{'recorder_ms': T + 1000}])
+    assert detected_crossings(root, 1) is None       # 别的机位有结果，不等于机位 1 有
+
+    (root / 'finish_problems' / 'crossings_camera1.json').write_text('{', encoding='utf-8')
+    assert detected_crossings(root, 1) is None
+    inside = load_context(root, item).start_ms + 10
+    _detections(root, 1, [{'recorder_ms': inside}])
+    assert [entry['recorder_ms'] for entry in load_context(root, item).detected] == [inside]
 
 
 @pytest.fixture
@@ -223,9 +264,13 @@ def test_incomplete_group_stays_pending_and_group_has_no_one_click_checked(synth
     panel = ProblemListPanel()
     panel.set_workspace(root)
     panel.table.setCurrentCell(0, 0)
-    assert panel.bunch_button.isHidden() is False
-    assert not panel.action_buttons
+    assert not panel.action_buttons       # 集团按人数判，不按那一列现成的理由
     context = load_context(root, item)
+    # 判读栏自己也算一遍：点出来的人、芯片、检测到的过线并排放着比。
+    _detections(root, 1, [{'recorder_ms': context.start_ms + 900, 'in_obstruction': False},
+                          {'recorder_ms': context.start_ms + 4200, 'in_obstruction': False}])
+    panel._sync_sidebar()
+    assert panel.side_notice.text() == '画面 0 人 · 芯片 4 条 · 还差 4 人'
     store = BunchReviewStore(directory)
     store.save(context, [mark(2300, '101')], 10)
     panel.refresh()
@@ -259,7 +304,6 @@ def test_the_group_is_counted_and_closed_on_the_problem_itself(synthetic_bunch):
         panel.record_viewed_frame(item.evidence['frame'], timestamp)
     for chip in context.chips[:3]:
         panel.add_mark(0.3, 0.6, chip.recorder_ms, frame_at(context, chip.recorder_ms))
-    panel._set_fully_viewed(True)
     panel._confirm_pending()
     record = BunchReviewStore(directory).latest_for(item)
     assert record['counted_riders'] == 3 and not record['completed']
@@ -268,13 +312,11 @@ def test_the_group_is_counted_and_closed_on_the_problem_itself(synthetic_bunch):
     assert panel.state(item) == '待处理'
     # The work the operator did is on the row, so the queue never looks untouched.
     row = next(index for index, entry in enumerate(panel.rows) if entry.item_id == item.item_id)
-    assert panel.table.item(row, 2).text() == '3 人'
+    assert panel.table.item(row, 2).text() == '3 人 / 4 条'
     assert panel.table.item(row, 2).foreground().color().name() == '#8a8f98'
 
-    # The last rider makes the count complete; the same key closes the group.
+    # 数到的人数正好等于芯片条数：这一团当场自己收尾，不用再按确认。
     panel.add_mark(0.7, 0.6, context.chips[3].recorder_ms, frame_at(context, context.chips[3].recorder_ms))
-    panel._set_fully_viewed(True)
-    panel._confirm_pending()
     record = BunchReviewStore(directory).latest_for(item)
     assert record['counted_riders'] == 4 and record['completed']
     assert panel.state(item).startswith('已处理：集团人工核对')
@@ -282,44 +324,63 @@ def test_the_group_is_counted_and_closed_on_the_problem_itself(synthetic_bunch):
     app.processEvents()
 
 
-def test_an_unresolved_child_doubt_is_shown_and_answered_on_the_spot(synthetic_bunch):
-    """A double chip inside the group is answered on its own frame, never by the count."""
+def test_reopening_a_completed_group_keeps_crossing_order_and_original_marks(synthetic_bunch):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    counts = [dict(mark(chip.recorder_ms - T), frame=frame_at(context, chip.recorder_ms))
+              for chip in reversed(context.chips)]
+    directory = root / 'finish_problems'
+    directory.mkdir()
+    (directory / 'problem_list.json').write_text(json.dumps({'items': [item.to_payload()]}), encoding='utf-8')
+    BunchReviewStore(directory).save(context, counts, 12, completed=True)
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(root)
+        assert not panel.rows
+        panel.queue_filter.setCurrentIndex(3)
+        panel.toggle_big_view()
+        assert panel.state(item).startswith('已处理')
+        assert [panel.count_table.item(row, 0).text() for row in range(4)] == ['1', '2', '3', '4']
+        panel.reopen_button.click()
+        assert panel.state(item) == '待处理'
+        assert panel.big_view
+        assert panel.current_marks() == counts
+        assert not BunchReviewStore(directory).latest_for(item)['completed']
+        panel.queue_filter.setCurrentIndex(0)
+        assert panel.current_item().item_id == item.item_id
+        assert panel.current_marks() == counts  # 切回待处理也不会立刻再次自动关闭。
+        panel.count_table.setCurrentCell(0, 0)
+        assert panel._editing_mark == 3
+        panel.exclude_button.click()
+        assert panel.state(item) == '待处理'
+        panel.restore_button.click()
+        record = BunchReviewStore(directory).latest_for(item)
+        assert record['completed']
+        assert [value['recorder_ms'] for value in record['marks']] == [value['recorder_ms'] for value in counts]
+    finally:
+        panel.close()
+        app.processEvents()
 
+
+def test_equal_counts_finish_even_when_time_reference_cannot_match_every_rider(synthetic_bunch):
     app = QApplication.instance() or QApplication([])
     root, item, _events = synthetic_bunch
     directory = root / 'finish_problems'
     directory.mkdir()
-    child = ProblemItem('child:1', KIND_TWO_CHIPS_ONE_CROSSING, CATEGORY_VIDEO, '一次过线，两个芯片',
-                        chip_time_ms=T + 2000, bibs=('101', '102'), event_ids=('e-0', 'e-1'),
-                        evidence={'group': item.item_id, 'frame': item.evidence['frame'],
-                                  'recorder_ms': T + 2000})
-    (directory / 'problem_list.json').write_text(json.dumps({
-        'items': [item.to_payload(), child.to_payload()], 'summary': {}, 'auto_passed': []}), encoding='utf-8')
+    (directory / 'problem_list.json').write_text(json.dumps({'items': [item.to_payload()]}), encoding='utf-8')
     panel = ProblemListPanel()
     panel.set_workspace(root)
-    panel.table.setCurrentCell(0, 0)
     context = load_context(root, item)
-    for timestamp in range(context.start_ms, context.end_ms + 1, 50):
-        panel.record_viewed_frame(item.evidence['frame'], timestamp)
-    for chip in context.chips:
-        panel.add_mark(0.3, 0.6, chip.recorder_ms, frame_at(context, chip.recorder_ms))
-    panel._set_fully_viewed(True)
-
-    # The totals match, and the child doubt still holds the group open on screen.
-    assert panel.crossing_controls.conflict_combo.count() == 2
-    assert '未核清疑点 1' in panel.crossing_controls.notice.text()
-    panel._confirm_pending()
-    assert not BunchReviewStore(directory).latest_for(item).get('completed')
-
-    # Answering it by its own evidence keeps every count and lets the same key close.
-    panel.reason_input.setText('同一车两块芯片，同一帧压线')
-    panel._decide_conflict('child:1', 'side_by_side')
-    assert panel.store.get('child:1').action == 'side_by_side'
-    assert panel.crossing_controls.conflict_combo.count() == 1
-    panel._set_fully_viewed(True)
-    panel._confirm_pending()
+    # 点在各自过线原帧，校时参考相差较多也不把数清人数变成第二次配对作业。
+    stamps = [context.start_ms + 100 + i * 100 for i in range(4)]
+    for stamp in reversed(stamps):
+        panel.add_mark(.3, .5, stamp, frame_at(context, stamp))
     record = BunchReviewStore(directory).latest_for(item)
     assert record['completed'] and record['counted_riders'] == 4
+    assert [mark['recorder_ms'] for mark in record['marks']] == list(reversed(stamps))
+    assert BunchReviewStore(directory).manual_entries([item], root) == []
+    panel.close()
     app.processEvents()
 
 
@@ -340,6 +401,11 @@ def test_exclusion_reason_and_evidence_roundtrip_without_exporting_cached_extras
     assert len(rows) == 1 and rows[0][0] == '550'
     assert '81' in rows[0][2]  # original mark index 5, frame 4000 / 50 displayed one-based
     counts[0]['exclusion_reason'] = '工作人员'
+    # 排除后剩四人、四条芯片，人数已对上；时间参考没有配上不另设门槛，
+    # 也不能把数量相等的记录误导出为补录。
+    assert store.save(context, counts, 20, completed=True, fully_viewed=True)['completed']
+    assert store.manual_entries([item], root) == []
+    counts[1]['exclusion_reason'] = '行人'
     with pytest.raises(ValueError, match='没有对应'):
         store.save(context, counts, 20, completed=True, fully_viewed=True)
     store.save(context, counts, 20)
@@ -371,7 +437,7 @@ def test_dialog_can_exclude_restore_and_reopen_without_changing_other_marks(synt
         assert 'exclusion_reason' not in dialog.marks[1]
         assert dialog.bib_input.isEnabled() and not dialog.restore_button.isEnabled()
         assert '同一号码' in completion_issue(context.chips, dialog.marks,
-                                            align_counts(context.chips, dialog.marks), True)
+                                            align_counts(context.chips, dialog.marks))
         assert dialog.save(False)
     finally:
         dialog.close()
@@ -382,6 +448,43 @@ def test_dialog_can_exclude_restore_and_reopen_without_changing_other_marks(synt
         encoding='utf-8').splitlines()]
     assert any(r['marks'][1].get('exclusion_reason') == '行人' for r in records)
     assert 'exclusion_reason' not in records[-1]['marks'][1]
+
+
+def test_the_strip_shows_every_detected_person_beside_the_chips(synthetic_bunch):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    # 两个落点都避开芯片预期时刻，画出来才知道是谁的线。
+    first, later, quiet = context.start_ms + 900, context.start_ms + 4200, context.start_ms + 550
+    _detections(root, 1, [
+        {'recorder_ms': context.start_ms - 400, 'in_obstruction': False},   # 本团之前
+        {'recorder_ms': first, 'in_obstruction': False},
+        {'recorder_ms': later, 'in_obstruction': True},
+        {'recorder_ms': context.end_ms + 400, 'in_obstruction': False},     # 本团之后
+    ])
+    dialog = BunchReviewDialog(root, item)
+    try:
+        timeline = dialog.timeline
+        assert [entry['recorder_ms'] for entry in timeline.detected] == [first, later]
+        assert '画面检测 2 处过线' in dialog.summary.text()
+
+        # 画出来看：每个人的线落在自己的时刻上，被遮挡的那一个浅一号。
+        dialog.layout().activate()
+        picture = QPixmap(timeline.size())
+        timeline.render(picture)
+        image = picture.toImage()
+        assert image.width() == timeline.width()
+        of = lambda ms: int((ms - context.start_ms) / (context.end_ms - context.start_ms) * (image.width() - 1))
+        band = (timeline.PEOPLE_TOP + timeline.PEOPLE_BOTTOM) // 2
+        person, hidden, empty = (image.pixelColor(of(ms), band) for ms in (first, later, quiet))
+        assert person.blue() > 150 and person.red() < 120      # 蓝线：画面看见了这个人
+        assert hidden.blue() > 150 and hidden.red() > person.red()   # 遮挡时的过线画浅一点
+        assert empty.name() == '#edf1f5'                       # 没人过线的时刻只有底色
+    finally:
+        dialog.close()
+        dialog.worker.requestInterruption()
+        assert dialog.worker.wait(3000)
+        app.processEvents()
 
 
 def test_dialog_reads_counts_saves_reopens_and_releases_worker(synthetic_bunch):
@@ -468,23 +571,20 @@ def test_legacy_group_without_frame_uses_only_unique_calibrated_camera(synthetic
     assert load_context(root, replace(legacy, evidence={'camera_index': 2})).camera == 2
 
 
-def test_seeking_first_and_last_frames_cannot_cover_unseen_middle(synthetic_bunch):
+def test_viewed_ranges_are_recorded_but_do_not_block_the_count(synthetic_bunch):
+    """看过哪几段仍然记着，但判据是人数对上芯片，不是每一帧都看过。"""
+
     root, item, _events = synthetic_bunch
     context = load_context(root, item)
     ranges = add_viewed([], context.start_ms, context.start_ms, context.end_ms)
-    ranges = add_viewed(ranges, context.end_ms, context.start_ms, context.end_ms)
-    assert uncovered_intervals(context.start_ms, context.end_ms, ranges)
     counts = [mark(c.recorder_ms-T) for c in context.chips]
     result = align_counts(context.chips, counts)
     assert not result['missing'] and not result['extras']
     store = BunchReviewStore(root / 'finish_problems')
-    with pytest.raises(ValueError, match='未查看'):
-        store.save(context, counts, 10, completed=True, fully_viewed=True, viewed_ranges=ranges)
-    store.save(context, counts, 10, viewed_ranges=ranges, visited_candidates=['count_difference'])
-    restored = store.get(context)
-    assert restored['viewed_ranges'] == ranges
-    assert restored['visited_candidates'] == ['count_difference']
-    assert not restored['completed']
+    saved = store.save(context, counts, 10, completed=True, viewed_ranges=ranges,
+                       visited_candidates=['count_difference'])
+    assert saved['completed'] and saved['viewed_ranges'] == ranges
+    assert saved['visited_candidates'] == ['count_difference']
 
 
 def test_normal_complete_count_does_not_require_names(synthetic_bunch):
@@ -540,8 +640,9 @@ def test_member_deletion_in_group_exports_one_record_and_blocks_completion(synth
     rows = list(csv.DictReader((root / 'exports/建议删除清单.csv').open(encoding='utf-8-sig')))
     assert rows[0]['事件ID'] == context.chips[0].event_id
     counts = [mark(c.recorder_ms-T) for c in context.chips]
-    with pytest.raises(ValueError, match='成员'):
-        BunchReviewStore(root / 'finish_problems').save(context, counts, 30, completed=True, fully_viewed=True)
+    # 成员建议交给 CycleRace，人数对上这一团本身就成立。
+    assert BunchReviewStore(root / 'finish_problems').save(
+        context, counts, 30, completed=True)['completed']
 
 
 def test_group_context_revision_changes_invalidate_draft(synthetic_bunch):
@@ -587,8 +688,9 @@ def test_dialog_local_navigation_leaves_group_pending_and_tracks_frames(syntheti
         app.processEvents()
 
 
-@pytest.mark.parametrize('running,paused', [(True, False), (True, True), (False, False), (False, True)])
-def test_group_entry_preserves_analysis_schedule_and_chip_receiver(synthetic_bunch, monkeypatch, running, paused):
+def test_the_workbench_is_the_group_tool_and_keeps_the_live_analysis_running(synthetic_bunch, monkeypatch):
+    """集团判读就是判读那一屏，不再停下来开一个窗口。"""
+
     app = QApplication.instance() or QApplication([])
     root, item, _events = synthetic_bunch
     directory = root / 'finish_problems'
@@ -597,55 +699,99 @@ def test_group_entry_preserves_analysis_schedule_and_chip_receiver(synthetic_bun
     panel = ProblemListPanel()
     panel.set_workspace(root)
     panel.table.setCurrentCell(0, 0)
-    receiver = object()
-    panel._chip_process = receiver
-    panel._process = object() if running else None
-    panel._live_paused = paused
-    calls = []
-
-    def stop():
-        assert panel._live_paused
-        panel._process = None
-        calls.append('stop')
-
-    class Dialog:
-        saved_completed = False
-
-        def __init__(self, *args):
-            pass
-
-        def exec_(self):
-            assert panel._process is None and panel._live_paused
-            assert panel._chip_process is receiver
-            calls.append('dialog')
-
-    monkeypatch.setattr('realtime.bunch_dialog.BunchReviewDialog', Dialog)
-    monkeypatch.setattr(panel, 'stop_analysis', stop)
-    monkeypatch.setattr(panel, '_start_analysis', lambda: calls.append('start'))
+    stops = []
+    monkeypatch.setattr(panel, 'stop_analysis', lambda: stops.append('stop'))
+    panel.show()
     try:
-        panel._open_bunch()
-        assert calls == ['stop', 'dialog'] + (['start'] if running and not paused else [])
-        assert panel._live_paused == paused and panel._chip_process is receiver
+        QTest.keyClick(panel, Qt.Key_F)
+        assert stops == []                     # 分析继续跑：核对不再打断接收
+        assert panel.timeline.isVisibleTo(panel)
+        assert not hasattr(panel, 'bunch_button')
+        QTest.keyClick(panel, Qt.Key_Escape)
+        assert not panel.timeline.isVisibleTo(panel)   # 回到清单，刻度让位给队列
     finally:
-        panel._chip_process = None
-        monkeypatch.setattr(panel, 'stop_analysis', lambda: None)
         panel.close()
         app.processEvents()
 
 
-def test_cross_segment_strip_rejects_stale_line_and_keeps_cache_gap(synthetic_bunch):
-    from realtime.bunch_dialog import group_strip
-    from realtime.line_sampling import LineGeometry, LineStrip, line_config_digest, save_strip
+def test_the_group_ruler_shows_the_people_and_seeks_from_a_click(synthetic_bunch):
+    app = QApplication.instance() or QApplication([])
     root, item, _events = synthetic_bunch
+    directory = root / 'finish_problems'
+    directory.mkdir()
+    (directory / 'problem_list.json').write_text(json.dumps({'items': [item.to_payload()]}))
     context = load_context(root, item)
+    middle = context.start_ms + 900
+    _detections(root, 1, [{'recorder_ms': middle, 'in_obstruction': False}])
+    _strips(root, context)
+    panel = ProblemListPanel()
+    panel.set_workspace(root)
+    panel.table.setCurrentCell(0, 0)
+    jumps = []
+    panel.jump_requested.connect(jumps.append)
+    panel.resize(1400, 700)
+    panel.show()
+    app.processEvents()
+    panel.layout().activate()
+    app.processEvents()
+    try:
+        QTest.keyClick(panel, Qt.Key_F)
+        app.processEvents()
+        panel.layout().activate()
+        timeline = panel.timeline
+        assert timeline.isVisibleTo(panel) and timeline.context is not None
+        assert [entry['recorder_ms'] for entry in timeline.detected] == [middle]
+        assert len(timeline.context.chips) == 4
+        # 刻度在画面上面，图片带晚一步补上：判读屏先出来，拼图不挡按键。
+        assert panel.layout().indexOf(timeline) < panel.layout().indexOf(panel.splitter)
+        for _ in range(60):
+            app.processEvents(QEventLoop.AllEvents, 20)
+            if timeline.image is not None:
+                break
+            QTest.qWait(20)
+        assert timeline.image is not None
+
+        # 点出来的人立刻出现在刻度上：人、芯片、检测三者同一条轴。
+        panel.add_mark(.3, .5, middle, frame_at(context, middle))
+        assert [mark['recorder_ms'] for mark in timeline.marks] == [middle]
+
+        # 点刻度就跳到那一刻：给出所在分段和片内位置，画面自己定位到帧。
+        app.processEvents()
+        click_x = timeline.width() * 3 // 4
+        QTest.mouseClick(timeline, Qt.LeftButton, pos=QPoint(click_x, 60))
+        app.processEvents()
+        # 点在哪一段上，就跳到哪一段的对应时刻（宽度以落点那一刻为准）。
+        clicked = click_x / max(1, timeline.width() - 1)
+        assert [jump['frame_index'] for jump in jumps] == [46, None]   # 先跳本团原帧，再跳点中的那一刻
+        piece = next(s for s in context.segments if s.segment.segment_id == jumps[-1]['segment_id'])
+        moment = piece.start_ms + jumps[-1]['position_ms']
+        assert abs((moment - context.start_ms) / (context.end_ms - context.start_ms) - clicked) <= 0.02
+        assert jumps[-1]['camera_index'] == context.camera
+    finally:
+        panel.close()
+        app.processEvents()
+
+
+def _strips(root, context):
+    """Write a sampled strip per segment, as the sampling run would have."""
+
+    from realtime.line_sampling import LineGeometry, LineStrip, line_config_digest, save_strip
     directory = root / 'finish_problems/strips/camera_01'
     directory.mkdir(parents=True)
     for segment in context.segments:
         line = context.lines[segment.segment.segment_id]
         geometry = LineGeometry.from_config(line, 160, 120, samples=10)
         strip = LineStrip(np.zeros((10, 80, 3), np.uint8), np.arange(80)*50, geometry, str(segment.path), 20)
-        save_strip(directory / (segment.path.stem+'.npz'), strip,
+        save_strip(directory / (segment.path.stem + '.npz'), strip,
                    {'segment_id': segment.segment.segment_id, 'line_digest': line_config_digest(line)})
+    return directory
+
+
+def test_cross_segment_strip_rejects_stale_line_and_keeps_cache_gap(synthetic_bunch):
+    from realtime.bunch_timeline import group_strip
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    _strips(root, context)
     image, present = group_strip(context)
     assert present and image[:, :800].mean() < 30 and image[:, 1000:].mean() < 30
     last = context.segments[-1].segment.segment_id
@@ -667,11 +813,12 @@ def test_later_member_hold_reopens_group_and_suppresses_manual_export(synthetic_
     assert len(store.manual_entries([item], root)) == 1
     BatchDecisionStore(root / 'finish_problems').save(
         group_member_batch(context), [context.chips[0].event_id], 'hold', 'needs another camera')
+    # 成员的暂存只压住这张补录单（同一个人不能记两次），整团已经数清了。
     assert store.manual_entries([item], root) == []
     (root / 'finish_problems/problem_list.json').write_text(json.dumps({'items': [item.to_payload()]}))
     panel = ProblemListPanel()
     panel.set_workspace(root)
-    assert panel.state(item) == '待处理'
+    assert panel.state(item).startswith('已处理')
     panel.close()
     app.processEvents()
 
@@ -731,55 +878,6 @@ def full_view(context):
     return ranges
 
 
-def test_equal_counts_never_close_a_double_chip_without_the_operators_own_answer(synthetic_bunch):
-    root, item, _events = synthetic_bunch
-    context = load_context(root, item)
-    first, second = context.chips[0], context.chips[1]
-    child = crossing_child(item, KIND_TWO_CHIPS_ONE_CROSSING, 'e-0-e-1', recorder_ms=first.recorder_ms,
-                           frame=frame_at(context, first.recorder_ms), bibs=(first.bib, second.bib),
-                           event_ids=(first.event_id, second.event_id), chip_time_ms=T + 2000)
-    write_children(root, item, [child])
-    marks = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
-    result = align_counts(context.chips, marks)
-    assert len(result['pairs']) == 4 and not result['missing'] and not result['extras']
-    # Four riders counted, four numbers read, the totals exactly equal - the
-    # double chip is still the operator's question, not the count's to answer.
-    assert [c.item_id for c in unresolved_crossing_conflicts(context, marks, result)] == [child.item_id]
-    store = BunchReviewStore(root / 'finish_problems')
-    ranges = full_view(context)
-    with pytest.raises(ValueError, match='人数相等'):
-        store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)
-    ProblemResolutionStore(root / 'finish_problems/problem_resolutions.jsonl').resolve(child, ACTION_SIDE_BY_SIDE)
-    assert unresolved_crossing_conflicts(context, marks, result) == []
-    saved = store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)
-    assert saved['completed'] and saved['counted_riders'] == 4 and saved['identified_riders'] == 4
-
-
-def test_equal_counts_do_not_close_a_missed_crossing_until_a_person_is_counted_there(synthetic_bunch):
-    root, item, _events = synthetic_bunch
-    context = load_context(root, item)
-    missed_ms = context.chips[1].recorder_ms + 400
-    child = crossing_child(item, KIND_NO_CHIP_CROSSING, 'crossing', recorder_ms=missed_ms,
-                           frame=frame_at(context, missed_ms), chip_time_ms=missed_ms - 300)
-    write_children(root, item, [child])
-    counts = [counted(context, chip.recorder_ms) for chip in context.chips]
-    result = align_counts(context.chips, counts)
-    assert len(result['pairs']) == 4 and not result['missing'] and not result['extras']
-    assert [c.item_id for c in unresolved_crossing_conflicts(context, counts, result)] == [child.item_id]
-    store = BunchReviewStore(root / 'finish_problems')
-    ranges = full_view(context)
-    with pytest.raises(ValueError, match='人数相等'):
-        store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)
-    # The person on the child's own frame is pointed at and read: the crossing
-    # is accounted, and the number reaches CycleRace through the missing list.
-    counts = [*counts, counted(context, missed_ms, '319')]
-    result = align_counts(context.chips, counts)
-    assert unresolved_crossing_conflicts(context, counts, result) == []
-    saved = store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)
-    assert saved['completed'] and saved['counted_riders'] == 5 and saved['identified_riders'] == 1
-    assert [row[0] for row in store.manual_entries([item], root)] == ['319']
-
-
 def test_a_normal_group_closes_without_numbers_when_the_count_answers_the_child(synthetic_bunch):
     root, item, _events = synthetic_bunch
     context = load_context(root, item)
@@ -821,14 +919,16 @@ def test_frame_identity_tolerates_extra_metadata_and_kept_copies():
     assert mark_on_frame({'recorder_ms': T + 500, 'bib': '319'}, current, T + 500)
 
 
-def test_a_child_added_later_gates_an_old_completed_export_under_an_unchanged_parent(synthetic_bunch):
+def test_a_doubt_added_later_is_a_row_of_its_own(synthetic_bunch):
+    """后来才出现的疑点自己在表里；已经数清的团和交出去的补录单都不变。"""
+
     root, item, _events = synthetic_bunch
     context = load_context(root, item)
     assert context.child_items == []  # the context filled its child list before any child existed
     counts = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
     counts.append(counted(context, context.chips[1].recorder_ms - 400, '319'))
     store = BunchReviewStore(root / 'finish_problems')
-    record = store.save(context, counts, 20, completed=True, fully_viewed=True)  # old records carry no viewed ranges
+    record = store.save(context, counts, 20, completed=True)  # old records carry no viewed ranges
     assert len(store.manual_entries([item], root)) == 1
     third, last = context.chips[2], context.chips[3]
     child = crossing_child(item, KIND_TWO_CHIPS_ONE_CROSSING, 'e-2-e-3', recorder_ms=third.recorder_ms,
@@ -837,32 +937,11 @@ def test_a_child_added_later_gates_an_old_completed_export_under_an_unchanged_pa
     write_children(root, item, [child])
     marks = record['marks']
     assert store.get(context) is not None  # the parent evidence did not change...
-    assert context.child_items == []  # ...and the cached child list stays what it was
-    result = align_counts(context.chips, marks)
-    assert [c.item_id for c in unresolved_crossing_conflicts(context, marks, result)] == [child.item_id]
-    assert store.manual_entries([item], root) == []  # a new doubt cannot keep exporting
-    with pytest.raises(ValueError, match='疑点'):
-        store.save(context, marks, 20, completed=True, fully_viewed=True)
-    ProblemResolutionStore(root / 'finish_problems/problem_resolutions.jsonl').resolve(child, ACTION_SIDE_BY_SIDE)
+    assert store.save(context, marks, 20, completed=True)['completed']
     assert len(store.manual_entries([item], root)) == 1
-
-
-def test_partial_viewing_still_blocks_a_count_that_answered_the_child(synthetic_bunch):
-    root, item, _events = synthetic_bunch
-    context = load_context(root, item)
-    child = crossing_child(item, KIND_NEAR_CROSSING, 'e-1', recorder_ms=context.chips[1].recorder_ms,
-                           frame=frame_at(context, context.chips[1].recorder_ms))
-    write_children(root, item, [child])
-    counts = [counted(context, chip.recorder_ms) for chip in context.chips]
-    partial = add_viewed(add_viewed([], context.start_ms, context.start_ms, context.end_ms),
-                         context.end_ms, context.start_ms, context.end_ms)
-    assert uncovered_intervals(context.start_ms, context.end_ms, partial)
-    store = BunchReviewStore(root / 'finish_problems')
-    with pytest.raises(ValueError, match='未查看'):
-        store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=partial)
-    covered = full_view(context)
-    assert not uncovered_intervals(context.start_ms, context.end_ms, covered)
-    assert store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=covered)['completed']
+    # 那一行还等着操作员：留哪一块芯片，或在那一帧上认号。
+    assert [c.item_id for c in unresolved_crossing_conflicts(context, marks,
+                                                             align_counts(context.chips, marks))] == [child.item_id]
 
 
 def test_a_child_answer_stops_counting_when_the_child_evidence_moves(synthetic_bunch):
@@ -882,71 +961,6 @@ def test_a_child_answer_stops_counting_when_the_child_evidence_moves(synthetic_b
     assert [c.item_id for c in unresolved_crossing_conflicts(context, marks, result)] == [child.item_id]
 
 
-def test_a_chip_without_a_crossing_needs_a_read_number_or_an_explicit_keep(synthetic_bunch):
-    root, item, _events = synthetic_bunch
-    context = load_context(root, item)
-    chip = context.chips[1]
-    child = crossing_child(item, KIND_CHIP_NO_CROSSING, 'e-1', recorder_ms=chip.recorder_ms,
-                           expected_recorder_ms=chip.recorder_ms, bibs=(chip.bib,), event_ids=(chip.event_id,),
-                           chip_time_ms=T + 3000)
-    write_children(root, item, [child])
-    untyped = [counted(context, c.recorder_ms) for c in context.chips]
-    result = align_counts(context.chips, untyped)
-    assert len(result['pairs']) == 4  # a bibbless count pairs by time order, a reference only
-    assert [c.item_id for c in unresolved_crossing_conflicts(context, untyped, result)] == [child.item_id]
-    store = BunchReviewStore(root / 'finish_problems')
-    ranges = full_view(context)
-    with pytest.raises(ValueError, match='人数相等'):
-        store.save(context, untyped, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)
-    # The chip's own number read on a counted person answers it...
-    read = [counted(context, c.recorder_ms, c.bib if c.event_id == chip.event_id else '') for c in context.chips]
-    result = align_counts(context.chips, read)
-    assert result['pairs'][1] == 1 and unresolved_crossing_conflicts(context, read, result) == []
-    assert store.save(context, read, 20, completed=True, fully_viewed=True,
-                      viewed_ranges=ranges)['identified_riders'] == 1
-    # ...and so does the card's own "keep"; the bare count never does.
-    with pytest.raises(ValueError, match='人数相等'):
-        store.save(context, untyped, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)
-    ProblemResolutionStore(root / 'finish_problems/problem_resolutions.jsonl').resolve(child, ACTION_KEEP)
-    assert unresolved_crossing_conflicts(context, untyped, align_counts(context.chips, untyped)) == []
-
-
-def test_member_keep_and_delete_decisions_answer_the_chip_doubts(synthetic_bunch):
-    from realtime.batch_review import BatchDecisionStore
-    root, item, _events = synthetic_bunch
-    context = load_context(root, item)
-    first, second, third = context.chips[0], context.chips[1], context.chips[2]
-    pair = crossing_child(item, KIND_TWO_CHIPS_ONE_CROSSING, 'pair', recorder_ms=first.recorder_ms,
-                          frame=frame_at(context, first.recorder_ms), bibs=(first.bib, second.bib),
-                          event_ids=(first.event_id, second.event_id))
-    solo = crossing_child(item, KIND_CHIP_NO_CROSSING, 'solo', recorder_ms=third.recorder_ms,
-                          expected_recorder_ms=third.recorder_ms, bibs=(third.bib,), event_ids=(third.event_id,))
-    write_children(root, item, [pair, solo])
-    marks = [counted(context, chip.recorder_ms) for chip in context.chips]  # a normal count, no numbers
-    result = align_counts(context.chips, marks)
-
-    def conflicts():
-        return {c.item_id for c in unresolved_crossing_conflicts(context, marks, result)}
-
-    assert conflicts() == {pair.item_id, solo.item_id}
-    decisions = BatchDecisionStore(root / 'finish_problems')
-    batch = group_member_batch(context)
-    decisions.save(batch, [first.event_id], 'keep', 'this rider was read out on the frame')
-    assert conflicts() == {pair.item_id, solo.item_id}  # one kept chip does not settle the pair
-    decisions.save(batch, [second.event_id], 'keep', 'second rider read out on the frame')
-    decisions.save(batch, [third.event_id], 'keep', 'kept with the crossing seen elsewhere')
-    assert conflicts() == set()
-    store = BunchReviewStore(root / 'finish_problems')
-    ranges = full_view(context)
-    assert store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)['completed']
-    # A deletion suggestion is an explicit answer too; the member handoff itself
-    # then keeps the group open until CycleRace applies it.
-    decisions.save(batch, [second.event_id], 'delete', 'one rider carried both chips')
-    assert conflicts() == set()
-    with pytest.raises(ValueError, match='成员'):
-        store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=ranges)
-
-
 def test_a_generic_checked_mark_never_answers_a_group_child(synthetic_bunch):
     root, item, _events = synthetic_bunch
     context = load_context(root, item)
@@ -964,3 +978,44 @@ def test_a_generic_checked_mark_never_answers_a_group_child(synthetic_bunch):
     marks = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
     result = align_counts(context.chips, marks)
     assert [c.item_id for c in unresolved_crossing_conflicts(context, marks, result)] == [child.item_id]
+
+
+def test_equal_counts_close_the_group_and_the_double_chip_is_its_own_row(synthetic_bunch):
+    """数到的人数就是判据：双芯片是表里自己的一行，由操作员在那一行上判。"""
+
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    first, second = context.chips[0], context.chips[1]
+    child = crossing_child(item, KIND_TWO_CHIPS_ONE_CROSSING, 'e-0-e-1', recorder_ms=first.recorder_ms,
+                           frame=frame_at(context, first.recorder_ms), bibs=(first.bib, second.bib),
+                           event_ids=(first.event_id, second.event_id), chip_time_ms=T + 2000)
+    write_children(root, item, [child])
+    marks = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
+    result = align_counts(context.chips, marks)
+    assert len(result['pairs']) == 4 and not result['missing'] and not result['extras']
+    # 四人对四条芯片，前后顺序不看，这一团就成立。
+    saved = BunchReviewStore(root / 'finish_problems').save(
+        context, marks, 20, completed=True, viewed_ranges=full_view(context))
+    assert saved['completed'] and saved['counted_riders'] == 4 and saved['identified_riders'] == 4
+    # 双芯片还是一条待判的行，等操作员说留哪一块、还是两个人。
+    assert [c.item_id for c in unresolved_crossing_conflicts(context, marks, result)] == [child.item_id]
+
+
+def test_a_missed_crossing_is_a_row_of_its_own_not_a_blocker(synthetic_bunch):
+    """画面里多出的一处过线自己在表里：认完号那一行就结，不必先拦住整团。"""
+
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    missed_ms = context.chips[1].recorder_ms + 400
+    child = crossing_child(item, KIND_NO_CHIP_CROSSING, 'crossing', recorder_ms=missed_ms,
+                           frame=frame_at(context, missed_ms), chip_time_ms=missed_ms - 300)
+    write_children(root, item, [child])
+    counts = [counted(context, chip.recorder_ms) for chip in context.chips]
+    store = BunchReviewStore(root / 'finish_problems')
+    saved = store.save(context, counts, 20, completed=True, viewed_ranges=full_view(context))
+    assert saved['completed'] and saved['counted_riders'] == 4
+    # 连同漏读的那位一起数进来，他就走本团的补录清单。
+    counts = [*counts, counted(context, missed_ms, '319')]
+    saved = store.save(context, counts, 20, completed=True, viewed_ranges=full_view(context))
+    assert saved['completed'] and saved['counted_riders'] == 5 and saved['identified_riders'] == 1
+    assert [row[0] for row in store.manual_entries([item], root)] == ['319']

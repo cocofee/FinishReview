@@ -1,21 +1,16 @@
 """The compact controls and the crossing-card rail of the finish workbench.
 
 Both widgets are presentation only: the caller owns the marks, the chips and
-the stores.  ``CrossingReviewControls`` sits under the evidence picture and
-says what the operator did — counted people, recognised numbers, exclusions,
-the keep/delete decisions of a multi-chip crossing and the evidence reasons
-that settle the child doubts of the same crossing; ``CrossingCardRail`` is the
-row of one-per-person (or one-per-group) cards that opens the original frame
-again, with the workbench's own controls on the same line as its title.
+the stores.  ``CrossingReviewControls`` sits under the evidence picture and says
+what the operator did — counted people, recognised numbers, exclusions; the
+count and the chip records are read side by side so the comparison is one
+glance.  ``CrossingCardRail`` is the row of one-per-person (or one-per-group)
+cards that opens the original frame again, with the workbench's own controls on
+the same line as its title.
 
-Two rules from the field workflow are built in here, because this is the last
-cheap place to keep them:
-
-* a count and a record are different numbers — the summary reads
-  ``已确认 N 人 · M 条有效记录`` and never adds one to the other;
-* a chip decision needs an explicitly chosen member, and a doubt needs an
-  explicitly chosen child — the first record is never selected for the
-  operator, and nothing is decided by pointing at it.
+One rule from the field workflow is built in here, because this is the last
+cheap place to keep it: a count and a record are different numbers — the summary
+reads ``已确认 N 人 · M 条有效记录`` and never adds one to the other.
 
 Nothing here writes a journal, a draft or a chip; every change leaves the
 widget as a signal, and the caller decides what to store.
@@ -30,7 +25,6 @@ from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -47,13 +41,6 @@ from PyQt5.QtWidgets import (
 
 from .chip_history import format_chip_time
 from .problem_items import (
-    ACTION_INSUFFICIENT,
-    ACTION_KEEP,
-    ACTION_LABELS,
-    ACTION_NOT_RIDER,
-    ACTION_RIDE_BACK,
-    ACTION_SAME_CROSSING,
-    ACTION_SIDE_BY_SIDE,
     CLASS_TITLES,
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
@@ -67,10 +54,8 @@ from .problem_items import (
 )
 
 
-# The reasons an operator excludes a person with.  The list is short on purpose,
-# and the string that is emitted is exactly the one shown here, so the reason
-# travels to the draft with no second vocabulary.
-EXCLUSION_REASONS = ("行人", "工作人员", "车辆", "往回骑或推车", "其他非选手")
+# 排除是二选一的一按：原帧说明一切，依据随后写进记录，不再让人先挑一句话。
+EXCLUSION_STANDING_REASON = "原帧不是选手过线（行人 / 车辆 / 工作人员）"
 
 # The short state a card carries: the queue's own words, kept local so this
 # module stays free of the panel's stores.
@@ -82,23 +67,6 @@ STATUS_LABELS = {
     STATUS_CLOSED_UPSTREAM: "CycleRace 已处理",
     STATUS_INFO: "参考",
 }
-
-# The one line a member combo shows before the operator has chosen a record;
-# it carries no event id, so the two decision buttons start disabled.
-MEMBER_PLACEHOLDER = "选择一条芯片记录…"
-
-# The child doubts of one crossing are settled by their evidence only.  A coarse
-# chip deletion or a plate recording belongs to the row that owns the exact
-# record, so only these reasons are offered here.
-CONFLICT_ACTIONS = (
-    ACTION_NOT_RIDER,
-    ACTION_RIDE_BACK,
-    ACTION_SAME_CROSSING,
-    ACTION_SIDE_BY_SIDE,
-    ACTION_KEEP,
-    ACTION_INSUFFICIENT,
-)
-CONFLICT_PLACEHOLDER = "选择一条疑点…"
 
 # What an untouched single rider looks like: matched by the analysis, counted
 # without an operator.  It must not read as a missed chip or as "reference".
@@ -131,16 +99,6 @@ def _excluded(mark: Mapping[str, Any]) -> bool:
     """
 
     return bool(_exclusion_reason(mark))
-
-
-def member_void(member: Mapping[str, Any]) -> bool:
-    """A record the upstream already voided is shown but is no valid record.
-
-    Its state also keeps the two decision buttons away: a voided record is not
-    decided again here, exactly as the batch log refuses to.
-    """
-
-    return "作废" in str(member.get("state") or "")
 
 
 def _mark_key(mark: Mapping[str, Any]) -> tuple:
@@ -214,11 +172,11 @@ def _file_stamp(path: Path) -> int:
 
 
 class CrossingReviewControls(QFrame):
-    """The group / count / chip actions that fit under the evidence picture.
+    """画面下那一行：点出来的人，和芯片条数的对照。
 
-    ``set_review`` is the only way data gets in, and it is silent: it repaints
-    the fields and never emits.  Only the operator's own keys and clicks emit,
-    so a refresh that lands between two keystrokes cannot decide anything.
+    数到多少人、芯片有几条，就摆在同一条线上；人数对上芯片条数，这一团就成立。
+    ``set_review`` 是数据唯一的入口，而且不发声：只重画字段，绝不因为刷新而决定
+    什么，所以两次按键之间落进来的一次刷新不会替操作员做主。
     """
 
     # A person on the frame was picked in the list (their index into the marks).
@@ -229,27 +187,16 @@ class CrossingReviewControls(QFrame):
     exclusion_changed = pyqtSignal(int, str)
     # A mis-clicked person; the excluded ones are restored before they are removed.
     mark_removed = pyqtSignal(int)
-    # One chip record of this crossing is kept or suggested for deletion.
-    member_decision = pyqtSignal(str, str)
-    # A child doubt of this crossing is the one being looked at.
-    conflict_selected = pyqtSignal(str)
-    # That child doubt is settled by this evidence reason.
-    conflict_decided = pyqtSignal(str, str)
-    # The operator says they have seen the whole group.
-    fully_viewed_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("crossingReviewControls")
         # The caller's data, read only; the widget holds no draft of its own.
         self._marks: tuple = ()
-        self._members: tuple = ()
-        self._conflicts: tuple = ()
+        self._records = 0
         self._selected_mark = -1
         self._bib_loaded_for = -1
         self._bib_loaded_key: Optional[tuple] = None
-        self._selected_member = ""
-        self._selected_conflict = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -301,12 +248,8 @@ class CrossingReviewControls(QFrame):
         mark_layout.addLayout(numbers_row)
         exclusion_row = QHBoxLayout()
         exclusion_row.setSpacing(4)
-        self.exclusion_combo = QComboBox(self.mark_group)
-        self.exclusion_combo.addItems(EXCLUSION_REASONS)
-        self.exclusion_combo.setToolTip("排除依据：排除一定要写明原因，原帧和原因都会留在记录里")
-        exclusion_row.addWidget(self.exclusion_combo)
-        self.exclude_button = QPushButton("排除", self.mark_group)
-        self.exclude_button.setToolTip("按所选原因把这位记为非选手：不计入人数，不算补录")
+        self.exclude_button = QPushButton("不是选手", self.mark_group)
+        self.exclude_button.setToolTip("把选中的这位记为非选手：不计入人数，不算补录；原帧和依据一起留档")
         self.exclude_button.clicked.connect(self._exclude)
         exclusion_row.addWidget(self.exclude_button)
         self.restore_button = QPushButton("恢复为选手", self.mark_group)
@@ -321,118 +264,30 @@ class CrossingReviewControls(QFrame):
         mark_layout.addLayout(exclusion_row)
         layout.addWidget(self.mark_group)
 
-        # The crossing's own chip records: keep the valid ones, suggest the
-        # deletion of the extras.  One at a time, and only one explicitly chosen.
-        self.member_group = QWidget(self)
-        member_row = QHBoxLayout(self.member_group)
-        member_row.setContentsMargins(0, 0, 0, 0)
-        member_row.setSpacing(4)
-        self.member_combo = QComboBox(self.member_group)
-        self.member_combo.setMinimumWidth(200)
-        self.member_combo.setToolTip("本次过线的芯片记录：号码 · 芯片时间 · 状态；先在这里选一条，再决定")
-        self.member_combo.activated[int].connect(self._member_activated)
-        member_row.addWidget(self.member_combo, 1)
-        self.keep_button = QPushButton("确认有效", self.member_group)
-        self.keep_button.setToolTip("这条记录对应的是本次有效过线，保留")
-        self.keep_button.clicked.connect(lambda: self._decide_member("keep"))
-        member_row.addWidget(self.keep_button)
-        self.delete_button = QPushButton("建议删除", self.member_group)
-        self.delete_button.setToolTip("这条记录是多余读数，作为建议交给 CycleRace，不在这里改写成绩")
-        self.delete_button.clicked.connect(lambda: self._decide_member("delete"))
-        member_row.addWidget(self.delete_button)
-        layout.addWidget(self.member_group)
-
-        # The child doubts of this crossing: look at one, and settle it by the
-        # evidence that can be seen.  Deleting chips and recording plates stay in
-        # the rows that own those exact records.
-        self.conflict_group = QWidget(self)
-        conflict_layout = QVBoxLayout(self.conflict_group)
-        conflict_layout.setContentsMargins(0, 0, 0, 0)
-        conflict_layout.setSpacing(3)
-        child_row = QHBoxLayout()
-        child_row.setSpacing(4)
-        self.conflict_combo = QComboBox(self.conflict_group)
-        self.conflict_combo.setMinimumWidth(220)
-        self.conflict_combo.setToolTip("本次过线相关的其他疑点：号码 · 类型 · 状态；先选一条，再查看或按依据处理")
-        self.conflict_combo.activated[int].connect(self._conflict_activated)
-        child_row.addWidget(self.conflict_combo, 1)
-        self.conflict_view_button = QPushButton("查看疑点", self.conflict_group)
-        self.conflict_view_button.setToolTip("跳到这条疑点的原帧，逐帧看它到底是什么")
-        self.conflict_view_button.clicked.connect(self._view_conflict)
-        child_row.addWidget(self.conflict_view_button)
-        conflict_layout.addLayout(child_row)
-        action_row = QHBoxLayout()
-        action_row.setSpacing(4)
-        self.conflict_label = QLabel("", self.conflict_group)
-        self.conflict_label.setWordWrap(True)
-        self.conflict_label.setStyleSheet("color: #667085; font-size: 9pt;")
-        action_row.addWidget(self.conflict_label, 1)
-        self.conflict_action = QComboBox(self.conflict_group)
-        self.conflict_action.setToolTip("这条疑点可以按原帧证据处理的原因；只提供能由证据直接确认的处理")
-        action_row.addWidget(self.conflict_action)
-        self.conflict_decide_button = QPushButton("确认所选处理", self.conflict_group)
-        self.conflict_decide_button.setToolTip("按所选原因处理这条疑点；不改写 CycleRace 成绩，只留依据")
-        self.conflict_decide_button.clicked.connect(self._decide_conflict)
-        action_row.addWidget(self.conflict_decide_button)
-        conflict_layout.addLayout(action_row)
-        layout.addWidget(self.conflict_group)
-
-        bottom = QHBoxLayout()
-        bottom.setSpacing(6)
-        self.fully_viewed = QCheckBox("已看完整团", self)
-        self.fully_viewed.setToolTip("看过完整团段且人数无遗漏或重复，才可确认；逐帧未看全就不能完成")
-        self.fully_viewed.toggled.connect(self.fully_viewed_changed)
-        bottom.addWidget(self.fully_viewed)
-        bottom.addStretch(1)
-        layout.addLayout(bottom)
-
         self._sync_summary()
         self._fill_marks()
-        self._fill_members()
-        self._fill_conflicts()
         self._show_mark(-1)
         self._sync_view()
 
     # ----- data in ----------------------------------------------------
-    def set_review(self, marks, members=(), conflicts=(), *, can_complete=False, fully_viewed=False,
-                   show_fully_viewed=True, notice=""):
-        """Show what the caller has: the counted people, the chips and the doubts.
+    def set_review(self, marks, records=0, *, notice=""):
+        """Show what the caller has: the counted people and how many chips recorded.
 
         ``marks`` are the people pointed at on the frame (``recorder_ms``,
         ``bib``, ``exclusion_reason`` and whatever the caller keeps for the
-        frame); ``members`` are the chip records (``event_id``, ``bib``,
-        ``chip_ms`` and an optional ``state``); ``conflicts`` are the child
-        problem items of this crossing.  All of them are read, never written.
-        The tick means the operator has seen the whole group, so it is shown
-        only where the caller says there is a group; without ``can_complete`` it
-        is disabled and cleared rather than left lying.
+        frame); ``records`` is how many chip records this crossing has, so the
+        line under the picture holds both halves of the comparison.  Both are
+        read, never written.
         """
 
         self._marks = tuple(marks or ())
-        self._members = tuple(members or ())
-        self._conflicts = tuple(conflicts or ())
+        self._records = int(records or 0)
         if not 0 <= self._selected_mark < len(self._marks):
             self._selected_mark = -1
-        if self._selected_member and self._selected_member not in {
-            str(member.get("event_id") or "") for member in self._members
-        }:
-            self._selected_member = ""
-        if self._selected_conflict and self._selected_conflict not in {
-            item.item_id for item in self._conflicts
-        }:
-            self._selected_conflict = ""
 
         self._fill_marks()
-        self._fill_members()
-        self._fill_conflicts()
         self._sync_summary()
         self._show_mark(self._selected_mark)
-        show_complete = bool(show_fully_viewed)
-        self.fully_viewed.blockSignals(True)
-        self.fully_viewed.setVisible(show_complete)
-        self.fully_viewed.setEnabled(show_complete and bool(can_complete))
-        self.fully_viewed.setChecked(show_complete and bool(can_complete) and bool(fully_viewed))
-        self.fully_viewed.blockSignals(False)
         self._set_notice(str(notice or ""))
         self._sync_view()
 
@@ -446,24 +301,6 @@ class CrossingReviewControls(QFrame):
         self.mark_combo.setCurrentIndex(index)
         self.mark_combo.blockSignals(False)
         self._show_mark(index, reload=True)
-
-    def select_conflict(self, item_id: str) -> None:
-        """Point the child selector at one doubt; quiet, the parent asked for it."""
-
-        wanted = str(item_id or "")
-        for index, item in enumerate(self._conflicts):
-            if item.item_id == wanted:
-                self.conflict_combo.blockSignals(True)
-                self.conflict_combo.setCurrentIndex(index + 1)
-                self.conflict_combo.blockSignals(False)
-                self._selected_conflict = wanted
-                self._sync_conflict_actions()
-                return
-        self.conflict_combo.blockSignals(True)
-        self.conflict_combo.setCurrentIndex(0)
-        self.conflict_combo.blockSignals(False)
-        self._selected_conflict = ""
-        self._sync_conflict_actions()
 
     # ----- the fields -------------------------------------------------
     def _fill_marks(self) -> None:
@@ -481,82 +318,10 @@ class CrossingReviewControls(QFrame):
         bib = str(mark.get("bib") or "").strip()
         return f"{index + 1} · {time_text} · {bib or '未认号'}"
 
-    def _fill_members(self) -> None:
-        self.member_combo.blockSignals(True)
-        self.member_combo.clear()
-        self.member_combo.addItem(MEMBER_PLACEHOLDER)
-        chosen = None
-        for index, member in enumerate(self._members):
-            self.member_combo.addItem(self._member_label(member))
-            event_id = str(member.get("event_id") or "")
-            self.member_combo.setItemData(index + 1, event_id, Qt.UserRole)
-            if event_id and event_id == self._selected_member:
-                chosen = index + 1
-            if member_void(member):
-                # Shown for the record, but not selectable and not decidable.
-                model = self.member_combo.model()
-                slot = model.item(index + 1) if hasattr(model, "item") else None
-                if slot is not None:
-                    slot.setEnabled(False)
-        # No record is chosen for the operator: the placeholder stays until they
-        # picked one themselves, so nothing is decided by the default.
-        self.member_combo.setCurrentIndex(chosen if chosen is not None else 0)
-        self.member_combo.blockSignals(False)
-
-    def _member_label(self, member: Mapping[str, Any]) -> str:
-        bib = str(member.get("bib") or "").strip() or "未认号"
-        state = str(member.get("state") or "").strip()
-        label = f"{bib} · {format_chip_time(member.get('chip_ms'))}"
-        return f"{label} · {state}" if state else label
-
-    def _fill_conflicts(self) -> None:
-        self.conflict_combo.blockSignals(True)
-        self.conflict_combo.clear()
-        self.conflict_combo.addItem(CONFLICT_PLACEHOLDER)
-        chosen = 0
-        for index, item in enumerate(self._conflicts):
-            self.conflict_combo.addItem(_item_summary(item))
-            self.conflict_combo.setItemData(index + 1, item.item_id, Qt.UserRole)
-            self.conflict_combo.setItemData(index + 1, self._conflict_tooltip(item), Qt.ToolTipRole)
-            if item.item_id == self._selected_conflict:
-                chosen = index + 1
-        # Nothing is chosen for the operator: the placeholder stays until they
-        # picked one themselves, so no doubt is decided by the default.
-        self.conflict_combo.setCurrentIndex(chosen)
-        self.conflict_combo.blockSignals(False)
-        self._sync_conflict_actions()
-
-    def _conflict_tooltip(self, item: ProblemItem) -> str:
-        lines = [item.title, item.detail]
-        if item.evidence.get("frame"):
-            lines.append("按「查看疑点」打开它的原帧，看过再按依据处理")
-        return "\n".join(line for line in lines if line)
-
-    def _sync_conflict_actions(self) -> None:
-        """Offer the child's own actions, minus the ones only its record may take."""
-
-        item = self._chosen_conflict()
-        self.conflict_action.blockSignals(True)
-        self.conflict_action.clear()
-        for action in item.actions if item is not None else ():
-            if action not in CONFLICT_ACTIONS:
-                continue
-            self.conflict_action.addItem(ACTION_LABELS.get(action, action))
-            self.conflict_action.setItemData(self.conflict_action.count() - 1, action, Qt.UserRole)
-        self.conflict_action.blockSignals(False)
-        if item is None:
-            self.conflict_label.setText("选择一条疑点后可按依据处理")
-            self.conflict_label.setToolTip("")
-        else:
-            self.conflict_label.setText(f"{item.title}：{item.detail}")
-            self.conflict_label.setToolTip(self._conflict_tooltip(item))
-        self._sync_buttons()
-
     def _sync_summary(self) -> None:
         active = sum(not _excluded(mark) for mark in self._marks)
         excluded = len(self._marks) - active
-        records = sum(not member_void(member) for member in self._members)
-        text = f"已确认 {active} 人 · {records} 条有效记录"
+        text = f"已确认 {active} 人 · {self._records} 条有效记录"
         if excluded:
             text += f" · 已排除 {excluded} 人"
         self.summary.setText(text)
@@ -565,8 +330,6 @@ class CrossingReviewControls(QFrame):
         """Show only the rows this crossing actually needs."""
 
         self.mark_group.setVisible(bool(self._marks))
-        self.member_group.setVisible(bool(self._members))
-        self.conflict_group.setVisible(bool(self._conflicts))
         self.notice.setVisible(bool(self.notice.text()))
 
     def _show_mark(self, index: int, *, reload: bool = False) -> None:
@@ -581,10 +344,6 @@ class CrossingReviewControls(QFrame):
             self.bib_input.setText(str(mark.get("bib") or ""))
             self._bib_loaded_for = index
             self._bib_loaded_key = key
-            # The reason combo shows what this person already carries, so an
-            # exclusion is read before it is written again.
-            recorded = self.exclusion_combo.findText(_exclusion_reason(mark))
-            self.exclusion_combo.setCurrentIndex(recorded if recorded >= 0 else 0)
         elif not valid and self._bib_loaded_for != -1:
             self.bib_input.clear()
             self._bib_loaded_for = -1
@@ -595,17 +354,13 @@ class CrossingReviewControls(QFrame):
     def _sync_buttons(self) -> None:
         valid = 0 <= self._selected_mark < len(self._marks)
         excluded = valid and _excluded(self._marks[self._selected_mark])
-        for widget in (self.bib_input, self.assign_button, self.exclusion_combo,
+        for widget in (self.bib_input, self.assign_button,
                        self.exclude_button, self.remove_button):
             widget.setEnabled(valid and not excluded)
-        self.restore_button.setEnabled(bool(excluded))
-        member = self._chosen_member()
-        decidable = member is not None and not member_void(member)
-        self.keep_button.setEnabled(decidable)
-        self.delete_button.setEnabled(decidable)
-        conflict = self._chosen_conflict()
-        self.conflict_view_button.setEnabled(conflict is not None)
-        self.conflict_decide_button.setEnabled(conflict is not None and self.conflict_action.count() > 0)
+        # 两种纠正只在各自成立时出现：是选手的人不需要「恢复」，被排除的人先恢复
+        # 再谈删除。
+        self.restore_button.setVisible(bool(excluded))
+        self.remove_button.setVisible(valid and not excluded)
 
     def _set_notice(self, text: str) -> None:
         self.notice.setText(text)
@@ -617,36 +372,12 @@ class CrossingReviewControls(QFrame):
             return None, None
         return self._selected_mark, self._marks[self._selected_mark]
 
-    def _chosen_member(self):
-        index = self.member_combo.currentIndex()
-        if index <= 0 or index > len(self._members):
-            return None
-        return self._members[index - 1]
-
-    def _chosen_conflict(self) -> Optional[ProblemItem]:
-        index = self.conflict_combo.currentIndex()
-        if index <= 0 or index > len(self._conflicts):
-            return None
-        return self._conflicts[index - 1]
-
     # ----- what the operator does -------------------------------------
     def _mark_activated(self, index: int) -> None:
         index = int(index)
         self._show_mark(index if 0 <= index < len(self._marks) else -1, reload=True)
         if self._selected_mark >= 0:
             self.mark_selected.emit(self._selected_mark)
-
-    def _member_activated(self, index: int) -> None:
-        member = self._members[index - 1] if 1 <= index <= len(self._members) else None
-        self._selected_member = str(member.get("event_id") or "") if member is not None else ""
-        self._sync_buttons()
-
-    def _conflict_activated(self, index: int) -> None:
-        item = self._conflicts[index - 1] if 1 <= index <= len(self._conflicts) else None
-        self._selected_conflict = item.item_id if item is not None else ""
-        self._sync_conflict_actions()
-        if item is not None:
-            self.conflict_selected.emit(item.item_id)
 
     def _assign_bib(self) -> None:
         index, mark = self._chosen_mark()
@@ -675,12 +406,8 @@ class CrossingReviewControls(QFrame):
         if _excluded(mark):
             self._set_notice("这位已经是已排除人员；如需纠正请按「恢复为选手」。")
             return
-        reason = self.exclusion_combo.currentText().strip()
-        if not reason:
-            self._set_notice("排除要写明依据：先在旁边选择原因。")
-            return
         self._set_notice("")
-        self.exclusion_changed.emit(index, reason)
+        self.exclusion_changed.emit(index, EXCLUSION_STANDING_REASON)
 
     def _restore(self) -> None:
         index, mark = self._chosen_mark()
@@ -700,41 +427,6 @@ class CrossingReviewControls(QFrame):
             return
         self._set_notice("")
         self.mark_removed.emit(index)
-
-    def _decide_member(self, action: str) -> None:
-        member = self._chosen_member()
-        if member is None:
-            self._set_notice("先在下拉里选一条芯片记录，再决定保留或删除；不替操作员默认第一条。")
-            return
-        event_id = str(member.get("event_id") or "")
-        if not event_id:
-            self._set_notice("这条记录没有编号，不能在这里决定。")
-            return
-        if member_void(member):
-            self._set_notice("这条记录已在上游作废，不再在这里决定。")
-            return
-        self._set_notice("")
-        self.member_decision.emit(event_id, action)
-
-    def _view_conflict(self) -> None:
-        item = self._chosen_conflict()
-        if item is None:
-            self._set_notice("先在下拉里选择一条疑点，再查看。")
-            return
-        self._set_notice("")
-        self.conflict_selected.emit(item.item_id)
-
-    def _decide_conflict(self) -> None:
-        item = self._chosen_conflict()
-        if item is None:
-            self._set_notice("先在下拉里选择一条疑点，再按依据处理。")
-            return
-        action = str(self.conflict_action.currentData(Qt.UserRole) or "")
-        if not action:
-            self._set_notice("这条疑点没有能由原帧证据直接确认的处理，请到它自己的入口处理。")
-            return
-        self._set_notice("")
-        self.conflict_decided.emit(item.item_id, action)
 
 
 class CrossingCardRail(QFrame):
@@ -988,16 +680,12 @@ class CrossingCardRail(QFrame):
 __all__ = [
     "AUTO_PASSED_STATE",
     "AUTO_PASSED_TITLE",
-    "CONFLICT_ACTIONS",
-    "CONFLICT_PLACEHOLDER",
     "CrossingCardRail",
     "CrossingReviewControls",
-    "EXCLUSION_REASONS",
-    "MEMBER_PLACEHOLDER",
+    "EXCLUSION_STANDING_REASON",
     "PREVIEW_CACHE_LIMIT",
     "RAIL_ENTRY_SIZE",
     "RAIL_ICON_SIZE",
     "RAIL_LIST_HEIGHT",
     "STATUS_LABELS",
-    "member_void",
 ]

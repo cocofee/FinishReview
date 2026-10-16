@@ -597,6 +597,31 @@ class PassageEventStore:
     def __len__(self) -> int:
         return len(self.events())
 
+    def clear(self) -> None:
+        """Drop every stored record, for a race that has not started yet.
+
+        The reviewer calls this only from the pre-race screen, with recording
+        stopped: after it returns, a reading that arrives is new data, stored
+        exactly as any other.  The deletion marks go with the records — they are
+        bound to a bib, chip and time, and a later race may legally repeat them.
+        """
+
+        with self._lock:
+            self._events.clear()
+            self._event_order.clear()
+            self._race_ids.clear()
+            self._deletions.clear()
+            self._recovered_incomplete_tail = False
+            for path in (self.journal_path, self.deletions_path):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise PassageJournalError(
+                        f"无法清空通过记录：{path}\n{error}"
+                    ) from error
+
     @property
     def recovered_incomplete_tail(self) -> bool:
         with self._lock:

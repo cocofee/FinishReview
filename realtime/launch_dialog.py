@@ -771,8 +771,8 @@ class FinishReviewLaunchDialog(QDialog):
         visual_settings_row.addWidget(self.visual_direction_combo)
         form.addRow("旧运动检测区域", visual_settings_row)
         visual_hint = QLabel(
-            "红黄蓝线用于旧运动检测区域，不是自动分析的实际取样线；"
-            "实际终点线请在问题清单的“取样线 / 认车”中配置。",
+            "红黄蓝线用于旧运动检测区域，不是自动分析的实际终点线；"
+            "实际终点线请在问题清单的“终点线 / 模型”中配置。",
             self,
         )
         visual_hint.setWordWrap(True)

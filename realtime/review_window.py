@@ -88,7 +88,8 @@ from .preflight import (
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
 from .workspace_context import (
-    EventWorkspaceMetadataStore, recovered_archive_path, saved_archive_path, saved_received_path, save_workspace_mode,
+    EventWorkspaceMetadataStore, recovered_archive_path, saved_archive_path, saved_live_path, saved_received_path,
+    save_workspace_mode,
 )
 from .review_export import export_review_summary
 from .review_clip import PassageReviewBindingStore
@@ -601,17 +602,20 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         restored_received = (saved_received_path(self.workspace_root)
                              if self.timing_provider == "cyclerace" else None)
+        restored_live = (saved_live_path(self.workspace_root)
+                         if self.timing_provider == "cyclerace" else None)
+        restored_selection = restored_received or restored_live
         restored_archive = ((saved_archive_path(self.workspace_root) or
-                             (None if restored_received else recovered_archive_path(self.workspace_root)))
+                             (None if restored_selection else recovered_archive_path(self.workspace_root)))
                             if self.timing_provider == "cyclerace" else None)
-        if restored_received is not None:
-            self.output_dir = restored_received
+        if restored_selection is not None:
+            self.output_dir = restored_selection
         if restored_archive is not None:
             self.output_dir = restored_archive
             self._workspace_mode = "archive"
         if self.timing_provider == "cyclerace":
             inbox_metadata = self._receiver_metadata_store.current()
-            if inbox_metadata is not None and restored_archive is None and restored_received is None:
+            if inbox_metadata is not None and restored_archive is None and restored_selection is None:
                 restored_output_dir = _event_workspace_dir(
                     self.workspace_root,
                     inbox_metadata,
@@ -634,10 +638,12 @@ class FinishReviewWindow(PassageReviewSurface):
         # restart.
         if (self.timing_provider == "cyclerace" and inbox_metadata is not None
                 and self._workspace_mode == "live" and restored_received is None):
-            self._merge_cyclerace_events(
-                passage_store,
-                inbox_metadata.race_id,
-            )
+            selected_metadata = (RaceMetadataStore(self.output_dir / "cyclerace_race_metadata.json").current()
+                                 if restored_live is not None else None)
+            if restored_live is None or (selected_metadata is not None and
+                    (selected_metadata.race_id, selected_metadata.stage_id) ==
+                    (inbox_metadata.race_id, inbox_metadata.stage_id)):
+                self._merge_cyclerace_events(passage_store, inbox_metadata.race_id)
         timeline_store = VideoTimelineStore(self.output_dir / "video_timeline.jsonl")
         metadata_store = (
             None
@@ -646,7 +652,7 @@ class FinishReviewWindow(PassageReviewSurface):
                                              passage_store, timeline_store)
         )
         if (metadata_store is not None and metadata_store.recovered and timeline_store.segments()
-                and restored_received is None):
+                and restored_selection is None):
             self._workspace_mode = "archive"
             metadata = metadata_store.current()
             metadata_store.select(metadata.race_id, metadata.stage_id)
@@ -1398,6 +1404,9 @@ class FinishReviewWindow(PassageReviewSurface):
         if self._recording_any_active():
             self.stop_recording()
             return
+        if self._workspace_mode == "archive":
+            self._return_to_live_event()
+            return
         if not is_supported_review_source(self.source):
             self._configure_devices()
             if not is_supported_review_source(self.source):
@@ -1583,19 +1592,29 @@ class FinishReviewWindow(PassageReviewSurface):
         if self._workspace_mode != "archive":
             return True
         metadata = self._receiver_metadata_store.current()
-        if metadata is None:
-            QMessageBox.warning(
-                self,
-                "无法返回当前赛事",
-                "尚未收到 CycleRace 当前赛事信息。",
-            )
-            return False
         try:
-            applied = self._activate_cyclerace_workspace(
-                metadata,
-                force=True,
-                preserve_cyclerace_receiver=True,
-            )
+            if metadata is not None:
+                applied = self._activate_cyclerace_workspace(
+                    metadata,
+                    force=True,
+                    preserve_cyclerace_receiver=True,
+                )
+            else:
+                received = self._received_event_candidates()
+                if received:
+                    applied = self._select_received_event(received[0].race_id, received[0].stage_id)
+                elif self._current_metadata() is not None:
+                    # 已选的赛事也可以现场录像，不要求计时设备重新发送名单或芯片。
+                    save_workspace_mode(self.workspace_root, self.output_dir, "live")
+                    applied = True
+                else:
+                    target = self.workspace_root / datetime.now(BEIJING_TIMEZONE).strftime("现场录像_%Y%m%d_%H%M%S_%f")
+                    applied = self._apply_settings(
+                        self._current_settings(output_dir=target), persist_settings=False,
+                        update_workspace_root=False, preserve_cyclerace_receiver=True,
+                    )
+                    if applied:
+                        save_workspace_mode(self.workspace_root, self.output_dir, "live_ready")
         except Exception as error:  # noqa: BLE001 - keep the archive open on failure.
             QMessageBox.warning(
                 self,
@@ -1607,12 +1626,146 @@ class FinishReviewWindow(PassageReviewSurface):
             return False
         self._workspace_mode = "live"
         self._archive_background_passage_count = 0
-        self._workspace_notice = ""
+        self._workspace_notice = "现场待机，可开始录像；无需等待芯片到达"
         self._capture_error = ""
+        self._prepare_live_recording_view(int(time.time() * 1000), "现场待机：点击开始录像，等待本次画面。")
         self.refresh()
         self._apply_pending_focus()
         self._update_runtime_status()
         return True
+
+    def _prepare_live_recording_view(self, started_at_ms: int, message: str) -> None:
+        """Show this recording and nothing older; the earlier evidence stays saved.
+
+        The filmstrip gets a fresh scope and the picture is cleared, so yesterday's
+        replay cannot be mistaken for today's field picture.  The saved records of
+        this race are untouched.
+        """
+
+        self._clear_selection_details()
+        self._opened_normal_crossing = ""
+        self.video_filmstrip.full_race.set_recording_start(started_at_ms)
+        if self._problem_workbench_active:
+            for pane in self.evidence_panes:
+                pane.clear_passage(message)
+            self._problem_count_mode_changed(True)
+
+    def _clear_event_data(self) -> None:
+        """Wipe this race's test data before the real race starts; nothing is kept back.
+
+        赛前试芯片和试画面留下的读数、判读与试录录像都属于本场垃圾数据。终点线、
+        认车模型、摄像头设置和保存位置不在此列，CycleRace 的正式成绩也不受任何影响。
+        """
+
+        panel = getattr(self, "problem_panel", None)
+        if self._recording_any_active():
+            QMessageBox.warning(self, "无法清空数据", "请先停止普通录像，再清空本场测试数据。")
+            return
+        if self._workspace_mode == "archive":
+            QMessageBox.warning(
+                self, "无法清空数据",
+                "正在查看历史赛事，未做任何改动。请先点「返回现场」，再清空本场测试数据。",
+            )
+            return
+        event_dir = self.output_dir.resolve()
+        root = self.workspace_root.resolve()
+        if event_dir != root and event_dir.parent != root:
+            QMessageBox.warning(self, "无法清空数据", "本场目录不在保存根目录中，未做任何改动。")
+            return
+        count = len(self.passage_store.events(include_inactive=True))
+        answer = QMessageBox.question(
+            self,
+            "清空本场数据",
+            f"将删除本场的 {count} 条通过记录、问题判读、校时和试录画面，不能恢复。\n"
+            "终点线、认车模型、摄像头和保存位置设置保留；CycleRace 正式成绩不受影响。\n\n"
+            "是否清空？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._invalidate_capture_refresh()
+        self.video_filmstrip.full_race.clear()
+        if panel is not None:
+            panel.reset_data()
+        failures = self._remove_event_data(event_dir, root)
+        for store, label in ((self.passage_store, "通过记录"), (self._receiver_passage_store, "收件箱")):
+            try:
+                store.clear()
+            except Exception as error:  # noqa: BLE001 - report what could not be removed.
+                failures.append(f"{label}：{error}")
+        applied = self._apply_settings(
+            self._current_settings(output_dir=self.output_dir),
+            persist_settings=False,
+            update_workspace_root=False,
+            preserve_cyclerace_receiver=True,
+            reload_data_source=True,
+        )
+        if not applied:
+            return
+        keep_marker = any(
+            (self.output_dir / name).is_file()
+            for name in ("cyclerace_race_metadata.json", "cyclerace_passage_events.jsonl")
+        )
+        try:
+            save_workspace_mode(self.workspace_root, self.output_dir,
+                                "live" if keep_marker else "live_ready")
+        except (OSError, ValueError) as error:
+            failures.append(f"赛事状态：{error}")
+        self._workspace_notice = "本场数据已清空；可开始正式录像，测试读数不会保留。"
+        self._refresh_problem_list()
+        self.refresh()
+        self._update_runtime_status()
+        if failures:
+            QMessageBox.warning(
+                self, "部分文件未能删除",
+                "以下文件仍留在磁盘上，请关闭占用它们的程序后重试：\n" + "\n".join(failures[:8]),
+            )
+
+    def _remove_event_data(self, event_dir: Path, root: Path) -> list[str]:
+        """Delete the saved results of this race, keeping what steers recording.
+
+        The sweep is a keep-list, not a name list: every journal written under the
+        event directory is test data, while the finish line, the chosen model and
+        the race identity are the settings an operator would hate to redraw.
+        """
+
+        from .problem_analysis import OUTPUT_DIRNAME
+
+        keep = {
+            "motion_finish_lines.json",
+            "finish_lines.json",
+            "cyclerace_race_metadata.json",
+            "review_event_scope.json",
+            ".finishreview",
+        }
+        keep_in_problems = ("analysis_config",)
+        failures: list[str] = []
+
+        def remove(path: Path) -> None:
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                failures.append(f"{path.name}：{error}")
+
+        for entry in sorted(event_dir.iterdir(), key=lambda item: item.name):
+            if entry.name in keep:
+                continue
+            if entry.name == OUTPUT_DIRNAME and entry.is_dir():
+                for item in sorted(entry.iterdir(), key=lambda node: node.name):
+                    if item.name.startswith(keep_in_problems):
+                        continue
+                    remove(item)
+                continue
+            remove(entry)
+        for name in ("inbox_timeline.jsonl",):
+            remove(root / CYCLERACE_INBOX_DIRNAME / name)
+        return failures
 
     def _configure_devices(self) -> None:
         dialog = FinishReviewLaunchDialog(
@@ -1946,6 +2099,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 self.workspace_root = requested_output_dir
                 self._receiver_passage_store = receiver_passage_store
                 self._receiver_metadata_store = receiver_metadata_store
+                self._workspace_mode = "live"
+                self._archive_background_passage_count = 0
             self.output_dir = output_dir
             self._finish_line_store = FinishLineStore(
                 self.output_dir / "motion_finish_lines.json", legacy_path=self.output_dir / "finish_lines.json"
@@ -2378,6 +2533,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.marks_changed.connect(self._problem_marks_changed)
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
+        self.problem_panel.clear_data_requested.connect(self._clear_event_data)
         self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
         self.problem_panel.summary_changed.connect(lambda _text: self._refresh_crossing_cards())
         self._normal_crossing_cards = {}
@@ -2389,6 +2545,10 @@ class FinishReviewWindow(PassageReviewSurface):
         self.crossing_cards = CrossingCardRail(self)
         self.crossing_cards.item_selected.connect(self._select_crossing_card)
         self.preview_panel.layout().addWidget(self.crossing_cards)
+        # 过线记录已经是左边那张表，横排卡片是同一批数据的第二面：收起来，
+        # 只留下这一行的两个工具（查找原录像 / 以当前帧校时）。
+        self.crossing_cards.list.hide()
+        self.crossing_cards.title.hide()
         self.recording_rail_button = QPushButton("查找原录像", self.crossing_cards)
         self.recording_rail_button.setCheckable(True)
         self.recording_rail_button.toggled.connect(self._set_recording_rail_visible)
@@ -2402,10 +2562,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self.group_start_button.clicked.connect(self._open_group_start)
         self.problem_panel.big_bar.insertWidget(0, self.group_start_button)
         self.group_start_button.hide()
-        self.group_confirm_button = QPushButton("确认本团人数", self)
-        self.group_confirm_button.clicked.connect(self.problem_panel._confirm_pending)
-        self.problem_panel.big_bar.insertWidget(1, self.group_confirm_button)
-        self.group_confirm_button.hide()
         self.return_problem_button = QPushButton("回到当前问题", self)
         self.return_problem_button.clicked.connect(self._return_to_problem)
         self.manual_problem_button = QPushButton("＋ 补记过线", self)
@@ -2428,12 +2584,16 @@ class FinishReviewWindow(PassageReviewSurface):
         if hasattr(self, "group_start_button"):
             group = item is not None and item.kind in ("bunch_check", "obstruction")
             self.group_start_button.setVisible(group)
-            self.group_confirm_button.setVisible(group)
         if getattr(self, "_problem_workbench_active", False):
             if not getattr(self, "_creating_manual_crossing", False):
                 self._return_to_problem()
             self._refresh_crossing_cards()
             self._problem_count_mode_changed(True)
+        # 表里点到的是一条自动对应的记录：那是在复查这条过线，点画面不算新建待处理。
+        # 放在 _return_to_problem 之后，因为回看问题本身会清掉这个标记。
+        from .problem_items import KIND_AUTO_PASSED
+        if item is not None and item.kind == KIND_AUTO_PASSED:
+            self._opened_normal_crossing = item.item_id
 
     def _problem_big_view_changed(self, big: bool) -> None:
         """Give the enlarged picture the room of the rail, and fit the frame to it.
@@ -2567,12 +2727,15 @@ class FinishReviewWindow(PassageReviewSurface):
         if frame is None:
             return ()
         from .bunch_review import is_excluded, mark_on_frame
-        return tuple((float(mark["x"]), float(mark["y"]),
-                      f"{index + 1}" + (f" {mark['bib']}" if mark.get("bib") else "")
-                      + (f" 已排除：{mark['exclusion_reason']}" if is_excluded(mark) else ""),
+        from .crossing_order import mark_order_labels, ordered_mark_indices
+        marks = self.problem_panel.current_marks()
+        labels = mark_order_labels(marks)
+        return tuple((float(marks[index]["x"]), float(marks[index]["y"]),
+                      labels[index] + (f" {marks[index]['bib']}" if marks[index].get("bib") else "")
+                      + (f" 已排除：{marks[index]['exclusion_reason']}" if is_excluded(marks[index]) else ""),
                       True, False)
-                     for index, mark in enumerate(self.problem_panel.current_marks())
-                     if mark_on_frame(mark, frame, frame["recorder_ms"]))
+                     for index in ordered_mark_indices(marks)
+                     if mark_on_frame(marks[index], frame, frame["recorder_ms"]))
 
     def _problem_browse_started(self):
         if getattr(self, "_problem_workbench_active", False):
@@ -2762,24 +2925,12 @@ class FinishReviewWindow(PassageReviewSurface):
         if not hasattr(self, "crossing_cards"):
             return
         panel = self.problem_panel
-        from .problem_items import CATEGORY_VIDEO, KIND_MANUAL_REVIEW, STATUS_INFO, ProblemItem, stable_item_id
-        current = panel.current_item()
-        normal = {}
-        for passed in (panel.payload or {}).get("auto_passed", []):
-            frame = passed.get("frame") or {}
-            if not frame or not passed.get("active_now", True):
-                continue
-            key = stable_item_id("passed", passed.get("event_id"), frame.get("camera_index"),
-                                 frame.get("segment_id"), frame.get("frame_index"))
-            evidence = dict(passed, auto_passed=True)
-            normal[key] = ProblemItem(key, KIND_MANUAL_REVIEW, CATEGORY_VIDEO, "正常单人已自动对应，可打开原帧复查",
-                                      chip_time_ms=passed.get("chip_time_ms"), bibs=(passed.get("bib", ""),),
-                                      status=STATUS_INFO, status_note="已自动对应", evidence=evidence)
+        from .problem_items import KIND_AUTO_PASSED
+        # 自动对应的正常单人已经是左边表里的一行（「全部」按时间排），不再另造一份卡片。
+        normal = {item.item_id: item for item in panel.items if item.kind == KIND_AUTO_PASSED}
         self._normal_crossing_cards = normal
-        if self._opened_normal_crossing not in normal:
+        if self._opened_normal_crossing and self._opened_normal_crossing not in normal:
             self._opened_normal_crossing = ""
-        selected = self._opened_normal_crossing or (current.item_id if current else "")
-        self.crossing_cards.set_items([*panel.rows, *normal.values()], panel.problem_dir, selected)
         if not self._rail_suggested:
             # Before any candidate is available the raw recording stays reachable:
             # the first calibration and a crossing the analysis never reported.
@@ -3341,7 +3492,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._auto_recording_error = ""
             self._capture_error = ""
             self._workspace_notice = ""
-            self.video_filmstrip.full_race.set_recording_start(recording_started_ms)
+            self._prepare_live_recording_view(recording_started_ms, "本次录像开始；有新过线时在这里出现。")
             self._refresh_timer.start()
             self._request_capture_refresh()
             self._lookup_cache.clear()

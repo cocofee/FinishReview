@@ -202,7 +202,7 @@ class RuntimeStatusPresenter:
 
         if snapshot.workspace_mode == "archive" and not recording_active:
             recording_text, recording_color = "普通录像: 历史查看", "#667085"
-            recording_tooltip = "返回当前赛事后可开始录像"
+            recording_tooltip = "点击返回现场，再开始录像；计时设备空闲也可以录像"
         elif snapshot.runtime_error and not recording_all_active:
             recording_text, recording_color = "普通录像: 异常", "#b54747"
             recording_tooltip = snapshot.runtime_error
@@ -225,17 +225,20 @@ class RuntimeStatusPresenter:
         self.widgets['record_button'].setText(
             "停止录像"
             if recording_active
-            else "历史查看中"
+            else "返回现场"
             if snapshot.workspace_mode == "archive"
             else "开始录像"
         )
-        self.widgets['record_button'].setEnabled(
-            recording_active or snapshot.workspace_mode != "archive"
+        self.widgets['record_button'].setEnabled(True)
+        self.widgets['record_button'].setToolTip(
+            "停止当前录像" if recording_active else
+            "返回现场待机，无需等待芯片到达" if snapshot.workspace_mode == "archive" else
+            "开始保存本次摄像头录像，无需等待芯片到达"
         )
         self.widgets['record_button'].setStyleSheet(
             "background: #a33d4b; color: white; border: 1px solid #a33d4b;"
             if recording_active
-            else "background: #eef1f4; color: #667085; border: 1px solid #cfd7df;"
+            else "background: #eaf2ff; color: #244c84; border: 1px solid #8cadd7;"
             if snapshot.workspace_mode == "archive"
             else "background: #247a52; color: white; border: 1px solid #247a52;"
         )

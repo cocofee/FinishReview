@@ -27,6 +27,7 @@ from .problem_items import (
     ACTION_DELETE_EXTRA_CHIP,
     ACTION_LABELS,
     ACTION_NOT_RIDER,
+    ACTION_RESULT_LABELS,
     ACTION_RECORD_BIB,
     ACTION_RIDE_BACK,
     ACTION_SAME_CROSSING,
@@ -123,7 +124,7 @@ class ProblemResolution:
 
     @property
     def label(self) -> str:
-        return ACTION_LABELS.get(self.action, self.action)
+        return ACTION_RESULT_LABELS.get(self.action) or ACTION_LABELS.get(self.action, self.action)
 
 
 class ProblemResolutionStore:

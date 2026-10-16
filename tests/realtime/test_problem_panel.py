@@ -72,18 +72,21 @@ def _items(two_chip_bibs=("020", "023")):
 
 
 def test_panel_lists_problems_resolves_and_exports(qapp, tmp_path, monkeypatch):
-    _write_list(tmp_path, _items(), [{"bib": "057", "frame": dict(FRAME), "source": "auto"}])
+    _write_list(tmp_path, _items(), [{"bib": "057", "chip_time_ms": T + 500, "frame": dict(FRAME), "source": "auto"}])
     panel = ProblemListPanel()
     jumps = []
     panel.jump_requested.connect(jumps.append)
     panel.set_workspace(tmp_path)
 
     # The line on screen is the queue in four classes; the long count is its tooltip.
-    assert panel.summary.text() == "疑点 多芯片 1 · 无芯片 1"
+    assert panel.summary.text() == "疑点 一人双芯片 1 · 漏读 1"
     assert panel.summary.toolTip() == "自动通过 1 人 · 待处理 2 条 · 无法核实 3 人 · 已处理 1 条"
     assert panel.table.rowCount() == 3  # two pending plus the reference list
     panel.queue_filter.setCurrentIndex(3)  # 全部
-    assert panel.table.rowCount() == 5
+    # 自动对应的单人不上表，但「全部」是这场比赛的过线记录：它也在里面。
+    assert panel.table.rowCount() == 6
+    assert [row.text() for row in (panel.table.item(index, 1) for index in range(panel.table.rowCount()))] \
+        == ["漏读", "单人", "一人双芯片", "一人双芯片", "非选手", "待确认"]
     panel.queue_filter.setCurrentIndex(0)
 
     panel.table.setCurrentCell(0, 0)
@@ -92,39 +95,112 @@ def test_panel_lists_problems_resolves_and_exports(qapp, tmp_path, monkeypatch):
     panel.jump_button.click()
     assert jumps == [FRAME]
 
-    record = next(button for button in panel.action_buttons if button.property("problemAction") == "record_bib")
-    record.click()
-    assert "号码" in panel.hint.text()
+    rider = next(button for button in panel.action_buttons if button.property("problemAction") == "rider_crossing")
+    # 号码看不清也是同一个按钮：先记下这次过线，留在待处理里等认号。
+    rider.click()
+    assert panel.store.get("no_chip:1").action == "confirm_crossing"
+    assert panel.state(panel.current_item()).startswith("待处理")
     asked = []
     monkeypatch.setattr(QMessageBox, "question", lambda *args: asked.append(args[2]) or QMessageBox.No)
     panel.bib_input.setText("067")
-    record.click()
+    rider.click()
     assert asked and "057" in asked[0]
-    assert panel.store.get("no_chip:1") is None
+    assert panel.store.get("no_chip:1").action == "confirm_crossing"
     monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
     panel.bib_input.setText("067")
-    record.click()
+    rider.click()
     assert panel.store.get("no_chip:1").bib == "067"
 
     panel.table.setCurrentCell(0, 0)
     assert panel.current_item().item_id == "two:1"
-    delete = next(button for button in panel.action_buttons if button.property("problemAction") == "delete_extra_chip")
-    panel.bib_input.setText("020")
-    delete.click()
-    # An empty reason is offered as the standing phrase, not demanded as typing.
-    assert "依据已填" in panel.hint.text() and panel.reason_input.text()
-    assert panel.state(panel.current_item()).startswith("待处理")
-    panel.bib_input.setText("020")
-    panel.reason_input.setText("一人带两块芯片")
-    delete.click()
+    # 一个人带两块芯片：按钮上写着留哪一块，按下就是答案。
+    keep = next(button for button in panel.action_buttons if button.text() == "留 020")
+    keep.click()
+    assert panel.store.get("two:1").action == "delete_extra_chip"
+    assert panel.store.get("two:1").reason == ACTION_REASON_PRESETS["delete_extra_chip"]
     assert panel.summary_text().startswith("自动通过 1 人 · 待处理 0 条")
 
     counts = panel.export()
     assert counts == {"补录清单.csv": 1, "建议删除清单.csv": 1, "建议改号改圈清单.csv": 0}
     rows = list(csv.reader((tmp_path / "finish_problems" / "exports" / "建议删除清单.csv").open(encoding="utf-8-sig")))
-    assert rows[1][0] == "020" and rows[1][2] == "e-020" and rows[1][4] == "一人带两块芯片"
+    assert rows[1][0] == "023" and rows[1][2] == "e-023" and rows[1][4] == ACTION_REASON_PRESETS["delete_extra_chip"]
     manual = list(csv.reader((tmp_path / "finish_problems" / "exports" / "补录清单.csv").open(encoding="utf-8-sig")))
     assert manual[1][0] == "067" and "第 813 帧" in manual[1][2]
+
+
+def test_the_queue_follows_crossings_including_manual_riders_without_chips(qapp, tmp_path):
+    from dataclasses import replace
+
+    from realtime.chip_history import format_chip_time
+    from realtime.clock_sync import CLOCK_MODEL_FILENAME, ClockModel, ClockModelStore
+
+    fit = ClockModel(1, 2000, 0, T, T, T + 20_000, 10, 10, 0, 2000, 10)
+    fit = ClockModelStore(tmp_path / CLOCK_MODEL_FILENAME).publish(fit)
+    frame = dict(FRAME, calibration_version=fit.version)
+    first = replace(_items()[1], evidence={"frame": frame, "recorder_ms": T + 2100},
+                    calibration_version=fit.version, chip_time_ms=T + 5000)
+    later = replace(_items()[0], evidence={"frame": frame, "recorder_ms": T + 2300},
+                    calibration_version=fit.version)
+    group = ProblemItem("group", KIND_BUNCH, CATEGORY_VIDEO, "集团", chip_time_ms=T + 400,
+                        bibs=("040", "041"), calibration_version=fit.version,
+                        evidence={"frame": frame, "recorder_ms": T + 2400, "recorder_start_ms": T - 5000})
+    normal = {"bib": "057", "event_id": "e-057", "chip_time_ms": T + 250,
+              "frame": frame, "recorder_ms": T + 2250}
+    _write_list(tmp_path, [group, later, first], [normal])
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(tmp_path)
+        manual = panel.add_manual_problem(frame, recorder_ms=T + 2200)
+        assert manual.chip_time_ms is None
+        assert [entry.item_id for entry in panel.rows] == [first.item_id, manual.item_id, later.item_id, "group"]
+        assert [panel.table.item(row, 0).text() for row in range(4)] == [
+            format_chip_time(T + value) for value in (100, 200, 300, 400)]
+        assert panel.current_item().item_id == manual.item_id
+        panel._step(1)
+        assert panel.current_item().item_id == later.item_id
+
+        panel.queue_filter.setCurrentIndex(3)
+        assert [entry.item_id for entry in panel.rows if entry.kind != "auto_passed"] == [
+            first.item_id, manual.item_id, later.item_id, "group"]
+        assert [panel.table.item(row, 0).text() for row in range(5)] == [
+            format_chip_time(T + value) for value in (100, 200, 250, 300, 400)]
+        assert next(entry for entry in panel.rows if entry.item_id == first.item_id).chip_time_ms == T + 5000
+        panel.queue_filter.setCurrentIndex(0)
+        assert [entry.item_id for entry in panel.rows] == [first.item_id, manual.item_id, later.item_id, "group"]
+    finally:
+        panel.close()
+
+
+def test_new_calibration_reorders_unversioned_crossings_and_preserves_selection(qapp, tmp_path):
+    from dataclasses import replace
+
+    from realtime.chip_history import format_chip_time
+    from realtime.clock_sync import CLOCK_MODEL_FILENAME, ClockModel, ClockModelStore
+
+    clocks = ClockModelStore(tmp_path / CLOCK_MODEL_FILENAME)
+    fit = ClockModel(1, 1000, 0, T, T, T + 20_000, 10, 10, 0, 1000, 10)
+    clocks.publish(fit)
+    clocks.publish(replace(fit, camera_index=2, intercept_ms=5000))
+    unversioned = replace(_items()[0], calibration_version=0,
+                          evidence={"frame": dict(FRAME, calibration_version=0), "recorder_ms": T + 1600})
+    pinned = replace(_items()[1], calibration_version=1,
+                     evidence={"frame": dict(FRAME, camera_index=2, calibration_version=1),
+                               "recorder_ms": T + 5500})
+    _write_list(tmp_path, [unversioned, pinned], [])
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(tmp_path)
+        assert [entry.item_id for entry in panel.rows] == [pinned.item_id, unversioned.item_id]
+        assert panel.current_item().item_id == pinned.item_id
+        clocks.publish(replace(fit, intercept_ms=2000))
+        panel.refresh()  # 清单没变，只有录像校时新增一版。
+        assert [entry.item_id for entry in panel.rows] == [unversioned.item_id, pinned.item_id]
+        assert panel.current_item().item_id == pinned.item_id
+        assert panel.table.item(0, 0).text() == format_chip_time(T - 400)
+        assert panel.table.item(1, 0).text() == format_chip_time(T + 500)
+        assert [entry.chip_time_ms for entry in panel.rows] == [unversioned.chip_time_ms, pinned.chip_time_ms]
+    finally:
+        panel.close()
 
 
 def test_upstream_voids_and_changes_reopen_or_close_items(qapp, tmp_path):
@@ -337,6 +413,61 @@ def test_the_picture_counts_people_and_the_count_survives_a_restart(qapp, tmp_pa
     assert restored.state(restored.current_item()) == "待处理"
 
 
+def test_crossing_order_survives_backtracking_editing_and_undo(qapp, tmp_path):
+    from realtime.chip_history import format_chip_time
+
+    _write_list(tmp_path, [_items()[0]], [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.toggle_big_view()
+    later = dict(FRAME, frame_index=900, position_ms=45_000)
+    earlier = dict(FRAME, frame_index=800, position_ms=40_000)
+    panel.add_mark(.3, .5, T + 300, later)
+    panel.add_mark(.4, .5, T + 100, earlier)
+    panel.add_mark(.6, .5, T + 100, earlier)
+    assert [panel.count_table.item(row, 0).text() for row in range(3)] == ["1 同时", "1 同时", "3"]
+    assert panel.count_table.item(0, 1).text() == format_chip_time(T + 100)
+    assert panel.count_table.currentRow() == 1  # 新点的是第三条原记录、第二行过线
+    assert [mark["recorder_ms"] for mark in panel.current_marks()] == [T + 300, T + 100, T + 100]
+
+    panel.count_table.setCurrentCell(0, 0)
+    panel.bib_input.setText("057")
+    panel.assign_button.click()
+    assert panel.current_marks()[1]["bib"] == "057"
+    assert panel.current_marks()[0]["bib"] == ""
+    panel.exclude_button.click()
+    assert panel.current_marks()[1]["exclusion_reason"]
+    panel.restore_button.click()
+    panel.remove_button.click()
+    assert [mark["x"] for mark in panel.current_marks()] == [.3, .6]
+    panel.undo_mark()  # 撤销最后一次点击，不是时间轴上最后过线的人。
+    assert [mark["x"] for mark in panel.current_marks()] == [.3]
+    panel.close()
+
+
+def test_the_chip_time_column_uses_each_events_official_time(qapp, tmp_path):
+    from realtime.chip_history import format_chip_time
+    from realtime.passage_receiver import PassageEvent
+
+    item = _items()[1]
+    _write_list(tmp_path, [item], [])
+    panel = ProblemListPanel()
+    events = [PassageEvent(event_id=identity, bib=bib, passage_time_ms=100 + i * 50,
+                           race_id="race", stage_id="stage", group_id="group", sequence=i + 1,
+                           passage_timestamp_ms=T + 100 + i * 50)
+              for i, (identity, bib) in enumerate(zip(item.event_ids, item.bibs))]
+    panel._events_provider = lambda: events
+    panel.set_workspace(tmp_path)
+    panel.toggle_big_view()
+    assert panel.count_table.rowCount() == 2
+    assert [panel.count_table.item(row, 3).text() for row in range(2)] == [
+        format_chip_time(T + 100), format_chip_time(T + 150)]
+    assert [panel.count_table.item(row, 0).text() for row in range(2)] == ["待看", "待看"]
+    panel.count_table.setCurrentCell(0, 0)
+    assert panel.person_box.isHidden()  # 芯片读数不是已确认的画面选手。
+    panel.close()
+
+
 def test_enter_settles_the_counted_crossing_by_its_class(qapp, tmp_path):
     _write_list(tmp_path, _items(), [])
     panel = ProblemListPanel()
@@ -350,7 +481,7 @@ def test_enter_settles_the_counted_crossing_by_its_class(qapp, tmp_path):
     two = panel.current_item()
     panel._confirm_pending()
     # Two people on one crossing with two chips are two riders side by side.
-    assert panel.state(two).startswith("已处理：确认是并排两人")
+    assert panel.state(two).startswith("已处理：两个人")
     assert panel.store.get("two:1").reason == "画面点出 2 人"
 
     panel.table.setCurrentCell(next(i for i, item in enumerate(panel.rows)
@@ -426,12 +557,11 @@ def test_near_crossing_records_a_plate_and_exports_its_time_source(qapp, tmp_pat
     panel.table.setCurrentCell(0, 0)
 
     assert [button.property("problemAction") for button in panel.action_buttons] == [
-        "record_bib", "same_crossing", "not_rider", "ride_back", "insufficient", "confirm_crossing",
+        "rider_crossing", "not_rider", "same_crossing",
     ]
     assert panel.state(near) == "待处理"
     panel.bib_input.setText("307")
-    record = next(button for button in panel.action_buttons if button.property("problemAction") == "record_bib")
-    record.click()
+    panel.action_buttons[0].click()  # 是选手：号码框里有 307，就按补录走
     assert panel.state(near).startswith("待 CycleRace：认号补录")
 
     assert panel.export() == {"补录清单.csv": 1, "建议删除清单.csv": 0, "建议改号改圈清单.csv": 0}
@@ -442,7 +572,9 @@ def test_near_crossing_records_a_plate_and_exports_its_time_source(qapp, tmp_pat
     assert "附近可能另有过线" in rows[0]["说明"]
 
 
-def test_excluding_or_confirming_a_crossing_requires_a_written_reason(qapp, tmp_path):
+def test_one_press_decides_with_its_standing_reason(qapp, tmp_path):
+    """一按就是判罚：理由跟着按压一起记下，不再让人读一遍再确认一遍。"""
+
     near = _near_crossing_item()
     _write_list(tmp_path, [near], [])
     panel = ProblemListPanel()
@@ -451,17 +583,15 @@ def test_excluding_or_confirming_a_crossing_requires_a_written_reason(qapp, tmp_
 
     same = next(button for button in panel.action_buttons if button.property("problemAction") == "same_crossing")
     same.click()
-    assert "依据" in panel.hint.text() and panel.state(near) == "待处理"
+    # Confirming "same crossing" closes the question without inventing a rider.
+    assert panel.state(near).startswith("已处理：同一次过线")
+    assert panel.store.get(near.item_id).reason == ACTION_REASON_PRESETS["same_crossing"]
+    assert panel.export() == {"补录清单.csv": 0, "建议删除清单.csv": 0, "建议改号改圈清单.csv": 0}
 
+    # The journal itself still refuses a ruling with no reason at all.
     for action in ("not_rider", "ride_back", "same_crossing"):
         with pytest.raises(ValueError, match="依据"):
             panel.store.resolve(near, action)
-
-    panel.reason_input.setText("同一人后轮，前轮已在同一帧压线")
-    same.click()
-    # Confirming "same crossing" closes the question without inventing a rider.
-    assert panel.state(near).startswith("已处理：确认是同一次过线")
-    assert panel.export() == {"补录清单.csv": 0, "建议删除清单.csv": 0, "建议改号改圈清单.csv": 0}
 
 
 def _keyboard_items():
@@ -489,8 +619,8 @@ def _row_of(panel, item_id):
     return next(index for index, item in enumerate(panel.rows) if item.item_id == item_id)
 
 
-def test_f_enlarges_the_picture_with_the_decisions_traveling_along(qapp, tmp_path):
-    """F is the key the operators already use; the decisions come with the picture."""
+def test_f_opens_the_judging_column_beside_the_big_picture(qapp, tmp_path):
+    """F is the key the operators already use: the picture grows, the queue steps aside."""
 
     _write_list(tmp_path, _keyboard_items(), [])
     panel = ProblemListPanel()
@@ -499,33 +629,32 @@ def test_f_enlarges_the_picture_with_the_decisions_traveling_along(qapp, tmp_pat
     panel.set_workspace(tmp_path)
     near = panel.rows[_row_of(panel, "near:1")]
 
-    head = panel.decision_box.parentWidget()
     panel.table.setCurrentCell(_row_of(panel, "near:1"), 0)
     QTest.keyClick(panel, Qt.Key_F)
     assert jumps == [FRAME]
-    assert not panel.table.isVisibleTo(panel) and not panel.detail_scroll.isVisibleTo(panel)
-    # The box stays on screen, now under the picture rather than beside it.
-    assert panel.decision_box.parentWidget() is panel and panel.big_title.text()
-    assert panel.decision_box.isVisibleTo(panel)
-    # Everything that runs and counts the queue hands its height to the picture,
-    # and the decisions stand in one line instead of a column of buttons.
+    assert not panel.table.isVisibleTo(panel)
+    # 过线顺序和芯片时间在同一张表里；名单不再与另一张芯片表来回对。
+    assert panel.detail_scroll.isVisibleTo(panel) and panel.decision_box.isVisibleTo(panel)
+    assert panel.big_help.isVisibleTo(panel) and panel.side_notice.isVisibleTo(panel)
+    assert panel.count_table.isVisibleTo(panel) and not hasattr(panel, "chip_table")
+    assert [panel.count_table.horizontalHeaderItem(i).text() for i in range(4)] == [
+        "顺序", "过线时间", "号码", "芯片时间"]
+    assert panel.undo_button.isHidden() and panel.clear_button.isHidden()
     assert not panel.header.isVisibleTo(panel) and panel.big_keys.isVisibleTo(panel)
-    assert panel.action_target is panel.action_line
-    assert [panel.action_line.itemAt(index).widget() for index in range(len(panel.action_buttons))]
+    # 卡片图片让位给名单，放大以后看的就是人。
+    assert not panel.card.isVisibleTo(panel) and not panel.filmstrip.isVisibleTo(panel)
 
-    # Looking and deciding happen in the same view: pick a decision, confirm it.
-    QTest.keyClick(panel, Qt.Key_2)
-    assert panel.reason_input.text() == ACTION_REASON_PRESETS["same_crossing"]
-    QTest.keyClick(panel, Qt.Key_Return)
-    assert panel.state(near).startswith("已处理：确认是同一次过线")
+    # Looking and deciding happen in the same view: one digit is the decision.
+    QTest.keyClick(panel, Qt.Key_3)  # 同一次过线
+    assert panel.state(near).startswith("已处理：同一次过线")
+    assert panel.store.get(near.item_id).reason == ACTION_REASON_PRESETS["same_crossing"]
     assert not panel.table.isVisibleTo(panel)  # deciding keeps the picture up
 
-    # The same key is the way back, and the box returns to its place with it.
+    # The same key is the way back, and the column returns to the queue.
     QTest.keyClick(panel, Qt.Key_F)
-    assert panel.table.isVisibleTo(panel) and panel.decision_box.parentWidget() is head
-    assert panel.detail_layout.indexOf(panel.decision_box) >= 0
-    assert panel.header.isVisibleTo(panel) and panel.action_target is panel.action_row
-    assert not panel.big_keys.isVisibleTo(panel)
+    assert panel.table.isVisibleTo(panel) and panel.header.isVisibleTo(panel)
+    assert panel.card.isVisibleTo(panel) and panel.decision_box.isVisibleTo(panel)
+    assert not panel.count_table.isVisibleTo(panel) and not panel.big_keys.isVisibleTo(panel)
 
     # Esc is the same way back, so a quick look never traps the queue.
     panel.table.setCurrentCell(_row_of(panel, "unknown:1"), 0)
@@ -559,26 +688,32 @@ def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
     panel = ProblemListPanel()
     panel.set_workspace(tmp_path)
     panel.table.setCurrentCell(0, 0)
-    assert [button.property("problemAction") for button in panel.action_buttons][:2] == ["record_bib",
-                                                                                         "same_crossing"]
+    assert [button.property("problemAction") for button in panel.action_buttons] == [
+        "rider_crossing", "not_rider", "same_crossing",
+    ]
 
-    # The reason is confirmed, not typed: one press fills the standing phrase,
-    # Enter decides, and the phrase is what gets recorded.
+    # One digit is the whole decision: the standing reason goes in with it.
     near = panel.current_item()
-    QTest.keyClick(panel, Qt.Key_2)
-    assert panel.reason_input.text() == ACTION_REASON_PRESETS["same_crossing"]
-    assert "依据已填" in panel.hint.text() and not panel.store.resolutions()
-
-    # Changing the decision drops the untouched phrase instead of deciding under it.
-    QTest.keyClick(panel, Qt.Key_1)
-    assert panel.reason_input.text() == "" and "号码" in panel.hint.text()
+    QTest.keyClick(panel, Qt.Key_3)
+    assert panel.store.get(near.item_id).action == "same_crossing"
+    assert panel.store.get(near.item_id).reason == ACTION_REASON_PRESETS["same_crossing"]
+    assert panel.state(near).startswith("已处理：同一次过线")
 
     # A digit with no button behind it decides nothing.
     panel.hint.clear()
     QTest.keyClick(panel, Qt.Key_9)
     assert panel.hint.text() == ""
 
-    QTest.keyClick(panel, Qt.Key_2)
+
+def test_enter_answers_the_rows_first_button(qapp, tmp_path):
+    """回车就是第一颗按钮：号码填好了就是补录，不用再按一次选它。"""
+
+    _write_list(tmp_path, [_near_crossing_item()], [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.table.setCurrentCell(0, 0)
+
+    panel.bib_input.setText("307")
     QTest.keyClick(panel, Qt.Key_Return)
-    assert panel.state(near).startswith("已处理：确认是同一次过线")
-    assert panel.store.resolutions()[0].reason == ACTION_REASON_PRESETS["same_crossing"]
+    assert panel.store.get("near:1").action == "record_bib"
+    assert panel.store.get("near:1").bib == "307"

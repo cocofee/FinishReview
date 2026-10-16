@@ -48,6 +48,9 @@ KIND_OBSTRUCTION = "obstruction"
 KIND_STANDING = "standing"
 KIND_NO_VIDEO = "no_video"
 KIND_MANUAL_REVIEW = "manual_review"
+# A normally auto-passed rider: not a task, but still this race's own crossing
+# record, so 「全部」 can show the whole field in time order.
+KIND_AUTO_PASSED = "auto_passed"
 KIND_WAITING = "evidence_pending"
 
 # Operator task classes (plan step 6). Every kind belongs to exactly one, so the
@@ -80,9 +83,9 @@ TYPE_ORDER = (TYPE_MULTI_CHIP, TYPE_BUNCH, TYPE_MISSED, TYPE_RECORD, TYPE_EVIDEN
 TYPE_CONFIRM = "confirm"
 
 CLASS_TITLES = {
-    TYPE_MULTI_CHIP: "多芯片",
+    TYPE_MULTI_CHIP: "一人双芯片",
     TYPE_BUNCH: "集团",
-    TYPE_MISSED: "无芯片",
+    TYPE_MISSED: "漏读",
     TYPE_CONFIRM: "待确认",
 }
 
@@ -111,6 +114,9 @@ KIND_TYPES = {
     KIND_LAP_MISSING: TYPE_RECORD,
     KIND_NOT_ARRIVED: TYPE_RECORD,
     KIND_SYNC: TYPE_RECORD,
+    # 芯片与画面自己对上的正常单人：是竞赛记录的一部分，不是谁的疑点，
+    # 所以归在记录里，不进任何一类待处理。
+    KIND_AUTO_PASSED: TYPE_RECORD,
     KIND_NO_VIDEO: TYPE_EVIDENCE,
     KIND_WAITING: TYPE_EVIDENCE,
 }
@@ -147,6 +153,7 @@ KIND_TITLES = {
     KIND_OBSTRUCTION: "线被挡 / 拥挤时段",
     KIND_STANDING: "有人停留",
     KIND_NO_VIDEO: "录像缺口内的芯片",
+    KIND_AUTO_PASSED: "自动对应的过线记录",
 }
 
 # Operator actions; the value is the button text.
@@ -164,27 +171,50 @@ ACTION_CHANGE = "suggest_change"
 ACTION_SYNCED = "synced"
 ACTION_CHECKED = "checked"
 
+# The buttons are the question the row asks, not the paperwork behind it: one
+# look at the frame, one click, no second press to agree with a reason.  The
+# wordier codes stay the machine's own vocabulary for the journals and the
+# hand-off lists; what the operator reads is here.
 ACTION_LABELS = {
-    ACTION_RECORD_BIB: "认号补录",
-    ACTION_CONFIRM_CROSSING: "确认过线，稍后认号",
-    ACTION_NOT_RIDER: "非选手",
-    ACTION_RIDE_BACK: "往回骑或推车",
-    ACTION_SAME_CROSSING: "确认是同一次过线",
-    ACTION_DELETE_EXTRA_CHIP: "删除多余芯片",
-    ACTION_SIDE_BY_SIDE: "确认是并排两人",
-    ACTION_DELETE_CHIP: "建议删除芯片",
-    ACTION_INSUFFICIENT: "证据不足",
+    ACTION_RECORD_BIB: "是选手",
+    ACTION_CONFIRM_CROSSING: "是选手，号码看不清",
+    ACTION_NOT_RIDER: "不是选手",
+    ACTION_RIDE_BACK: "不是完赛过线",
+    ACTION_SAME_CROSSING: "同一次过线",
+    ACTION_DELETE_EXTRA_CHIP: "只算这一条",
+    ACTION_SIDE_BY_SIDE: "两个人",
+    ACTION_DELETE_CHIP: "建议删除",
+    ACTION_INSUFFICIENT: "看不清，先放着",
     ACTION_KEEP: "确认有效",
     ACTION_CHANGE: "建议改号改圈",
     ACTION_SYNCED: "已在 CycleRace 处理",
     ACTION_CHECKED: "已核对",
 }
 
+# What the journal and the rows call the same decision once it is made: the
+# button says what the operator saw, this says what the row now stands for and
+# what was handed to CycleRace.
+ACTION_RESULT_LABELS = {
+    ACTION_RECORD_BIB: "认号补录",
+    ACTION_CONFIRM_CROSSING: "确认过线，待认号",
+    ACTION_NOT_RIDER: "非选手过线",
+    ACTION_RIDE_BACK: "回头或推车",
+    ACTION_SAME_CROSSING: "同一次过线",
+    ACTION_SIDE_BY_SIDE: "两个人",
+    ACTION_DELETE_CHIP: "建议删除",
+    ACTION_DELETE_EXTRA_CHIP: "建议删除",
+    ACTION_KEEP: "确认有效",
+    ACTION_INSUFFICIENT: "证据不足",
+    ACTION_CHANGE: "建议改号改圈",
+    ACTION_SYNCED: "已在 CycleRace 处理",
+    ACTION_CHECKED: "已核对",
+}
+
 # Standing reasons for the decisions that must carry one: the operator looks at
-# the frame and confirms what it shows instead of typing it out, and the field
-# stays editable for anything the frame shows differently.
+# the frame and the reason is filled in for them, in one click; the field stays
+# editable for anything the frame shows differently.
 ACTION_REASON_PRESETS = {
-    ACTION_NOT_RIDER: "原帧是行人或工作人员，不是选手过线",
+    ACTION_NOT_RIDER: "原帧是行人、工作人员或其它车辆，不是选手过线",
     ACTION_RIDE_BACK: "原帧该选手往回骑或推车，不是正常过线",
     ACTION_SAME_CROSSING: "原帧是同一人的后轮或影子，前轮已在同一帧压线",
     ACTION_DELETE_CHIP: "同一车两块芯片，同一帧压线",
@@ -193,6 +223,8 @@ ACTION_REASON_PRESETS = {
 
 KIND_ACTIONS = {
     KIND_MANUAL_REVIEW: (ACTION_RECORD_BIB, ACTION_CONFIRM_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_CHECKED),
+    # 正常单人不上表：芯片已经答过，复查时点开原帧即可，不摆按钮。
+    KIND_AUTO_PASSED: (),
     KIND_WAITING: (),
     KIND_TEST_CHIP: (ACTION_DELETE_CHIP, ACTION_KEEP),
     KIND_UNKNOWN_BIB: (ACTION_CHANGE, ACTION_DELETE_CHIP, ACTION_KEEP),
@@ -217,6 +249,92 @@ KIND_ACTIONS = {
     KIND_STANDING: (ACTION_NOT_RIDER, ACTION_RECORD_BIB),
     KIND_NO_VIDEO: (ACTION_CHECKED,),
 }
+
+
+# The button that says "是选手" without asking which paper it is: the number typed
+# beside it decides whether the press records a bib or keeps the crossing.
+ACTION_RIDER = "rider_crossing"
+
+# The buttons a row asks, in the operator's own words: one look at the frame, one
+# press, nothing to read and agree with afterwards.  Each entry is
+# (label, action, bib): ``bib`` is what the number box carries when the press is
+# made — for a two-chip crossing it is the record the press discards, so the
+# label can name the one that stays.
+def operator_actions(item: "ProblemItem") -> tuple[tuple[str, str, str], ...]:
+    kind = item.kind
+    if kind == KIND_TWO_CHIPS_ONE_CROSSING:
+        bibs = [bib for bib in item.bibs if bib]
+        if len(bibs) == 2:
+            first, second = bibs
+            return (
+                (f"留 {first}", ACTION_DELETE_EXTRA_CHIP, second),
+                (f"留 {second}", ACTION_DELETE_EXTRA_CHIP, first),
+                (ACTION_LABELS[ACTION_SIDE_BY_SIDE], ACTION_SIDE_BY_SIDE, ""),
+            )
+    if kind in (KIND_NO_CHIP_CROSSING, KIND_NEAR_CROSSING, KIND_MANUAL_REVIEW, KIND_STANDING):
+        buttons = [(ACTION_LABELS[ACTION_RECORD_BIB], ACTION_RIDER, ""),
+                   (ACTION_LABELS[ACTION_NOT_RIDER], ACTION_NOT_RIDER, "")]
+        if kind == KIND_NEAR_CROSSING:
+            buttons.append((ACTION_LABELS[ACTION_SAME_CROSSING], ACTION_SAME_CROSSING, ""))
+        elif kind in (KIND_MANUAL_REVIEW, KIND_STANDING):
+            buttons.append((ACTION_LABELS[ACTION_RIDE_BACK], ACTION_RIDE_BACK, ""))
+        return tuple(buttons)
+    return tuple((ACTION_LABELS.get(action, action), action, "") for action in item.actions)
+
+
+def row_label(item: "ProblemItem") -> str:
+    """The row's own word on the table — the operator's vocabulary, one glance.
+
+    Six crossings are read straight off the row: 单人, 多人, 集团, 漏读,
+    一人双芯片, and 分不清 when the model cannot say what came through the line.
+    Everything else keeps its class word.
+    """
+
+    bike = item.evidence.get("bike") or {}
+    if str(bike.get("decision", "")) == "disputed":
+        return "分不清"
+    if item.status == STATUS_EXCLUDED or str(bike.get("decision", "")) == "exclude":
+        return "非选手"
+    if item.kind == KIND_AUTO_PASSED:
+        return "单人"
+    if item.kind == KIND_TWO_CHIPS_ONE_CROSSING:
+        return "一人双芯片"
+    if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION, KIND_STANDING):
+        chips = int(item.evidence.get("chip_count") or len(item.bibs) or 0)
+        video = int(item.evidence.get("video_count") or 0)
+        return "集团" if max(chips, video) >= 4 else "多人"
+    if item.kind == KIND_NO_CHIP_CROSSING:
+        return "漏读"
+    if item.kind == KIND_NEAR_CROSSING:
+        return "可能漏读"
+    if item.kind == KIND_CHIP_NO_CROSSING:
+        return "有芯片没画面"
+    if item.kind == KIND_MANUAL_REVIEW:
+        return "单人"
+    return CLASS_TITLES[problem_class(item)]
+
+
+def auto_passed_item(passed: Mapping[str, Any]) -> Optional["ProblemItem"]:
+    """The row a normally auto-passed rider keeps in 「全部」: a record, not a task.
+
+    It is not in the queue — the chips already answered it — but it stays the
+    race's own crossing, so the operator can look at any of them again, in time
+    order, and add anyone the chips missed from that very frame.
+    """
+
+    frame = passed.get("frame") or {}
+    if not frame or not passed.get("active_now", True):
+        return None
+    return ProblemItem(
+        item_id=stable_item_id(KIND_AUTO_PASSED, passed.get("event_id"), frame.get("camera_index"),
+                               frame.get("segment_id"), frame.get("frame_index")),
+        kind=KIND_AUTO_PASSED, category=CATEGORY_VIDEO,
+        detail="正常单人已自动对应；这是复查，不是待处理。画面里还有别人时用「＋ 补记过线」。",
+        chip_time_ms=passed.get("chip_time_ms"), bibs=(str(passed.get("bib", "")),),
+        event_ids=(str(passed["event_id"]),) if passed.get("event_id") else (),
+        status=STATUS_INFO, status_note="已自动对应",
+        evidence=dict(passed, auto_passed=True),
+    )
 
 
 def stable_item_id(kind: str, *parts: object) -> str:
@@ -339,5 +457,6 @@ def sort_items(items) -> list[ProblemItem]:
 
 
 __all__ = [name for name in globals() if name.isupper() or name in {
-    "ProblemItem", "sort_items", "stable_item_id", "task_type",
+    "ProblemItem", "auto_passed_item", "operator_actions", "row_label",
+    "sort_items", "stable_item_id", "task_type",
 }]

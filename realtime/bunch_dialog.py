@@ -16,8 +16,10 @@ from PyQt5.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .bunch_review import (BunchContext, BunchReviewStore, align_counts, completion_issue, is_excluded, load_context,
-                           add_viewed, uncovered_intervals, review_candidates, group_member_batch)
+from .bunch_review import (BunchContext, BunchReviewStore, align_counts, completion_issue, detected_crossings,
+                           is_excluded, load_context, add_viewed, uncovered_intervals, review_candidates,
+                           group_member_batch)
+from .bunch_timeline import BunchTimeline, group_strip, pixmap_of
 from .chip_history import format_chip_time
 from .line_sampling import load_strip, line_config_digest
 
@@ -104,36 +106,6 @@ class BunchDecoder:
         return None
 
 
-def group_strip(context: BunchContext, cancelled=lambda: False) -> tuple[np.ndarray, bool]:
-    """Reuse sampled strips, retaining blank regions for actual cache gaps."""
-    width, height = 1600, 90
-    canvas = np.full((height, width, 3), 230, np.uint8)
-    present = False
-    for segment in context.segments:
-        if cancelled():
-            break
-        path = (context.workspace / "finish_problems" / "strips" / f"camera_{context.camera:02d}"
-                / (segment.path.stem + '.npz'))
-        if not path.is_file():
-            continue
-        strip = load_strip(path)
-        if (strip.meta or {}).get('segment_id') != segment.segment.segment_id:
-            continue
-        line = context.lines.get(segment.segment.segment_id, context.line)
-        if not line or (strip.meta or {}).get("line_digest") != line_config_digest(line):
-            continue
-        times = strip.pts_ms + segment.start_ms
-        a, b = np.searchsorted(times, (context.start_ms, context.end_ms))
-        if b <= a:
-            continue
-        x0 = max(0, round((float(times[a]) - context.start_ms) / (context.end_ms - context.start_ms) * (width - 1)))
-        x1 = min(width, round((float(times[b - 1]) - context.start_ms) / (context.end_ms - context.start_ms) * (width - 1)) + 1)
-        if x1 > x0:
-            canvas[:, x0:x1] = cv2.resize(strip.strip[:, a:b], (x1 - x0, height), interpolation=cv2.INTER_AREA)
-            present = True
-    return canvas, present
-
-
 class DecodeWorker(QThread):
     frame_ready = pyqtSignal(int, object)
     strip_ready = pyqtSignal(str, object, bool)
@@ -173,11 +145,6 @@ class DecodeWorker(QThread):
                     self.failed.emit(number, f'原录像读取失败：{error}')
         finally:
             reader.close()
-
-
-def pixmap_of(image):
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return QPixmap.fromImage(QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format_RGB888).copy())
 
 
 class CountView(QGraphicsView):
@@ -280,53 +247,6 @@ class CountView(QGraphicsView):
             self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
 
 
-class BunchTimeline(QWidget):
-    seek = pyqtSignal(int)
-
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(140)
-        self.context, self.image, self.marks, self.current = None, None, [], None
-        self.viewed = []
-        self.candidates = []
-        self.setToolTip('整团过线图：红色为芯片预期时刻，绿色为选手计数，灰色为已排除人员；点击跳到原帧')
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor('#edf1f5'))
-        if self.context is None:
-            return
-        ctx = self.context
-        xof = lambda t: int((t - ctx.start_ms) / (ctx.end_ms - ctx.start_ms) * (self.width() - 1))
-        if self.image:
-            painter.drawPixmap(0, 46, self.width(), 72, self.image)
-        for i, chip in enumerate(ctx.chips):
-            x = xof(chip.recorder_ms)
-            painter.setPen(QColor('#ba2525'))
-            painter.drawLine(x, 37, x, 118)
-            painter.drawText(max(0, min(x, self.width() - 38)), 12 + (i % 3) * 12, chip.bib)
-        for mark in self.marks:
-            painter.setPen(QColor('#8793a1' if is_excluded(mark) else '#18834a'))
-            x = xof(mark['recorder_ms'])
-            painter.drawLine(x, 47, x, 118)
-        if self.current is not None:
-            painter.setPen(QPen(QColor('#b400cc'), 2))
-            painter.drawLine(xof(self.current), 35, xof(self.current), 119)
-        for left, right in self.viewed:
-            painter.fillRect(xof(left), 119, max(1, xof(right)-xof(left)), 4, QColor("#18834a"))
-        for candidate in self.candidates:
-            painter.setPen(QColor("#bb6b00"))
-            painter.drawLine(xof(candidate["start_ms"]), 39, xof(candidate["end_ms"]), 39)
-        painter.setPen(QColor('#374151'))
-        painter.drawText(0, 136, format_chip_time(ctx.start_ms))
-        painter.drawText(max(0, self.width() - 100), 136, format_chip_time(ctx.end_ms))
-
-    def mousePressEvent(self, event):
-        if self.context:
-            self.seek.emit(round(self.context.start_ms + event.pos().x() / max(1, self.width() - 1)
-                                 * (self.context.end_ms - self.context.start_ms)))
-
-
 class BunchReviewDialog(QDialog):
     def __init__(self, workspace, item, parent=None):
         super().__init__(parent)
@@ -352,7 +272,8 @@ class BunchReviewDialog(QDialog):
         header.addWidget(self.clock)
         layout.addLayout(header)
         self.timeline = BunchTimeline()
-        layout.addWidget(QLabel("整团过线图 / 芯片刻度（主界面的整场时间胶卷仍用于浏览整场录像）"))
+        layout.addWidget(QLabel("整团过线图 / 芯片刻度：蓝 画面检测到的每一个人（浅蓝 当时画面被遮挡）· 红 芯片预期时刻 · "
+                                "绿 选手计数 · 灰 已排除人员（点击跳到原帧；整场浏览仍用主界面的时间胶卷）"))
         layout.addWidget(self.timeline)
         attention = QHBoxLayout()
         self.previous_candidate = QPushButton("上一候选疑点")
@@ -512,6 +433,7 @@ class BunchReviewDialog(QDialog):
         self.bias.setValue(record.get('fallback_bias_ms', 0))
         self.bias.blockSignals(False)
         self.timeline.context, self.timeline.image = self.context, None
+        self.timeline.detected = self.context.detected
         self.dirty = False
         self.update_results()
 
@@ -644,7 +566,11 @@ class BunchReviewDialog(QDialog):
     def update_results(self):
         result = align_counts(self.context.chips, self.marks, self.bias.value())
         excluded = sum(is_excluded(mark) for mark in self.marks)
-        self.summary.setText(f'芯片 {len(self.context.chips)} 个 · 选手计数 {len(self.marks) - excluded} 人 · '
+        # 画面检测是本团里每个人都在场的凭据：芯片少了它就没有对照。
+        seen = ('画面检测 %d 处过线' % len(self.context.detected)
+                if detected_crossings(self.context.workspace, self.context.camera) is not None
+                else '画面检测结果缺失')
+        self.summary.setText(f'芯片 {len(self.context.chips)} 个 · {seen} · 选手计数 {len(self.marks) - excluded} 人 · '
                              f'人工认号 {sum(bool(m.get("bib")) and not is_excluded(m) for m in self.marks)} 人 · '
                              f'已排除 {excluded} 人 · '
                              f'多出 {len(result["extras"])} 人 · 未对应芯片 {len(result["missing"])} 个')
@@ -787,7 +713,7 @@ class BunchReviewDialog(QDialog):
             if self.context.gaps or uncovered_intervals(self.context.start_ms, self.context.end_ms, self.viewed_ranges, tolerance=100):
                 self.notice.setText("仍有未查看范围或原录像缺口；不能只查看候选就关闭整团。")
                 return False
-            issue = completion_issue(self.context.chips, self.marks, result, self.fully_viewed.isChecked())
+            issue = completion_issue(self.context.chips, self.marks, result)
             if issue:
                 self.notice.setText(issue)
                 return False

@@ -47,7 +47,12 @@ def saved_received_path(root):
     return _saved_path(root, "live_received")
 
 
-def _saved_path(root, mode):
+def saved_live_path(root):
+    """An explicit return to the field also works before timing data arrives."""
+    return _saved_path(root, "live") or _saved_path(root, "live_ready", require_event=False)
+
+
+def _saved_path(root, mode, *, require_event=True):
     root = Path(root).resolve()
     value = _read_object(root / ".finishreview" / ARCHIVE_FILENAME)
     relative = value.get("relative_path")
@@ -55,8 +60,8 @@ def _saved_path(root, mode):
         return None
     candidate = (root / relative).resolve()
     if ((candidate == root or candidate.parent == root) and candidate.is_dir()
-            and any((candidate / name).is_file() for name in
-                    ("cyclerace_passage_events.jsonl", "cyclerace_race_metadata.json"))):
+            and (not require_event or any((candidate / name).is_file() for name in
+                    ("cyclerace_passage_events.jsonl", "cyclerace_race_metadata.json")))):
         return candidate
     return None
 

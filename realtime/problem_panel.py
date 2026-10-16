@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
 )
 
+from .bunch_timeline import BunchTimeline
 from .chip_history import format_chip_time
 from .live_chip_checks import LIVE_CHIP_FILENAME, input_signature, merge_chip_snapshot
 from .analysis_settings import read_settings, settings_token
@@ -51,6 +52,7 @@ from .problem_items import (
     ACTION_NOT_RIDER,
     ACTION_REASON_PRESETS,
     ACTION_RECORD_BIB,
+    ACTION_RIDER,
     ACTION_RIDE_BACK,
     ACTION_SAME_CROSSING,
     ACTION_SIDE_BY_SIDE,
@@ -60,11 +62,13 @@ from .problem_items import (
     STATUS_EXCLUDED,
     STATUS_INFO,
     STATUS_WAITING,
+    KIND_AUTO_PASSED,
     KIND_BUNCH,
     KIND_MANUAL_REVIEW,
     KIND_NO_VIDEO,
     KIND_OBSTRUCTION,
     KIND_SYNC,
+    KIND_TWO_CHIPS_ONE_CROSSING,
     KIND_WAITING,
     CATEGORY_VIDEO,
     CLASS_ORDER,
@@ -77,7 +81,10 @@ from .problem_items import (
     TYPE_MULTI_CHIP,
     TYPE_OTHER,
     ProblemItem,
+    auto_passed_item,
+    operator_actions,
     problem_class,
+    row_label,
 )
 from .problem_resolutions import (
     RESOLUTIONS_FILENAME,
@@ -111,6 +118,9 @@ def _missed_entry(item: ProblemItem, batch, bunch_parent) -> bool:
 # cannot settle it yet.  The standing reason says why, and stays editable.
 PENDING_REASON = "路人 / 遮挡 / 看不清，先放着"
 
+# 判读集团时画面上面那条刻度的一句话图例：四种颜色各是什么，一眼就分得清。
+TIMELINE_HELP = "整团过线图 · 按时间从左到右过线 · 点刻度回看"
+
 # The one token a row of the queue carries when its class does not already name it.
 SHORT_NOTES = {
     KIND_NO_VIDEO: "无录像",
@@ -128,6 +138,8 @@ STATE_INFO = "参考"
 STATE_STALE = "上游已修改，请重新处理"
 STATE_WAITING = "待证据"
 STATE_HANDOFF = "待 CycleRace"
+# 正常单人的行：芯片已经答过，不是待处理，只是一条可复查的过线记录。
+STATE_AUTO = "自动对应"
 
 
 class ProblemListPanel(QFrame):
@@ -144,6 +156,8 @@ class ProblemListPanel(QFrame):
     count_mode_changed = pyqtSignal(bool)
     # Stepping the picture frame by frame, from the panel's own keys.
     frame_step_requested = pyqtSignal(int)
+    # 赛前把本场试出来的记录清掉；由主窗口确认并删除文件，面板不自己动数据。
+    clear_data_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -233,8 +247,10 @@ class ProblemListPanel(QFrame):
         self.queue_filter.setToolTip("待证据是等录像或校时的；标过「先放着」的留在待处理里，灰字显示")
         self.queue_filter.currentIndexChanged.connect(self._queue_filter_changed)
         controls.addWidget(self.queue_filter)
-        self.sampling_button = QPushButton("取样线", self.header)
-        self.sampling_button.setToolTip("终点线按机位和录制会话配置；只分析已封存录像")
+        self.sampling_button = QPushButton("终点线 / 模型", self.header)
+        self.sampling_button.setToolTip(
+            "绘制本机位终点线，选择本机 YOLOX ONNX 模型并试运行；只分析已封存录像"
+        )
         self.sampling_button.clicked.connect(self._configure_sampling)
         controls.addWidget(self.sampling_button)
         self.analyze_button = QPushButton("分析", self.header)
@@ -245,6 +261,13 @@ class ProblemListPanel(QFrame):
         self.export_button.setToolTip("导出补录、建议删除、建议改号改圈三张清单给 CycleRace")
         self.export_button.clicked.connect(self.export)
         controls.addWidget(self.export_button)
+        self.clear_data_button = QPushButton("清空数据", self.header)
+        self.clear_data_button.setToolTip(
+            "赛前试芯片、试画面后重新开始：删除本场的通过记录、判读和试录画面；"
+            "终点线、认车模型和摄像头设置保留"
+        )
+        self.clear_data_button.clicked.connect(self.clear_data_requested.emit)
+        controls.addWidget(self.clear_data_button)
         header_layout.addLayout(controls)
         # The four classes are the filter: one row of tabs, each carrying how much of
         # that class is still open, so the queue is narrowed without a second control.
@@ -261,6 +284,19 @@ class ProblemListPanel(QFrame):
         class_row.addStretch(1)
         header_layout.addLayout(class_row)
         layout.addWidget(self.header)
+        # 整团过线图 / 芯片刻度就压在画面上面，和原来那一版一样：芯片、点出来的
+        # 人、画面检测到的每一个人排在同一条时间轴上。集团核对只有这一处。
+        self.timeline_help = QLabel(TIMELINE_HELP, self)
+        self.timeline_help.setStyleSheet("color:#667085; font-size:9pt;")
+        self.timeline_help.hide()
+        layout.addWidget(self.timeline_help)
+        self.timeline = BunchTimeline(self)
+        self.timeline.seek.connect(self._seek_group_time)
+        self.timeline.hide()
+        self._timeline_signature = None
+        self._band_cache: dict = {}
+        self._band_token = None
+        layout.addWidget(self.timeline)
         splitter = self.splitter = QSplitter(Qt.Horizontal, self)
         splitter.setChildrenCollapsible(False)
         # Three columns only: when it happened, which class it is, and the one token
@@ -269,14 +305,14 @@ class ProblemListPanel(QFrame):
         self.table = QTableWidget(0, 3, splitter)
         self.table.setObjectName("finishProblemTable")
         self.table.setStyleSheet("QTableWidget::item:selected {background:#d6eeea; color:#123d36;}")
-        self.table.setHorizontalHeaderLabels(["时间", "类型", "记号"])
+        self.table.setHorizontalHeaderLabels(["过线时间", "类型", "画面 / 芯片"])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setMinimumWidth(240)
-        for column, width in enumerate((78, 66)):
+        self.table.setMinimumWidth(320)
+        for column, width in enumerate((128, 80)):
             self.table.setColumnWidth(column, width)
         self.table.currentCellChanged.connect(lambda row, *_args: self._show(row))
         self.table.cellDoubleClicked.connect(lambda *_args: self._jump())
@@ -311,6 +347,34 @@ class ProblemListPanel(QFrame):
         self.filmstrip.setToolTip("前后各约 1 秒，每 0.25 秒一张")
         images.addWidget(self.filmstrip, 1)
         detail_layout.addLayout(images)
+        # 同一张表按过线先后放画面与芯片；修正操作只跟着选中的人出现。
+        self.big_help = QLabel("按过线先后看 · 点人计数 · 人数对上自动完成", detail)
+        self.big_help.setWordWrap(True)
+        self.big_help.setStyleSheet("color:#667085; font-size:9pt;")
+        self.big_help.hide()
+        detail_layout.addWidget(self.big_help)
+        self.count_table = QTableWidget(0, 4, detail)
+        self.count_table.setHorizontalHeaderLabels(["顺序", "过线时间", "号码", "芯片时间"])
+        self.count_table.setToolTip("按画面过线先后排列；同时过线共用顺序号。未认号的芯片对应仅供参考。")
+        self.count_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.count_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.count_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.count_table.verticalHeader().setVisible(False)
+        self.count_table.horizontalHeader().setStretchLastSection(True)
+        self.count_table.setWordWrap(False)
+        for column, width in enumerate((58, 108, 92, 108)):
+            self.count_table.setColumnWidth(column, width)
+        self.count_table.setMinimumHeight(150)
+        self.count_table.setMaximumHeight(300)
+        self.count_table.currentCellChanged.connect(lambda row, *_args: self._count_row_changed(row))
+        self._crossing_rows = []
+        self.count_table.hide()
+        detail_layout.addWidget(self.count_table)
+        self.side_notice = QLabel("", detail)
+        self.side_notice.setWordWrap(True)
+        self.side_notice.setStyleSheet("font-weight:600;")
+        self.side_notice.hide()
+        detail_layout.addWidget(self.side_notice)
         # The decisions live in one movable box: when the picture takes the whole
         # area the box travels with it, so the operator looks and decides in the
         # same view instead of walking back to the list between the two.
@@ -327,13 +391,32 @@ class ProblemListPanel(QFrame):
         self.decision_layout.addLayout(reason_row)
         self.bib_input.textChanged.connect(self._remember_draft)
         self.reason_input.textChanged.connect(self._remember_draft)
-        self.action_row = QVBoxLayout()
-        # The same decisions are laid out twice: stacked beside the list, and as one
-        # line under a full picture, where their height is the picture's height.
-        self.action_line = QHBoxLayout()
-        self.action_line.setSpacing(4)
-        self.action_line.addStretch(1)
-        self.action_target = self.action_row
+        # 一个人身上的三件事：号码、不是选手、点错了。只在放大判读时出现，
+        # 就在号码框下面，认完号顺手按。
+        self.person_box = QWidget(self.decision_box)
+        person_row = QHBoxLayout(self.person_box)
+        person_row.setContentsMargins(0, 0, 0, 0)
+        person_row.setSpacing(4)
+        self.assign_button = QPushButton("记号码", self.person_box)
+        self.assign_button.setToolTip("把号码框里的号码记在名单中选中的人身上；留空表示暂不认号")
+        self.assign_button.clicked.connect(self._assign_selected_bib)
+        person_row.addWidget(self.assign_button)
+        self.exclude_button = QPushButton("不是选手", self.person_box)
+        self.exclude_button.setToolTip("选中的这位是行人、车辆或工作人员：不计入人数，原帧和依据一起留档")
+        self.exclude_button.clicked.connect(self._exclude_selected)
+        person_row.addWidget(self.exclude_button)
+        self.restore_button = QPushButton("恢复为选手", self.person_box)
+        self.restore_button.setToolTip("去掉排除标记，把这位放回人数里")
+        self.restore_button.clicked.connect(self._restore_selected)
+        person_row.addWidget(self.restore_button)
+        self.remove_button = QPushButton("删除误点", self.person_box)
+        self.remove_button.setToolTip("点错的人直接去掉；已排除的人先恢复再删除")
+        self.remove_button.clicked.connect(self._remove_selected)
+        person_row.addWidget(self.remove_button)
+        self.person_box.hide()
+        self.decision_layout.addWidget(self.person_box)
+        # 判罚就这一列：判断在右边这一栏里从上往下按，编号和数字键一一对应。
+        self.action_row = self.action_target = QVBoxLayout()
         # The class entry sits above the decisions, so the tool for this problem is
         # visible where the evidence is; there is no hidden entry to remember.
         self.batch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MULTI_CHIP], self.decision_box)
@@ -342,12 +425,6 @@ class ProblemListPanel(QFrame):
         self.batch_button.clicked.connect(self._open_batch)
         self.batch_button.hide()
         self.action_row.addWidget(self.batch_button)
-        self.bunch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_BUNCH], self.decision_box)
-        self.bunch_button.setStyleSheet("font-weight:600;")
-        self.bunch_button.setToolTip("打开这条集团和遮挡时段，逐帧核对整团人数；回车只管确认依据，不会打开它")
-        self.bunch_button.clicked.connect(self._open_bunch)
-        self.bunch_button.hide()
-        self.action_row.addWidget(self.bunch_button)
         self.missed_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MISSED], self.decision_box)
         self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除")
         self.missed_button.setStyleSheet("font-weight:600;")
@@ -378,16 +455,18 @@ class ProblemListPanel(QFrame):
         self.action_row.addWidget(self.clear_button)
         # The two steps through the queue travel with the picture: with the list out of
         # sight the operator still moves problem by problem without leaving the frame.
-        self.prev_button = QPushButton("↑ 上一个疑点", self.decision_box)
-        self.prev_button.setToolTip("上一条疑点（放大时按 ↑）")
+        self.prev_button = QPushButton("↑ 上一处过线", self.decision_box)
+        self.prev_button.setToolTip("按过线先后回到上一处（↑）")
         self.prev_button.clicked.connect(lambda _checked=False: self._step(-1))
         self.prev_button.hide()
-        self.action_row.addWidget(self.prev_button)
-        self.next_button = QPushButton("↓ 下一个疑点", self.decision_box)
-        self.next_button.setToolTip("下一条疑点（放大时按 ↓）")
+        self.next_button = QPushButton("下一处过线 ↓", self.decision_box)
+        self.next_button.setToolTip("按过线先后查看下一处（↓）")
         self.next_button.clicked.connect(lambda _checked=False: self._step(1))
         self.next_button.hide()
-        self.action_row.addWidget(self.next_button)
+        queue_steps = QHBoxLayout()
+        queue_steps.addWidget(self.prev_button)
+        queue_steps.addWidget(self.next_button)
+        self.action_row.addLayout(queue_steps)
         self.action_buttons: list[QPushButton] = []
         self.reopen_button = QPushButton("重新处理", self.decision_box)
         self.reopen_button.clicked.connect(self._reopen)
@@ -401,26 +480,12 @@ class ProblemListPanel(QFrame):
         reason_row.addWidget(self.hold_button)
         self.action_row.addStretch(1)
         self.decision_layout.addLayout(self.action_row)
-        # Whichever of the two is in use, the empty one takes no height back.
-        self.decision_layout.addLayout(self.action_line)
         self.detail_layout = detail_layout
         detail_layout.addWidget(self.decision_box)
         detail_layout.addStretch(1)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
-        from .crossing_widgets import CrossingReviewControls
-        self.crossing_controls = CrossingReviewControls(self)
-        self.crossing_controls.mark_selected.connect(self._select_mark)
-        self.crossing_controls.bib_assigned.connect(self._assign_mark_bib)
-        self.crossing_controls.exclusion_changed.connect(self._exclude_mark)
-        self.crossing_controls.mark_removed.connect(self._remove_mark)
-        self.crossing_controls.member_decision.connect(self._decide_member)
-        self.crossing_controls.conflict_selected.connect(self._show_conflict)
-        self.crossing_controls.conflict_decided.connect(self._decide_conflict)
-        self.crossing_controls.fully_viewed_changed.connect(self._set_fully_viewed)
-        self.crossing_controls.hide()
-        layout.addWidget(self.crossing_controls)
         # The line the big view hands the decisions to; hidden until then.  The keys
         # have their own label here so the hint below stays free for what just
         # happened to the row.
@@ -491,7 +556,6 @@ class ProblemListPanel(QFrame):
         for button in self.action_buttons:
             button.setEnabled(not self._browsing)
         item = self.current_item()
-        self.bunch_button.setEnabled(not self._browsing and not (item and item.evidence.get("superseded")))
         self.batch_button.setEnabled(not self._browsing)
         self.missed_button.setEnabled(not self._browsing)
         if browsing:
@@ -541,6 +605,45 @@ class ProblemListPanel(QFrame):
         self.refresh()
         if self.current_item() is None:
             self.current_changed.emit(None)
+
+    def reset_data(self) -> None:
+        """Forget the results of a test run before the race itself starts.
+
+        The readers stop first, and the in-memory drafts go with them: the 400 ms
+        draft timer would otherwise write the cleared marks back to disk right
+        after the window has deleted the files.
+        """
+
+        self.stop_analysis()
+        self.stop_chip_checks()
+        self._draft_timer.stop()
+        self.payload = None
+        self.items, self.rows = [], []
+        self._signature = None
+        self._render_signature = None
+        self._last_live_signature = None
+        self._next_analysis = 0.0
+        self._final_analysis_pending = False
+        self._finalizing_live = False
+        self._drafts, self._held = {}, {}
+        self._marks, self._viewed, self._operator_items = {}, {}, {}
+        self._group_context, self._group_context_id = None, None
+        self._editing_mark = -1
+        self._shown_id = None
+        self._shown_frame = None
+        self._pending_action = ""
+        self._browsing = False
+        self.store = None
+        self.bunch_store = None
+        self.analysis_status = "等待已封存录像"
+        self.bib_input.clear()
+        self.reason_input.clear()
+        self._sync_marks()
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        self.table.blockSignals(False)
+        self._show(-1)
+        self.hint.setText("本场数据已清空；可开始正式录像，测试读数不会保留。")
 
     def set_scope(self, race_id, stage_id):
         scope = (str(race_id or ""), str(stage_id or ""))
@@ -645,6 +748,12 @@ class ProblemListPanel(QFrame):
             pass
         except (OSError, ValueError, TypeError, KeyError) as error:
             self.hint.setText(f"人工问题读取失败：{error}")
+        # 正常单人有自己的一行，但不在队列里：芯片已经答过，它们让「全部」成为
+        # 这场比赛完整的过线记录——按时间一位位翻，想复查哪一次都行。
+        self.items = [item for item in self.items if item.kind != KIND_AUTO_PASSED]
+        self.items += [auto for auto in (auto_passed_item(entry)
+                                         for entry in (self.payload or {}).get("auto_passed", []))
+                       if auto is not None]
         if self._scope[0]:
             self.items = [item for item in self.items if not item.evidence.get("operator_scope")
                           or tuple(item.evidence["operator_scope"]) == self._scope]
@@ -732,6 +841,8 @@ class ProblemListPanel(QFrame):
         return all(event is not None and not event.is_active for event in involved)
 
     def state(self, item: ProblemItem) -> str:
+        if item.kind == KIND_AUTO_PASSED:
+            return STATE_AUTO
         if item.status == STATUS_WAITING:
             return STATE_WAITING
         if item.status == STATUS_EXCLUDED:
@@ -754,20 +865,13 @@ class ProblemListPanel(QFrame):
         if record is not None:
             if record.get("item_snapshot") != item.to_payload():
                 return STATE_STALE
-            from .bunch_review import load_context, pending_member_decisions
+            from .bunch_review import load_context
             try:
                 context = load_context(self.workspace_dir, item, record["camera"])
                 if self.bunch_store.get(context) is None:
                     return STATE_STALE
-                if record.get("completed") and pending_member_decisions(context):
-                    return STATE_PENDING
             except (ValueError, OSError):
                 return STATE_STALE
-            if record.get("completed"):
-                from .bunch_review import align_counts, unresolved_crossing_conflicts
-                if unresolved_crossing_conflicts(context, record.get("marks", []),
-                                                  align_counts(context.chips, record.get("marks", []))):
-                    return STATE_PENDING
             current = {event.event_id: event for event in self._events_provider()}
             for chip in record.get("chips", []):
                 event = current.get(chip["event_id"])
@@ -792,7 +896,8 @@ class ProblemListPanel(QFrame):
     def summary_text(self) -> str:
         if self.payload is None and not self.items:
             return "问题清单：尚未分析录像"
-        states = [self.state(item) for item in self.items if not item.grouped]
+        states = [self.state(item) for item in self.items
+                  if not item.grouped and item.kind != KIND_AUTO_PASSED]
         pending = sum(self.is_pending_state(state) for state in states)
         done = sum(state.startswith(STATE_RESOLVED) or state == STATE_UPSTREAM for state in states)
         summary = (self.payload or {}).get("summary", {})
@@ -805,10 +910,12 @@ class ProblemListPanel(QFrame):
         return text + (f" · 待证据 {waiting} 条" if waiting else "") + (f" · 待 CycleRace {handoff} 条" if handoff else "")
 
     def _render(self) -> None:
+        from .crossing_time import item_crossing_time, workspace_clocks
+        clocks = workspace_clocks(self.workspace_dir) if self.workspace_dir else None
         signature = (tuple((repr(item.to_payload()), self.state(item)) for item in self.items),
                      self.queue_filter.currentIndex(), self._class_filter, tuple(self._held.items()),
                      self._bunch_signature(), repr((self.payload or {}).get("summary")),
-                     repr((self.payload or {}).get("cameras")), repr(self._marks))
+                     repr((self.payload or {}).get("cameras")), repr(self._marks), clocks)
         if signature == self._render_signature:
             return
         self._render_signature = signature
@@ -821,22 +928,26 @@ class ProblemListPanel(QFrame):
             if item.grouped:
                 continue
             state = self.state(item)
-            pending = self.is_pending_state(state) or state == STATE_INFO
+            # 自动对应的单人不是待处理：它只在「全部」里，作为这场比赛的过线记录。
+            pending = (self.is_pending_state(state) or state == STATE_INFO) and item.kind != KIND_AUTO_PASSED
             visible = (mode == 3 or (mode == 0 and pending) or (mode == 1 and state == STATE_WAITING)
-                       or (mode == 2 and not pending and state != STATE_WAITING)
+                       or (mode == 2 and not pending and state != STATE_WAITING and item.kind != KIND_AUTO_PASSED)
                        or (item.item_id == selected and item.evidence.get("superseded")))
             if visible and self._class_matches(item):
                 self.rows.append(item)
+        times = {item.item_id: item_crossing_time(item, self.workspace_dir, clocks=clocks) for item in self.rows}
+        self.rows.sort(key=lambda item: (times[item.item_id].value_ms if times[item.item_id] else 2 ** 62,
+                                         item.priority, item.item_id))
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.rows))
         restore = -1
         for index, item in enumerate(self.rows):
             state = self.state(item)
-            values = (
-                format_chip_time(item.chip_time_ms) if item.chip_time_ms is not None else "--",
-                CLASS_TITLES[problem_class(item)],
-                self.short_note(item, state),
-            )
+            crossing_time = times[item.item_id]
+            time_text = format_chip_time(crossing_time.value_ms) if crossing_time else "--"
+            if crossing_time and crossing_time.source in ("expected", "chip") and item.kind != KIND_AUTO_PASSED:
+                time_text += " 参考"
+            values = (time_text, row_label(item), self.short_note(item, state))
             colour = self._row_colour(item, state)
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
@@ -867,14 +978,16 @@ class ProblemListPanel(QFrame):
         """
 
         cls = problem_class(item)
+        if item.kind == KIND_AUTO_PASSED:
+            return item.bibs[0] if item.bibs else "—"
         if cls == TYPE_BUNCH:
             record = self.bunch_store.latest_for(item) if self.bunch_store is not None else None
             from .bunch_review import rider_count
             counted = rider_count(self._marks[item.item_id]) if item.item_id in self._marks else int((record or {}).get("counted_riders") or 0)
-            if counted:
-                return f"{counted} 人"
             chips = int(item.evidence.get("chip_count") or len(item.bibs) or 0)
-            return f"{chips} 芯片" if chips else "—"
+            video = str(counted) if counted else (str(item.evidence["video_count"]) + "?"
+                                                 if "video_count" in item.evidence else "待数")
+            return f"{video} 人 / {chips} 条"
         if cls == TYPE_CONFIRM:
             return SHORT_NOTES.get(item.kind, "—")
         if item.bibs:
@@ -961,10 +1074,9 @@ class ProblemListPanel(QFrame):
             self.batch_button.hide()
             self.decision_box.hide()
             self.title.setText(self.queue_text())
-            self.detail.setText("正常单人自动对应；从过线卡片打开疑点，或从录像直接点人补记。")
+            self.detail.setText("正常单人自动对应；过线记录都在左边的表里，也可以从录像直接点人补记。")
             self.jump_button.setEnabled(False)
             self.reopen_button.setEnabled(False)
-            self.bunch_button.hide()
             self.missed_button.hide()
             self.hold_button.setEnabled(False)
             if changed:
@@ -973,15 +1085,17 @@ class ProblemListPanel(QFrame):
         self.decision_box.show()
         self.hold_button.setEnabled(item.status != STATUS_WAITING)
         self.hold_button.setText("返回待处理" if item.item_id in self._held else "待确认")
-        is_bunch = item.kind in (KIND_BUNCH, KIND_OBSTRUCTION)
         batch = self._batch_parent(item)
         self.batch_button.setVisible(batch is not None)
-        self.bunch_button.setVisible(is_bunch)
-        self.bunch_button.setEnabled(item.status != STATUS_WAITING)
         self.missed_button.setVisible(_missed_entry(item, batch, self._bunch_parent(item)))
         self.missed_button.setEnabled(item.status != STATUS_WAITING)
-        self.bib_input.setVisible(not is_bunch and batch is None)
-        self.reason_input.setVisible(True)
+        # Both fields are set further down, where the buttons say whether this row
+        # takes a number at all: an empty box beside a decision that cannot use it
+        # is one more thing to look past.
+        self.bib_input.setVisible(False)
+        # The reason is filled in from the frame with the same press; the field stays
+        # in the drafts but is not a step of its own on the judging surface.
+        self.reason_input.setVisible(False)
         state = self.state(item)
         headline = (
             f"{item.title} · {format_chip_time(item.chip_time_ms) if item.chip_time_ms else '--'} · {state}"
@@ -996,6 +1110,9 @@ class ProblemListPanel(QFrame):
         if item.calibration_version:
             detail += f"\n校时版本 v{item.calibration_version}"
         self.detail.setText(detail)
+        if item.kind == KIND_AUTO_PASSED:
+            # 这一行是过线记录，不是待办：说清楚，免得有人在这里等一个要按的钮。
+            self.hint.setText(f"{item.bibs[0] or '该选手'} 已自动对应；这是复查，不会新建待处理。")
         for key, target in (("card", self.card), ("filmstrip", self.filmstrip)):
             relative = item.evidence.get(key)
             if relative and self.problem_dir is not None:
@@ -1009,19 +1126,38 @@ class ProblemListPanel(QFrame):
         resolved = state.startswith((STATE_RESOLVED, STATE_HANDOFF))
         self.reopen_button.setEnabled(resolved)
         self.reopen_button.setVisible(resolved)
-        actions = (ACTION_SYNCED,) if state.startswith(STATE_HANDOFF) else (() if is_bunch or resolved or item.status == STATUS_WAITING else item.actions)
+        # The row asks its own question: the buttons below are the answer, in the
+        # operator's words, and one press is the whole decision — no reason to read
+        # first, no second press to agree with it.
+        buttons: tuple[tuple[str, str, str], ...] = ()
+        is_bunch = item.kind in (KIND_BUNCH, KIND_OBSTRUCTION)
+        if state.startswith(STATE_HANDOFF):
+            buttons = ((ACTION_LABELS[ACTION_SYNCED], ACTION_SYNCED, ""),)
+        elif not (is_bunch or resolved or item.status == STATUS_WAITING):
+            buttons = operator_actions(item)
         if batch is not None:
-            actions = ()
+            buttons = ()
             self.reopen_button.hide()
         if item.evidence.get("superseded"):
-            actions = ()
+            buttons = ()
             self.hold_button.setEnabled(False)
-            self.bunch_button.setEnabled(False)
-        for action in actions:
-            button = QPushButton(ACTION_LABELS.get(action, action), self)
+        takes_bib = any(action in (ACTION_RIDER, ACTION_RECORD_BIB, ACTION_CHANGE,
+                                   ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP)
+                        for _label, action, _bib in buttons)
+        self.bib_input.setVisible(takes_bib and item.kind != KIND_TWO_CHIPS_ONE_CROSSING)
+        for label, action, bib in buttons:
+            button = QPushButton(label, self)
             button.setProperty("problemAction", action)
-            button.setToolTip(f"{ACTION_LABELS.get(action, action)}（数字键 {len(self.action_buttons) + 1}）")
-            button.clicked.connect(lambda _checked=False, action=action: self._resolve(action))
+            # Enter answers the row's first button; which chip record of a two-chip
+            # crossing stays is the operator's own read, so it is never the default.
+            button.setProperty("enterDefault",
+                               not (item.kind == KIND_TWO_CHIPS_ONE_CROSSING and action == ACTION_DELETE_EXTRA_CHIP))
+            key = len(self.action_buttons) + 1
+            button.setToolTip(
+                f"号码框填了就补录；没填就先记为待认号（数字键 {key}）" if action == ACTION_RIDER
+                else f"{label}（数字键 {key}）"
+            )
+            button.clicked.connect(lambda _checked=False, action=action, bib=bib: self._resolve_operator(action, bib))
             self.action_target.insertWidget(len(self.action_buttons), button)
             self.action_buttons.append(button)
         self.set_browsing(self._browsing)
@@ -1031,9 +1167,30 @@ class ProblemListPanel(QFrame):
     def _reopen(self) -> None:
         item = self.current_item()
         if item is not None and item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
-            self._open_bunch()
-        else:
-            self._resolve("reopen")
+            context = self._inline_context()
+            if context is None or self.bunch_store is None:
+                self.hint.setText(self._group_context_error or "本团证据不可用，请先刷新。")
+                return
+            record = self.bunch_store.get(context)
+            if record is None:
+                self.hint.setText("集团证据已变化，请刷新后重新核对。")
+                return
+            marks = [dict(mark) for mark in self._marks.get(item.item_id, record.get("marks", []))]
+            try:
+                self.bunch_store.save(context, marks, record.get("seconds", 0), completed=False,
+                                      fully_viewed=record.get("fully_viewed", False),
+                                      fallback_bias_ms=record.get("fallback_bias_ms", 0),
+                                      viewed_ranges=record.get("viewed_ranges", []),
+                                      visited_candidates=record.get("visited_candidates", ()))
+            except (OSError, RuntimeError, ValueError) as error:
+                self.hint.setText(f"集团未能重新处理：{error}")
+                return
+            self._marks[item.item_id] = marks
+            self.save_drafts()
+            self._render()
+            self.hint.setText("已重新打开本团，原点数保留；可直接修改。")
+            return
+        self._resolve("reopen")
 
     def _batch_parent(self, item):
         if item.evidence.get("batch_members"):
@@ -1159,8 +1316,28 @@ class ProblemListPanel(QFrame):
                       "bib": "", "exclusion_reason": "", "frame": ref})
         self._editing_mark = len(marks) - 1
         self._marks_updated()
-        self.crossing_controls.select_mark(self._editing_mark)
-        self.hint.setText(f"已点 {rider_count(marks)} 人：点错按「撤销」；左右方向键逐帧，回车确认。")
+        self.hint.setText(f"已点 {rider_count(marks)} 人；按过线时间排序，点错按退格撤销。")
+        # 数到的人数正好等于芯片条数：这一团自己收尾，不用再按确认。
+        self._auto_close_group(item)
+
+    def _auto_close_group(self, item) -> bool:
+        """人数与芯片条数相等，就是这一团成立的判据：当场核清，不留一步确认。
+
+        只有人数真的往上走到相等的那一下才收尾（新点一位，或把一位恢复为选手）。
+        重新打开一条已核清的集团时恢复出来的点数不会再自己合上，否则重开就白按了。
+        """
+
+        context = self._inline_context()
+        if item is None or context is None or item.kind not in (KIND_BUNCH, KIND_OBSTRUCTION):
+            return False
+        from .bunch_review import rider_count
+        counted = rider_count(self.current_marks())
+        if not counted or counted != len(context.chips):
+            return False
+        if self.state(item).startswith((STATE_RESOLVED, STATE_HANDOFF)):
+            return False
+        self._confirm_bunch_count(item, counted)
+        return True
 
     def undo_mark(self) -> None:
         item = self.current_item()
@@ -1187,11 +1364,12 @@ class ProblemListPanel(QFrame):
         marks = self.current_marks()
         self.marks_label.setText(f"已点 {rider_count(marks)} 人")
         show = self.current_item() is not None and bool(self.current_item().evidence.get("frame"))
-        for widget in (self.marks_label, self.undo_button, self.clear_button):
-            widget.setVisible(show)
+        self.marks_label.setVisible(show and not self._big_view)
+        self.undo_button.hide()  # 退格仍可撤销；所选那个人用「删除误点」
+        self.clear_button.hide()
         self.undo_button.setEnabled(bool(marks))
         self.clear_button.setEnabled(bool(marks))
-        self._sync_crossing_controls()
+        self._sync_sidebar()
         self.marks_changed.emit(tuple(marks))
 
     def _inline_context(self):
@@ -1230,50 +1408,231 @@ class ProblemListPanel(QFrame):
         from .bunch_review import add_viewed
         state = self._view_state(context)
         state["ranges"] = add_viewed(state["ranges"], recorder_ms, context.start_ms, context.end_ms)
+        self.timeline.current = int(recorder_ms)
         self._draft_timer.start()
-        self._sync_crossing_controls()
+        self._sync_sidebar()
 
-    def _sync_crossing_controls(self):
-        if not hasattr(self, "crossing_controls"):
-            return
+    def _sync_sidebar(self):
+        """把这次过线的人和芯片记录放在同一张表里。"""
+
         item, marks = self.current_item(), self.current_marks()
-        self.crossing_controls.setVisible(bool(item and (marks or item.evidence.get("batch_members")
-                                                        or item.kind in (KIND_BUNCH, KIND_OBSTRUCTION))))
-        if item is None:
+        chips = self._sidebar_chips(item)
+        self._fill_count_table(marks)
+        self.side_notice.setText(self._sidebar_notice(item, marks, chips))
+        self._sync_person_buttons()
+        self._sync_timeline()
+        if self._big_view:
+            for widget in (self.big_help, self.count_table, self.side_notice):
+                widget.setVisible(True)
+
+    def _sync_timeline(self):
+        """画面上面那条刻度：本团的芯片、点出来的人、检测到的每一个人。
+
+        只在放大判读集团时出现，清单里那一屏留给队列。同一画面每秒重画几十次
+        是白费的，画的东西没变就不重画。
+        """
+
+        from .bunch_review import is_excluded
+        context = self._inline_context() if self._big_view else None
+        self.timeline.setVisible(context is not None)
+        self.timeline_help.setVisible(context is not None)
+        if context is None:
+            self.timeline.context = None
+            self._timeline_signature = None
             return
-        members, complete, viewed, notice, conflicts = [], False, False, "", ()
+        changed = self.timeline.context is not context
+        if changed:
+            # 换了另一团：紫色标线和上一团的图片带都不能留下。
+            self.timeline.current = None
+            self.timeline.image = None
+        marks = self.current_marks()
+        cursor = (None if self.timeline.current is None else
+                  round((self.timeline.current - context.start_ms) / max(1, context.end_ms - context.start_ms)
+                        * max(1, self.timeline.width() - 1)))
+        signature = (id(context), len(context.chips), len(context.detected), cursor,
+                     tuple((mark['recorder_ms'], is_excluded(mark)) for mark in marks))
+        if signature == self._timeline_signature:
+            return
+        self._timeline_signature = signature
+        self.timeline.context = context
+        self._load_group_band(context)
+        self.timeline.detected = context.detected
+        self.timeline.marks = marks
+        self.timeline.update()
+
+    def _load_group_band(self, context) -> None:
+        """本团的过线图片带：取样条拼一张要一两百毫秒，等判读屏画好再补上。
+
+        同一团只算一次（记住这张图），换团时旧图先撤掉，免得看着像这一团的。
+        """
+
+        key = (str(context.workspace), context.camera, context.start_ms, context.end_ms)
+        cached = self._band_cache.get(key)
+        if cached is not None:
+            self.timeline.image = cached
+            return
+        if self._band_token == key:
+            return
+        self._band_token = key
+        QTimer.singleShot(80, lambda: self._finish_group_band(key, context))
+
+    def _finish_group_band(self, key, context) -> None:
+        if self._band_token != key or context is not self._inline_context():
+            return                                  # 早换团了，这一张已经没用
+        from .bunch_timeline import group_strip, pixmap_of
+        try:
+            image, present = group_strip(context)
+        except (OSError, ValueError, RuntimeError) as error:
+            self.hint.setText(f"过线图没读出来：{error}；仍可逐帧点数。")
+            return
+        if self._band_token != key:
+            return
+        if len(self._band_cache) > 3:
+            self._band_cache.clear()
+        self._band_cache[key] = pixmap_of(image)
+        self.timeline.image = self._band_cache[key]
+        self.timeline.update()
+        if not present:
+            self.hint.setText("本团没有已生成的过线图缓存；仍可逐帧点数。灰色区域不代表无人过线。")
+
+    def _seek_group_time(self, recorder_ms: int) -> None:
+        """点到刻度上哪一刻，画面就跳到那一刻的原帧。"""
+
+        context = self._inline_context()
+        if context is None:
+            return
+        for piece in context.segments:
+            if piece.start_ms <= recorder_ms <= piece.end_ms:
+                self.jump_requested.emit({
+                    "camera_index": context.camera, "segment_id": piece.segment.segment_id,
+                    "video_path": str(piece.path), "position_ms": int(recorder_ms - piece.start_ms),
+                    "frame_index": None,
+                })
+                self.hint.setText("已跳到刻度上那一刻；点压线的人计数，左键拖动看细节。")
+                return
+
+    def _sidebar_chips(self, item) -> list:
+        return [(chip.bib, chip.chip_ms) for chip in self._crossing_chips(item)]
+
+    def _crossing_chips(self, item) -> list:
+        """每块芯片保留自己的官方时间，附近的参考芯片不当成此人身份。"""
+
+        from .bunch_review import BunchChip
+        if item is None:
+            return []
         context = self._inline_context()
         if context is not None:
-            from .bunch_review import (align_counts, group_member_batch,
-                                       unresolved_crossing_conflicts, uncovered_intervals)
-            state = self._view_state(context)
-            missing = uncovered_intervals(context.start_ms, context.end_ms, state["ranges"], tolerance=100)
-            complete = not missing and not context.gaps
-            viewed = complete and state.get("fully_viewed", False)
-            result = align_counts(context.chips, marks)
-            notice = (f"未查看 {sum(b-a for a,b in missing)/1000:.1f} 秒 · "
-                      f"未对应记录 {len(result['missing'])} · 多出 {len(result['extras'])} 人")
-            if context.gaps:
-                notice += f" · 录像缺口 {len(context.gaps)} 处"
-            try:
-                conflicts = tuple(unresolved_crossing_conflicts(context, marks, result))
-            except (OSError, ValueError) as error:
-                conflicts = ()
-                notice += f" · 疑点读取失败：{error}"
-            if conflicts:
-                complete = False
-                notice += f" · 未核清疑点 {len(conflicts)}"
-            batch = group_member_batch(context)
+            return context.chips
+        try:
+            events = {event.event_id: event for event in self._events_provider()} if item.event_ids else {}
+        except Exception:  # noqa: BLE001 - 对照表不能因为上游掉线就打不开
+            events = {}
+        members = {member["event_id"]: member for member in item.evidence.get("batch_members", [])}
+        chips = []
+        for index, bib in enumerate(item.bibs):
+            event_id = item.event_ids[index] if index < len(item.event_ids) else ""
+            event = events.get(event_id)
+            member = members.get(event_id, {})
+            chip_ms = (int(event.timeline_timestamp_ms) if event is not None else
+                       member.get("chip_ms"))
+            if chip_ms is None and len(item.bibs) == 1:
+                chip_ms = item.chip_time_ms
+            chips.append(BunchChip(event_id, bib, chip_ms, 0))
+        return sorted(chips, key=lambda chip: chip.chip_ms if chip.chip_ms is not None else 2 ** 62)
+
+    def _sidebar_notice(self, item, marks, chips) -> str:
+        """计数只说人数差；逐人时间参考不增加集团完成门槛。"""
+
+        from .bunch_review import rider_count
+        if item is None:
+            return ""
+        counted = rider_count(marks)
+        text = f"画面 {counted} 人 · 芯片 {len(chips)} 条"
+        context = self._inline_context()
+        if context is None:
+            return text + (f" · {self._group_context_error}" if self._group_context_error else "")
+        if counted and counted == len(chips):
+            text += " · 人数已对上"
+        elif counted < len(chips):
+            text += f" · 还差 {len(chips) - counted} 人"
         else:
-            batch = self._batch_parent(item)
-            notice = self._group_context_error if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION) else ""
-        if batch is not None:
-            events = tuple(self._events_provider())
-            members = [dict(member, state=self.batch_store.state(batch, member, events) if self.batch_store else "待证据")
-                       for member in batch.evidence.get("batch_members", [])]
-        self.crossing_controls.set_review(marks, members, conflicts, can_complete=complete,
-                                          fully_viewed=viewed, show_fully_viewed=context is not None,
-                                          notice=notice)
+            text += f" · 多出 {counted - len(chips)} 人待核"
+        if context.gaps:
+            text += f" · 录像缺口 {len(context.gaps)} 处"
+        return text
+
+    def _fill_count_table(self, marks) -> None:
+        """过线顺序、过线时间、认出号码与芯片时间在同一行里。"""
+
+        from .bunch_review import is_excluded
+        from .crossing_rows import crossing_rows
+        from .crossing_time import recorder_crossing_time
+        item = self.current_item()
+        context = self._inline_context()
+        chips = self._crossing_chips(item)
+        self._crossing_rows = crossing_rows(marks, chips, time_reference=context is not None)
+        self.count_table.blockSignals(True)
+        self.count_table.setRowCount(len(self._crossing_rows))
+        selected = -1
+        for row, entry in enumerate(self._crossing_rows):
+            index, chip_index = entry["mark_index"], entry["chip_index"]
+            chip = chips[chip_index] if chip_index is not None else None
+            mark = marks[index] if index is not None else None
+            excluded = mark is not None and is_excluded(mark)
+            if mark is not None:
+                frame = dict(mark.get("frame") or {})
+                if item is not None and item.calibration_version:
+                    frame["calibration_version"] = item.calibration_version
+                crossing = recorder_crossing_time(mark["recorder_ms"], frame, self.workspace_dir, context=context)
+                time_text = format_chip_time(crossing.value_ms)
+                bib = "已排除" if excluded else (mark.get("bib") or (f"{chip.bib} 参考" if chip else "未认号"))
+                chip_text = format_chip_time(chip.chip_ms) if chip else "—"
+                tooltip = ("画面过线时间已按本条校时换算；芯片时间为官方读数。"
+                           if crossing.source == "aligned" else "录像原时刻（尚未换算）；芯片时间为官方读数。")
+                tooltip += f"\n录像原时刻：{format_chip_time(mark['recorder_ms'])}"
+                if entry["reference"]:
+                    tooltip += "\n按时间对应，仅作参考；未确认此人号码。"
+                if excluded:
+                    tooltip += f"\n排除依据：{mark.get('exclusion_reason', '')}"
+                entry["frame"] = frame
+            else:
+                time_text, bib, chip_text = "待看画面", chip.bib, format_chip_time(chip.chip_ms)
+                tooltip = "芯片已有读数，尚未在画面中确认对应的人；不编排过线名次。"
+            values = (entry["order"], time_text, bib, chip_text)
+            for column, text in enumerate(values):
+                cell = QTableWidgetItem(str(text))
+                cell.setData(Qt.UserRole, index)
+                cell.setToolTip(tooltip)
+                if excluded or mark is None:
+                    cell.setForeground(QColor("#8a8f98"))
+                self.count_table.setItem(row, column, cell)
+            if index is not None and index == self._editing_mark:
+                selected = row
+        if selected >= 0:
+            self.count_table.setCurrentCell(selected, 0)
+        else:
+            self.count_table.setCurrentCell(-1, -1)
+        self.count_table.blockSignals(False)
+
+    def _sync_person_buttons(self) -> None:
+        """一个人身上的三件事，只在放大判读、而且名单里真的选中一位时出现。"""
+
+        from .bunch_review import is_excluded
+        marks = self.current_marks()
+        valid = self._big_view and 0 <= self._editing_mark < len(marks)
+        excluded = valid and is_excluded(marks[self._editing_mark])
+        takes_bib = any(button.property("problemAction") in (ACTION_RIDER, ACTION_RECORD_BIB, ACTION_CHANGE,
+                                                             ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP)
+                        for button in self.action_buttons)
+        item = self.current_item()
+        self.bib_input.setVisible((valid and not excluded) or
+                                  (takes_bib and item is not None and item.kind != KIND_TWO_CHIPS_ONE_CROSSING))
+        self.person_box.setVisible(valid)
+        for widget in (self.assign_button, self.exclude_button):
+            widget.setVisible(not excluded)
+        self.restore_button.setVisible(bool(excluded))
+        for widget in (self.assign_button, self.exclude_button, self.remove_button):
+            widget.setEnabled(valid and not excluded)
 
     def _marks_updated(self):
         context = self._inline_context()
@@ -1289,22 +1648,39 @@ class ProblemListPanel(QFrame):
             for column in range(self.table.columnCount()):
                 self.table.item(row, column).setForeground(QColor("#8a8f98"))
 
-    def _select_mark(self, index):
-        marks = self.current_marks()
-        if not 0 <= index < len(marks):
-            return
-        self._editing_mark = index
-        frame = marks[index].get("frame")
-        if frame:
-            self.jump_requested.emit(dict(frame))
+    def _count_row_changed(self, row: int) -> None:
+        """名单里选了一行，画面就跟到那一刻；这位就是下面的号码和纠正的对象。"""
 
-    def _assign_mark_bib(self, index, bib):
+        if not 0 <= row < len(self._crossing_rows):
+            return
+        entry = self._crossing_rows[row]
+        index = entry["mark_index"]
+        self._editing_mark = index if index is not None else -1
+        if index is None:
+            self._sync_person_buttons()
+            if self._inline_context() is not None:
+                self._seek_group_time(entry["recorder_ms"])
+            else:
+                self._jump()
+            return
+        mark = self.current_marks()[index]
+        self.bib_input.setText(str(mark.get("bib") or ""))
+        self._sync_person_buttons()
+        if mark.get("frame"):
+            self.jump_requested.emit(dict(mark["frame"]))
+
+    def _assign_selected_bib(self) -> None:
+        """号码框里的号码，记在名单中选中的那一位身上。"""
+
+        index = self._editing_mark
         marks = self.current_marks()
         if not 0 <= index < len(marks):
+            self.hint.setText("先在名单里点一位，再记号码。")
             return
         from .bunch_review import is_excluded
-        bib = bib.strip()
+        bib = self.bib_input.text().strip()
         if is_excluded(marks[index]):
+            self.hint.setText("已排除的人不填号码；先「恢复为选手」再认号。")
             return
         if bib and any(i != index and not is_excluded(mark) and mark.get("bib") == bib
                        for i, mark in enumerate(marks)):
@@ -1314,138 +1690,67 @@ class ProblemListPanel(QFrame):
         self._marks_updated()
         self.hint.setText("号码已记住；普通计数不必逐人认号。")
 
+    def _exclude_selected(self) -> None:
+        index = self._editing_mark
+        if not 0 <= index < len(self.current_marks()):
+            self.hint.setText("先在名单里点一位，再记为非选手。")
+            return
+        from .crossing_widgets import EXCLUSION_STANDING_REASON
+        self._exclude_mark(index, EXCLUSION_STANDING_REASON)
+
+    def _restore_selected(self) -> None:
+        index = self._editing_mark
+        if not 0 <= index < len(self.current_marks()):
+            return
+        self._exclude_mark(index, "")
+
+    def _remove_selected(self) -> None:
+        index = self._editing_mark
+        if not 0 <= index < len(self.current_marks()):
+            self.hint.setText("先在名单里点一位，再删除。")
+            return
+        self._remove_mark(index)
+
     def _exclude_mark(self, index, reason):
         marks = self.current_marks()
         if not 0 <= index < len(marks):
             return
         marks[index]["exclusion_reason"] = reason.strip()
+        self._editing_mark = index
         self._marks_updated()
         self.hint.setText("已记为非选手，证据保留。" if reason else "已恢复为选手计数。")
+        if not reason:
+            # 恢复回来的这一位也可能刚好把人数补到与芯片条数相等。
+            self._auto_close_group(self.current_item())
 
     def _remove_mark(self, index):
         item = self.current_item()
         if item is None or not 0 <= index < len(self.current_marks()):
             return
         self._marks[item.item_id].pop(index)
+        self._editing_mark = min(index, len(self._marks[item.item_id]) - 1)
         self._marks_updated()
 
-    def _set_fully_viewed(self, checked):
-        context = self._inline_context()
-        if context is not None:
-            self._view_state(context)["fully_viewed"] = bool(checked)
-            self.save_drafts()
-
-    def _decide_member(self, event_id, action):
-        self.refresh()
-        item = self.current_item()
-        if item is None or self.batch_store is None or self._browsing:
-            return
-        context = self._inline_context()
-        if context is not None:
-            from .bunch_review import group_member_batch, load_context
-            try:
-                current = load_context(self.workspace_dir, item)
-                if current.signature != context.signature:
-                    raise ValueError("集团证据已变化，请重新打开核对")
-                batch = group_member_batch(current)
-            except (ValueError, OSError) as error:
-                self.hint.setText(str(error))
-                return
-        else:
-            batch = self._batch_parent(item)
-        if batch is None:
-            return
-        reason = self.reason_input.text().strip() or (
-            "原帧已核对：此记录对应有效过线" if action == "keep" else "原帧已核对：一人携带多芯片，建议作废所选记录")
-        try:
-            self.batch_store.save(batch, [event_id], action, reason, tuple(self._events_provider()))
-        except (OSError, ValueError, RuntimeError) as error:
-            self.hint.setText(f"成员决定未保存：{error}")
-            return
-        self._render_signature = None
-        self._render()
-        self.hint.setText("已保存所选记录；其他成员不受影响。")
-
-    def _conflict_item(self, item_id: str):
-        """The group's own child doubt, read fresh so an answered one is gone."""
-
-        context = self._inline_context()
-        if context is None or self.workspace_dir is None:
-            return None
-        from .bunch_review import load_child_items
-        value = next((child for child in load_child_items(self.workspace_dir, context.item.item_id)
-                      if child.get("item_id") == item_id), None)
-        return None if value is None else ProblemItem.from_payload(value)
-
-    def _show_conflict(self, item_id):
-        child = self._conflict_item(item_id)
-        frame = (child.evidence.get("frame") or {}) if child is not None else {}
-        if not frame:
-            self.hint.setText("这条疑点没有原帧；请查看它的文字说明。")
-            return
-        self.jump_requested.emit(dict(frame))
-        self.hint.setText(f"已跳到疑点原帧：{child.title}。看清后回到画面下选择处理。")
-
-    def _decide_conflict(self, item_id, action):
-        """Answer one child doubt of the group by what its own frame shows."""
-
-        self.refresh()
-        item = self.current_item()
-        if item is None or self.store is None:
-            return
-        context = self._inline_context()
-        child = self._conflict_item(item_id)
-        if context is None or child is None:
-            self.hint.setText("这条疑点已变化；请重新查看后再处理。")
-            return
-        if action == "keep":
-            # Keeping a record is the member flow's own answer, bound to the exact
-            # event; it decides nothing else about the crossing.
-            from .bunch_review import group_member_batch
-            event_id = child.event_ids[0] if child.event_ids else ""
-            batch = group_member_batch(context)
-            known = {member["event_id"] for member in batch.evidence.get("batch_members", [])}
-            if not event_id or event_id not in known or self.batch_store is None:
-                self.hint.setText("这条记录不在本团的成员清单里，不能在这里保留。")
-                return
-            try:
-                self.batch_store.save(batch, [event_id], "keep",
-                                      self.reason_input.text().strip() or "原帧已核对：此记录对应有效过线",
-                                      tuple(self._events_provider()))
-            except (OSError, ValueError, RuntimeError) as error:
-                self.hint.setText(f"疑点处理未保存：{error}")
-                return
-            self.hint.setText("已保留这条芯片记录；集团的过线疑点随之核清。")
-            self._render_signature = None
-            self._render()
-            return
-        reason = self.reason_input.text().strip() or ACTION_REASON_PRESETS.get(action, "")
-        if action in (ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_SAME_CROSSING) and not reason:
-            self.hint.setText("排除或确认同一次过线需要写明依据；可先在原因框填写。")
-            return
-        try:
-            self.store.resolve(child, action, reason=reason,
-                               position=tuple(child.evidence.get("position", ())))
-        except (OSError, RuntimeError, ValueError) as error:
-            self.hint.setText(f"疑点处理未保存：{error}")
-            return
-        self.hint.setText("已按原帧证据处理这条疑点；其余疑点和人数保持不变。")
-        self._render_signature = None
-        self._render()
-
     def _confirm_pending(self) -> None:
-        """Enter confirms the decision whose standing reason is already in the field."""
+        """Enter answers the row: the count first, else the first button it shows.
 
-        if not self._pending_action:
-            if self.current_marks():
-                # People counted on the picture and nothing else chosen: for the class
-                # that is settled by counting, the count itself is the claim.
-                self._confirm_count()
-                return
-            self.hint.setText("回车确认要先选一项处理：按数字键，依据会自动填好。")
+        A two-chip crossing is the one question Enter will not answer by itself:
+        which record stays is the operator's own read of the frame, so it waits
+        for a number key or a click.
+        """
+
+        if self.current_marks():
+            # People counted on the picture and nothing else chosen: for the class
+            # that is settled by counting, the count itself is the claim.
+            self._confirm_count()
             return
-        action, self._pending_action = self._pending_action, ""
-        self._resolve(action)
+        buttons = [button for button in self.action_buttons
+                   if button.isVisibleTo(self) and button.isEnabled() and button.property("enterDefault")]
+        if buttons:
+            buttons[0].click()
+            return
+        self.hint.setText("回车是第一个按钮；这一条要先按数字键或点按钮选一项。" if self.action_buttons
+                          else "回车确认要先选一项处理：按数字键。")
 
     def _confirm_count(self) -> None:
         """Turn the counted people into the decision of this problem's class."""
@@ -1589,12 +1894,10 @@ class ProblemListPanel(QFrame):
         return self._big_view
 
     def toggle_big_view(self) -> None:
-        """Enlarge the crossing in place, decisions and all, on one screen.
+        """放大以后就是判读那一屏：左边大画面，右边点出来的人和本处芯片。
 
-        The frame is what the operator judges from, and on a laptop the queue and
-        the detail pane take most of the width.  The pane keeps its place in the
-        window; only the panes either side step aside, and the decision box moves
-        down with the picture, so looking and deciding never need two windows.
+        画面在窗口里不动，只是队列让开；右边这一栏收起卡片图片，换成一张按过线
+        时间排列的名单，号码和芯片时间同排，下面就是要按的那几个答案。
         """
 
         item = self.current_item()
@@ -1603,23 +1906,24 @@ class ProblemListPanel(QFrame):
         # instead of leaving a dead press (operator: "F does not work").
         frame = dict(item.evidence.get("frame") or {}) if item is not None else {}
         self._big_view = not self._big_view
+        self.detail_scroll.setMinimumWidth(404 if self._big_view else 260)
         self.table.setVisible(not self._big_view)
-        self.detail_scroll.setVisible(not self._big_view)
         # The header hands its height to the picture: a 4:3 frame can only grow with
         # the room above and below it, and on a laptop there is little to spare.
         self.header.setVisible(not self._big_view)
         self.big_title.setVisible(self._big_view)
         self.big_keys.setVisible(self._big_view)
-        self._reflow_decisions()
+        # 判读那一栏：卡片图片让位给统一的过线表。
+        self.card.setVisible(not self._big_view)
+        self.filmstrip.setVisible(not self._big_view)
+        self.detail.setVisible(not self._big_view)
+        for widget in (self.big_help, self.count_table, self.side_notice):
+            widget.setVisible(self._big_view)
         self._sync_step_buttons()
         self._sync_marks()
         # The picture counts people while it is the big one, and only then.
         self.count_mode_changed.emit(self._big_view)
         if self._big_view:
-            self.detail_layout.removeWidget(self.decision_box)
-            # The box lands at the right of the row under the frame: name and key
-            # guide on the left, the decisions themselves beside them.
-            self.big_bar.addWidget(self.decision_box)
             self.big_title.setText(f"{item.title} · {self.state(item)}" if item is not None else "录像判读 · 点人即可补记过线")
             self.decision_box.setVisible(item is not None)
             if frame and not self._browsing:
@@ -1631,31 +1935,11 @@ class ProblemListPanel(QFrame):
             # The queue is gone from the screen, so the panel keeps the keys.
             self.setFocus()
         else:
-            self.big_bar.removeWidget(self.decision_box)
-            # Back where it lives, above the trailing stretch of the detail pane.
-            self.detail_layout.insertWidget(self.detail_layout.count() - 1, self.decision_box)
             self.table.setFocus()
             self.hint.setText("已回到清单：1–9 处理，回车确认依据，F 看大图。")
+        self._sync_person_buttons()
         # The workbench answers this by giving the picture the rest of its own room.
         self.big_view_changed.emit(self._big_view)
-
-    def _reflow_decisions(self) -> None:
-        """Stack the decisions beside the list, or line them up under a full picture."""
-
-        target = self.action_line if self._big_view else self.action_row
-        if target is self.action_target:
-            return
-        widgets = [self.marks_label, self.prev_button, self.next_button, self.undo_button,
-                   self.clear_button] + list(self.action_buttons) + [
-            self.batch_button, self.bunch_button, self.missed_button, self.jump_button,
-            self.reopen_button,
-        ]
-        for index, widget in enumerate(widgets):
-            self.action_target.removeWidget(widget)
-            # Ahead of the trailing stretch, so both layouts keep the order the
-            # number keys 1–9 read out.
-            target.insertWidget(index, widget)
-        self.action_target = target
 
     def hideEvent(self, event) -> None:
         # Leaving the workbench must not leave the queue hidden behind a stale
@@ -1793,40 +2077,26 @@ class ProblemListPanel(QFrame):
         except (OSError, ValueError, RuntimeError) as error:
             self.hint.setText(f"批次处理不可用：{error}")
 
-    def _open_bunch(self) -> None:
-        self.refresh()
-        item = self.current_item()
-        if item is None or self.workspace_dir is None or self._browsing or item.evidence.get("superseded") or item.status == STATUS_WAITING:
-            return
-        from .bunch_dialog import BunchReviewDialog
-        try:
-            dialog = BunchReviewDialog(self.workspace_dir, item, self)
-        except (ValueError, RuntimeError, OSError) as error:
-            self.hint.setText(f"无法打开集团核对：{error}")
-            return
-        paused = self._live_paused
-        running = self._process is not None
-        self._live_paused = True
-        self.stop_analysis()
-        try:
-            dialog.exec_()
-        finally:
-            self._live_paused = paused
-            self._last_live_signature = None
-            self._next_analysis = time.monotonic() + 10
-            if running and not paused:
-                self._start_analysis()
-        self.refresh()
-        self.hint.setText("集团核对结果已保存。" if dialog.saved_completed else "集团进度已保留，可再次打开继续核对。")
-
     def _jump(self) -> None:
         item = self.current_item()
-        if item is not None and item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
-            self._open_bunch()
-            return
         if item is not None and item.evidence.get("frame"):
             self.jump_requested.emit(dict(item.evidence["frame"]))
             self.hint.setText("已跳到原帧；在机位画面中逐帧核对号码，再回到清单处理。")
+
+    def _resolve_operator(self, action: str, bib: str = "") -> None:
+        """One press on a row's own button is the decision.
+
+        「是选手」is the same button whether the number was read or not: with a
+        number typed it records the bib, empty it keeps the crossing and waits for
+        the number.  A two-chip button carries the record it discards, so the
+        label can name the one that stays.
+        """
+
+        if action == ACTION_RIDER:
+            action = ACTION_RECORD_BIB if self.bib_input.text().strip() else ACTION_CONFIRM_CROSSING
+        elif bib:
+            self.bib_input.setText(bib)
+        self._resolve(action)
 
     def _claims(self, exclude: str) -> list:
         """Bibs already tied to frames: auto-passed riders and other decisions."""
@@ -1871,15 +2141,6 @@ class ProblemListPanel(QFrame):
             # when they wrote none, and rides along when they did.
             note = f"画面点出 {counted} 人"
             reason = f"{reason}；{note}" if reason else note
-        standing = ACTION_REASON_PRESETS.get(self._pending_action)
-        if standing and action != self._pending_action and reason == standing:
-            # A key other than the one that filled the field means the operator
-            # changed their mind: drop the untouched standing reason rather than
-            # let it ride along with a decision they did not make.  This comes before
-            # the per-action checks so the field never claims what they did not pick.
-            reason = ""
-            self.reason_input.clear()
-            self._pending_action = ""
         if action in (ACTION_RECORD_BIB, ACTION_CONFIRM_CROSSING) and len(marks) > 1:
             self._split_counted_crossings(item)
             return
@@ -1897,13 +2158,9 @@ class ProblemListPanel(QFrame):
                 return
         if action in ACTION_REASON_PRESETS and not reason:
             # The frame is what was looked at; the standing reason says which claim
-            # that look makes.  It lands in the field to confirm or rewrite, so the
-            # decision still carries a reason without anyone typing one out.
-            preset = ACTION_REASON_PRESETS[action]
-            self._pending_action = action
-            self.reason_input.setText(preset)
-            self.hint.setText(f"依据已填「{preset}」；回车或再按一次这个键就是确认。")
-            return
+            # that look makes.  It rides into the journal with the same press — one
+            # look, one click, nothing to read and agree with afterwards.
+            reason = ACTION_REASON_PRESETS[action]
         if action == ACTION_DELETE_EXTRA_CHIP and len(item.bibs) > 1 and bib not in item.bibs:
             self.hint.setText(f"请在号码框填写要删除的芯片号码：{'、'.join(item.bibs)}。")
             return
@@ -2112,7 +2369,7 @@ class ProblemListPanel(QFrame):
         if (not recording and not self._final_analysis_pending) or self._live_paused or self._process is not None or time.monotonic() < self._next_analysis:
             return
         if not any((self.workspace_dir / name).exists() for name in ("finish_lines.json", "long_image_lines.json", "finish_problems/analysis_config.json")):
-            self.analysis_status = "等待终点线配置（设置中配置终点线）"
+            self.analysis_status = "等待终点线配置（在“终点线 / 模型”中配置）"
             self.stage_health["分析"] = self.analysis_status
             return
         signature = []

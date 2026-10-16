@@ -621,6 +621,26 @@ def test_failed_deletion_keeps_record_and_previous_deletions(tmp_path, monkeypat
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_clear_removes_records_and_deletion_marks_before_a_race(tmp_path):
+    journal = tmp_path / "passage-events.jsonl"
+    store = PassageEventStore(journal)
+    event = PassageEvent.from_payload(passage_payload())
+    store.append(event)
+    store.delete(event.event_id, reason="赛前测试")
+    assert store.events() == ()
+    assert store.deletions_path.exists()
+
+    store.clear()
+
+    assert store.events(include_inactive=True) == ()
+    assert not journal.exists()
+    assert not store.deletions_path.exists()
+
+    # 新一场比赛可以用同样的号码、芯片和时刻重新计入，不被赛前删除标记挡住。
+    store.append(event)
+    assert store.get(event.event_id) == event
+
+
 @pytest.mark.parametrize(
     "payload",
     [

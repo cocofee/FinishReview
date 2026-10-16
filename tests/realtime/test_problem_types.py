@@ -15,6 +15,7 @@ from realtime import problem_items as kinds_module
 from realtime.problem_items import (
     CATEGORY_CHIP,
     CATEGORY_VIDEO,
+    KIND_AUTO_PASSED,
     KIND_BEFORE_GUN,
     KIND_BUNCH,
     KIND_NEAR_CROSSING,
@@ -110,12 +111,16 @@ def test_counting_row_counts_each_class_once_and_ignores_reference_items(qapp, t
     assert counts[TYPE_MULTI_CHIP] == 1 and counts[TYPE_BUNCH] == 1 and counts[TYPE_MISSED] == 1
     # The record check and the evidence wait are not crossings: both read 待确认.
     assert counts[TYPE_CONFIRM] == 2
-    assert panel.class_buttons[TYPE_MULTI_CHIP].text() == "多芯片 1"
-    assert panel.class_buttons[TYPE_MISSED].text() == "无芯片 1"
+    assert panel.class_buttons[TYPE_MULTI_CHIP].text() == "一人双芯片 1"
+    assert panel.class_buttons[TYPE_MISSED].text() == "漏读 1"
     # The reference entry is shown in the queue and the voided one waits under
-    # 已处理; neither is anybody's task, so the tabs count five of the seven items.
+    # 已处理; neither is anybody's task, so the tabs count five of the items.
     assert "missing:1" in [item.item_id for item in panel.rows]
-    assert len([item for item in panel.items if not item.grouped]) == 7
+    # 自动对应的那一位也是本场的过线记录，表里留一行，但默认视图里不出现。
+    auto_rows = [item for item in panel.items if item.kind == KIND_AUTO_PASSED]
+    assert len(auto_rows) == 1
+    assert auto_rows[0] not in panel.rows
+    assert len([item for item in panel.items if not item.grouped]) == 8
     assert sum(counts.values()) == 5
     assert panel.auto_passed_text() == "无需人工处理 1 人"
     assert panel.evidence_gap_text() == "证据缺口 1 条待证据 · 2 人无录像可核"
@@ -178,17 +183,18 @@ def test_each_class_opens_its_own_tool_from_the_problem_itself(qapp, tmp_path):
 
     select("near:1")
     assert panel.missed_button.text() == "查看候选证据"
-    assert panel.missed_button.isVisibleTo(panel) and panel.bunch_button.isHidden()
+    assert panel.missed_button.isVisibleTo(panel)
     panel.missed_button.click()
     assert jumps == [FRAME] and "保留待证据" in panel.hint.text()
 
     select("bunch:1")
-    assert panel.bunch_button.text() == "打开集团逐帧核对"
-    assert panel.bunch_button.isVisibleTo(panel) and panel.missed_button.isHidden()
+    # 集团的工具就是这一屏本身：按 F 点数，没有第二个窗口可开。
+    assert panel.missed_button.isHidden()
+    assert not hasattr(panel, "bunch_button")
 
     select("gun:1")
     # The record class is decided in place: no class tool claims it.
-    assert panel.missed_button.isHidden() and panel.bunch_button.isHidden()
+    assert panel.missed_button.isHidden()
     assert [button.property("problemAction") for button in panel.action_buttons]
 
 
