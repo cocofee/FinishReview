@@ -1,9 +1,9 @@
-"""The counting row of the workbench: one class per kind, one row per item.
+"""The four class tabs of the workbench: one class per row, one row per item.
 
-The three classes the operator works through (multi-chip, group, missed read)
-plus the chip-record checks and the evidence-blocked items.  A kind that fell
-through to a default would disappear from the counts while still sitting in the
-queue, so the mapping is complete and tested.
+The three crossings the picture settles — multi-chip, group, missed read — and
+待确认 for everything else, which only waits for the operator to say what it is.
+A kind that fell through to a default would disappear from the counts while still
+sitting in the queue, so the mapping is complete and tested.
 """
 
 import json
@@ -27,6 +27,7 @@ from realtime.problem_items import (
     STATUS_INFO,
     STATUS_WAITING,
     TYPE_BUNCH,
+    TYPE_CONFIRM,
     TYPE_EVIDENCE,
     TYPE_MISSED,
     TYPE_MULTI_CHIP,
@@ -105,14 +106,18 @@ def test_counting_row_counts_each_class_once_and_ignores_reference_items(qapp, t
     panel = ProblemListPanel()
     panel.set_workspace(tmp_path)
 
-    counts = panel.type_counts()
+    counts = panel.class_counts()
     assert counts[TYPE_MULTI_CHIP] == 1 and counts[TYPE_BUNCH] == 1 and counts[TYPE_MISSED] == 1
-    assert counts[TYPE_RECORD] == 1 and counts[TYPE_EVIDENCE] == 1 and counts[TYPE_OTHER] == 0
-    assert panel.type_buttons[TYPE_MULTI_CHIP].text() == "多芯片疑点 1"
-    assert panel.type_buttons[TYPE_MISSED].text() == "漏读疑点 1"
-    # Reference and closed items are shown in the queue but are nobody's task.
-    assert panel.type_buttons[TYPE_OTHER].isHidden()
-    assert panel.auto_label.text() == "无需人工处理 1 人"
+    # The record check and the evidence wait are not crossings: both read 待确认.
+    assert counts[TYPE_CONFIRM] == 2
+    assert panel.class_buttons[TYPE_MULTI_CHIP].text() == "多芯片 1"
+    assert panel.class_buttons[TYPE_MISSED].text() == "无芯片 1"
+    # The reference entry is shown in the queue and the voided one waits under
+    # 已处理; neither is anybody's task, so the tabs count five of the seven items.
+    assert "missing:1" in [item.item_id for item in panel.rows]
+    assert len([item for item in panel.items if not item.grouped]) == 7
+    assert sum(counts.values()) == 5
+    assert panel.auto_passed_text() == "无需人工处理 1 人"
     assert panel.evidence_gap_text() == "证据缺口 1 条待证据 · 2 人无录像可核"
 
 
@@ -123,7 +128,7 @@ def test_a_match_inside_a_pending_group_is_counted_but_still_flagged(qapp, tmp_p
     panel = ProblemListPanel()
     panel.set_workspace(tmp_path)
 
-    assert panel.auto_label.text() == "无需人工处理 2 人（其中 1 人落在待核集团/遮挡时段内，不代表该时段已核清）"
+    assert panel.auto_passed_text() == "无需人工处理 2 人（其中 1 人落在待核集团/遮挡时段内，不代表该时段已核清）"
 
 
 def test_clicking_a_class_filters_the_queue_to_it_and_clicking_again_returns(qapp, tmp_path):
@@ -132,30 +137,31 @@ def test_clicking_a_class_filters_the_queue_to_it_and_clicking_again_returns(qap
     panel.set_workspace(tmp_path)
     assert len(panel.rows) == 5  # four open tasks plus the reference list
 
-    panel.type_buttons[TYPE_MISSED].click()
-    assert panel._type_filter == TYPE_MISSED and panel.type_buttons[TYPE_MISSED].isChecked()
+    panel.class_buttons[TYPE_MISSED].click()
+    assert panel._class_filter == TYPE_MISSED and panel.class_buttons[TYPE_MISSED].isChecked()
     assert [item.item_id for item in panel.rows] == ["near:1"]
 
-    panel.type_buttons[TYPE_MISSED].click()
-    assert panel._type_filter == "" and not panel.type_buttons[TYPE_MISSED].isChecked()
+    panel.class_buttons[TYPE_MISSED].click()
+    assert panel._class_filter == "" and not panel.class_buttons[TYPE_MISSED].isChecked()
     assert len(panel.rows) == 5
 
-    # The class filter narrows by class; the state row still decides what is shown,
-    # so the reference entry of the same class appears with the open one.
-    panel.type_buttons[TYPE_RECORD].click()
+    # The class tab narrows by class; what is open or closed still decides what is
+    # shown, so the reference entry of the same class appears beside the open one.
+    panel.class_buttons[TYPE_CONFIRM].click()
     assert [item.item_id for item in panel.rows] == ["gun:1", "missing:1"]
-    # The class row and the state row are one filter, not two competing ones.
-    panel.queue_filter.setCurrentIndex(4)
-    assert panel._type_filter == "" and len(panel.rows) == 7
+    # The two filters are independent axes: the class tab still holds while the
+    # queue filter brings the closed and the waiting rows back into view.
+    panel.queue_filter.setCurrentIndex(3)
+    assert panel._class_filter == TYPE_CONFIRM
+    assert [item.item_id for item in panel.rows] == ["gun:1", "wait:1", "missing:1"]
 
 
-def test_the_evidence_class_shows_what_only_waits_for_evidence(qapp, tmp_path):
+def test_the_evidence_view_shows_what_only_waits_for_evidence(qapp, tmp_path):
     _workspace(tmp_path, [])
     panel = ProblemListPanel()
     panel.set_workspace(tmp_path)
 
-    panel.type_buttons[TYPE_EVIDENCE].click()
-    assert panel.queue_filter.currentIndex() == 1
+    panel.queue_filter.setCurrentIndex(1)  # 待证据
     assert [item.item_id for item in panel.rows] == ["wait:1"]
     assert not panel.action_buttons
 

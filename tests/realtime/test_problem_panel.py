@@ -78,11 +78,13 @@ def test_panel_lists_problems_resolves_and_exports(qapp, tmp_path, monkeypatch):
     panel.jump_requested.connect(jumps.append)
     panel.set_workspace(tmp_path)
 
-    assert panel.summary.text() == "自动通过 1 人 · 待处理 2 条 · 无法核实 3 人 · 已处理 1 条"
+    # The line on screen is the queue in four classes; the long count is its tooltip.
+    assert panel.summary.text() == "疑点 多芯片 1 · 无芯片 1"
+    assert panel.summary.toolTip() == "自动通过 1 人 · 待处理 2 条 · 无法核实 3 人 · 已处理 1 条"
     assert panel.table.rowCount() == 3  # two pending plus the reference list
-    panel.show_closed.setChecked(True)
+    panel.queue_filter.setCurrentIndex(3)  # 全部
     assert panel.table.rowCount() == 5
-    panel.show_closed.setChecked(False)
+    panel.queue_filter.setCurrentIndex(0)
 
     panel.table.setCurrentCell(0, 0)
     assert not panel.card.pixmap().isNull()
@@ -115,7 +117,7 @@ def test_panel_lists_problems_resolves_and_exports(qapp, tmp_path, monkeypatch):
     panel.bib_input.setText("020")
     panel.reason_input.setText("一人带两块芯片")
     delete.click()
-    assert panel.summary.text().startswith("自动通过 1 人 · 待处理 0 条")
+    assert panel.summary_text().startswith("自动通过 1 人 · 待处理 0 条")
 
     counts = panel.export()
     assert counts == {"补录清单.csv": 1, "建议删除清单.csv": 1, "建议改号改圈清单.csv": 0}
@@ -199,19 +201,21 @@ def test_refresh_preserves_selected_problem_and_per_item_drafts(qapp, tmp_path):
 
 
 def test_hold_is_not_resolution_and_manual_item_survives_analysis(qapp, tmp_path):
+    from realtime.problem_panel import PENDING_REASON
     _write_list(tmp_path, _items(), [])
     panel = ProblemListPanel()
     panel.set_workspace(tmp_path)
     panel._hold()
-    assert not panel._held
+    # 待确认 is one press with nothing typed, and it decides nothing.
+    assert panel._held["no_chip:1"] == PENDING_REASON
+    assert panel.store.get("no_chip:1") is None
+    # The row stays in the queue greyed, so the operator meets it again.
+    assert "no_chip:1" in [item.item_id for item in panel.rows]
+    row = next(i for i, item in enumerate(panel.rows) if item.item_id == "no_chip:1")
+    assert panel.table.item(row, 2).foreground().color().name() == "#8a8f98"
     panel.reason_input.setText("wait for judge")
     panel._hold()
-    assert panel.store.get("no_chip:1") is None
-    assert "no_chip:1" not in [item.item_id for item in panel.rows]
-    panel.queue_filter.setCurrentIndex(2)
-    assert panel.current_item().item_id == "no_chip:1"
-    panel._hold()
-    panel.queue_filter.setCurrentIndex(0)
+    assert not panel._held  # pressing it again hands the row back
     manual = panel.add_manual_problem(FRAME, "check jersey")
     assert manual.evidence["frame"] == FRAME
     assert not manual.bibs and manual.chip_time_ms is None
@@ -411,6 +415,11 @@ def test_f_enlarges_the_picture_with_the_decisions_traveling_along(qapp, tmp_pat
     # The box stays on screen, now under the picture rather than beside it.
     assert panel.decision_box.parentWidget() is panel and panel.big_title.text()
     assert panel.decision_box.isVisibleTo(panel)
+    # Everything that runs and counts the queue hands its height to the picture,
+    # and the decisions stand in one line instead of a column of buttons.
+    assert not panel.header.isVisibleTo(panel) and panel.big_keys.isVisibleTo(panel)
+    assert panel.action_target is panel.action_line
+    assert [panel.action_line.itemAt(index).widget() for index in range(len(panel.action_buttons))]
 
     # Looking and deciding happen in the same view: pick a decision, confirm it.
     QTest.keyClick(panel, Qt.Key_2)
@@ -423,6 +432,8 @@ def test_f_enlarges_the_picture_with_the_decisions_traveling_along(qapp, tmp_pat
     QTest.keyClick(panel, Qt.Key_F)
     assert panel.table.isVisibleTo(panel) and panel.decision_box.parentWidget() is head
     assert panel.detail_layout.indexOf(panel.decision_box) >= 0
+    assert panel.header.isVisibleTo(panel) and panel.action_target is panel.action_row
+    assert not panel.big_keys.isVisibleTo(panel)
 
     # Esc is the same way back, so a quick look never traps the queue.
     panel.table.setCurrentCell(_row_of(panel, "unknown:1"), 0)

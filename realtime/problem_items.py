@@ -73,6 +73,21 @@ TYPE_TITLES = {
 # Counting-row order; the last class only appears when it holds items.
 TYPE_ORDER = (TYPE_MULTI_CHIP, TYPE_BUNCH, TYPE_MISSED, TYPE_RECORD, TYPE_EVIDENCE, TYPE_OTHER)
 
+# What the operator's queue is shown as: the three crossings the picture settles —
+# one vehicle with several chips, a group to count, a rider no chip recorded — and
+# everything else, which only waits for them to say what it is.  The six task types
+# above stay the machine's own classification; these four are the operator's.
+TYPE_CONFIRM = "confirm"
+
+CLASS_TITLES = {
+    TYPE_MULTI_CHIP: "多芯片",
+    TYPE_BUNCH: "集团",
+    TYPE_MISSED: "无芯片",
+    TYPE_CONFIRM: "待确认",
+}
+
+CLASS_ORDER = (TYPE_MULTI_CHIP, TYPE_BUNCH, TYPE_MISSED, TYPE_CONFIRM)
+
 KIND_TYPES = {
     KIND_TWO_CHIPS_ONE_CROSSING: TYPE_MULTI_CHIP,
     KIND_DUPLICATE_READ: TYPE_MULTI_CHIP,
@@ -213,6 +228,20 @@ def task_type(kind: str) -> str:
     """Operator class of a kind; unknown kinds stay visible as 其他疑点."""
 
     return KIND_TYPES.get(kind, TYPE_OTHER)
+
+
+def problem_class(item: "ProblemItem") -> str:
+    """Which of the four the queue shows this item as.
+
+    An item waiting for evidence is nobody's decision, so it reads as 待确认 even
+    when its kind is one of the three crossings.
+    """
+
+    if item.status == STATUS_WAITING:
+        return TYPE_CONFIRM
+    if item.task_type in (TYPE_MULTI_CHIP, TYPE_BUNCH, TYPE_MISSED):
+        return item.task_type
+    return TYPE_CONFIRM
 
 
 @dataclass(frozen=True, slots=True)

@@ -378,20 +378,67 @@ def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path
         window.problem_panel.refresh()
         window.problem_panel.table.setCurrentCell(0, 0)
         qapp.processEvents()
+        before = window.regular_pane.height()
+        fits = []
+        original_fit = window._fit_visible_evidence_views
+        window._fit_visible_evidence_views = lambda: (fits.append(1), original_fit())
 
         # What the pane's F shortcut leads to: no second window while judging.
+        window.problem_panel.set_browsing(True)
         window._toggle_maximized_pane(window.regular_pane)
         qapp.processEvents()
         assert window._maximized_window is None
         assert window.problem_panel._big_view
         assert not window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.decision_box.parentWidget() is window.problem_panel
+        # The time rail stands aside so the 4:3 crossing can actually grow, and the
+        # frame is fitted to the room it just gained.
+        assert not window.preview_panel.isVisibleTo(window)
+        assert window.regular_pane.height() > before
+        # Enlarging put this problem's own frame on screen, so nothing is being
+        # browsed and the decisions stay live instead of greyed with a way back.
+        assert not window.problem_panel._browsing
+        qapp.processEvents()
+        assert fits
 
         window._toggle_maximized_pane(window.regular_pane)
         qapp.processEvents()
         assert not window.problem_panel._big_view
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.decision_box.parentWidget() is not window.problem_panel
+        assert window.preview_panel.isVisibleTo(window)
+        assert window.regular_pane.height() == before
+    finally:
+        window.close()
+
+
+def test_the_problem_frame_counts_by_clock_across_the_archive(qapp, tmp_path):
+    """Judging a rebound two-minute archive is still judging this crossing."""
+
+    from types import SimpleNamespace
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        clip = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=tmp_path / "clip.mkv",
+            media_started_at_ms=1_789_600_000_000, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        archive = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=tmp_path / "archive.mkv",
+            media_started_at_ms=1_789_600_000_000 - 60_000, media_duration_ms=120_000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        frame = dict(camera_index=1, segment_id=clip.segment_id, video_path=str(tmp_path / "clip.mkv"),
+                     position_ms=2000, frame_index=50)
+        pane = SimpleNamespace(location=SimpleNamespace(segment=archive))
+        # 62 s into the archive is the clip's own second, another session's file.
+        assert window._shows_the_problem_frame(pane, 62_000, frame)
+        assert not window._shows_the_problem_frame(pane, 65_000, frame)
+        pane.location = SimpleNamespace(segment=clip)
+        assert window._shows_the_problem_frame(pane, 2_500, frame)
+        assert not window._shows_the_problem_frame(pane, 8_000, frame)
+        assert not window._shows_the_problem_frame(SimpleNamespace(location=None), 2_000, frame)
     finally:
         window.close()
 

@@ -59,18 +59,23 @@ from .problem_items import (
     STATUS_INFO,
     STATUS_WAITING,
     KIND_BUNCH,
-    KIND_OBSTRUCTION,
     KIND_MANUAL_REVIEW,
+    KIND_NO_VIDEO,
+    KIND_OBSTRUCTION,
+    KIND_SYNC,
+    KIND_WAITING,
     CATEGORY_VIDEO,
+    CLASS_ORDER,
+    CLASS_TITLES,
     TYPE_BUNCH,
+    TYPE_CONFIRM,
     TYPE_ENTRY_LABELS,
     TYPE_EVIDENCE,
     TYPE_MISSED,
     TYPE_MULTI_CHIP,
-    TYPE_ORDER,
     TYPE_OTHER,
-    TYPE_TITLES,
     ProblemItem,
+    problem_class,
 )
 from .problem_resolutions import (
     RESOLUTIONS_FILENAME,
@@ -100,6 +105,18 @@ def _missed_entry(item: ProblemItem, batch, bunch_parent) -> bool:
             and item.status != STATUS_WAITING and batch is None and bunch_parent is None)
 
 
+# 待确认 keeps the row in the queue instead of deciding it: the operator looked and
+# cannot settle it yet.  The standing reason says why, and stays editable.
+PENDING_REASON = "路人 / 遮挡 / 看不清，先放着"
+
+# The one token a row of the queue carries when its class does not already name it.
+SHORT_NOTES = {
+    KIND_NO_VIDEO: "无录像",
+    KIND_WAITING: "等录像",
+    KIND_SYNC: "不一致",
+    KIND_MANUAL_REVIEW: "人工",
+}
+
 STATE_PENDING = "待处理"
 STATE_DISPUTED = "有争议"
 STATE_RESOLVED = "已处理"
@@ -116,6 +133,9 @@ class ProblemListPanel(QFrame):
     summary_changed = pyqtSignal(str)
     analysis_finished = pyqtSignal()
     current_changed = pyqtSignal(object)
+    # The workbench listens: the picture takes the room of everything else, and
+    # gives it back when the queue returns.
+    big_view_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -150,15 +170,17 @@ class ProblemListPanel(QFrame):
         self._shown_frame = None
         self._scope = ("", "")
         self._browsing = False
-        self._type_filter = ""
+        self._class_filter = ""
         # The big view gives the picture the room of the queue; see toggle_big_view.
         self._big_view = False
         # The action whose standing reason is already in the field, waiting for a
         # second press of the same key or Enter to be committed; see _resolve.
         self._pending_action = ""
         # Receiver, recorder, sampling, clock and analysis fail separately: a
-        # single "video problem" line would hide which of them stopped.
+        # single "video problem" line would hide which of them stopped.  The long
+        # per-camera wording lives one hover away, on the window's status line.
         self.stage_health: dict[str, str] = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
+        self.stage_detail = ""
         self._live = False
         self._live_paused = False
         self._next_analysis = 0.0
@@ -175,79 +197,69 @@ class ProblemListPanel(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(4)
+        # Everything that runs the queue lives in one header: the big view stands the
+        # whole block aside and gives its height to the picture.  Two short rows — what
+        # is left to work through, and the four classes it is worked as — because the
+        # operator reads the picture, not the panel.
+        self.header = QWidget(self)
+        header_layout = QVBoxLayout(self.header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(4)
         controls = QHBoxLayout()
-        self.summary = QLabel("问题清单：尚未分析录像", self)
-        self.summary.setWordWrap(True)
-        layout.addWidget(self.summary)
-        # Counting row (plan step 6): what was matched without the operator, how much
-        # work of each class is open, and what only waits for evidence. Clicking a
-        # class narrows the queue to it; the class entry button then opens its tool.
-        type_row = QHBoxLayout()
-        type_row.setSpacing(4)
-        self.auto_label = QLabel("无需人工处理 —— 人", self)
-        self.auto_label.setWordWrap(True)
-        self.auto_label.setToolTip(
-            "按有效通过事件去重后的自动对应人数。其中仍落在待核集团或遮挡时段内的会另行标出，"
-            "这些选手的对应不作废，但整个集团是否核清不由自动对应决定。"
-        )
-        type_row.addWidget(self.auto_label, 1)
-        layout.addLayout(type_row)
-        # Buttons on their own line: six of them must not be squeezed off a laptop screen.
-        button_row = QHBoxLayout()
-        button_row.setSpacing(4)
-        self.type_buttons: dict[str, QPushButton] = {}
-        for value in TYPE_ORDER:
-            button = QPushButton(TYPE_TITLES[value], self)
-            button.setCheckable(True)
-            button.setToolTip(f"只看{TYPE_TITLES[value]}；再点一次取消，回到全部类型")
-            button.clicked.connect(lambda _checked=False, value=value: self._filter_by_type(value))
-            button.hide()
-            self.type_buttons[value] = button
-            button_row.addWidget(button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
-        settings_row = QHBoxLayout()
-        self.sampling_button = QPushButton("取样线 / 认车", self)
-        self.sampling_button.clicked.connect(self._configure_sampling)
-        settings_row.addWidget(self.sampling_button)
-        self.analysis_details = QLabel("实际终点线按机位和录制会话配置；只分析已封存录像。", self)
-        self.analysis_details.setWordWrap(True)
-        settings_row.addWidget(self.analysis_details, 1)
-        layout.addLayout(settings_row)
-        self.queue_filter = QComboBox(self)
-        self.queue_filter.addItems(["待处理", "待证据", "暂存", "交接 / 已处理", "全部"])
+        controls.setSpacing(4)
+        self.summary = QLabel("尚未分析录像", self.header)
+        self.summary.setWordWrap(False)
+        self.summary.setToolTip("悬浮显示本轮自动对应、无法核实和各类待处理的数量")
+        controls.addWidget(self.summary, 1)
+        self.queue_filter = QComboBox(self.header)
+        self.queue_filter.addItems(["待处理", "待证据", "已处理", "全部"])
+        self.queue_filter.setToolTip("待证据是等录像或校时的；标过「先放着」的留在待处理里，灰字显示")
         self.queue_filter.currentIndexChanged.connect(self._queue_filter_changed)
         controls.addWidget(self.queue_filter)
-        self.show_closed = QCheckBox("显示已处理和已排除", self)
-        self.show_closed.toggled.connect(self._render)
-        controls.addWidget(self.show_closed)
-        self.expand_groups = QCheckBox("展开集团和拥挤时段", self)
-        self.expand_groups.setToolTip("集团和拥挤时段里的问题归在一条里核对；展开后逐条显示")
-        self.expand_groups.toggled.connect(self._render)
-        controls.addWidget(self.expand_groups)
-        self.analyze_button = QPushButton("分析录像", self)
+        self.sampling_button = QPushButton("取样线", self.header)
+        self.sampling_button.setToolTip("终点线按机位和录制会话配置；只分析已封存录像")
+        self.sampling_button.clicked.connect(self._configure_sampling)
+        controls.addWidget(self.sampling_button)
+        self.analyze_button = QPushButton("分析", self.header)
         self.analyze_button.setToolTip("低优先级后台分析；比赛中只读取已封存短段，不等待五分钟归档")
         self.analyze_button.clicked.connect(self._toggle_analysis)
         controls.addWidget(self.analyze_button)
-        self.export_button = QPushButton("导出清单", self)
+        self.export_button = QPushButton("导出", self.header)
         self.export_button.setToolTip("导出补录、建议删除、建议改号改圈三张清单给 CycleRace")
         self.export_button.clicked.connect(self.export)
         controls.addWidget(self.export_button)
-        layout.addLayout(controls)
+        header_layout.addLayout(controls)
+        # The four classes are the filter: one row of tabs, each carrying how much of
+        # that class is still open, so the queue is narrowed without a second control.
+        class_row = QHBoxLayout()
+        class_row.setSpacing(4)
+        self.class_buttons: dict[str, QPushButton] = {}
+        for value in CLASS_ORDER:
+            button = QPushButton(CLASS_TITLES[value], self.header)
+            button.setCheckable(True)
+            button.setToolTip(f"只看{CLASS_TITLES[value]}；再点一次取消，回到全部")
+            button.clicked.connect(lambda _checked=False, value=value: self._filter_by_class(value))
+            self.class_buttons[value] = button
+            class_row.addWidget(button)
+        class_row.addStretch(1)
+        header_layout.addLayout(class_row)
+        layout.addWidget(self.header)
         splitter = self.splitter = QSplitter(Qt.Horizontal, self)
         splitter.setChildrenCollapsible(False)
-        self.table = QTableWidget(0, 5, splitter)
+        # Three columns only: when it happened, which class it is, and the one token
+        # that names it.  The state and the sentence live in the tooltip and in the
+        # detail beside the picture; a row is read at a glance.
+        self.table = QTableWidget(0, 3, splitter)
         self.table.setObjectName("finishProblemTable")
         self.table.setStyleSheet("QTableWidget::item:selected {background:#d6eeea; color:#123d36;}")
-        self.table.setHorizontalHeaderLabels(["时间", "类型", "号码", "状态", "说明"])
+        self.table.setHorizontalHeaderLabels(["时间", "类型", "记号"])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setMinimumWidth(240)
-        self.table.setColumnHidden(4, True)
-        for column, width in enumerate((78, 110, 55, 85)):
+        for column, width in enumerate((78, 66)):
             self.table.setColumnWidth(column, width)
         self.table.currentCellChanged.connect(lambda row, *_args: self._show(row))
         self.table.cellDoubleClicked.connect(lambda *_args: self._jump())
@@ -299,6 +311,12 @@ class ProblemListPanel(QFrame):
         self.bib_input.textChanged.connect(self._remember_draft)
         self.reason_input.textChanged.connect(self._remember_draft)
         self.action_row = QVBoxLayout()
+        # The same decisions are laid out twice: stacked beside the list, and as one
+        # line under a full picture, where their height is the picture's height.
+        self.action_line = QHBoxLayout()
+        self.action_line.setSpacing(4)
+        self.action_line.addStretch(1)
+        self.action_target = self.action_row
         # The class entry sits above the decisions, so the tool for this problem is
         # visible where the evidence is; there is no hidden entry to remember.
         self.batch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MULTI_CHIP], self.decision_box)
@@ -323,27 +341,51 @@ class ProblemListPanel(QFrame):
         self.jump_button.setToolTip("跳到原帧；按 F 把画面放大到整个工作区（再按 F 或 Esc 收回）")
         self.jump_button.clicked.connect(self._jump)
         self.action_row.addWidget(self.jump_button)
+        # The two steps through the queue travel with the picture: with the list out of
+        # sight the operator still moves problem by problem without leaving the frame.
+        self.prev_button = QPushButton("↑ 上一个疑点", self.decision_box)
+        self.prev_button.setToolTip("上一条疑点（放大时按 ↑）")
+        self.prev_button.clicked.connect(lambda _checked=False: self._step(-1))
+        self.prev_button.hide()
+        self.action_row.addWidget(self.prev_button)
+        self.next_button = QPushButton("↓ 下一个疑点", self.decision_box)
+        self.next_button.setToolTip("下一条疑点（放大时按 ↓）")
+        self.next_button.clicked.connect(lambda _checked=False: self._step(1))
+        self.next_button.hide()
+        self.action_row.addWidget(self.next_button)
         self.action_buttons: list[QPushButton] = []
         self.reopen_button = QPushButton("重新处理", self.decision_box)
         self.reopen_button.clicked.connect(self._reopen)
         self.action_row.addWidget(self.reopen_button)
-        self.hold_button = QPushButton("暂存", self.decision_box)
-        self.hold_button.setToolTip("填写原因后暂存，不标记为已解决；可从暂存清单恢复")
+        # 待确认 is the one button that is not a verdict: "先放着" — a passer-by, a
+        # blocked line, a frame that cannot be read yet.  The row stays in the queue
+        # marked, so nothing is decided by leaving it and nothing is lost by it.
+        self.hold_button = QPushButton("待确认", self.decision_box)
+        self.hold_button.setToolTip("先放着（T）：标为路人 / 遮挡 / 看不清，留在清单里下次再看；再点一次回到待处理")
         self.hold_button.clicked.connect(self._hold)
         reason_row.addWidget(self.hold_button)
         self.action_row.addStretch(1)
         self.decision_layout.addLayout(self.action_row)
+        # Whichever of the two is in use, the empty one takes no height back.
+        self.decision_layout.addLayout(self.action_line)
         self.detail_layout = detail_layout
         detail_layout.addWidget(self.decision_box)
         detail_layout.addStretch(1)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
-        # The line the big view hands the decisions to; empty until then.
+        # The line the big view hands the decisions to; hidden until then.  The keys
+        # have their own label here so the hint below stays free for what just
+        # happened to the row.
         self.big_title = QLabel("", self)
         self.big_title.setStyleSheet("font-weight: 600;")
+        self.big_title.hide()
+        self.big_keys = QLabel("1–9 处理 · 回车确认 · ↑↓ 上下条 · F / Esc 回清单", self)
+        self.big_keys.setStyleSheet("color: #667085; font-size: 9pt;")
+        self.big_keys.hide()
         self.big_bar = QHBoxLayout()
-        self.big_bar.addWidget(self.big_title)
+        self.big_bar.addWidget(self.big_title, 1)
+        self.big_bar.addWidget(self.big_keys)
         layout.addLayout(self.big_bar)
         self.hint = QLabel("", self)
         self.hint.setWordWrap(True)
@@ -378,16 +420,21 @@ class ProblemListPanel(QFrame):
             self.hint.setText(f"草稿保存失败：{error}")
 
     def _hold(self):
+        """Mark the row 待确认 — a passer-by, a blocked line, a frame not to be read yet.
+
+        Nothing is decided by it and nothing is lost: the row stays in the queue,
+        grey, with whatever the operator typed as its reason, or the standing one.
+        """
+
         item = self.current_item()
         if item is None:
             return
         if item.item_id in self._held:
             self._held.pop(item.item_id)
-        elif not self.reason_input.text().strip():
-            self.hint.setText("暂存需要填写原因；暂存不会将问题标记为已解决。")
-            return
+            self.hint.setText("已回到待处理。")
         else:
-            self._held[item.item_id] = self.reason_input.text().strip()
+            self._held[item.item_id] = self.reason_input.text().strip() or PENDING_REASON
+            self.hint.setText("已标为待确认，留在清单里灰字显示；再按一次就是回到待处理。")
         self.save_drafts()
         self._render()
 
@@ -489,7 +536,7 @@ class ProblemListPanel(QFrame):
             enforce_settings = bool(read_settings(self.workspace_dir).get("settings_revision"))
         except (OSError, ValueError) as error:
             token, enforce_settings = "invalid", True
-            self.analysis_details.setText(f"分析配置不可用：{error}")
+            self.stage_detail = f"分析配置不可用：{error}"
         signature.append(token)
         if signature != self._signature:
             try:
@@ -563,7 +610,7 @@ class ProblemListPanel(QFrame):
                           if item.category == CATEGORY_VIDEO and item.kind != KIND_MANUAL_REVIEW else item for item in self.items]
             self.stage_health["取样"] = "配置已变更，等待重新取样"
             self.stage_health["校时"] = "配置已变更，等待重新校时"
-            self.analysis_details.setText("配置已变更：旧视频结论不可提交，等待重新取样、校时与认车；芯片自检继续。")
+            self.stage_detail = "配置已变更：旧视频结论不可提交，等待重新取样、校时与认车；芯片自检继续。"
         elif token != "invalid":
             cameras = (self.payload or {}).get("cameras", {})
             missing_lines = sum(len(value.get("missing_line_segments") or ()) for value in cameras.values())
@@ -579,7 +626,7 @@ class ProblemListPanel(QFrame):
                 if value.get("missing_line_segments"):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
                 statuses.append(f"机位 {camera}：{detail}")
-            self.analysis_details.setText("；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。")
+            self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
         from .bunch_review import BunchReviewStore
         try:
             self.bunch_store = BunchReviewStore(self.problem_dir)
@@ -670,37 +717,26 @@ class ProblemListPanel(QFrame):
 
     def _render(self) -> None:
         signature = (tuple((repr(item.to_payload()), self.state(item)) for item in self.items),
-                     self.show_closed.isChecked(), self.expand_groups.isChecked(),
-                     self.queue_filter.currentIndex(), self._type_filter, tuple(self._held.items()),
+                     self.queue_filter.currentIndex(), self._class_filter, tuple(self._held.items()),
                      repr((self.payload or {}).get("summary")))
         if signature == self._render_signature:
             return
         self._render_signature = signature
         selected = self.rows[self.table.currentRow()].item_id if 0 <= self.table.currentRow() < len(self.rows) else None
-        show_all = self.show_closed.isChecked()
         mode = self.queue_filter.currentIndex()
-        members: dict[str, list[ProblemItem]] = {}
-        for item in self.items:
-            if item.grouped:
-                members.setdefault(item.grouped, []).append(item)
         self.rows = []
         for item in self.items:
+            # Members of a batch or a group are worked inside their tool, never as
+            # rows of their own: the queue holds what the operator decides by hand.
             if item.grouped:
                 continue
             state = self.state(item)
             pending = self.is_pending_state(state) or state == STATE_INFO
-            held = item.item_id in self._held
-            visible = (show_all or mode == 4 or (mode == 0 and pending and not held)
-                       or (mode == 1 and state == STATE_WAITING) or (mode == 2 and held and pending)
-                       or (mode == 3 and not pending and state != STATE_WAITING)
+            visible = (mode == 3 or (mode == 0 and pending) or (mode == 1 and state == STATE_WAITING)
+                       or (mode == 2 and not pending and state != STATE_WAITING)
                        or (item.item_id == selected and item.evidence.get("superseded")))
-            if visible and self._type_matches(item, state):
+            if visible and self._class_matches(item):
                 self.rows.append(item)
-            if self.expand_groups.isChecked():
-                self.rows += [
-                    member for member in members.get(item.item_id, [])
-                    if (show_all or self.is_pending_state(self.state(member))) and self._type_matches(member)
-                ]
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.rows))
         restore = -1
@@ -708,15 +744,15 @@ class ProblemListPanel(QFrame):
             state = self.state(item)
             values = (
                 format_chip_time(item.chip_time_ms) if item.chip_time_ms is not None else "--",
-                ("└ " if item.grouped else "") + item.title,
-                "、".join(item.bibs[:4]) + ("…" if len(item.bibs) > 4 else ""),
-                ("暂存" if item.item_id in self._held and self.is_pending_state(state) else state), item.detail,
+                CLASS_TITLES[problem_class(item)],
+                self.short_note(item, state),
             )
+            colour = self._row_colour(item, state)
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
-                cell.setToolTip(item.detail)
-                if column == 3 and self.is_pending_state(state):
-                    cell.setForeground(QColor("#b54747"))
+                cell.setToolTip(f"{state} · {item.title}\n{item.detail}")
+                if colour is not None:
+                    cell.setForeground(colour)
                 self.table.setItem(index, column, cell)
             if item.item_id == selected:
                 restore = index
@@ -726,26 +762,59 @@ class ProblemListPanel(QFrame):
             self.table.setCurrentCell(0, 0)
         self.table.blockSignals(False)
         self._show(self.table.currentRow())
-        self._refresh_type_row()
+        self._refresh_class_row()
         text = self.summary_text()
-        self.summary.setText(text)
+        self.summary.setText(self.queue_text())
+        self.summary.setToolTip(text)
         self.summary_changed.emit(text)
 
-    def _type_matches(self, item: ProblemItem, state: str = "") -> bool:
-        if not self._type_filter:
-            return True
-        if self._type_filter == TYPE_EVIDENCE:
-            return item.task_type == TYPE_EVIDENCE or (state or self.state(item)) == STATE_WAITING
-        return item.task_type == self._type_filter
+    def short_note(self, item: ProblemItem, state: str = "") -> str:
+        """The one token a row carries: the numbers to look at, never a sentence.
 
-    def _refresh_type_row(self) -> None:
-        counts = self.type_counts()
-        self.auto_label.setText(self.auto_passed_text())
-        for value, button in self.type_buttons.items():
-            count = counts[value]
-            button.setText(f"{TYPE_TITLES[value]} {count}")
-            button.setVisible(value != TYPE_OTHER or count > 0)
-            button.setChecked(value == self._type_filter)
+        A group shows how many chips were read, or how many riders the operator
+        already counted — once counted, the row says so in grey even before the
+        group is closed, so nothing looks untouched that someone has worked on.
+        """
+
+        cls = problem_class(item)
+        if cls == TYPE_BUNCH:
+            record = self.bunch_store.latest_for(item) if self.bunch_store is not None else None
+            counted = int((record or {}).get("counted_riders") or 0)
+            if counted:
+                return f"{counted} 人"
+            chips = int(item.evidence.get("chip_count") or len(item.bibs) or 0)
+            return f"{chips} 芯片" if chips else "—"
+        if cls == TYPE_CONFIRM:
+            return SHORT_NOTES.get(item.kind, "—")
+        if item.bibs:
+            return "、".join(item.bibs[:4]) + ("…" if len(item.bibs) > 4 else "")
+        return "—"
+
+    def _row_colour(self, item: ProblemItem, state: str) -> Optional[QColor]:
+        """Grey for what is settled or already looked at, red for what fights back."""
+
+        if state in (STATE_DISPUTED, STATE_STALE):
+            return QColor("#b54747")
+        if not self.is_pending_state(state) or item.item_id in self._held or self._in_progress(item):
+            return QColor("#8a8f98")
+        return None
+
+    def _in_progress(self, item: ProblemItem) -> bool:
+        """A group half counted: its record is saved but the group is not closed."""
+
+        if self.bunch_store is None:
+            return False
+        record = self.bunch_store.latest_for(item)
+        return bool(record) and not record.get("completed")
+
+    def _class_matches(self, item: ProblemItem) -> bool:
+        return not self._class_filter or problem_class(item) == self._class_filter
+
+    def _refresh_class_row(self) -> None:
+        counts = self.class_counts()
+        for value, button in self.class_buttons.items():
+            button.setText(f"{CLASS_TITLES[value]} {counts[value]}")
+            button.setChecked(value == self._class_filter)
 
     def current_item(self) -> Optional[ProblemItem]:
         row = self.table.currentRow()
@@ -760,6 +829,7 @@ class ProblemListPanel(QFrame):
         if not changed and frame != self._shown_frame:
             self._browsing = True
         self._shown_frame = frame
+        self._sync_step_buttons()
         if changed:
             self._shown_id = identity
             bib, reason = self._drafts.get(identity, ("", ""))
@@ -774,7 +844,7 @@ class ProblemListPanel(QFrame):
             # starts the two-stage bargain over instead of inheriting the claim.
             self._pending_action = ""
         for button in self.action_buttons:
-            self.action_row.removeWidget(button)
+            self.action_target.removeWidget(button)
             button.deleteLater()
         self.action_buttons = []
         self.card.clear()
@@ -795,7 +865,7 @@ class ProblemListPanel(QFrame):
                 self.current_changed.emit(None)
             return
         self.hold_button.setEnabled(item.status != STATUS_WAITING)
-        self.hold_button.setText("返回待处理" if item.item_id in self._held else "暂存")
+        self.hold_button.setText("返回待处理" if item.item_id in self._held else "待确认")
         is_bunch = item.kind in (KIND_BUNCH, KIND_OBSTRUCTION)
         batch = self._batch_parent(item)
         self.batch_button.setVisible(batch is not None)
@@ -845,7 +915,7 @@ class ProblemListPanel(QFrame):
             button.setProperty("problemAction", action)
             button.setToolTip(f"{ACTION_LABELS.get(action, action)}（数字键 {len(self.action_buttons) + 1}）")
             button.clicked.connect(lambda _checked=False, action=action: self._resolve(action))
-            self.action_row.insertWidget(len(self.action_buttons), button)
+            self.action_target.insertWidget(len(self.action_buttons), button)
             self.action_buttons.append(button)
         self.set_browsing(self._browsing)
         if changed:
@@ -914,16 +984,43 @@ class ProblemListPanel(QFrame):
         if key == Qt.Key_Escape and self._big_view:
             self.toggle_big_view()
             return True
+        if key == Qt.Key_T:
+            # 待确认 is the one key that must work from the picture: it is pressed
+            # when the frame does not tell enough, which is exactly where the eyes are.
+            self._hold()
+            return True
+        if self._big_view and key in (Qt.Key_Up, Qt.Key_Down):
+            # With the list out of sight, the arrows walk the queue instead of it.
+            self._step(-1 if key == Qt.Key_Up else 1)
+            return True
         if Qt.Key_1 <= key <= Qt.Key_9:
             self._click_action(key - Qt.Key_1 + 1)
             return True
         return False
 
+    def _step(self, delta: int) -> None:
+        """Move to the neighbouring problem without leaving the enlarged picture."""
+
+        row = self.table.currentRow() + delta
+        if 0 <= row < len(self.rows):
+            self.table.setCurrentCell(row, 0)
+        if self._big_view:
+            self.setFocus()
+
+    def _sync_step_buttons(self) -> None:
+        """The two queue steps show with the picture only; beside the list the arrows do it."""
+
+        row = self.table.currentRow()
+        for button, delta, enabled in ((self.prev_button, -1, row > 0),
+                                       (self.next_button, 1, 0 <= row < len(self.rows) - 1)):
+            button.setVisible(self._big_view)
+            button.setEnabled(enabled)
+
     def _confirm_pending(self) -> None:
         """Enter confirms the decision whose standing reason is already in the field."""
 
         if not self._pending_action:
-            self.hint.setText("回车确认已填依据的处理；先用数字键选一项，依据会自动填好。")
+            self.hint.setText("回车确认要先选一项处理：按数字键，依据会自动填好。")
             return
         action, self._pending_action = self._pending_action, ""
         self._resolve(action)
@@ -943,21 +1040,48 @@ class ProblemListPanel(QFrame):
         self._big_view = not self._big_view
         self.table.setVisible(not self._big_view)
         self.detail_scroll.setVisible(not self._big_view)
+        # The header hands its height to the picture: a 4:3 frame can only grow with
+        # the room above and below it, and on a laptop there is little to spare.
+        self.header.setVisible(not self._big_view)
+        self.big_title.setVisible(self._big_view)
+        self.big_keys.setVisible(self._big_view)
+        self._reflow_decisions()
+        self._sync_step_buttons()
         if self._big_view:
             self.detail_layout.removeWidget(self.decision_box)
+            # The box lands at the right of the row under the frame: name and key
+            # guide on the left, the decisions themselves beside them.
             self.big_bar.addWidget(self.decision_box)
             self.big_title.setText(f"{item.title} · {self.state(item)}")
             self.decision_box.show()
             self.jump_requested.emit(dict(item.evidence["frame"]))
             # The queue is gone from the screen, so the panel keeps the keys.
             self.setFocus()
-            self.hint.setText("已放大原帧：1–9 直接处理这条，回车确认依据，F 或 Esc 回到清单。")
         else:
             self.big_bar.removeWidget(self.decision_box)
             # Back where it lives, above the trailing stretch of the detail pane.
             self.detail_layout.insertWidget(self.detail_layout.count() - 1, self.decision_box)
             self.table.setFocus()
-            self.hint.setText("已回到清单：1–9 是这条的处理按钮，回车确认依据，F 再看大图。")
+            self.hint.setText("已回到清单：1–9 处理，回车确认依据，F 看大图。")
+        # The workbench answers this by giving the picture the rest of its own room.
+        self.big_view_changed.emit(self._big_view)
+
+    def _reflow_decisions(self) -> None:
+        """Stack the decisions beside the list, or line them up under a full picture."""
+
+        target = self.action_line if self._big_view else self.action_row
+        if target is self.action_target:
+            return
+        widgets = [self.prev_button, self.next_button] + list(self.action_buttons) + [
+            self.batch_button, self.bunch_button, self.missed_button, self.jump_button,
+            self.reopen_button,
+        ]
+        for index, widget in enumerate(widgets):
+            self.action_target.removeWidget(widget)
+            # Ahead of the trailing stretch, so both layouts keep the order the
+            # number keys 1–9 read out.
+            target.insertWidget(index, widget)
+        self.action_target = target
 
     def hideEvent(self, event) -> None:
         # Leaving the workbench must not leave the queue hidden behind a stale
@@ -974,39 +1098,48 @@ class ProblemListPanel(QFrame):
         if 1 <= number <= len(buttons):
             buttons[number - 1].click()
 
-    def _filter_by_type(self, value: str) -> None:
-        """The counting row works as the queue filter; there is no separate entry."""
+    def _filter_by_class(self, value: str) -> None:
+        """A class tab narrows the queue to its own work; pressing it again lets go."""
 
-        self._type_filter = "" if self._type_filter == value else value
-        for key, button in self.type_buttons.items():
-            button.setChecked(key == self._type_filter)
-        self.queue_filter.blockSignals(True)
-        self.queue_filter.setCurrentIndex(1 if self._type_filter == TYPE_EVIDENCE else 0)
-        self.queue_filter.blockSignals(False)
+        self._class_filter = "" if self._class_filter == value else value
+        for key, button in self.class_buttons.items():
+            button.setChecked(key == self._class_filter)
         self._render()
 
     def _queue_filter_changed(self) -> None:
-        if self._type_filter:
-            self._type_filter = ""
-            for button in self.type_buttons.values():
-                button.setChecked(False)
         self._render()
 
-    def type_counts(self) -> dict[str, int]:
+    def class_counts(self) -> dict[str, int]:
         """Open work per class: each item is counted once, in the row the operator works in."""
 
-        counts = dict.fromkeys(TYPE_ORDER, 0)
+        counts = dict.fromkeys(CLASS_ORDER, 0)
         for item in self.items:
             if item.grouped:
                 continue  # members are handled inside their batch or group
             state = self.state(item)
-            if state == STATE_WAITING or (item.task_type == TYPE_EVIDENCE
-                                          and not (state.startswith(STATE_RESOLVED) or state.startswith(STATE_HANDOFF)
-                                                   or state in (STATE_UPSTREAM, STATE_EXCLUDED))):
-                counts[TYPE_EVIDENCE] += 1
-            elif self.is_pending_state(state):
-                counts[item.task_type] += 1
+            if self._is_waiting_work(item, state) or self.is_pending_state(state):
+                counts[problem_class(item)] += 1
         return counts
+
+    def _is_waiting_work(self, item: ProblemItem, state: str = "") -> bool:
+        """Open work that only waits for evidence: nobody's decision to make today."""
+
+        state = state or self.state(item)
+        if state == STATE_WAITING:
+            return True
+        if item.task_type != TYPE_EVIDENCE:
+            return False
+        return not (state.startswith((STATE_RESOLVED, STATE_HANDOFF))
+                    or state in (STATE_UPSTREAM, STATE_EXCLUDED))
+
+    def queue_text(self) -> str:
+        """The one line the queue says about itself; the long count is its tooltip."""
+
+        if self.payload is None and not self.items:
+            return "尚未分析录像"
+        counts = self.class_counts()
+        parts = [f"{CLASS_TITLES[value]} {counts[value]}" for value in CLASS_ORDER if counts[value]]
+        return "疑点 " + " · ".join(parts) if parts else "疑点 已清空"
 
     def auto_passed_text(self) -> str:
         payload = self.payload or {}
@@ -1022,7 +1155,7 @@ class ProblemListPanel(QFrame):
 
     def evidence_gap_text(self) -> str:
         summary = (self.payload or {}).get("summary", {})
-        waiting = self.type_counts()[TYPE_EVIDENCE]
+        waiting = sum(1 for item in self.items if not item.grouped and self._is_waiting_work(item))
         unverifiable = int(summary.get("unverifiable", 0))
         if not waiting and not unverifiable:
             return "证据缺口 无"
@@ -1030,7 +1163,7 @@ class ProblemListPanel(QFrame):
 
     def health_text(self) -> str:
         parts = [f"{name} {self.stage_health.get(name) or '—'}" for name in ("接收", "录制", "取样", "校时", "分析")]
-        return " · ".join(parts)
+        return " · ".join(parts) + (f" · {self.stage_detail}" if self.stage_detail else "")
 
     def clock_health(self) -> str:
         """Clock state per camera, kept apart from sampling and analysis failures."""
@@ -1164,7 +1297,7 @@ class ProblemListPanel(QFrame):
             preset = ACTION_REASON_PRESETS[action]
             self._pending_action = action
             self.reason_input.setText(preset)
-            self.hint.setText(f"依据已填「{preset}」；再按一次同一个键就是确认，改成你看到的情形也可以。")
+            self.hint.setText(f"依据已填「{preset}」；回车或再按一次这个键就是确认。")
             return
         if action == ACTION_DELETE_EXTRA_CHIP and len(item.bibs) > 1 and bib not in item.bibs:
             self.hint.setText(f"请在号码框填写要删除的芯片号码：{'、'.join(item.bibs)}。")

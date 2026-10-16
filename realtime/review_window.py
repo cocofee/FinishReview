@@ -166,6 +166,9 @@ IS_WINDOWS = os.name == "nt"
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
 LIVE_EVIDENCE_DATE_TOLERANCE_MS = LIVE_DATE_TOLERANCE_MS
+# How far the picture may sit from a problem's own frame before the panel calls it
+# "browsing elsewhere"; one second covers stepping a few frames around a crossing.
+PROBLEM_FRAME_TOLERANCE_MS = 1000
 CYCLERACE_INBOX_DIRNAME = ".finishreview"
 _TEST_GROUP_NAMES = frozenset({"test", "testgroup"})
 _TEST_GROUP_MARKERS = ("测试", "检测")
@@ -2361,6 +2364,7 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         self.problem_panel.jump_requested.connect(self._open_problem_frame)
         self.problem_panel.current_changed.connect(self._problem_selection_changed)
+        self.problem_panel.big_view_changed.connect(self._problem_big_view_changed)
         self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
         self.return_problem_button = QPushButton("回到当前问题", self)
         self.return_problem_button.clicked.connect(self._return_to_problem)
@@ -2382,6 +2386,18 @@ class FinishReviewWindow(PassageReviewSurface):
     def _problem_selection_changed(self, item):
         if getattr(self, "_problem_workbench_active", False):
             self._return_to_problem()
+
+    def _problem_big_view_changed(self, big: bool) -> None:
+        """Give the enlarged picture the room of the rail, and fit the frame to it.
+
+        A 4:3 crossing only grows with the height it is given, so while one
+        problem is judged the time rail steps aside; the frame is re-fitted to the
+        new area both ways, the same as the old judging window did when it opened.
+        """
+
+        if getattr(self, "_problem_workbench_active", False):
+            self.preview_panel.setVisible(not big)
+        QTimer.singleShot(0, self._fit_visible_evidence_views)
 
     def _problem_browse_started(self):
         if getattr(self, "_problem_workbench_active", False):
@@ -2411,9 +2427,28 @@ class FinishReviewWindow(PassageReviewSurface):
         item = self.problem_panel.current_item()
         frame = item.evidence.get("frame", {}) if item else {}
         if frame:
-            same = pane.location is not None and pane.location.segment.segment_id == frame.get("segment_id")
-            same = same and abs(int(position_ms) - int(frame.get("position_ms", 0))) <= 1000
-            self.problem_panel.set_browsing(not same)
+            self.problem_panel.set_browsing(not self._shows_the_problem_frame(pane, position_ms, frame))
+
+    def _shows_the_problem_frame(self, pane, position_ms: int, frame: dict) -> bool:
+        """Whether what is on the screen is this problem's own frame.
+
+        A two-minute archive counts as the same moment as the clip it covers, so the
+        comparison follows the recording clock whenever both sides know it, and falls
+        back to the file only when they do not: judging a rebound archive is still
+        judging this crossing, and the panel must not call that "browsing".
+        """
+
+        location = getattr(pane, "location", None)
+        if location is None:
+            return False
+        source = self.timeline_store.get_segment(str(frame.get("segment_id", "")))
+        on_screen = location.segment.media_started_at_ms
+        wanted = getattr(source, "media_started_at_ms", None)
+        if on_screen is None or wanted is None:
+            same = location.segment.segment_id == str(frame.get("segment_id", ""))
+            return same and abs(int(position_ms) - int(frame.get("position_ms", 0))) <= PROBLEM_FRAME_TOLERANCE_MS
+        return abs((on_screen + int(position_ms))
+                   - (wanted + int(frame.get("position_ms", 0)))) <= PROBLEM_FRAME_TOLERANCE_MS
 
     def _open_race_filmstrip_frame(self, frame):
         if getattr(self, "_problem_workbench_active", False):
@@ -2491,7 +2526,11 @@ class FinishReviewWindow(PassageReviewSurface):
         if segment.media_started_at_ms is not None:
             self.video_filmstrip.full_race.browse_to(segment.media_started_at_ms + position)
         if self._seek_retained_camera_frame(location, position, index, int(frame.get("camera_index", 1) or 1)):
-            self.problem_panel.hint.setText(f"已定位原录像第 {index + 1} 帧，请逐帧核对号码后在清单中处理。")
+            # The pane is on the problem's own frame now, so the panel is not
+            # browsing elsewhere and may be decided on: F would otherwise leave the
+            # operator looking at the right picture while every button stays greyed.
+            self.problem_panel.set_browsing(False)
+            self.problem_panel.hint.setText(f"已定位原录像第 {index + 1} 帧，请逐帧核对号码后处理。")
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label
