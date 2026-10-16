@@ -5,15 +5,22 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import pytest
+from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
+from realtime.batch_review import aggregate_batches, read_snapshots
+from realtime.chip_checks import chip_check_items
+from realtime.chip_history import ChipRead
 from realtime.problem_items import (
     CATEGORY_COVERAGE,
     CATEGORY_VIDEO,
+    KIND_BUNCH,
     KIND_NEAR_CROSSING,
     KIND_NO_CHIP_CROSSING,
     KIND_NOT_ARRIVED,
     KIND_TWO_CHIPS_ONE_CROSSING,
+    KIND_UNKNOWN_BIB,
     STATUS_CLOSED_UPSTREAM,
     STATUS_EXCLUDED,
     STATUS_INFO,
@@ -356,3 +363,88 @@ def test_excluding_or_confirming_a_crossing_requires_a_written_reason(qapp, tmp_
     # Confirming "same crossing" closes the question without inventing a rider.
     assert panel.state(near).startswith("已处理：确认是同一次过线")
     assert panel.export() == {"补录清单.csv": 0, "建议删除清单.csv": 0, "建议改号改圈清单.csv": 0}
+
+
+def _keyboard_items():
+    """One row of each entry: a missed candidate, a batch, a group, two plain rows."""
+
+    reads = [ChipRead(f"e-{index}", f"0{index}", f"chip-{index}", "g", "race group", "",
+                      T + index * 20, index * 20, 0, T + index * 20, 1, 1, True, False)
+             for index in range(30, 38)]
+    batch = next(item for item in aggregate_batches(chip_check_items(reads), read_snapshots(reads),
+                                                   ["", ""], ())
+                 if item.evidence.get("batch_members"))
+    return [
+        _near_crossing_item(),
+        batch,
+        ProblemItem("bunch:1", KIND_BUNCH, CATEGORY_VIDEO, "集团核对", chip_time_ms=T + 2_000,
+                    event_ids=("e-040",), evidence={"frame": dict(FRAME)}),
+        ProblemItem("unknown:1", KIND_UNKNOWN_BIB, CATEGORY_VIDEO, "号码无法核实", chip_time_ms=T + 3_000,
+                    bibs=("099",), event_ids=("e-099",), evidence={"frame": dict(FRAME)}),
+        ProblemItem("unknown:2", KIND_UNKNOWN_BIB, CATEGORY_VIDEO, "无名无帧", chip_time_ms=T + 4_000,
+                    bibs=("098",), event_ids=("e-098",), evidence={}),
+    ]
+
+
+def _row_of(panel, item_id):
+    return next(index for index, item in enumerate(panel.rows) if item.item_id == item_id)
+
+
+def test_enter_opens_the_tool_of_the_row_on_screen(qapp, tmp_path, monkeypatch):
+    """The queue is worked one row after another, in time order, mouse untouched."""
+
+    _write_list(tmp_path, _keyboard_items(), [])
+    panel = ProblemListPanel()
+    jumps = []
+    panel.jump_requested.connect(jumps.append)
+    panel.set_workspace(tmp_path)
+    calls = []
+    monkeypatch.setattr(panel, "_open_batch", lambda: calls.append("batch"))
+    monkeypatch.setattr(panel, "_open_bunch", lambda: calls.append("bunch"))
+    monkeypatch.setattr(panel, "_open_missed", lambda: calls.append("missed"))
+    batch_row = next(index for index, item in enumerate(panel.rows) if item.evidence.get("batch_members"))
+
+    for row, expected in ((_row_of(panel, "near:1"), "missed"), (batch_row, "batch"),
+                          (_row_of(panel, "bunch:1"), "bunch")):
+        panel.table.setCurrentCell(row, 0)
+        before = len(calls)
+        QTest.keyClick(panel.table, Qt.Key_Return)  # the table itself holds the focus
+        assert calls[before:] == [expected]
+        before = len(calls)
+        QTest.keyClick(panel, Qt.Key_Return)  # a button or the panel holds it
+        assert calls[before:] == [expected]
+
+    # A row without a tool is looked at, and one without a frame says so.
+    panel.table.setCurrentCell(_row_of(panel, "unknown:1"), 0)
+    QTest.keyClick(panel.table, Qt.Key_Return)
+    assert jumps[-1] == FRAME
+    panel.table.setCurrentCell(_row_of(panel, "unknown:2"), 0)
+    panel.hint.clear()
+    QTest.keyClick(panel.table, Qt.Key_Return)
+    assert "没有工具也没有原帧" in panel.hint.text() and len(jumps) == 1
+
+
+def test_digits_press_the_decision_buttons_of_the_row_on_screen(qapp, tmp_path):
+    """Digits run down the decisions of the row on screen, in the order they are shown."""
+
+    _write_list(tmp_path, [_near_crossing_item()], [])
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel.table.setCurrentCell(0, 0)
+    assert [button.property("problemAction") for button in panel.action_buttons][:2] == ["record_bib",
+                                                                                         "same_crossing"]
+
+    QTest.keyClick(panel, Qt.Key_2)
+    assert "依据" in panel.hint.text() and not panel.store.resolutions()
+    QTest.keyClick(panel, Qt.Key_1)
+    assert "号码" in panel.hint.text()
+
+    # A digit with no button behind it decides nothing.
+    panel.hint.clear()
+    QTest.keyClick(panel, Qt.Key_9)
+    assert panel.hint.text() == ""
+
+    near = panel.current_item()
+    panel.reason_input.setText("同一人后轮，前轮已在同一帧压线")
+    QTest.keyClick(panel, Qt.Key_2)
+    assert panel.state(near).startswith("已处理：确认是同一次过线")

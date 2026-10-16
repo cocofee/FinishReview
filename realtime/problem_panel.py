@@ -17,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt5.QtCore import QProcess, QProcessEnvironment, QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QProcess, QProcessEnvironment, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -242,6 +242,9 @@ class ProblemListPanel(QFrame):
             self.table.setColumnWidth(column, width)
         self.table.currentCellChanged.connect(lambda row, *_args: self._show(row))
         self.table.cellDoubleClicked.connect(lambda *_args: self._jump())
+        # The table treats Enter as its own activation and never passes it on, so
+        # one key has to work the same wherever the focus sits inside the panel.
+        self.table.installEventFilter(self)
         detail_scroll = QScrollArea(splitter)
         detail_scroll.setWidgetResizable(True)
         detail_scroll.setMinimumWidth(260)
@@ -286,16 +289,18 @@ class ProblemListPanel(QFrame):
         # visible where the evidence is; there is no hidden entry to remember.
         self.batch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MULTI_CHIP], detail)
         self.batch_button.setStyleSheet("font-weight:600;")
+        self.batch_button.setToolTip("打开这条批次，按成员逐条处理（回车）")
         self.batch_button.clicked.connect(self._open_batch)
         self.batch_button.hide()
         self.action_row.addWidget(self.batch_button)
         self.bunch_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_BUNCH], detail)
         self.bunch_button.setStyleSheet("font-weight:600;")
+        self.bunch_button.setToolTip("打开这条集团和遮挡时段，逐帧核对整团人数（回车）")
         self.bunch_button.clicked.connect(self._open_bunch)
         self.bunch_button.hide()
         self.action_row.addWidget(self.bunch_button)
         self.missed_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MISSED], detail)
-        self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除")
+        self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除（回车）")
         self.missed_button.setStyleSheet("font-weight:600;")
         self.missed_button.clicked.connect(self._open_missed)
         self.missed_button.hide()
@@ -804,6 +809,7 @@ class ProblemListPanel(QFrame):
         for action in actions:
             button = QPushButton(ACTION_LABELS.get(action, action), self)
             button.setProperty("problemAction", action)
+            button.setToolTip(f"{ACTION_LABELS.get(action, action)}（数字键 {len(self.action_buttons) + 1}）")
             button.clicked.connect(lambda _checked=False, action=action: self._resolve(action))
             self.action_row.insertWidget(len(self.action_buttons), button)
             self.action_buttons.append(button)
@@ -836,6 +842,56 @@ class ProblemListPanel(QFrame):
             return
         self.jump_requested.emit(dict(item.evidence["frame"]))
         self.hint.setText("已跳到候选过线的原帧：逐帧看这一处变化，认得出号码就补录；看不清就保留待证据，不凭猜测排除。")
+
+    # ----- working the queue by keyboard ---------------------------------
+    def keyPressEvent(self, event) -> None:
+        """A live race is worked in time order; reaching for the mouse must not slow it.
+
+        Qt delivers a key here only when the focused child has no use for it, so a
+        bib or reason field keeps its own characters and the table keeps its arrows;
+        everything else — a button, the panel itself — reaches this handler.
+        """
+
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._activate_current()
+            return
+        if Qt.Key_1 <= event.key() <= Qt.Key_9:
+            self._click_action(event.key() - Qt.Key_1 + 1)
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event):
+        # The table answers Enter with its own activation and never lets it out.
+        if (watched is self.table and event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)):
+            self._activate_current()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _activate_current(self) -> None:
+        """Enter opens the tool this row is worked in, and its frame when it has none."""
+
+        if self.current_item() is None:
+            return
+        if self.batch_button.isVisibleTo(self):
+            self._open_batch()
+        elif self.bunch_button.isVisibleTo(self):
+            self._open_bunch()
+        elif self.missed_button.isVisibleTo(self):
+            self._open_missed()
+        elif self.jump_button.isEnabled():
+            self._jump()
+        else:
+            self.hint.setText("这条问题没有工具也没有原帧：用数字键或右侧按钮直接处理。")
+        self.table.setFocus()
+
+    def _click_action(self, number: int) -> None:
+        """Digits press the decision buttons of the row on screen, in the order shown."""
+
+        buttons = [button for button in self.action_buttons
+                   if button.isVisibleTo(self) and button.isEnabled()]
+        if 1 <= number <= len(buttons):
+            buttons[number - 1].click()
 
     def _filter_by_type(self, value: str) -> None:
         """The counting row works as the queue filter; there is no separate entry."""
@@ -1042,6 +1098,9 @@ class ProblemListPanel(QFrame):
         self.save_drafts()
         self.hint.setText(f"已记录：{ACTION_LABELS.get(action, '重新处理')}。")
         self._render()
+        # The list drops the decided row and lands back on the oldest one; keep the
+        # queue under the fingers so the next row is one Down away.
+        self.table.setFocus()
 
     def export(self) -> Optional[dict]:
         if self.store is None or self.problem_dir is None:
