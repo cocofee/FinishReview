@@ -768,6 +768,74 @@ def test_the_first_rider_calibration_keeps_the_original_chip_record(qapp, tmp_pa
         window.close()
 
 
+@pytest.mark.parametrize("days", [0, 1])
+def test_chip_click_opens_raw_reference_before_model_line_or_calibration(qapp, tmp_path, days):
+    from PyQt5.QtGui import QImage
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        event = _event(passage_timestamp_ms=start + 2000 + days * 86_400_000,
+                       received_at_ms=start + 2200)
+        window.passage_store.append(event)
+        panel = window.problem_panel
+        panel.refresh()
+        index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == event.bib)
+        panel._arrival_clicked(index)
+        pane = window.regular_pane
+        assert pane.location.segment.segment_id == segment.segment_id
+        assert pane.location.video_path == video
+        assert pane.location.playback_position_ms == 2000
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert "参考录像" in panel.hint.text() and "不代表已确认过线" in panel.hint.text()
+        assert pane._reference_only is True
+        assert not panel.confirm_arrival_button.isEnabled()
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert window.passage_store.get(event.event_id).timeline_timestamp_ms == event.timeline_timestamp_ms
+        assert not (tmp_path / "video_clock_calibrations.jsonl").exists()
+        if days:
+            assert "正式时间未改" in panel.hint.text()
+        # Reference playback remains usable for the explicit manual workflow.
+        panel._confirm_bicycle()
+        assert panel.current_item().evidence.get("frame")
+        assert panel.confirm_arrival_button.isEnabled()
+        panel.confirm_arrival_button.click()
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("mismatch", ["race", "camera", "time", "missing"])
+def test_chip_reference_does_not_borrow_unrelated_or_missing_video(qapp, tmp_path, mismatch):
+    window = _window(tmp_path, workbench=True)
+    try:
+        start = 1_789_600_000_000
+        video = tmp_path / "original.mkv"
+        if mismatch != "missing":
+            video.write_bytes(b"video")
+        window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=2 if mismatch == "camera" else 1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test",
+            race_id="other-race" if mismatch == "race" else "race-1")
+        event = _event(passage_timestamp_ms=start + (60_000 if mismatch == "time" else 2000),
+                       received_at_ms=start + (60_200 if mismatch == "time" else 2200))
+        window.passage_store.append(event)
+        window.problem_panel.refresh()
+        index = next(i for i, row in enumerate(window.problem_panel._arrival_rows) if row.bib == event.bib)
+        window.problem_panel._arrival_clicked(index)
+        assert window.regular_pane.location is None
+        assert not window.problem_panel.confirm_arrival_button.isEnabled()
+    finally:
+        window.close()
+
+
 def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_path):
     """The view does not split into a second counting screen when focus changes."""
 

@@ -70,6 +70,19 @@ def test_finish_line_has_one_visible_entry(panel):
     assert "终点线 / 模型" not in menu_texts
 
 
+def test_unclassified_chip_click_requests_playback_but_classified_picture_is_preserved(panel):
+    changes = QSignalSpy(panel.current_changed)
+    panel._arrival_clicked(row(panel, "258"))
+    assert changes and panel.current_item() == panel._selected_arrival().item
+    assert not any(entry.decision for entry in panel._arrival_rows)
+
+    panel._confirm_bicycle()
+    changes = QSignalSpy(panel.current_changed)
+    panel._arrival_clicked(row(panel, "321"))
+    assert not changes  # Identity assignment must not seek away from a judged frame.
+    assert panel._selected_arrival().bib == "321"
+
+
 def test_f_enlarges_evidence_and_escape_restores_arrival_table(panel):
     changes = QSignalSpy(panel.big_view_changed)
     panel.table.setFocus()

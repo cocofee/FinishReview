@@ -2604,7 +2604,12 @@ class FinishReviewWindow(PassageReviewSurface):
                 panel.select_item(item.item_id)
                 index = next((i for i, row in enumerate(panel._arrival_rows) if row.key == selected_key), None)
                 if index is not None:
-                    panel._arrival_clicked(index)
+                    # Restore only the identity: clicking would reopen its chip
+                    # reference and discard the raw frame being classified.
+                    panel._selected_key = selected_key
+                    panel._active_item = item
+                    panel.table.setCurrentCell(index, 0)
+                    panel._sync_arrival_confirmation()
         except (OSError, ValueError, RuntimeError) as error:
             panel.hint.setText(f"当前原帧未保存：{error}")
         finally:
@@ -2816,8 +2821,10 @@ class FinishReviewWindow(PassageReviewSurface):
             self._open_problem_frame(dict(item.evidence["frame"]))
         elif item is not None:
             self._set_sync_playing(False, seek_final=False)
+            if self._open_chip_reference(item):
+                return
             for pane in self.evidence_panes:
-                pane.clear_passage("此问题暂无原帧；请查看右侧芯片信息")
+                pane.clear_passage("该芯片时刻暂无可回看录像；请检查录像覆盖或从下方胶卷查找")
             self.problem_panel.set_browsing(False)
         else:
             self.problem_panel.set_browsing(False)
@@ -2829,6 +2836,41 @@ class FinishReviewWindow(PassageReviewSurface):
                 else:
                     for pane in self.evidence_panes:
                         pane.clear_passage(self.problem_panel.queue_text() + "；可从原录像打开画面校时或补记")
+
+    def _open_chip_reference(self, item) -> bool:
+        """Raw playback must not depend on detection, line setup or calibration."""
+        reference = item.evidence.get("reference_frame")
+        if reference and self._open_problem_frame(dict(reference, reference_only=True)):
+            return True
+        events = [self.passage_store.get(event_id) for event_id in item.event_ids]
+        event = next((event for event in events if event is not None and event.is_active), None)
+        if event is None:
+            return False
+        timestamp = self._evidence_timestamp(event)
+        if timestamp is None:
+            return False
+        timestamp = align_evidence_timestamp(timestamp, event.received_at_ms)
+        camera = int(item.evidence.get("camera_index") or self._camera_one_pane().camera_index)
+        lookup = self.timeline_store.locate_passage(
+            timestamp, race_id=event.race_id, pre_roll_ms=0, prefer_continuous_media=True,
+        )
+        locations = [location for location in lookup.locations
+                     if location.status == "located" and location.segment.camera_index == camera
+                     and location.segment.clock_source == DEFAULT_CLOCK_SOURCE]
+        if not locations:
+            return False
+        # Immutable short clips are preferred, but a sealed archive can cover
+        # a missing clip without waiting for any analysis cache to catch up.
+        location = min(locations, key=lambda value: (
+            value.video_path.suffix.lower() == ".m3u8",
+            value.segment.media_duration_ms or 0,
+        ))
+        return self._open_problem_frame({
+            "camera_index": camera, "segment_id": location.segment.segment_id,
+            "video_path": str(location.video_path), "position_ms": location.passage_position_ms,
+            "reference_only": True,
+            "date_aligned": timestamp != event.timeline_timestamp_ms,
+        })
 
     def _on_preview_frame_ready(self, pane, image, position_ms, frame_index):
         super()._on_preview_frame_ready(pane, image, position_ms, frame_index)
@@ -3063,7 +3105,7 @@ class FinishReviewWindow(PassageReviewSurface):
         ) else None
         self.video_filmstrip.full_race.set_analysis_progress(ranges, timestamp, enabled=self._problem_workbench_active)
 
-    def _open_problem_frame(self, frame) -> None:
+    def _open_problem_frame(self, frame) -> bool:
         """Open the item's original frame in its camera's pane, without changing identity."""
 
         from .video_timeline import PassageVideoLocation
@@ -3074,7 +3116,7 @@ class FinishReviewWindow(PassageReviewSurface):
             path = self.output_dir / path
         if segment is None or not path.is_file():
             self.problem_panel.hint.setText("原录像缺失或不在本赛事的录像索引中，未跳转其他录像。")
-            return
+            return False
         position = int(frame.get("position_ms", 0))
         index = None if frame.get("frame_index") is None else int(frame["frame_index"])
         location = PassageVideoLocation(segment, path, position, position, 0,
@@ -3082,16 +3124,26 @@ class FinishReviewWindow(PassageReviewSurface):
         self._set_sync_playing(False, seek_final=False)
         if segment.media_started_at_ms is not None:
             self.video_filmstrip.full_race.browse_to(segment.media_started_at_ms + position)
-        if self._seek_retained_camera_frame(location, position, index, int(frame.get("camera_index", 1) or 1)):
+        opened = self._seek_retained_camera_frame(location, position, index, int(frame.get("camera_index", 1) or 1))
+        if opened:
             # The pane is on the problem's own frame now, so the panel is not
             # browsing elsewhere and may be decided on: F would otherwise leave the
             # operator looking at the right picture while every button stays greyed.
-            self.problem_panel.set_browsing(False)
+            reference = bool(frame.get("reference_only"))
+            self.problem_panel.set_browsing(reference)
             target = f"第 {index + 1} 帧" if index is not None else f"片内 {position / 1000:.2f} 秒"
-            self.problem_panel.hint.setText(f"已定位原录像{target}，请逐帧核对后处理。")
+            self._active_playback_pane().set_reference_only(reference)
+            if reference:
+                date_note = "；芯片日期与接收日期不同，按接收日期查找，正式时间未改" if frame.get("date_aligned") else ""
+                self.problem_panel.hint.setText(
+                    f"参考录像 · {target}：尚未校时/匹配，不代表已确认过线{date_note}。请逐帧找压线帧，再按 1 人工确认。"
+                )
+            else:
+                self.problem_panel.hint.setText(f"已定位原录像{target}，请逐帧核对后处理。")
         # The problem's pane is the one that takes the counting clicks from here on.
         self._problem_count_mode_changed(True)
         self._problem_marks_changed(None)
+        return opened
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label

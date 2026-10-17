@@ -61,13 +61,14 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.currentCellChanged.disconnect()
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
+        self.table.cellDoubleClicked.connect(lambda index, _column: self._open_row(index))
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态"])
         for column, width in enumerate((42, 66, 137)):
             self.table.setColumnWidth(column, width)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
-        self.table.setToolTip("点击只选择运动员；在放大画面定位压线原帧后，点“确认过线”保存")
+        self.table.setToolTip("点击回看对应时段；已确认有自行车时单击只选运动员，双击仍可回看；定位压线原帧后点“确认过线”保存")
         self.quick_toolbar = QWidget(self)
         bar = QHBoxLayout(self.quick_toolbar)
         bar.setContentsMargins(2, 3, 2, 3)
@@ -292,7 +293,8 @@ class QuickReviewPanel(ProblemListPanel):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
-                cell.setToolTip("点击回看保存原帧" if row.decision else "点击只选择；定位压线原帧后再点“确认过线”")
+                cell.setToolTip("点击回看保存原帧" if row.decision else
+                                "点击回看对应时段；已确认有自行车时单击只选择运动员，双击回看；不会自动确认过线")
                 self.table.setItem(index, column, cell)
             if row.key == self._selected_key:
                 selected = index
@@ -359,7 +361,14 @@ class QuickReviewPanel(ProblemListPanel):
             self._open_row(index)
             self.jump_requested.emit(dict(row.decision["frame"]))
             return
-        # Select the identity without seeking away from the frame being judged.
+        # Preserve a deliberately classified picture while assigning identities,
+        # but do not strand a newly received chip on an unrelated/empty picture.
+        category = self._category()
+        frame = self._frame_provider()
+        if not (category and category.get("action") == "bicycle" and frame
+                and frame.get("frame_index", -1) >= 0):
+            self._open_row(index)
+            return
         self._selected_key = row.key
         self.table.setCurrentCell(index, 0)
         self._sync_arrival_confirmation()

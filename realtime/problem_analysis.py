@@ -1054,6 +1054,29 @@ def analyse_camera(
                 f"{len(changed_anchors)} 个人工校时锚点对应的芯片记录已作废、替换或已变更，不能用于本次配对"
             )
         result["calibration_warnings"] = warnings
+
+        # A chip can be opened before video clock calibration.  The receipt
+        # timestamp is only a calendar hint, so the resulting frame is marked
+        # as reference-only and is never used for pairing or auto-pass.
+        reference_locator = None
+        if coverage:
+            locate_reference = _chip_locator(files, 0)
+
+            def reference_locator(read: ChipRead):
+                evidence_ms = align_evidence_timestamp(
+                    int(read.chip_ms), int(getattr(read, "received_at_ms", 0) or 0),
+                )
+                located = locate_reference(read, evidence_ms)
+                if not located:
+                    return None
+                frame = dict(located.get("frame", {}))
+                frame["reference_only"] = True
+                frame["date_aligned"] = int(evidence_ms) != int(read.chip_ms)
+                return {
+                    "reference_frame": frame,
+                    "reference_reason": "按芯片接收日期定位；尚未完成视频校时，不代表已确认过线",
+                    "evidence_timestamp_ms": int(evidence_ms),
+                }
         if config.model_path and coverage:
             try:
                 video_items, verdicts = _uncalibrated_video_items(
@@ -1103,7 +1126,8 @@ def analyse_camera(
             # waiting for the first anchor. Both remain visible in the queue.
             if reads:
                 result["items"] += waiting_items(
-                    reads, camera, "等待第一名原始帧校时后进行芯片配对"
+                    reads, camera, "等待第一名原始帧校时后进行芯片配对",
+                    evidence_factory=reference_locator,
                 )
             by_segment = {f.meta.get("segment_id"): f for f in files}
             for item in result["items"]:
@@ -1122,7 +1146,9 @@ def analyse_camera(
         # Without a configured detector there is no independent video result.
         result["error"] = "自动校时失败：" + "；".join(warnings)
         if config.live:
-            result["items"] = waiting_items(reads, camera, result["error"])
+            result["items"] = waiting_items(
+                reads, camera, result["error"], evidence_factory=reference_locator,
+            )
         return result
     store = ClockModelStore(config.clock_model_path or output_dir / CLOCK_MODEL_FILENAME)
     line_signature = hashlib.sha256(json.dumps(sorted({(item.meta.get("line_digest", ""), item.meta.get("geometry_digest", ""))
@@ -1345,11 +1371,27 @@ def analyse_camera(
     return result
 
 
-def waiting_items(reads, camera, reason):
-    return [ProblemItem(stable_item_id(KIND_WAITING, camera, read.read_id), KIND_WAITING,
-                        CATEGORY_VIDEO, reason, chip_time_ms=read.chip_ms,
-                        bibs=(read.bib,), event_ids=(read.event_id,), status=STATUS_WAITING)
-            for read in reads if not read.excluded and not read.manual_entry]
+def waiting_items(reads, camera, reason, *, evidence_factory=None):
+    """Build pending-chip rows, optionally retaining a safe reference frame."""
+    items = []
+    for read in reads:
+        if read.excluded or read.manual_entry:
+            continue
+        evidence = {}
+        if evidence_factory is not None:
+            try:
+                located = evidence_factory(read)
+            except (OSError, RuntimeError, ValueError, TypeError):
+                located = None
+            if located:
+                evidence.update(located)
+        items.append(ProblemItem(
+            stable_item_id(KIND_WAITING, camera, read.read_id), KIND_WAITING,
+            CATEGORY_VIDEO, reason, chip_time_ms=read.chip_ms,
+            bibs=(read.bib,), event_ids=(read.event_id,), status=STATUS_WAITING,
+            evidence=evidence,
+        ))
+    return items
 
 
 ANALYSIS_CONFIG_FILENAME = "analysis_config.json"

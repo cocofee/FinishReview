@@ -712,6 +712,26 @@ def test_without_a_usable_anchor_the_camera_still_waits(synthetic_race, tmp_path
     assert not (config.resolved_output() / "video_clock_models.jsonl").exists()
 
 
+@pytest.mark.parametrize("days", [0, 1])
+def test_uncalibrated_chip_keeps_reference_video_without_claiming_a_crossing(synthetic_race, tmp_path, days):
+    from realtime.problem_items import KIND_WAITING
+
+    _root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    original = workspace.reads[0]
+    read = replace(original, chip_ms=original.chip_ms + days * 86_400_000)
+    result = analyse_camera(replace(config, live=True), workspace, 1, strips, reads=(read,))
+
+    waiting, = result["items"]
+    assert waiting.kind == KIND_WAITING and waiting.status == "waiting"
+    assert waiting.chip_time_ms == read.chip_ms
+    assert "frame" not in waiting.evidence  # Not a detected/paired crossing.
+    reference = waiting.evidence["reference_frame"]
+    assert reference["reference_only"] is True and reference["date_aligned"] == bool(days)
+    assert reference["position_ms"] == pytest.approx(original.chip_ms - START, abs=50)
+    assert waiting.evidence["evidence_timestamp_ms"] == original.chip_ms
+    assert result["auto_passed"] == [] and result.get("model") is None
+
+
 def test_video_model_runs_before_first_rider_calibration(synthetic_race, tmp_path, monkeypatch):
     """A finish-line camera can be tested with a walking person before chips arrive."""
 
