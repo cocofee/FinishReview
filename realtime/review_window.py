@@ -301,6 +301,21 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
     raise RuntimeError("无法为赛事创建唯一保存目录")
 
 
+def _unique_choice_labels(labels: list[str]) -> list[str]:
+    """同名赛事和赛段撞车时补个序号，保证每个选项都能唯一对回一个赛事。"""
+    used: set[str] = set()
+    unique: list[str] = []
+    for label in labels:
+        candidate = label
+        serial = 0
+        while candidate in used:
+            serial += 1
+            candidate = f"{label}（{serial}）"
+        used.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
 class _PassageSignalBridge(QObject):
     accepted = pyqtSignal(object)
     metadata_accepted = pyqtSignal(object)
@@ -1459,14 +1474,15 @@ class FinishReviewWindow(PassageReviewSurface):
         for event in events:
             scope = (event.race_id, event.stage_id)
             counts[scope] = counts.get(scope, 0) + 1
-        labels = [f"历史目录 · {item.race_name} · {item.stage_name}"
+        labels = [f"历史 · {item.race_name} · {item.stage_name}"
                   f"（{counts.get((item.race_id, item.stage_id), 0)} 条）"
-                  for index, item in enumerate(candidates)]
-        received_labels = [f"接入已收到的赛事 · {item.race_name} · {item.stage_name} [{item.race_id}]"
-                           for item in received]
+                  for item in candidates]
+        received_labels = [f"实时 · {item.race_name} · {item.stage_name}" for item in received]
         labels = received_labels + labels
         if not labels:
             return
+        # 界面只显示短名，赛事 ID 不进文字；点选仍按位置拿回原来的 ID 接入。
+        labels = _unique_choice_labels(labels)
         current = self._current_metadata()
         index = next((i for i, item in enumerate(candidates) if current is not None
                       and (item.race_id, item.stage_id) == (current.race_id, current.stage_id)), 0)
