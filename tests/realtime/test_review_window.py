@@ -380,10 +380,14 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         window.problem_panel.table.setCurrentCell(0, 0)
         qapp.processEvents()
         window.problem_panel.set_browsing(True)
+        pane_height = window.regular_pane.video_view.height()
         window._toggle_maximized_pane(window.regular_pane)
         qapp.processEvents()
         assert window._maximized_window is None
-        assert not window.problem_panel._big_view
+        assert window.problem_panel._big_view
+        assert not window.preview_panel.isVisibleTo(window)
+        assert window.regular_pane.video_view.height() > pane_height
+        assert window.problem_panel.quick_toolbar.isVisibleTo(window.problem_panel)
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
@@ -399,12 +403,31 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.preview_panel.isVisibleTo(window)
+
+        view = window.regular_pane.video_view
+        view.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(view.viewport(), Qt.Key_F)
+        qapp.processEvents()
+        assert window.problem_panel.big_view
+        assert not window.preview_panel.isVisibleTo(window)
+        QTest.keyClick(view.viewport(), Qt.Key_Escape)
+        qapp.processEvents()
+        assert not window.problem_panel.big_view
+        assert window.preview_panel.isVisibleTo(window)
+
+        window.regular_pane.maximize_btn.click()
+        qapp.processEvents()
+        assert window.problem_panel.big_view
+        window.regular_pane.maximize_btn.click()
+        qapp.processEvents()
+        assert not window.problem_panel.big_view
     finally:
         window.close()
 
 
-def test_picture_clicks_do_not_count_and_number_row_saves_current_frame(qapp, tmp_path):
-    """Classify with 1, then identify a rider by clicking their existing event row."""
+def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp, tmp_path):
+    """Choose the athlete, locate the finish-line frame, then confirm explicitly."""
 
     import json
     from PyQt5.QtCore import QPoint
@@ -458,10 +481,133 @@ def test_picture_clicks_do_not_count_and_number_row_saves_current_frame(qapp, tm
         qapp.processEvents()
         QTest.mouseClick(window.problem_panel.table.viewport(), Qt.LeftButton,
                          pos=window.problem_panel.table.visualItemRect(cell).center())
+        assert not any(row.decision for row in window.problem_panel._arrival_rows)
+        assert window.problem_panel.confirm_arrival_button.isEnabled()
+        assert pane._current_frame_index == 51
+        # Only explicit confirmation saves the frame, after the operator steps forward.
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2250, 56)
+        window.problem_panel.confirm_arrival_button.click()
         confirmed = [row for row in window.problem_panel._arrival_rows if row.decision]
         assert len(confirmed) == 1 and confirmed[0].bib == "321"
-        assert confirmed[0].decision["frame"]["frame_index"] == 51
-        assert confirmed[0].decision["frame"]["recorder_ms"] == start + 2050
+        assert confirmed[0].decision["frame"]["frame_index"] == 56
+        assert confirmed[0].decision["frame"]["recorder_ms"] == start + 2250
+    finally:
+        window.close()
+
+
+def test_raw_frame_can_be_classified_and_confirmed_without_analysis_or_f(qapp, tmp_path):
+    from PyQt5.QtGui import QImage
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.show()
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        target = _event(event_id="raw-321", bib="321", passage_timestamp_ms=start + 2000)
+        window.passage_store.append(target)
+        panel = window.problem_panel
+        panel.refresh()
+        row_index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "321")
+        panel._arrival_clicked(row_index)
+        window._open_problem_frame(dict(camera_index=1, segment_id=segment.segment_id,
+                                       video_path=str(video), position_ms=2000, frame_index=50))
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert "1" in panel.confirmation_status.text()
+        panel._confirm_bicycle()
+        assert panel._selected_arrival().bib == "321"
+        assert panel.current_item().item_id.startswith("manual:")
+        assert not panel.big_view
+        assert panel.confirm_arrival_button.isEnabled(), panel.confirmation_status.text()
+        assert pane._current_frame_index == 50
+        panel.confirm_arrival_button.click()
+        saved = next(row.decision for row in panel._arrival_rows if row.bib == "321")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["segment_id"] == segment.segment_id
+    finally:
+        window.close()
+
+
+def test_real_finish_line_follows_session_time_and_clears_identity_guide(qapp, tmp_path):
+    import json
+    from PyQt5.QtGui import QImage
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.show()
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        window.passage_store.append(_event(passage_timestamp_ms=start + 2000))
+        window.problem_panel.refresh()
+        line = dict(camera_index=1, race_id="race-1", stage_id="stage-1", session_id="camera_01_test",
+                    effective_from_ms=start, revision=1, points=[[.2, .1], [.5, .6], [.8, .9]])
+        config = tmp_path / "finish_problems/analysis_config.json"
+        config.parent.mkdir(exist_ok=True)
+        config.write_text(json.dumps({"sampling_profiles": [line,
+            dict(line, revision=2, effective_from_ms=start + 3000, points=[[.7, .1], [.7, .9]])]}), encoding="utf-8")
+        window._open_problem_frame(dict(camera_index=1, segment_id=segment.segment_id,
+                                       video_path=str(video), position_ms=2000, frame_index=50))
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert pane.video_view._finish_line_points == ((.2, .1), (.5, .6), (.8, .9))
+        assert pane.video_view._marker is None
+        window.problem_panel.toggle_big_view()
+        assert pane.video_view._finish_line_points == ((.2, .1), (.5, .6), (.8, .9))
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 3500, 88)
+        assert pane.video_view._finish_line_points == ((.7, .1), (.7, .9))
+        config.write_text(json.dumps({"sampling_profiles": [dict(line, session_id="another-session")]}), encoding="utf-8")
+        window._refresh_problem_finish_lines()
+        assert not pane.video_view._finish_line_points
+        assert "未设置" in window.problem_panel.finish_line_status.text()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("workbench", [True, False])
+def test_each_f_entry_reloads_saved_line_even_when_no_new_frame(qapp, tmp_path, workbench):
+    import json
+    from PyQt5.QtGui import QImage
+
+    window = _window(tmp_path, workbench=workbench)
+    try:
+        window.show()
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=1_789_600_000_000, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        window._open_problem_frame(dict(camera_index=1, segment_id=segment.segment_id,
+                                       video_path=str(video), position_ms=2000, frame_index=50))
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+        config = tmp_path / "finish_lines.json"
+        for x in (.3, .6, .8):
+            # Save while the same paused frame remains on screen; opening F must
+            # not depend on another decoder callback to pick up the new line.
+            config.write_text(json.dumps({"finish_lines": [dict(camera_index=1, x1=x, y1=.1,
+                                                               x2=x, y2=.9)]}), encoding="utf-8")
+            window._toggle_maximized_pane(pane)
+            assert pane.video_view._finish_line_points == ((x, .1), (x, .9))
+            assert pane._current_frame_index == 50
+            pane.video_view.zoom_by(1.2)
+            pane.video_view.fit_to_window()
+            assert pane.video_view._finish_line_points == ((x, .1), (x, .9))
+            window._toggle_maximized_pane(pane)
+        config.unlink()
+        window._toggle_maximized_pane(pane)
+        assert not pane.video_view._finish_line_points
+        window._toggle_maximized_pane(pane)
+        qapp.processEvents()
     finally:
         window.close()
 
@@ -658,8 +804,10 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         qapp.processEvents()
         QTest.keyClick(rail.canvas.viewport(), Qt.Key_F)
         qapp.processEvents()
-        assert not panel.big_view
+        assert panel.big_view
         assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isHidden()
+        assert not window.preview_panel.isVisibleTo(window)
+        assert panel.quick_toolbar.isVisibleTo(panel)
         panel.toggle_big_view()
         qapp.processEvents()
 
@@ -668,7 +816,7 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         qapp.processEvents()
         QTest.keyClick(window.recheck_button, Qt.Key_F)
         qapp.processEvents()
-        assert not panel.big_view
+        assert panel.big_view
         panel.toggle_big_view()
         qapp.processEvents()
 

@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PyQt5.QtCore import QEvent, Qt
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QAbstractSpinBox, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit,
     QMenu, QPlainTextEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget,
@@ -39,6 +39,9 @@ class ArrivalRow:
 
 class QuickReviewPanel(ProblemListPanel):
     quick_review = True
+    confirmation_preparing = pyqtSignal()
+    candidate_preparing = pyqtSignal()
+    sampling_configured = pyqtSignal()
 
     def __init__(self, parent=None):
         self._quick_ready = False
@@ -59,12 +62,12 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
         self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["顺序", "过线时间", "号码", "状态"])
-        for column, width in enumerate((42, 137, 66)):
+        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态"])
+        for column, width in enumerate((42, 66, 137)):
             self.table.setColumnWidth(column, width)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
-        self.table.setToolTip("参考时间与号码在同一行；前轮过线时点对应号码确认")
+        self.table.setToolTip("点击只选择运动员；在放大画面定位压线原帧后，点“确认过线”保存")
         self.quick_toolbar = QWidget(self)
         bar = QHBoxLayout(self.quick_toolbar)
         bar.setContentsMargins(2, 3, 2, 3)
@@ -73,12 +76,18 @@ class QuickReviewPanel(ProblemListPanel):
         self.bicycle_button = QPushButton("1  有自行车", self.quick_toolbar)
         self.non_rider_button = QPushButton("2  非选手", self.quick_toolbar)
         self.defer_button = QPushButton("3  暂放", self.quick_toolbar)
+        self.confirm_arrival_button = QPushButton("确认过线", self.quick_toolbar)
+        self.confirm_arrival_button.setToolTip(
+            "先选左侧运动员，再将画面停在其前轮压终点线的一帧，最后点击确认过线"
+        )
         self.quick_undo_button = QPushButton("撤销 ⌫", self.quick_toolbar)
-        for button in (self.bicycle_button, self.non_rider_button, self.defer_button, self.quick_undo_button):
+        for button in (self.bicycle_button, self.non_rider_button, self.defer_button,
+                       self.confirm_arrival_button, self.quick_undo_button):
             bar.addWidget(button)
         self.bicycle_button.clicked.connect(self._confirm_bicycle)
         self.non_rider_button.clicked.connect(lambda: self._classify("not_rider"))
         self.defer_button.clicked.connect(lambda: self._classify("held"))
+        self.confirm_arrival_button.clicked.connect(self._confirm_selected_arrival)
         self.quick_undo_button.clicked.connect(self._undo_arrival)
         more = QPushButton("更多", self.quick_toolbar)
         menu = QMenu(more)
@@ -92,6 +101,15 @@ class QuickReviewPanel(ProblemListPanel):
         more.setMenu(menu)
         bar.addWidget(more)
         self.layout().insertWidget(0, self.quick_toolbar)
+        guidance = QHBoxLayout()
+        self.finish_line_button = QPushButton("设置终点线", self)
+        self.finish_line_button.clicked.connect(self._configure_sampling)
+        guidance.addWidget(self.finish_line_button)
+        self.finish_line_status = QLabel("终点线未设置：请先在实际画面上画线", self)
+        guidance.addWidget(self.finish_line_status)
+        self.confirmation_status = QLabel("", self)
+        guidance.addWidget(self.confirmation_status, 1)
+        self.layout().insertLayout(1, guidance)
         self._quick_ready = True
         QApplication.instance().installEventFilter(self)
         self._render()
@@ -258,6 +276,7 @@ class QuickReviewPanel(ProblemListPanel):
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row),
                             candidate_binding(row.item)) for row in rows))
         if signature == self._quick_render_signature:
+            self._sync_arrival_confirmation()
             return
         self._quick_render_signature = signature
         self.table.blockSignals(True)
@@ -267,13 +286,11 @@ class QuickReviewPanel(ProblemListPanel):
         for index, row in enumerate(rows):
             state = self._row_state(row)
             time = format_chip_time(row.time_ms) if row.time_ms is not None else "—"
-            if row.reference:
-                time += " 参考"
-            for column, text in enumerate((str(index + 1), time, row.bib or "—", state)):
+            for column, text in enumerate((str(index + 1), row.bib or "—", time, state)):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
-                cell.setToolTip("点击回看保存原帧" if row.decision else "前轮过线时，点对应号码确认")
+                cell.setToolTip("点击回看保存原帧" if row.decision else "点击只选择；定位压线原帧后再点“确认过线”")
                 self.table.setItem(index, column, cell)
             if row.key == self._selected_key:
                 selected = index
@@ -303,6 +320,7 @@ class QuickReviewPanel(ProblemListPanel):
                 if changed:
                     self.current_changed.emit(fresh)
         self.bicycle_button.setEnabled(self.current_item() is not None)
+        self._sync_arrival_confirmation()
 
     def _open_row(self, index):
         if not 0 <= index < len(self._arrival_rows):
@@ -314,6 +332,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.setCurrentCell(index, 0)
         self._sync_timeline()
         self.current_changed.emit(row.item)
+        self._sync_arrival_confirmation()
 
     def _sync_timeline(self):
         if not self._quick_ready:
@@ -338,15 +357,63 @@ class QuickReviewPanel(ProblemListPanel):
             self._open_row(index)
             self.jump_requested.emit(dict(row.decision["frame"]))
             return
-        category = self._category()
-        if category is not None and category["action"] == "bicycle":
-            self._confirm_arrival(row)
-        else:
-            self._open_row(index)
-            self.hint.setText("先看画面，按 1 确认有自行车；前轮过线时点对应号码。")
+        # Select the identity without seeking away from the frame being judged.
+        self._selected_key = row.key
+        self.table.setCurrentCell(index, 0)
+        self._sync_arrival_confirmation()
+        self.hint.setText("已选中运动员。请停在前轮压终点线的一帧，再点“确认过线”。")
 
-    def _usable(self):
+    def _selected_arrival(self):
+        index = self.table.currentRow()
+        return self._arrival_rows[index] if 0 <= index < len(self._arrival_rows) else None
+
+    def _sync_arrival_confirmation(self):
+        row = self._selected_arrival()
         item = self._candidate_item()
+        category = self._category()
+        frame = self._frame_provider()
+        valid_frame = bool(frame and frame.get("frame_index", -1) >= 0
+                           and frame.get("position_ms", -1) >= 0
+                           and frame.get("segment_id") and frame.get("video_path")
+                           and frame.get("recorder_ms") is not None)
+        if row is None or row.event is None or not row.event.is_active or not row.bib:
+            reason = "请先选择有有效芯片记录的运动员"
+        elif row.decision is not None:
+            reason = "该运动员已确认；修改前请先撤销"
+        elif not valid_frame:
+            reason = "请从胶卷打开有效原帧"
+        elif item is None or not item.evidence.get("frame"):
+            reason = "请先按 1 确认当前画面有自行车"
+        elif (item.status == STATUS_WAITING or item.evidence.get("configuration_stale")
+              or item.evidence.get("superseded")):
+            reason = "当前候选证据已失效，请重新打开原帧"
+        elif category is None or category.get("action") != "bicycle":
+            reason = "请先按 1 确认当前画面有自行车"
+        elif row.item.evidence.get("configuration_stale"):
+            reason = "所选记录配置已变化，请重新分析"
+        else:
+            reason = ""
+        self.confirm_arrival_button.setEnabled(not reason)
+        self.confirm_arrival_button.setToolTip(reason or "保存所选运动员与当前显示的压线原帧；不会修改正式芯片时间")
+        self.confirmation_status.setText(reason or "已就绪：停在前轮压线帧后点“确认过线”")
+
+    def set_finish_line_status(self, configured):
+        self.finish_line_status.setText("绿色实线：实际终点线" if configured else "终点线未设置：请先在实际画面上画线")
+        self.finish_line_status.setStyleSheet("color:#17675b;" if configured else "color:#9a5b12;")
+
+    def _configure_sampling(self):
+        super()._configure_sampling()
+        self.sampling_configured.emit()
+
+    def _confirm_selected_arrival(self):
+        row = self._selected_arrival()
+        if row is None:
+            self.hint.setText("请先从左侧选择要确认的运动员。")
+            return
+        self._confirm_arrival(row)
+
+    def _usable(self, item=None):
+        item = item or self._candidate_item()
         if item is None or self._arrival_store is None:
             return False
         if item.status == STATUS_WAITING or item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
@@ -365,6 +432,8 @@ class QuickReviewPanel(ProblemListPanel):
         self._classify("bicycle")
 
     def _classify(self, action):
+        if action != "held":
+            self.candidate_preparing.emit()
         if not self._usable():
             return
         item = self._candidate_item()
@@ -394,13 +463,21 @@ class QuickReviewPanel(ProblemListPanel):
             self.hint.setText(f"审核未保存：{error}")
             return
         self._render()
-        self.hint.setText("已确认有自行车；前轮过线时，点击对应号码。" if action == "bicycle"
+        self.hint.setText("已确认有自行车；选择运动员，定位压线帧后点“确认过线”（F 可放大）。" if action == "bicycle"
                           else "已暂放。" if action == "held" else "已排除此画面候选。")
         if action in ("held", "not_rider"):
             self._step(1)
 
     def _confirm_arrival(self, row):
-        if not self._usable():
+        if row.decision:
+            self.hint.setText("该运动员已确认；若要修改，请先撤销误确认，再重新定位压线帧。")
+            return
+        item = self._candidate_item()
+        category = self._category()
+        if category is None or category.get("action") != "bicycle":
+            self.hint.setText("请先确认画面中有自行车，再定位压线帧并确认运动员。")
+            return
+        if not self._usable(item):
             return
         events = self._events()
         event = events.get(row.event.event_id) if row.event else None
@@ -414,11 +491,11 @@ class QuickReviewPanel(ProblemListPanel):
         if row.item.evidence.get("configuration_stale"):
             self.hint.setText("证据配置已变化，请重新分析。")
             return
+        self.confirmation_preparing.emit()
         frame = self._frame_provider()
         if frame is None:
             self.hint.setText("请先打开有效录像，停在该选手前轮压线的原帧。")
             return
-        item = self._candidate_item()
         frame = dict(frame, calibration_version=item.calibration_version)
         crossing = recorder_crossing_time(frame.get("recorder_ms"), frame, self.workspace_dir)
         try:
@@ -461,8 +538,16 @@ class QuickReviewPanel(ProblemListPanel):
             return True
         if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
             return False
+        # F must work from any workbench child; Esc symmetrically restores the rail.
+        if event.key() == Qt.Key_F:
+            self.toggle_big_view()
+            return True
+        if event.key() == Qt.Key_Escape and self._big_view:
+            self.toggle_big_view()
+            return True
         actions = {Qt.Key_1: self._confirm_bicycle, Qt.Key_2: lambda: self._classify("not_rider"),
                    Qt.Key_3: lambda: self._classify("held"), Qt.Key_Backspace: self._undo_arrival,
+                   Qt.Key_Return: self._confirm_selected_arrival, Qt.Key_Enter: self._confirm_selected_arrival,
                    Qt.Key_Up: lambda: self._step(-1), Qt.Key_Down: lambda: self._step(1),
                    Qt.Key_Left: lambda: self.frame_step_requested.emit(-1),
                    Qt.Key_Right: lambda: self.frame_step_requested.emit(1)}
@@ -475,8 +560,19 @@ class QuickReviewPanel(ProblemListPanel):
         self._browsing = bool(browsing)
 
     def toggle_big_view(self):
-        # The picture and the complete arrival table already share one permanent view.
-        self.hint.setText("前轮过线时，直接点击左侧对应号码。")
+        """Expand the evidence area while keeping the arrival list and actions visible."""
+
+        self._big_view = not self._big_view
+        self._sync_step_buttons()
+        self._sync_arrival_confirmation()
+        self.count_mode_changed.emit(self._big_view)
+        if self._big_view:
+            self.hint.setText("画面已放大：选择运动员，停在前轮压线的一帧，再点“确认过线”。F / Esc 返回。")
+            self.setFocus()
+        else:
+            self.hint.setText("已返回胶卷视图；名单点击只选人，定位压线帧后点“确认过线”（F 可放大）。")
+            self.table.setFocus()
+        self.big_view_changed.emit(self._big_view)
 
     def export_arrivals(self):
         if self.problem_dir is None:

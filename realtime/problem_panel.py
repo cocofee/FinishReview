@@ -2043,7 +2043,10 @@ class ProblemListPanel(QFrame):
         for camera, value in sorted((self.payload or {}).get("cameras", {}).items(), key=lambda pair: str(pair[0])):
             calibration = value.get("calibration") or {}
             if not calibration:
-                texts.append(f"机位 {camera} 等待校时")
+                if value.get("calibration_pending"):
+                    texts.append(f"机位 {camera} 视频已分析，待首人校时")
+                else:
+                    texts.append(f"机位 {camera} 等待校时")
                 continue
             source = calibration.get("source_text", "自动校时")
             note = f"机位 {camera} {source} v{calibration.get('version')}"
