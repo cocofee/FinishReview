@@ -525,7 +525,7 @@ class VisualLineCalibrationDialog(QDialog):
 
     def __init__(self, source: str, *, line_x: float = 0.50, gate_width: float = 0.08, roi_top: float = 0.08, roi_bottom: float = 0.95, direction: str = "left_to_right", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("设置过线辅助终点线")
+        self.setWindowTitle("旧运动检测位置")
         self.resize(900, 620)
         self._line_x = max(0.02, min(0.98, float(line_x)))
         self._gate_width = max(0.02, min(0.30, float(gate_width)))
@@ -534,8 +534,9 @@ class VisualLineCalibrationDialog(QDialog):
         self._direction = direction if direction in {"left_to_right", "right_to_left"} else "left_to_right"
         layout = QVBoxLayout(self)
         self._calibration_hint = (
-            "红线=正式终点线；黄线=两侧辅助检测线；蓝线=上、下有效检测边界。"
+            "红线=旧运动检测的过线位置；黄线=两侧辅助检测线；蓝线=上、下有效检测边界。"
             "拖动红线和蓝线到实际位置，再选择正向。蓝线外不参与检测。"
+            "这里不是自动分析的实际终点线。"
         )
         self.help_label = QLabel(
             "在画面上拖动红线和蓝线到实际位置，再选择正向。",

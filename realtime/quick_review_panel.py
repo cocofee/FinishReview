@@ -92,7 +92,6 @@ class QuickReviewPanel(ProblemListPanel):
         more = QPushButton("更多", self.quick_toolbar)
         menu = QMenu(more)
         menu.addAction("分析录像", self._toggle_analysis)
-        menu.addAction("终点线 / 模型", self._configure_sampling)
         menu.addAction("导出过线记录", self.export_arrivals)
         menu.addAction("导出交接清单", self.export)
         menu.addAction("复杂异常处理", self._open_legacy)
@@ -102,7 +101,10 @@ class QuickReviewPanel(ProblemListPanel):
         bar.addWidget(more)
         self.layout().insertWidget(0, self.quick_toolbar)
         guidance = QHBoxLayout()
-        self.finish_line_button = QPushButton("设置终点线", self)
+        self.finish_line_button = QPushButton("终点线 / 模型", self)
+        self.finish_line_button.setToolTip(
+            "绘制本机位终点线，选择本机 YOLOX ONNX 模型并试运行；只分析已封存录像"
+        )
         self.finish_line_button.clicked.connect(self._configure_sampling)
         guidance.addWidget(self.finish_line_button)
         self.finish_line_status = QLabel("终点线未设置：请先在实际画面上画线", self)

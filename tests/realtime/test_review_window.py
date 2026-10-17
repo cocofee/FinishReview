@@ -2946,9 +2946,39 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
     assert dialog.rtsp_address_edit.isHidden()
     assert dialog.rtsp_username_edit.isHidden()
     assert dialog.rtsp_password_edit.isHidden()
+    assert "旧运动检测区域" not in visible_text
+    assert "调整红黄蓝标线" not in visible_text
     assert dialog.minimumSizeHint().height() <= 680
     for forbidden in ("0.0.0.0", "18765", "端口"):
         assert forbidden not in visible_text
+    dialog.close()
+
+
+def test_device_settings_keep_legacy_motion_values_without_showing_them(qapp, tmp_path):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="",
+            output_dir=tmp_path,
+            passage_host="0.0.0.0",
+            passage_port=18765,
+            camera_index=1,
+            visual_detection_enabled=False,
+            visual_camera_index=2,
+            visual_finish_line=0.42,
+            visual_gate_width=0.1,
+            visual_forward_direction="right_to_left",
+        ),
+        device_provider=lambda: (),
+    )
+
+    settings = dialog.settings
+    assert settings.visual_detection_enabled is False
+    assert settings.visual_camera_index == 2
+    assert settings.visual_finish_line == 0.42
+    assert settings.visual_gate_width == 0.1
+    assert settings.visual_forward_direction == "right_to_left"
+    labels = " ".join(widget.text() for widget in dialog.findChildren(QLabel))
+    assert "旧运动检测区域" not in labels
     dialog.close()
 
 
