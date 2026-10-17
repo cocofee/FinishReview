@@ -1026,7 +1026,7 @@ def run_offline_analysis(
         segments = workspace.archive_segments(camera)
         missing = [segment for segment in segments if line_for_segment(config, workspace, segment) is None]
         if not segments or len(missing) == len(segments):
-            reason = "等待已封存录像" if not segments else "等待实际终点线或不跨改线边界的封存片段"
+            reason = "等待录像存好" if not segments else "等待实际终点线，或等待一段不跨改线边界的录像存好"
             result = {"camera_index": camera, "error": reason, "items": waiting_items(workspace.reads, camera, reason),
                       "auto_passed": [], "waiting_reason": "recording" if not segments else "finish_line",
                       "sealed_through_ms": max((segment.end_ms for segment in segments), default=None)}

@@ -260,7 +260,7 @@ class SamplingSettingsDialog(QDialog):
             if self.worker is None:
                 self._select(self.segment_combo.currentIndex())
         else:
-            self.notice.setText("等待已封存录像：请先录制并等待首个短段封存，不需要停止录像。")
+            self.notice.setText("还没有存好的录像：请先开始录制，等第一段存好，不需要停止录像。")
             self.buttons.button(QDialogButtonBox.Save).setEnabled(False)
             self.probe_button.setEnabled(False)
 

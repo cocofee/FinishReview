@@ -776,12 +776,12 @@ class ProblemListPanel(QFrame):
                           if item.category == CATEGORY_VIDEO and item.kind != KIND_MANUAL_REVIEW else item for item in self.items]
             self.stage_health["取样"] = "配置已变更，等待重新取样"
             self.stage_health["校时"] = "配置已变更，等待重新校时"
-            self.stage_detail = "配置已变更：旧视频结论不可提交，等待重新取样、校时与认车；芯片自检继续。"
+            self.stage_detail = "配置已变更：旧视频结论不能提交，等待重新取样、时间对齐与认车；芯片检查照常。"
         elif token != "invalid":
             cameras = (self.payload or {}).get("cameras", {})
             missing_lines = sum(len(value.get("missing_line_segments") or ()) for value in cameras.values())
             self.stage_health["取样"] = (f"{missing_lines} 个片段缺线或跨改线边界" if missing_lines
-                                         else "已按机位配置" if cameras else "等待已封存录像")
+                                         else "已按机位配置" if cameras else "等待录像存好")
             self.stage_health["校时"] = self.clock_health() or "等待自动校时"
             statuses = []
             for camera, value in cameras.items():
@@ -792,7 +792,7 @@ class ProblemListPanel(QFrame):
                 if value.get("missing_line_segments"):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
                 statuses.append(f"机位 {camera}：{detail}")
-            self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
+            self.stage_detail = "；".join(statuses) or "视频在等录像存好和实际终点线；认车状态还没分析。"
         # A manual count of several people becomes one independent crossing per
         # mark. Hide its unchanged source so recognising one never settles the rest.
         split = {}
@@ -2005,12 +2005,12 @@ class ProblemListPanel(QFrame):
         through = [value["analyzed_through_ms"] for value in cameras.values()
                    if value.get("analyzed_through_ms") and not value.get("error")]
         if any(value.get("error") for value in cameras.values()):
-            return "部分机位等待录像或校时" if through else "等待录像 / 首人校时"
+            return "部分机位在等录像或时间对齐" if through else "在等录像或首人时间对齐"
         if through:
             return f"已分析到 {format_chip_time(min(through)).split('.')[0]} · 当前无待处理疑点"
         if not cameras:
-            return "芯片自检已更新 · 视频尚未分析"
-        return "等待录像 / 首人校时"
+            return "芯片记录已更新 · 视频还没分析"
+        return "在等录像或首人时间对齐"
 
     def auto_passed_text(self) -> str:
         payload = self.payload or {}
@@ -2362,7 +2362,7 @@ class ProblemListPanel(QFrame):
         if self._live and not recording:
             self._final_analysis_pending = True
         self._live = bool(recording)
-        self.stage_health["录制"] = "● 录像中" if recording else "录像未启动"
+        self.stage_health["录制"] = "● 录像中" if recording else "没有在录像"
         if self.workspace_dir is None:
             return
         if (not recording and self._process is None and not self._final_analysis_pending

@@ -237,7 +237,7 @@ def test_no_sealed_video_disables_editing(qapp, tmp_path):
     (tmp_path / "review_event_scope.json").write_text('{"race_id":"race", "stage_id":"stage"}')
     dialog = SamplingSettingsDialog(tmp_path)
     assert not dialog.buttons.button(QDialogButtonBox.Save).isEnabled()
-    assert "封存" in dialog.notice.text()
+    assert "存好的录像" in dialog.notice.text()
     dialog.reject()
 
 
@@ -336,7 +336,7 @@ def test_recording_line_and_calibration_waits_are_distinct(sealed, tmp_path):
     empty.mkdir()
     (empty / "review_event_scope.json").write_text('{"race_id":"race", "stage_id":"stage"}')
     missing_video = run_offline_analysis(AnalysisConfig(empty, cameras=(1,), min_available_mb=0, render_cards=False), lower_priority=False)
-    assert "封存录像" in missing_video["cameras"][1]["skipped"]
+    assert "等待录像存好" in missing_video["cameras"][1]["skipped"]
 
 
 def test_archive_crossing_line_change_boundary_is_not_sampled_with_old_line(sealed):
