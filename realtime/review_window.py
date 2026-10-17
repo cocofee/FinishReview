@@ -2573,7 +2573,11 @@ class FinishReviewWindow(PassageReviewSurface):
         rail.follow_button.show()
         rail.navigation_started.connect(self._problem_browse_started)
         rail.follow_button.toggled.connect(lambda enabled: self._problem_browse_started() if enabled else None)
-        self.pipeline_label = QLabel("录像未启动 · 封存到 等待首段 ｜ 分析到 等待录像 / 校时 ｜ 积压 0 秒", self)
+        self.pipeline_label = QLabel(
+            "没有在录像 · 正在等第一段存好 ｜ 分析还没开始（在等录像就绪或时间对齐）"
+            " ｜ 处理没落后（积压 0 秒） ｜ 没发现缺段",
+            self,
+        )
         self.pipeline_label.setWordWrap(True)
         self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
         self.layout().insertWidget(1, self.pipeline_label)
@@ -3769,18 +3773,18 @@ class FinishReviewWindow(PassageReviewSurface):
         panel.live_tick(recording)
         live_cameras = (panel.payload or {}).get("cameras", {})
         through = [value.get("analyzed_through_ms") for value in live_cameras.values() if value.get("analyzed_through_ms")]
-        analyzed = datetime.fromtimestamp(min(through) / 1000).strftime("%H:%M:%S") if through else "等待录像 / 校时"
+        analyzed = datetime.fromtimestamp(min(through) / 1000).strftime("%H:%M:%S") if through else ""
         self.pipeline_label.setToolTip(panel.chip_status + "\n" + panel.analysis_status
                                        + "\n" + panel.health_text() + "\n" + panel.summary.toolTip())
         analysis_state = panel.analysis_status.replace("\n", " ")
         # Routine progress already reads as "分析到 HH:MM:SS" below; only a
         # stopped or failed analysis adds a note here, and only its first clause.
-        healthy = any(word in analysis_state for word in ("等待", "空闲", "后台分析中", "本轮分析完成"))
+        healthy = any(word in analysis_state for word in ("等待", "空闲", "后台分析", "本轮分析完成"))
         analysis_note = "" if healthy else analysis_state.split("；")[0].split("，")[0].split("：")[0]
         short_ends = [segment.media_started_at_ms + segment.media_duration_ms for segment in self.timeline_store.segments()
                       if segment.end_reason == "retained_problem_segment" and segment.media_started_at_ms is not None
                       and segment.media_duration_ms is not None and (not panel._scope[0] or segment.race_id == panel._scope[0])]
-        sealed = datetime.fromtimestamp(max(short_ends) / 1000).strftime("%H:%M:%S") if short_ends else "等待首段"
+        sealed = datetime.fromtimestamp(max(short_ends) / 1000).strftime("%H:%M:%S") if short_ends else ""
         seconds = max(0, int(time.monotonic() - self._recording_started_at)) if recording else 0
         duration = f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
         backlog_seconds = max(0, (max(short_ends) - min(through)) // 1000) if short_ends and through else 0
@@ -3790,11 +3794,16 @@ class FinishReviewWindow(PassageReviewSurface):
         # are a hover away and in the header above — the operator works from the
         # queue and the picture, not from this bar.
         chip_note = panel.chip_status.split("（")[0] if "发现" in panel.chip_status else ""
+        # 现场话术：正在做什么、卡在哪、要不要动手；录像时长和积压秒数照旧保留。
+        recording_text = f"● 录像中 {duration}" if recording else "没有在录像"
+        sealed_text = f"已存好到 {sealed}" if sealed else "正在等第一段存好"
+        analyzed_text = f"已分析到 {analyzed}" if analyzed else "分析还没开始（在等录像就绪或时间对齐）"
+        backlog_text = f"处理落后 {backlog_seconds} 秒" if backlog_seconds else "处理没落后（积压 0 秒）"
         self.pipeline_label.setText(
-            f"{'● 录像 ' + duration if recording else '录像未启动'} · 封存到 {sealed}"
+            f"{recording_text} · {sealed_text}"
             + (f" ｜ {chip_note}" if chip_note else "")
             + (f" ｜ 分析 {analysis_note}" if analysis_note else "")
-            + f" ｜ 分析到 {analyzed} ｜ 积压 {backlog_seconds} 秒 ｜ {panel.evidence_gap_text()}"
+            + f" ｜ {analyzed_text} ｜ {backlog_text} ｜ {panel.evidence_gap_text()}"
         )
         self._poll_recording_health()
         self._update_runtime_status()

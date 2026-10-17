@@ -177,13 +177,13 @@ class ProblemListPanel(QFrame):
         self._chip_generation = 0
         self._chip_signature = None
         self._chip_retry_after = 0.0
-        self.chip_status = "芯片自检等待记录"
+        self.chip_status = "芯片还没收到记录"
         self._chip_timer = QTimer(self)
         self._chip_timer.setSingleShot(True)
         self._chip_timer.setInterval(400)
         self._chip_timer.timeout.connect(self._start_chip_checks)
         self._progress_buffer = b""
-        self.analysis_status = "等待已封存录像"
+        self.analysis_status = "等待录像存好"
         self.bunch_store = None
         self._drafts = {}
         self._held = {}
@@ -635,7 +635,7 @@ class ProblemListPanel(QFrame):
         self._browsing = False
         self.store = None
         self.bunch_store = None
-        self.analysis_status = "等待已封存录像"
+        self.analysis_status = "等待录像存好"
         self.bib_input.clear()
         self.reason_input.clear()
         self._sync_marks()
@@ -2029,8 +2029,11 @@ class ProblemListPanel(QFrame):
         waiting = sum(1 for item in self.items if not item.grouped and self._is_waiting_work(item))
         unverifiable = int(summary.get("unverifiable", 0))
         if not waiting and not unverifiable:
-            return "证据缺口 无"
-        return f"证据缺口 {waiting} 条待证据" + (f" · {unverifiable} 人无录像可核" if unverifiable else "")
+            return "没发现缺段"
+        parts = [f"还有 {waiting} 条缺证据"] if waiting else []
+        if unverifiable:
+            parts.append(f"{unverifiable} 人没有录像可核对")
+        return " · ".join(parts)
 
     def health_text(self) -> str:
         parts = [f"{name} {self.stage_health.get(name) or '—'}" for name in ("接收", "录制", "取样", "校时", "分析")]
@@ -2262,7 +2265,7 @@ class ProblemListPanel(QFrame):
         self._chip_generation += 1
         self._chip_signature = None
         self._chip_retry_after = 0.0
-        self.chip_status = "芯片自检等待记录"
+        self.chip_status = "芯片还没收到记录"
         self.stage_health["接收"] = self.chip_status
         process, self._chip_process = self._chip_process, None
         if process is not None:
@@ -2275,12 +2278,12 @@ class ProblemListPanel(QFrame):
         pending = sum(ProblemItem.from_payload(item).pending for item in payload["items"])
         counts = payload["counts"]
         self.chip_status = (
-            f"芯片自检{'发现 ' + str(pending) + ' 项疑点' if pending else '正常'}"
-            f"（已落盘消息 {counts['journal_messages']} / 有效通过 {counts['effective_passages']}）"
+            f"芯片{'发现 ' + str(pending) + ' 项疑点' if pending else '正常'}"
+            f"（收到消息 {counts['journal_messages']} 条 / 有效过线 {counts['effective_passages']} 条）"
         )
         self.stage_health["接收"] = self.chip_status
         missing = payload.get("missing_inputs", [])
-        self.summary.setToolTip("原始读卡消息数未知；已落盘消息含修订，不等于人数。\n"
+        self.summary.setToolTip("原始读卡消息数未知；收到的消息含修订，不等于人数。\n"
                                 + ("未执行的检查，缺少：" + "；".join(missing) if missing else ""))
 
     def _chip_tick(self):
@@ -2289,7 +2292,7 @@ class ProblemListPanel(QFrame):
         try:
             signature = input_signature(self.workspace_dir)
         except OSError as error:
-            self.chip_status = f"芯片自检读取失败：{error}"
+            self.chip_status = f"芯片记录读不出来：{error}"
             self.stage_health["接收"] = self.chip_status
             return
         if not signature:
@@ -2299,7 +2302,7 @@ class ProblemListPanel(QFrame):
             if cached:
                 self._chip_signature = cached.get("input_signature")
         if signature != self._chip_signature and not self._chip_timer.isActive():
-            self.chip_status = "芯片自检等待更新（上一结果保留）"
+            self.chip_status = "芯片有新记录，正在重算（先看上一次结果）"
             self.stage_health["接收"] = self.chip_status
             self._chip_timer.start()
 
@@ -2321,7 +2324,7 @@ class ProblemListPanel(QFrame):
         process.errorOccurred.connect(lambda error: self._chip_done(process, generation, -1)
                                      if error == QProcess.FailedToStart else None)
         self._chip_process = process
-        self.chip_status = "芯片自检中（视频分析独立运行）"
+        self.chip_status = "正在查芯片记录（不影响录像分析）"
         self.stage_health["接收"] = self.chip_status
         process.start()
 
@@ -2332,7 +2335,7 @@ class ProblemListPanel(QFrame):
         try:
             if code != 0:
                 error = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")[-300:]
-                raise ValueError(error.strip() or "芯片自检进程启动或运行失败")
+                raise ValueError(error.strip() or "检查程序没能启动")
             payload = json.loads(bytes(process.readAllStandardOutput()).decode("utf-8"))
             if self._scope[0] and (payload["race_id"], payload["stage_id"]) != self._scope:
                 raise ValueError("赛事已变化，未发布旧结果")
@@ -2348,7 +2351,7 @@ class ProblemListPanel(QFrame):
             self._chip_signature = payload["input_signature"]
             self.refresh()
         except (OSError, ValueError, KeyError, TypeError) as error:
-            self.chip_status = f"芯片自检失败，保留上一结果：{error}"
+            self.chip_status = f"查芯片记录失败，先看上一次结果：{error}"
             self.stage_health["接收"] = self.chip_status
             self._chip_retry_after = time.monotonic() + 5
         finally:
@@ -2363,13 +2366,13 @@ class ProblemListPanel(QFrame):
         if self.workspace_dir is None:
             return
         if (not recording and self._process is None and not self._final_analysis_pending
-                and self.analysis_status == "等待已封存录像"):
-            self.analysis_status = "视频分析等待录像；芯片自检独立运行"
+                and self.analysis_status == "等待录像存好"):
+            self.analysis_status = "等待录像就绪；芯片照常自检"
         self.stage_health["分析"] = self.analysis_status
         if (not recording and not self._final_analysis_pending) or self._live_paused or self._process is not None or time.monotonic() < self._next_analysis:
             return
         if not any((self.workspace_dir / name).exists() for name in ("finish_lines.json", "long_image_lines.json", "finish_problems/analysis_config.json")):
-            self.analysis_status = "等待终点线配置（在“终点线 / 模型”中配置）"
+            self.analysis_status = "还没画终点线，到「终点线 / 模型」里画一条"
             self.stage_health["分析"] = self.analysis_status
             return
         signature = []
@@ -2384,7 +2387,7 @@ class ProblemListPanel(QFrame):
         try:
             signature.append(("settings", settings_token(self.workspace_dir)))
         except (OSError, ValueError) as error:
-            self.analysis_status = f"分析配置错误：{error}"
+            self.analysis_status = f"分析设置有问题：{error}"
             self.stage_health["分析"] = self.analysis_status
             return
         if not signature or (signature == self._last_live_signature and not self._final_analysis_pending):
@@ -2458,14 +2461,14 @@ class ProblemListPanel(QFrame):
         if not self._live:
             self._final_analysis_pending = False
         self.analyze_button.setText("停止分析")
-        self.analysis_status = "后台分析中（低优先级）"
+        self.analysis_status = "后台分析中（低优先级，不影响录像）"
         self.stage_health["分析"] = self.analysis_status
         process.start()
 
     def _analysis_error(self, error):
         if error == QProcess.FailedToStart:
             self._analysis_done(-1)
-            self.analysis_status = "分析进程无法启动；录像不受影响，请检查运行环境"
+            self.analysis_status = "分析程序起不来；录像不受影响，请检查运行环境"
 
     def _read_progress(self) -> None:
         if self._process is None:
@@ -2515,9 +2518,9 @@ class ProblemListPanel(QFrame):
         elif self._live_paused:
             self.analysis_status = "分析已暂停；录像继续"
         elif _args and _args[0] != 0:
-            self.analysis_status = "分析失败，已保留上一版清单：" + (error.strip() or "请查看日志")
+            self.analysis_status = "这次分析没成功，先看上一版清单：" + (error.strip() or "请查看日志")
         else:
-            self.analysis_status = "本轮分析完成，等待新短段" if self.payload else "录像分析未完成，请查看日志"
+            self.analysis_status = "本轮分析完成，等待新短段" if self.payload else "录像分析没做完，请查看日志"
         self.stage_health["分析"] = self.analysis_status
         self.analysis_finished.emit()
 

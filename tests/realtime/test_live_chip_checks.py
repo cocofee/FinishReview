@@ -105,7 +105,7 @@ def test_automatic_path_without_video_or_line_preserves_draft_and_restart(qapp, 
     wait_for(qapp, lambda: panel.payload is not None)
     assert panel._process is None
     assert panel.items[0].kind == "duplicate_read"
-    assert "有效通过 2" in panel.chip_status
+    assert "有效过线 2" in panel.chip_status
     panel.reason_input.setText("operator draft")
     selected = panel.current_item().item_id
     journal(tmp_path, [event(), event("b", offset=100), event("normal", "30", 30_000)])

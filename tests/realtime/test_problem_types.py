@@ -123,7 +123,7 @@ def test_counting_row_counts_each_class_once_and_ignores_reference_items(qapp, t
     assert len([item for item in panel.items if not item.grouped]) == 8
     assert sum(counts.values()) == 5
     assert panel.auto_passed_text() == "无需人工处理 1 人"
-    assert panel.evidence_gap_text() == "证据缺口 1 条待证据 · 2 人无录像可核"
+    assert panel.evidence_gap_text() == "还有 1 条缺证据 · 2 人没有录像可核对"
 
 
 def test_a_match_inside_a_pending_group_is_counted_but_still_flagged(qapp, tmp_path):
