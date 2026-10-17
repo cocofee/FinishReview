@@ -8,6 +8,9 @@ import os
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from realtime.runtime_paths import configure_qt_plugin_path
+
+configure_qt_plugin_path()
 
 from PyQt5.QtCore import QCoreApplication, QEvent, QThread  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402

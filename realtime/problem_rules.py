@@ -491,8 +491,8 @@ def build_video_items(
             kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
             detail=f"{format_chip_time(chip_time)} 线上活动，认车为{LABEL_TEXT.get(verdict.label, verdict.label)}"
                    + (f"（{verdict.vehicle}）" if verdict.vehicle else ""),
-            chip_time_ms=chip_time, status=STATUS_EXCLUDED,
-            status_note=f"已排除：{LABEL_TEXT.get(verdict.label, verdict.label)} {verdict.score:.2f}",
+            chip_time_ms=chip_time, status=STATUS_OPEN,
+            status_note="待人工确认",
             priority=90, evidence=_crossing_evidence(crossing, version, verdict),
             calibration_version=version,
         ))
@@ -542,7 +542,8 @@ def build_video_items(
     outcome.items += _no_video_items(camera_index, no_video)
     outcome.stats = {
         "candidates": len(candidates),
-        "excluded": len(excluded),
+        "excluded": 0,
+        "suggested_exclusions": len(excluded),
         "late_pairs": len(outcome.late_pairs),
         "duplicates": outcome.duplicates,
         "merged_fragments": len(outcome.fragments),

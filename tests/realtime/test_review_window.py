@@ -354,8 +354,8 @@ def test_workbench_is_default_and_incoming_passages_do_not_take_over(qapp, tmp_p
     window.close()
 
 
-def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path):
-    """The operator's own key, kept as it was: the picture grows where the work is."""
+def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
+    """The arrival table stays beside the picture without a second judging layout."""
 
     import json
     from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
@@ -379,31 +379,19 @@ def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path
         window.problem_panel.refresh()
         window.problem_panel.table.setCurrentCell(0, 0)
         qapp.processEvents()
-        before = window.regular_pane.height()
-        fits = []
-        original_fit = window._fit_visible_evidence_views
-        window._fit_visible_evidence_views = lambda: (fits.append(1), original_fit())
-
-        # What the pane's F shortcut leads to: no second window while judging.
         window.problem_panel.set_browsing(True)
         window._toggle_maximized_pane(window.regular_pane)
         qapp.processEvents()
         assert window._maximized_window is None
-        assert window.problem_panel._big_view
-        assert not window.problem_panel.table.isVisibleTo(window.problem_panel)
-        # 判读那一栏留在画面旁边：顺序与芯片时间合在一张表，卡片图片让开。
-        assert window.problem_panel.count_table.isVisibleTo(window.problem_panel)
-        # The time rail stands aside so the 4:3 crossing can actually grow, and the
-        # frame is fitted to the room it just gained.
-        assert not window.preview_panel.isVisibleTo(window)
-        assert window.regular_pane.height() > before
-        # Enlarging preserves a manually browsed frame; it must not seek away
-        # from the evidence the operator was inspecting.
+        assert not window.problem_panel._big_view
+        assert window.problem_panel.table.isVisibleTo(window.problem_panel)
+        assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
+        assert window.problem_panel.detail_scroll.isHidden()
+        assert window.problem_panel.table.columnCount() == 4
         assert window.problem_panel._browsing
         window._return_to_problem()
         assert not window.problem_panel._browsing
         qapp.processEvents()
-        assert fits
 
         window._toggle_maximized_pane(window.regular_pane)
         qapp.processEvents()
@@ -411,13 +399,12 @@ def test_f_in_the_workbench_enlarges_in_place_instead_of_a_window(qapp, tmp_path
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.preview_panel.isVisibleTo(window)
-        assert window.regular_pane.height() == before
     finally:
         window.close()
 
 
-def test_clicking_the_enlarged_picture_counts_one_person_per_click(qapp, tmp_path):
-    """The operator's counting: point at a rider on the frame, that is one person."""
+def test_picture_clicks_do_not_count_and_number_row_saves_current_frame(qapp, tmp_path):
+    """Classify with 1, then identify a rider by clicking their existing event row."""
 
     import json
     from PyQt5.QtCore import QPoint
@@ -452,35 +439,29 @@ def test_clicking_the_enlarged_picture_counts_one_person_per_click(qapp, tmp_pat
         qapp.processEvents()
         window.problem_panel.toggle_big_view()  # F: the picture takes the clicks
         qapp.processEvents()
-        assert pane.video_view._count_mode
+        assert not pane.video_view._count_mode
 
         target = view.viewport().rect().center()
         QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
-        qapp.processEvents()
-        marks = window.problem_panel.current_marks()
-        assert len(marks) == 1
-        assert 0.0 <= marks[0]["x"] <= 1.0 and 0.0 <= marks[0]["y"] <= 1.0
-        # The moment is the frame's own: this crossing sits at its recorded second.
-        assert marks[0]["recorder_ms"] == start + int(pane._current_position_ms)
-        # The counted person is drawn on the frame as number one.
-        drawn = [overlay for overlay in window._continuous_marker_overlays(pane) if overlay[2] == "1"]
-        assert drawn and abs(drawn[0][0] - marks[0]["x"]) < 0.01
-
-        window.problem_panel.undo_mark()
         qapp.processEvents()
         assert not window.problem_panel.current_marks()
-        # Counting is available on the ordinary picture too; F is optional.
-        window.problem_panel.toggle_big_view()
-        qapp.processEvents()
-        assert pane.video_view._count_mode
-        target = view.viewport().rect().center()
-        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
-        qapp.processEvents()
-        assert len(window.problem_panel.current_marks()) == 1
+        target_event = _event(event_id="read-321", bib="321", passage_timestamp_ms=start + 1900)
+        window.passage_store.append(target_event)
+        window.problem_panel.refresh()
+        for _ in range(5):
+            QTest.keyClick(view.viewport(), Qt.Key_1)
+        assert not any(row.decision for row in window.problem_panel._arrival_rows)
+        target_row = next(i for i, row in enumerate(window.problem_panel._arrival_rows) if row.bib == "321")
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
-        assert not window._problem_count_overlays(pane)
-        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
-        assert len(window._problem_count_overlays(pane)) == 1
+        cell = window.problem_panel.table.item(target_row, 2)
+        window.problem_panel.table.scrollToItem(cell)
+        qapp.processEvents()
+        QTest.mouseClick(window.problem_panel.table.viewport(), Qt.LeftButton,
+                         pos=window.problem_panel.table.visualItemRect(cell).center())
+        confirmed = [row for row in window.problem_panel._arrival_rows if row.decision]
+        assert len(confirmed) == 1 and confirmed[0].bib == "321"
+        assert confirmed[0].decision["frame"]["frame_index"] == 51
+        assert confirmed[0].decision["frame"]["recorder_ms"] == start + 2050
     finally:
         window.close()
 
@@ -570,8 +551,7 @@ def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_pa
         window._refresh_crossing_cards()
         qapp.processEvents()
 
-        assert not window.problem_panel.rows  # 待处理里没有他：芯片已经答过
-        window.problem_panel.queue_filter.setCurrentIndex(3)  # 「全部」按时间列出整场
+        # Normal and exceptional arrivals share the same permanent table.
         auto = [item for item in window.problem_panel.rows if item.kind == KIND_AUTO_PASSED]
         assert len(auto) == 1
         qapp.processEvents()
@@ -642,8 +622,8 @@ def test_the_first_rider_calibration_keeps_the_original_chip_record(qapp, tmp_pa
         window.close()
 
 
-def test_f_enlarges_the_picture_wherever_the_hands_are(qapp, tmp_path):
-    """The operator's F must not depend on which corner of the workbench has focus."""
+def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_path):
+    """The view does not split into a second counting screen when focus changes."""
 
     import json
     from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
@@ -678,7 +658,8 @@ def test_f_enlarges_the_picture_wherever_the_hands_are(qapp, tmp_path):
         qapp.processEvents()
         QTest.keyClick(rail.canvas.viewport(), Qt.Key_F)
         qapp.processEvents()
-        assert panel.big_view
+        assert not panel.big_view
+        assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isHidden()
         panel.toggle_big_view()
         qapp.processEvents()
 
@@ -687,7 +668,7 @@ def test_f_enlarges_the_picture_wherever_the_hands_are(qapp, tmp_path):
         qapp.processEvents()
         QTest.keyClick(window.recheck_button, Qt.Key_F)
         qapp.processEvents()
-        assert panel.big_view
+        assert not panel.big_view
         panel.toggle_big_view()
         qapp.processEvents()
 
@@ -846,6 +827,20 @@ def test_ambiguous_legacy_workspace_requires_selection_and_remembers_it(qapp, tm
         assert [item.event_id for item in restored._visible_events] == ["second"]
     finally:
         restored.close()
+
+
+def test_single_event_workspace_hides_useless_event_picker(qapp, tmp_path):
+    passages = PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl")
+    passages.append(_event(event_id="only"))
+    RaceMetadataStore(tmp_path / "cyclerace_race_metadata.json").store(
+        RaceMetadata(race_id="race-1", stage_id="stage-1", revision=1, emitted_at_ms=1)
+    )
+    window = _window(tmp_path)
+    try:
+        assert window._current_metadata() is not None
+        assert window.select_event_button.isHidden()
+    finally:
+        window.close()
 
 
 def test_received_race_can_be_selected_without_metadata_and_survives_restart(qapp, tmp_path):

@@ -1481,6 +1481,15 @@ class FinishReviewWindow(PassageReviewSurface):
                 item = candidates[index - len(received)]
                 self._select_workspace_event(item.race_id, item.stage_id)
 
+    def _workspace_event_selection_needed(self) -> bool:
+        """Only expose event switching when this directory is genuinely ambiguous."""
+        if not isinstance(self.metadata_store, EventWorkspaceMetadataStore):
+            return False
+        scopes = {(item.race_id, item.stage_id) for item in self.metadata_store.candidates()}
+        if self.timing_provider == "cyclerace":
+            scopes.update((item.race_id, item.stage_id) for item in self._received_event_candidates())
+        return len(scopes) > 1
+
     def _received_event_candidates(self):
         if self.timing_provider != "cyclerace":
             return ()
@@ -2440,7 +2449,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.event_path_label.setToolTip(
             f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
         )
-        self.select_event_button.setVisible(isinstance(self.metadata_store, EventWorkspaceMetadataStore))
+        self.select_event_button.setVisible(self._workspace_event_selection_needed())
         if metadata is None and len({(item.race_id, item.stage_id)
                                      for item in self.passage_store.events()}) > 1:
             self.event_name_label.setText("请选择赛事")
@@ -2469,7 +2478,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if expanded:
             self._selected_event_id = ""
             self.problem_panel.splitter.insertWidget(1, self.evidence_splitter)
-            self.problem_panel.splitter.setSizes([310, 680, 280])
+            self.problem_panel.splitter.setSizes([360, 1000, 0])
             self.review_content_splitter.insertWidget(0, self.workspace_splitter)
             self.review_content_splitter.setSizes([520, 210])
             self.evidence_splitter.show()
@@ -2519,9 +2528,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self.review_content_splitter.setSizes([sum(sizes) // 2, sum(sizes) // 2])
 
     def _init_problem_list(self) -> None:
-        from .problem_panel import ProblemListPanel
+        from .quick_review_panel import QuickReviewPanel
 
-        self.problem_panel = ProblemListPanel(self.results_panel)
+        self.problem_panel = QuickReviewPanel(self.results_panel)
+        self.problem_panel.set_frame_provider(
+            lambda: self._frame_for_problem_count(self._problem_pane())
+        )
         self.results_panel.layout().insertWidget(1, self.problem_panel)
         self.problem_panel.hide()
         self.problem_panel.set_events_provider(
@@ -2617,6 +2629,10 @@ class FinishReviewWindow(PassageReviewSurface):
         takes typing keeps the letter, as it must.
         """
 
+        if (getattr(self, "_problem_workbench_active", False)
+                and self.problem_panel._queue_key(event)):
+            event.accept()
+            return
         if (event.key() == Qt.Key_F
                 and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
                 and getattr(self, "_problem_workbench_active", False)):
@@ -2640,7 +2656,8 @@ class FinishReviewWindow(PassageReviewSurface):
 
         active = getattr(self, "_problem_workbench_active", False)
         for pane in self.evidence_panes:
-            pane.video_view.set_count_mode(active and pane.source_kind == "regular"
+            pane.video_view.set_count_mode(active and not getattr(self.problem_panel, "quick_review", False)
+                                           and pane.source_kind == "regular"
                                            and pane.location is not None and pane._current_frame_index >= 0)
 
     def _frame_for_problem_count(self, pane):
@@ -2940,6 +2957,9 @@ class FinishReviewWindow(PassageReviewSurface):
         self._set_recording_rail_visible(self.recording_rail_button.isChecked())
 
     def _select_crossing_card(self, item_id):
+        if getattr(self.problem_panel, "quick_review", False):
+            self.problem_panel.select_item(item_id)
+            return
         normal = self._normal_crossing_cards.get(item_id)
         if normal is not None:
             self._opened_normal_crossing = item_id

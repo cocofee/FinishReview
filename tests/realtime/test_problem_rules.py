@@ -203,7 +203,7 @@ def test_unpaired_crossings_chips_and_repeated_spots():
     assert set(two.bibs) == {"6", "7"} and two.status == STATUS_CLOSED_UPSTREAM
 
 
-def test_manual_entry_closes_crossing_and_bike_verdicts_decide_exclusion():
+def test_manual_entry_closes_crossing_and_model_exclusions_wait_for_operator():
     crossing = _crossing(T0 + 50_000)
     walker = _crossing(T0 + 70_000)
     unsure = _crossing(T0 + 90_000)
@@ -218,8 +218,10 @@ def test_manual_entry_closes_crossing_and_bike_verdicts_decide_exclusion():
 
     statuses = {item.chip_time_ms: item.status for item in outcome.items}
     assert statuses[T0 + 49_000] == STATUS_CLOSED_UPSTREAM
-    assert statuses[T0 + 69_000] == STATUS_EXCLUDED
+    assert statuses[T0 + 69_000] == "open"
     assert statuses[T0 + 89_000] == STATUS_DISPUTED
+    assert outcome.stats["excluded"] == 0
+    assert outcome.stats["suggested_exclusions"] == 1
 
 
 def test_bunches_and_obstructions_get_manual_check_items():

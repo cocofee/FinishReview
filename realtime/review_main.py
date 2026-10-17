@@ -613,6 +613,8 @@ def configure_application_icon(app: QApplication) -> None:
 def run_packaged_smoke_test(app_argv: list[str]) -> int:
     """Create the packaged Qt window without starting external services."""
 
+    from realtime.runtime_paths import configure_qt_plugin_path
+    configure_qt_plugin_path()
     app = QApplication.instance() or QApplication(app_argv)
     install_qthread_shutdown(app)
     configure_application_font(app)
@@ -730,6 +732,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    from realtime.runtime_paths import configure_qt_plugin_path
+    configure_qt_plugin_path()
     app = QApplication.instance() or QApplication(app_argv)
     install_qthread_shutdown(app)
     configure_application_font(app)

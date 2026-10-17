@@ -8,6 +8,19 @@ from pathlib import Path
 from typing import Optional
 
 
+def configure_qt_plugin_path() -> None:
+    """Qt 5's compiled lookup can lose Unicode Windows user-directory names."""
+    if os.name != "nt" or getattr(sys, "frozen", False):
+        return
+    import PyQt5
+    platforms = Path(PyQt5.__file__).parent / "Qt5" / "plugins" / "platforms"
+    if (platforms / "qwindows.dll").is_file():
+        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(platforms))
+        os.environ.setdefault("QT_PLUGIN_PATH", str(platforms.parent))
+        from PyQt5.QtCore import QCoreApplication
+        QCoreApplication.addLibraryPath(str(platforms.parent))
+
+
 def application_dir(
     *,
     frozen: Optional[bool] = None,
