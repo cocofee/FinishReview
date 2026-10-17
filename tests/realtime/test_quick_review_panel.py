@@ -57,6 +57,19 @@ def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
         assert "自行车" not in " ".join(panel.table.item(i, j).text() for j in range(4))
 
 
+def test_finish_line_has_one_visible_entry(panel):
+    from PyQt5.QtWidgets import QPushButton
+
+    assert panel.finish_line_button.text() == "终点线 / 模型"
+    menu_texts = [
+        action.text()
+        for button in panel.quick_toolbar.findChildren(QPushButton)
+        if button.menu() is not None
+        for action in button.menu().actions()
+    ]
+    assert "终点线 / 模型" not in menu_texts
+
+
 def test_f_enlarges_evidence_and_escape_restores_arrival_table(panel):
     changes = QSignalSpy(panel.big_view_changed)
     panel.table.setFocus()

@@ -66,9 +66,6 @@ from .stream_recorder import (
         split_rtsp_credentials,
     )
 from .thread_lifecycle import track_qthread
-from .visual_crossing import (
-    VisualLineCalibrationDialog,
-)
 
 logger = logging.getLogger("FinishReview")
 IS_WINDOWS = os.name == "nt"
@@ -749,45 +746,10 @@ class FinishReviewLaunchDialog(QDialog):
             self.framerate_combo.addItem(f"{value:g} FPS", value)
         form.addRow("USB录像帧率", self.framerate_combo)
 
-        visual_settings_row = QHBoxLayout()
-        visual_settings_row.setSpacing(6)
-        self.visual_enabled_checkbox = QCheckBox("启用", self)
-        self.visual_enabled_checkbox.setChecked(self._visual_detection_enabled)
-        visual_settings_row.addWidget(self.visual_enabled_checkbox)
-        self.visual_camera_combo = QComboBox(self)
-        self.visual_camera_combo.addItem("机位1", self._camera_index)
-        self.visual_camera_combo.addItem("机位2", self._camera_index + 1)
-        self.visual_camera_combo.setCurrentIndex(
-            max(0, self.visual_camera_combo.findData(self._visual_camera_index))
-        )
-        visual_settings_row.addWidget(self.visual_camera_combo)
-        self.visual_line_label = QLabel(
-            f"终点线 {self._visual_finish_line * 100:.1f}%",
-            self,
-        )
-        visual_settings_row.addWidget(self.visual_line_label, 1)
-        self.visual_calibrate_button = QPushButton("调整红黄蓝标线", self)
-        self.visual_calibrate_button.clicked.connect(self._calibrate_visual_line)
-        visual_settings_row.addWidget(self.visual_calibrate_button)
-        self.visual_direction_combo = QComboBox(self)
-        self.visual_direction_combo.addItem("正向：左 → 右", "left_to_right")
-        self.visual_direction_combo.addItem("正向：右 → 左", "right_to_left")
-        self.visual_direction_combo.setCurrentIndex(
-            max(
-                0,
-                self.visual_direction_combo.findData(self._visual_forward_direction),
-            )
-        )
-        visual_settings_row.addWidget(self.visual_direction_combo)
-        form.addRow("旧运动检测区域", visual_settings_row)
-        visual_hint = QLabel(
-            "红黄蓝线用于旧运动检测区域，不是自动分析的实际终点线；"
-            "实际终点线请在问题清单的“终点线 / 模型”中配置。",
-            self,
-        )
-        visual_hint.setWordWrap(True)
-        visual_hint.setStyleSheet("color: #667085;")
-        form.addRow("", visual_hint)
+        # The old red/yellow/blue motion-detection region is kept as saved
+        # settings only. Offering it here looked like a second finish-line
+        # setting; the actual line is drawn on a sealed frame from the review
+        # list's "终点线 / 模型" dialog.
 
         high_speed_row = QHBoxLayout()
         high_speed_row.setSpacing(6)
@@ -1902,56 +1864,18 @@ class FinishReviewLaunchDialog(QDialog):
             racetiger_poll_interval_seconds=(
                 self.racetiger_poll_interval_spin.value()
             ),
-            visual_detection_enabled=self.visual_enabled_checkbox.isChecked(),
-            visual_camera_index=int(
-                self.visual_camera_combo.currentData() or self._camera_index
+            visual_detection_enabled=self._visual_detection_enabled,
+            visual_camera_index=(
+                self._visual_camera_index
+                if self._visual_camera_index in (self._camera_index, self._camera_index + 1)
+                else self._camera_index
             ),
             visual_finish_line=self._visual_finish_line,
             visual_gate_width=self._visual_gate_width,
-            visual_forward_direction=str(
-                self.visual_direction_combo.currentData() or "left_to_right"
-            ),
+            visual_forward_direction=self._visual_forward_direction,
             visual_roi_top=self._visual_roi_top,
             visual_roi_bottom=self._visual_roi_bottom,
         )
-
-    def _calibrate_visual_line(self) -> None:
-        source = (
-            self._current_rtsp_source()
-            if self.visual_camera_combo.currentData() == self._camera_index
-            else self._current_secondary_rtsp_source()
-        )
-        if not is_rtsp_source(source):
-            QMessageBox.information(
-                self,
-                "无法设置终点线",
-                "请选择有效的 RTSP 机位后再设置。",
-            )
-            return
-        dialog = VisualLineCalibrationDialog(
-            source,
-            line_x=self._visual_finish_line,
-            gate_width=self._visual_gate_width,
-            roi_top=self._visual_roi_top,
-            roi_bottom=self._visual_roi_bottom,
-            direction=self._visual_forward_direction,
-            parent=self,
-        )
-        if dialog.exec_() == QDialog.Accepted:
-            camera_index = int(
-                self.visual_camera_combo.currentData() or self._camera_index
-            )
-            self._visual_finish_line = dialog.line_x
-            self._visual_gate_width = dialog.gate_width
-            self._visual_roi_top = dialog.roi_top
-            self._visual_roi_bottom = dialog.roi_bottom
-            self._visual_forward_direction = dialog.direction
-            self.visual_direction_combo.setCurrentIndex(
-                max(0, self.visual_direction_combo.findData(dialog.direction))
-            )
-            self.visual_line_label.setText(
-                f"终点线 {self._visual_finish_line * 100:.1f}%"
-            )
 
     def _selected_recording_source(self) -> str:
         if self.source_type_combo.currentData() == "rtsp":
