@@ -11,7 +11,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable, Iterable, Mapping, Optional
 
-from PyQt5.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
     QColor,
@@ -481,6 +481,7 @@ class EvidenceImageView(QGraphicsView):
         self._fit_mode = True
         self._marker_mode = False
         self._count_mode = False
+        self._finish_line_points = ()
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
@@ -775,6 +776,14 @@ class EvidenceImageView(QGraphicsView):
     def set_marker_label_visible(self, visible: bool) -> None:
         self._show_marker_label = bool(visible)
         self.viewport().update()
+
+    def set_finish_line(self, points=()) -> None:
+        """Keep actual camera geometry separate from rider identity markers."""
+
+        points = tuple((float(x), float(y)) for x, y in points)
+        if points != self._finish_line_points:
+            self._finish_line_points = points
+            self.viewport().update()
 
     def set_batch_roster(
         self,
@@ -1103,6 +1112,16 @@ class EvidenceImageView(QGraphicsView):
             return
         scale = max(0.001, abs(self.transform().m11()))
         painter.save()
+        if self._finish_line_points:
+            painter.setRenderHint(QPainter.Antialiasing)
+            # Cosmetic strokes stay legible in both fitted and source-resolution views.
+            for color, width in (("#071c17", 5), ("#00edbb", 3)):
+                pen = QPen(QColor(color), width)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
+                    painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
+                                     QPointF(b[0] * self._source_width, b[1] * self._source_height))
         for index, (x_normalized, y_normalized, label, confirmed, simple) in enumerate(
             self._history_markers
         ):

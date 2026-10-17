@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import importlib
 import os
 import re
@@ -2451,6 +2452,12 @@ class FinishReviewWindow(PassageReviewSurface):
     def _uses_popup_judging(self):
         return not getattr(self, "_problem_workbench_active", False) and super()._uses_popup_judging()
 
+    def _toggle_maximized_pane(self, pane):
+        # Reopening a paused frame may not decode again. Refresh saved geometry
+        # on every F entry as well as on frame changes, including popup judging.
+        self._refresh_problem_finish_lines()
+        super()._toggle_maximized_pane(pane)
+
     def _begin_marking(self, pane):
         if not getattr(self, "_problem_workbench_active", False):
             return super()._begin_marking(pane)
@@ -2485,9 +2492,11 @@ class FinishReviewWindow(PassageReviewSurface):
 
         self.problem_panel = QuickReviewPanel(self.results_panel)
         self.problem_panel.set_frame_provider(
-            lambda: self._frame_for_problem_count(self._problem_pane())
+            lambda: self._frame_for_problem_count(self._active_playback_pane())
         )
         self.problem_panel.confirmation_preparing.connect(self._pause_arrival_confirmation)
+        self.problem_panel.candidate_preparing.connect(self._prepare_arrival_candidate)
+        self.problem_panel.sampling_configured.connect(self._refresh_problem_finish_lines)
         self.results_panel.layout().insertWidget(1, self.problem_panel)
         self.problem_panel.hide()
         self.problem_panel.set_events_provider(
@@ -2565,7 +2574,86 @@ class FinishReviewWindow(PassageReviewSurface):
     def _pause_arrival_confirmation(self):
         # Freeze the displayed frame without seeking to a playback clock estimate.
         self._set_sync_playing(False, seek_final=False)
-        self._problem_pane().set_playing(False)
+        self._active_playback_pane().set_playing(False)
+
+    def _prepare_arrival_candidate(self):
+        """Raw filmstrip review does not need to wait for automatic video analysis."""
+
+        panel = self.problem_panel
+        pane = self._active_playback_pane()
+        frame = self._frame_for_problem_count(pane)
+        if frame is None:
+            return
+        item = panel.current_item()
+        if item is not None:
+            if item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
+                return
+            original = item.evidence.get("frame")
+            if original and self._shows_the_problem_frame(pane, frame["position_ms"], original):
+                return
+        selected_key = panel._selected_key
+        self._pause_arrival_confirmation()
+        try:
+            self._creating_manual_crossing = True
+            location = self._persist_filmstrip_location(pane.location)
+            pane._location = location
+            frame.update(segment_id=location.segment.segment_id, video_path=str(location.video_path))
+            item = panel.add_manual_problem(frame, reason="人工查看录像候选", recorder_ms=frame["recorder_ms"],
+                                            thumbnail=pane.video_view._pixmap_item.pixmap())
+            if item is not None:
+                panel.select_item(item.item_id)
+                index = next((i for i, row in enumerate(panel._arrival_rows) if row.key == selected_key), None)
+                if index is not None:
+                    panel._arrival_clicked(index)
+        except (OSError, ValueError, RuntimeError) as error:
+            panel.hint.setText(f"当前原帧未保存：{error}")
+        finally:
+            self._creating_manual_crossing = False
+
+    def _refresh_problem_finish_lines(self):
+        """Resolve the real line for the displayed camera, session and recording time."""
+
+        if not hasattr(self, "problem_panel"):
+            return
+        from .analysis_settings import CONFIG_PATH, normalized_points
+        from .analysis_workspace import session_id_for_path
+
+        paths = [self.output_dir / name for name in ("long_image_lines.json", "finish_lines.json", CONFIG_PATH)]
+        try:
+            signature = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size)
+                              if path.exists() else (str(path),) for path in paths)
+            if signature != getattr(self, "_review_line_signature", None):
+                lines, settings = {}, {}
+                for path in paths:
+                    payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                    if path == paths[-1]:
+                        if not isinstance(payload, dict):
+                            raise ValueError("分析配置必须是JSON对象")
+                        settings = payload
+                    records = payload.get("finish_lines", []) if isinstance(payload, dict) else payload
+                    for line in records:
+                        lines[int(line["camera_index"])] = line
+                self._review_line_config = (lines, settings.get("sampling_profiles", []))
+                self._review_line_signature = signature
+            lines, profiles = self._review_line_config
+            scope = self.problem_panel._arrival_scope
+            for pane in self.evidence_panes:
+                frame = self._frame_for_problem_count(pane)
+                line = None
+                if frame and pane.source_kind == "regular":
+                    session = re.sub(r"_review_\d+$", "", session_id_for_path(pane.location.video_path))
+                    matches = [p for p in profiles if int(p["camera_index"]) == pane.camera_index
+                               and p["session_id"] == session and (p["race_id"], p.get("stage_id", "")) == scope
+                               and int(p["effective_from_ms"]) <= frame["recorder_ms"]]
+                    line = (max(matches, key=lambda p: (int(p["effective_from_ms"]), int(p["revision"])))
+                            if matches else lines.get(pane.camera_index))
+                pane.video_view.set_finish_line(normalized_points(line) if line else ())
+            active = self._active_playback_pane()
+            self.problem_panel.set_finish_line_status(bool(active.video_view._finish_line_points))
+        except (OSError, ValueError, KeyError, TypeError):
+            for pane in self.evidence_panes:
+                pane.video_view.set_finish_line()
+            self.problem_panel.set_finish_line_status(False)
 
     def _problem_big_view_changed(self, big: bool) -> None:
         """Give the enlarged picture the room of the rail, and fit the frame to it.
@@ -2579,6 +2667,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self.preview_panel.setVisible(not big)
         QTimer.singleShot(0, self._fit_visible_evidence_views)
         self._problem_count_mode_changed(True)
+        self._refresh_problem_finish_lines()
 
     def keyPressEvent(self, event) -> None:
         """F enlarges the picture from whatever corner of the workbench holds the keys.
@@ -2743,12 +2832,16 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _on_preview_frame_ready(self, pane, image, position_ms, frame_index):
         super()._on_preview_frame_ready(pane, image, position_ms, frame_index)
+        self._refresh_problem_finish_lines()
         if not getattr(self, "_problem_workbench_active", False):
             return
         pane.video_view.set_identity_badge_visible(False)
         pane.active_badge.hide()
         pane.status_label.hide()
         if getattr(self.problem_panel, "quick_review", False):
+            # The red "待补录" identity guide is not the camera's finish line.
+            pane.video_view.clear_marker()
+            pane.video_view.set_history_markers(())
             self.problem_panel._sync_arrival_confirmation()
         if pane is not self._active_playback_pane():
             return

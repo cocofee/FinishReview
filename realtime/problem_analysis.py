@@ -41,6 +41,9 @@ from .analysis_settings import (read_settings, resolved_model_path, settings_tok
 from .batch_review import (BATCH_IDENTITY_FILENAME, aggregate_batches, identity_chain, previous_items,
                            read_snapshots, save_identity, unambiguous_auto_passed)
 from .bike_check import (
+    DECISION_DISPUTED,
+    DECISION_KEEP,
+    LABEL_TEXT,
     LABEL_PEDESTRIAN,
     LABEL_VEHICLE,
     BikeVerdict,
@@ -79,10 +82,13 @@ from .line_sampling import (
     save_strip,
 )
 from .problem_items import (
+    KIND_NO_CHIP_CROSSING,
+    KIND_LINE_ACTIVITY,
     KIND_NO_VIDEO,
     KIND_WAITING,
     STATUS_WAITING,
     CATEGORY_VIDEO,
+    STATUS_OPEN,
     stable_item_id,
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
@@ -91,6 +97,7 @@ from .problem_items import (
     sort_items,
 )
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
+from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, check_target_tracks
 
 
 logger = logging.getLogger("FinishReview.ProblemAnalysis")
@@ -529,6 +536,212 @@ def _save_bike_cache(path, payload):
     temporary.replace(path)
 
 
+def _verification_sources(files, crossing):
+    """Resolve real neighbouring frames, never borrowing another line/session."""
+    own = next((item for item in files if str(item.meta.get("video_path")) == crossing.video_path), None)
+    if own is None:
+        return []
+    sources = []
+    for offset in VERIFICATION_OFFSETS_MS:
+        target = crossing.recorder_ms + offset
+        for item in files:
+            if (item.meta.get("session_id") != crossing.session_id
+                    or item.meta.get("line_digest") != own.meta.get("line_digest")
+                    or (item.geometry.width, item.geometry.height) != (own.geometry.width, own.geometry.height)
+                    or not len(item.pts)):
+                continue
+            if not item.start_ms + item.pts[0] - 25 <= target <= item.end_ms + 25:
+                continue
+            position = float(item.pts[int(np.argmin(np.abs(item.start_ms + item.pts - target)))])
+            stamp = item.start_ms + position
+            if any(left <= stamp <= right for left, right in item.meta.get("excluded_ranges", [])):
+                continue
+            if abs(stamp - target) <= 50:
+                sources.append((item, position))
+                break
+    return sources
+
+
+def _verify_crossing_candidates(config, camera, files, crossings, *, progress, checkpoint):
+    """Run the target gate only in short windows triggered by line changes."""
+    cache_path = config.resolved_output() / f"target_crossings_camera{camera}.json"
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    checks, detector = {}, None
+    try:
+        model_key = model_fingerprint(config.model_path, config.model_input)
+    except (OSError, ValueError) as error:
+        logger.warning("crossing verification model unavailable: %s", error)
+        return {c.key: TargetCrossingCheck("unverified", "model_failed") for c in crossings}
+    for index, crossing in enumerate(crossings):
+        sources = _verification_sources(files, crossing)
+        signature = []
+        for item, position in sources:
+            path = Path(item.meta["video_path"])
+            try:
+                stat = path.stat()
+                stamp = [stat.st_size, stat.st_mtime_ns]
+            except OSError:
+                stamp = None
+            signature.append([str(path), position, stamp, item.meta.get("geometry_digest"),
+                              item.meta.get("line_digest"), item.meta.get("excluded_ranges", [])])
+        key = hashlib.sha256(json.dumps([1, model_key, crossing.key, crossing.segment_points,
+                                        signature], sort_keys=True).encode()).hexdigest()
+        saved = cache.get(key)
+        if saved is not None:
+            checks[crossing.key] = TargetCrossingCheck(**dict(saved, observed_ms=tuple(saved["observed_ms"])))
+            continue
+        progress("跨线验证", index, len(crossings))
+        if len(sources) < len(VERIFICATION_OFFSETS_MS):
+            checks[crossing.key] = TargetCrossingCheck("unverified", "missing_context")
+            continue  # A later sealed neighbour can complete this window.
+        reader = None
+        observations = []
+        try:
+            if detector is None:
+                detector = YoloxDetector(config.model_path, config.model_input)
+            width, height = sources[0][0].geometry.width, sources[0][0].geometry.height
+            cx, cy = crossing.contact
+            size = min(1200, width, height)
+            x0 = int(np.clip(cx - size / 2, 0, width - size))
+            y0 = int(np.clip(cy - size * .65, 0, height - size))
+            for item, position in sources:
+                if checkpoint is not None:
+                    checkpoint()
+                path = item.meta["video_path"]
+                if reader is None or str(reader.path) != str(Path(path)):
+                    if reader is not None:
+                        reader.close()
+                    reader = FrameReader(path, config.decode_threads)
+                frames = reader.frames_at([position])
+                if not frames or abs(frames[0][1] - position) > 50:
+                    continue
+                frame, pts = frames[0]
+                if frame.shape[:2] != (height, width):
+                    continue
+                detections = detector.detect(frame[y0:y0 + size, x0:x0 + size])
+                # Coordinates always stay in the original decoded frame.
+                boxes = [replace(d, x=d.x + x0, y=d.y + y0) for d in detections
+                         if d.x > 2 and d.y > 2 and d.x + d.w < size - 3 and d.y + d.h < size - 3]
+                observations.append((item.start_ms + pts, boxes))
+            check = check_target_tracks(observations, crossing.segment_points, frame_size=(width, height))
+        except Exception as error:
+            logger.warning("crossing verification unavailable for %s: %s", crossing.key, error)
+            check = TargetCrossingCheck("unverified", "model_failed")
+            if detector is None:
+                return {c.key: checks.get(c.key, check) for c in crossings}
+        finally:
+            if reader is not None:
+                reader.close()
+        checks[crossing.key] = check
+        if check.reason != "model_failed":
+            cache[key] = asdict(check)
+        if checkpoint is not None:
+            checkpoint()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_bike_cache(cache_path, cache)
+    return checks
+
+
+def _unchecked_line_items(crossings, checks, camera, model=None):
+    if not checks:
+        return []
+    items = []
+    reasons = {
+        "missing_context": "缺少前后封存画面",
+        "discontinuous_context": "前后画面不连续",
+        "clipped_target": "目标被画面边缘截断",
+        "insufficient_track": "同一目标的连续轨迹不足",
+        "ambiguous_tracks": "多个目标的轨迹关联不清",
+        "model_failed": "模型加载或推理失败",
+    }
+    for crossing in crossings:
+        check = checks[crossing.key]
+        if check.state != "unverified":
+            continue
+        version = model.version if model else 0
+        items.append(ProblemItem(
+            stable_item_id(KIND_LINE_ACTIVITY, camera, crossing.key), KIND_LINE_ACTIVITY, CATEGORY_VIDEO,
+            "终点线发生变化，但尚未确认目标穿越；不计过线、不自动配对芯片；"
+            + reasons.get(check.reason, "轨迹证据不足"),
+            chip_time_ms=model.to_chip(crossing.recorder_ms, crossing.session_id) if model else None,
+            status=STATUS_DISPUTED, status_note="遮挡或轨迹证据不足，待核实", priority=35,
+            evidence={"frame": crossing.frame_payload(version), "contact": list(crossing.contact),
+                      "segment_points": [list(p) for p in crossing.segment_points],
+                      "recorder_ms": crossing.recorder_ms, "crossing_check": asdict(check),
+                      "calibration_pending": model is None}, calibration_version=version,
+        ))
+    return items
+
+
+def _uncalibrated_video_items(
+    config: AnalysisConfig,
+    camera: int,
+    crossings: list[CrossingRecord],
+    *,
+    periods: list[tuple[int, int]],
+    progress: ProgressCallback,
+    checkpoint: Optional[Callable[[], None]],
+    verified_verdicts: Optional[dict[str, BikeVerdict]] = None,
+) -> tuple[list[ProblemItem], dict[str, BikeVerdict]]:
+    """Classify finish-line candidates before chip/video clock calibration.
+
+    Calibration is required for chip pairing, but it is not required to answer
+    the independent camera-test question (person, bicycle, or vehicle).  Keep
+    these candidates in recorder time and mark pairing as pending.
+    """
+
+    candidates = list(crossings)
+
+    def crowded(recorder_ms: int) -> bool:
+        return any(start - 5_000 <= recorder_ms <= end + 5_000 for start, end in periods)
+
+    verdicts = verified_verdicts if verified_verdicts is not None else _bike_verdicts(
+        config, camera, candidates, crowded,
+        progress=progress, checkpoint=checkpoint,
+    )
+    items: list[ProblemItem] = []
+    for crossing in candidates:
+        verdict = verdicts.get(crossing.key)
+        status = STATUS_OPEN
+        detail = "视频候选待首人校时"
+        evidence = {
+            "frame": crossing.frame_payload(0),
+            "contact": list(crossing.contact),
+            "segment_points": [list(point) for point in crossing.segment_points],
+            "recorder_ms": int(crossing.recorder_ms),
+            "row": int(crossing.row),
+            "calibration_pending": True,
+        }
+        if verdict is not None:
+            detail += f"；模型判断 {LABEL_TEXT.get(verdict.label, verdict.label)} ({float(verdict.score):.2f})"
+            if verdict.vehicle:
+                detail += f"（{verdict.vehicle}）"
+            if verdict.decision == DECISION_DISPUTED:
+                status = STATUS_DISPUTED
+            evidence["bike"] = {
+                "label": verdict.label,
+                "score": round(float(verdict.score), 3),
+                "decision": verdict.decision,
+                "reason": verdict.reason,
+                "vehicle": verdict.vehicle,
+            }
+        items.append(ProblemItem(
+            item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera, crossing.key),
+            kind=KIND_NO_CHIP_CROSSING,
+            category=CATEGORY_VIDEO,
+            detail=detail,
+            status=status,
+            status_note="确认第一名原始帧后开始芯片配对",
+            priority=10,
+            evidence=evidence,
+            calibration_version=0,
+        ))
+    return items, verdicts
+
+
 def calibrate_evidence_clock(crossings, reads, *, camera_index):
     """Try receipt-supported calendar offsets, still requiring visual calibration.
 
@@ -675,20 +888,45 @@ def analyse_camera(
     crossings, obstructions, coverage, raw = detect_session_crossings(
         files, camera, params, checkpoint=checkpoint, cache=config.live,
     )
+    line_candidates = list(crossings)
+    crossing_checks = {}
+    verified_verdicts = None
+    if config.model_path:
+        crossing_checks = _verify_crossing_candidates(
+            config, camera, files, line_candidates, progress=progress, checkpoint=checkpoint,
+        )
+        crossings = [c for c in line_candidates if crossing_checks[c.key].state == "confirmed"]
+        verified_verdicts = {}
+        periods = merge_obstructions(obstructions)
+        for crossing in crossings:
+            check = crossing_checks[crossing.key]
+            crowded = crossing.in_obstruction or any(a - 5_000 <= crossing.recorder_ms <= b + 5_000 for a, b in periods)
+            verified_verdicts[crossing.key] = BikeVerdict(
+                check.label, check.score, DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP,
+                "遮挡时段，目标跨线已验证，仍需人工确认" if crowded else "目标轨迹跨线已验证；不自动判定选手身份",
+                len(check.observed_ms), vehicle=check.vehicle,
+            )
+        for entry in raw:
+            key = f"{camera}|{entry['video_path']}|{entry['frame_index']}|{entry['row']}"
+            entry["crossing_check"] = asdict(crossing_checks[key])
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"crossings_camera{camera}.json").write_text(json.dumps(
-        {"schema_version": 1, "camera_index": camera, "crossings": raw,
+        {"schema_version": 1, "camera_index": camera,
+         "crossings": [entry for entry in raw if not crossing_checks or entry["crossing_check"]["state"] == "confirmed"],
+         "line_events": raw,
          "coverage": [list(item) for item in coverage],
          "obstructions": [[item.start_ms, item.end_ms] for item in obstructions]},
         ensure_ascii=False,
     ), encoding="utf-8")
 
+    pairing_crossings = [c for c in crossings if verified_verdicts is None
+                         or verified_verdicts[c.key].label == "bicycle"]
     calibration = calibrate_evidence_clock(
-        [ClockCrossing(item.recorder_ms, item.session_id) for item in crossings],
+        [ClockCrossing(item.recorder_ms, item.session_id) for item in pairing_crossings],
         reads,
         camera_index=camera,
     )
-    sessions = {item.session_id for item in crossings if item.session_id}
+    sessions = {session for _start, _end, session in coverage if session}
     anchors, other_recording_anchors, changed_anchors = manual_anchors_for_run(
         workspace, camera, reads, sessions,
     )
@@ -700,6 +938,13 @@ def analyse_camera(
         "camera_index": camera,
         "files": len(files),
         "crossings": len(crossings),
+        "line_candidates": len(line_candidates),
+        "crossing_verification": {
+            "state": "enabled" if config.model_path else "not_configured",
+            "confirmed": sum(c.state == "confirmed" for c in crossing_checks.values()),
+            "not_crossed": sum(c.state == "not_crossed" for c in crossing_checks.values()),
+            "unverified": sum(c.state == "unverified" for c in crossing_checks.values()),
+        },
         "coverage": [list(item) for item in coverage],
         "calibration_warnings": warnings,
         "items": [],
@@ -708,9 +953,12 @@ def analyse_camera(
                         "message": "认车未配置，降噪未启用" if not config.model_path else "认车等待校时及候选",
                         "crop_mode": config.crop_modes.get(camera, "up")},
     }
+    if any(check.reason == "model_failed" for check in crossing_checks.values()):
+        result["bike_status"].update(state="failed", message="跨线模型运行失败；线事件保留待核，不自动配对")
     if choice.model is None:
-        # The whole camera waits, as before, but say why an operator anchor could
-        # not start it: another recording's anchor must never unlock this one.
+        # A clock is required for chip pairing, but not for the independent
+        # finish-line object check.  Keep that check running so a camera can be
+        # tested by walking through its configured line before race chips exist.
         if other_recording_anchors:
             warnings.append(
                 f"另有 {len(other_recording_anchors)} 个人工校时锚点属于其他录像会话，不能用于本次配对"
@@ -720,6 +968,72 @@ def analyse_camera(
                 f"{len(changed_anchors)} 个人工校时锚点对应的芯片记录已作废、替换或已变更，不能用于本次配对"
             )
         result["calibration_warnings"] = warnings
+        if config.model_path and coverage:
+            try:
+                video_items, verdicts = _uncalibrated_video_items(
+                    config, camera, crossings,
+                    periods=merge_obstructions(obstructions),
+                    progress=progress, checkpoint=checkpoint,
+                    verified_verdicts=verified_verdicts,
+                )
+            except Exception as error:  # A model failure must not hide crossings.
+                logger.warning("uncalibrated bike check unavailable: %s", error)
+                video_items, verdicts = _uncalibrated_video_items(
+                    config, camera, crossings, periods=[], progress=progress,
+                    checkpoint=checkpoint, verified_verdicts={},
+                )
+                result["bike_status"].update(
+                    state="failed",
+                    message=f"认车加载/推理失败，候选保留：{error}",
+                )
+            result["items"] = video_items + _unchecked_line_items(line_candidates, crossing_checks, camera)
+            for item in video_items:
+                frame = item.evidence.get("frame", {})
+                key = f"{camera}|{frame.get('video_path')}|{frame.get('frame_index')}|{item.evidence.get('row')}"
+                if key in crossing_checks:
+                    item.evidence["crossing_check"] = asdict(crossing_checks[key])
+            if result["bike_status"].get("state") != "failed":
+                result["bike_status"].update(
+                    state="enabled" if verdicts else "waiting_crossing" if line_candidates else "no_candidates",
+                    message=(
+                        "认车已运行；等待第一名校时后进行芯片配对"
+                        if verdicts else "尚无确认穿越的目标；线变化与遮挡不计过线"
+                    ),
+                    model_digest=model_fingerprint(config.model_path, config.model_input),
+                )
+            result["calibration_pending"] = True
+            first = next(iter(pairing_crossings), None)
+            if first is not None:
+                result["first_rider_candidate"] = {
+                    "recorder_ms": int(first.recorder_ms),
+                    "frame": first.frame_payload(0),
+                    "session_id": first.session_id,
+                }
+            if config.live and coverage:
+                result["analyzed_through_ms"] = max(
+                    end for _start, end, _session in coverage
+                ) - config.evidence_delay_ms
+            # A hotel test may have no chip reads; a live race can have reads
+            # waiting for the first anchor. Both remain visible in the queue.
+            if reads:
+                result["items"] += waiting_items(
+                    reads, camera, "等待第一名原始帧校时后进行芯片配对"
+                )
+            by_segment = {f.meta.get("segment_id"): f for f in files}
+            for item in result["items"]:
+                frame = item.evidence.get("frame")
+                source = by_segment.get(frame.get("segment_id")) if frame else None
+                if source is not None:
+                    meta = source.meta
+                    frame.update(line_config=meta.get("line_config", {}),
+                                 line_digest=meta.get("line_digest", ""),
+                                 geometry_digest=meta.get("geometry_digest", ""),
+                                 geometry_path=str(source.path.parent / meta["geometry_file"])
+                                 if meta.get("geometry_file") else "",
+                                 line_source=meta.get("line_source", "configured"),
+                                 snap_offset_px=meta.get("snap_offset_px", 0))
+            return result
+        # Without a configured detector there is no independent video result.
         result["error"] = "自动校时失败：" + "；".join(warnings)
         if config.live:
             result["items"] = waiting_items(reads, camera, result["error"])
@@ -757,7 +1071,7 @@ def analyse_camera(
     for session in {item[2] for item in coverage}:
         if served_sessions is not None and session not in served_sessions:
             continue
-        session_crossings = [item for item in crossings if item.session_id == session]
+        session_crossings = [item for item in pairing_crossings if item.session_id == session]
         session_reads = by_session.get(session, [])
         pairing = pair_crossings(
             session_crossings, [item.recorder_ms for item in session_crossings],
@@ -765,6 +1079,9 @@ def analyse_camera(
         )
         matched += pairing.matched
         video_only += pairing.video_only
+        if verified_verdicts is not None:
+            video_only += [c for c in crossings if c.session_id == session
+                           and verified_verdicts[c.key].label != "bicycle"]
         chip_only += pairing.chip_only
     uncalibrated_sessions = sorted({
         name for _start, _end, name in coverage
@@ -850,11 +1167,13 @@ def analyse_camera(
     def crowded(recorder_ms: int) -> bool:
         return any(start - 5_000 <= recorder_ms <= end + 5_000 for start, end in periods)
 
-    to_check = [item for item in video_only if not item.in_obstruction]
+    to_check = list(video_only)
     if config.check_paired_bikes:
         to_check += [item[0] for item in matched]
     try:
-        verdicts = _bike_verdicts(config, camera, to_check, crowded, progress=progress, checkpoint=checkpoint)
+        verdicts = verified_verdicts if verified_verdicts is not None else _bike_verdicts(
+            config, camera, to_check, crowded, progress=progress, checkpoint=checkpoint,
+        )
         if config.model_path:
             result["bike_status"].update(state="enabled" if to_check else "no_candidates",
                                          message="认车已启用（含有效缓存）" if to_check else "已配置；本轮无待认车候选",
@@ -885,7 +1204,7 @@ def analyse_camera(
     result["fragments"] = outcome.fragments
     result["near_crossings"] = outcome.near_crossings
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
-    result["items"] = list(outcome.items)
+    result["items"] = list(outcome.items) + _unchecked_line_items(line_candidates, crossing_checks, camera, model)
     result["auto_passed"] = outcome.auto_passed
     recognition = result["bike_status"]
     evidence_signature = hashlib.sha256(json.dumps([line_signature, recognition], sort_keys=True).encode()).hexdigest()

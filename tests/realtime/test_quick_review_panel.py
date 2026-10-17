@@ -25,7 +25,8 @@ def panel(qapp, tmp_path):
                        "旧识别描述不应出现在判读界面", chip_time_ms=FRAME["recorder_ms"],
                        bibs=("321", "258"), event_ids=("one", "two"),
                        evidence={"frame": FRAME, "bike": {"label": "bicycle", "score": .94}})
-    (directory / "problem_list.json").write_text(json.dumps({"items": [item.to_payload()]}), encoding="utf-8")
+    (directory / "problem_list.json").write_text(json.dumps({"race_id": SCOPE[0], "stage_id": SCOPE[1],
+                                                            "items": [item.to_payload()]}), encoding="utf-8")
     widget = QuickReviewPanel()
     widget.events = [event(), event("258", "two", FRAME["recorder_ms"] + 500)]
     widget.frame = dict(FRAME)
@@ -76,7 +77,7 @@ def test_selecting_athlete_does_not_confirm_until_explicit_finish_line_action(pa
     panel._arrival_clicked(row(panel, "321"))
     assert not any(entry.decision for entry in panel._arrival_rows)
     assert panel._selected_arrival().bib == "321"
-    assert not panel.confirm_arrival_button.isEnabled()
+    assert panel.confirm_arrival_button.isEnabled()  # F changes layout, not permission to judge.
 
     panel.toggle_big_view()
     assert panel.confirm_arrival_button.isEnabled()
@@ -149,6 +150,27 @@ def test_no_picture_no_confirmation_and_no_automatic_identity(panel):
     assert not panel.confirm_arrival_button.isEnabled()
     panel.confirm_arrival_button.click()
     assert not any(entry.decision for entry in panel._arrival_rows)
+
+
+def test_confirmation_explains_missing_classification_and_works_without_f(panel):
+    assert not panel.confirm_arrival_button.isEnabled()
+    assert "1" in panel.confirmation_status.text()
+    panel._confirm_bicycle()
+    assert not panel.big_view
+    assert panel.confirm_arrival_button.isEnabled()
+    QTest.keyClick(panel, Qt.Key_Return)
+    assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+
+
+def test_athlete_waiting_for_analysis_does_not_block_manual_candidate(panel):
+    from realtime.problem_items import STATUS_WAITING
+    panel._arrival_rows[0].item = replace(panel._arrival_rows[0].item, status=STATUS_WAITING)
+    # The source candidate remains usable; the chip row's automatic-analysis status is separate.
+    panel._active_item = panel.items[0]
+    panel._confirm_bicycle()
+    assert panel.confirm_arrival_button.isEnabled()
+    panel.confirm_arrival_button.click()
+    assert sum(row.decision is not None for row in panel._arrival_rows) == 1
 
 
 def test_exclude_and_hold_are_manual_and_do_not_delete_chip_events(panel):

@@ -246,7 +246,7 @@ def build_video_items(
     excluded = []
     before_race = []
     for crossing in video_only:
-        if crossing.in_obstruction:
+        if crossing.in_obstruction and crossing.key not in verdicts:
             continue
         if race_start_ms is not None and crossing.recorder_ms < race_start_ms:
             before_race.append(crossing)
@@ -264,6 +264,9 @@ def build_video_items(
     read_of: dict[str, ChipRead] = {read.read_id: read for read in [*chip_only, *(item[1] for item in matched)]}
     expected_values = sorted(expected.values())
     for crossing, verdict in sorted(candidates, key=lambda item: item[0].recorder_ms):
+        if verdict is not None and verdict.label in ("pedestrian", "vehicle"):
+            rest.append((crossing, verdict))
+            continue  # A nearby chip cannot turn a non-bicycle target into a rider.
         late = [
             read for read in chip_only
             if read.read_id not in resolved and (

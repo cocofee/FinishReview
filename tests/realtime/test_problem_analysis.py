@@ -482,8 +482,8 @@ def test_editor_line_drives_full_pipeline_and_new_calibration_version(synthetic_
     assert payload["auto_passed"][0]["frame"]["geometry_digest"]
 
 
-def test_model_disabled_failure_and_enabled_keep_same_missing_candidate(synthetic_race, tmp_path, monkeypatch):
-    from realtime.bike_check import BikeVerdict
+def test_crossing_gate_failure_keeps_line_evidence_without_claiming_crossings(synthetic_race, tmp_path, monkeypatch):
+    from realtime.target_crossing import TargetCrossingCheck
 
     _root, workspace, original, strips = synthetic_race
     reads = tuple(read for i, read in enumerate(workspace.reads) if i != 5)
@@ -494,10 +494,12 @@ def test_model_disabled_failure_and_enabled_keep_same_missing_candidate(syntheti
     config.model_path.write_bytes(b"invalid model")
     failed = analyse_camera(config, workspace, 1, strips, reads=reads)
     assert failed["bike_status"]["state"] == "failed"
-    assert KIND_NO_CHIP_CROSSING in _kinds(failed)
-    assert _kinds(failed) == _kinds(disabled)
-    monkeypatch.setattr(problem_analysis, "YoloxDetector", lambda *a: object())
-    monkeypatch.setattr(problem_analysis, "classify_frames", lambda *a, **kw: BikeVerdict("bicycle", .9, "keep"))
+    assert failed["crossings"] == 0 and not failed["auto_passed"]
+    assert failed["line_candidates"] == len(CROSSINGS_S)
+    assert len([i for i in failed["items"] if i.evidence.get("crossing_check")]) == len(CROSSINGS_S)
+    monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
+        c.key: TargetCrossingCheck("confirmed", "anchor_crossed_line", "bicycle", .9) for c in crossings
+    })
     enabled = analyse_camera(config, workspace, 1, strips, reads=reads)
     assert enabled["bike_status"]["state"] == "enabled"
     assert _kinds(enabled) == _kinds(disabled)
@@ -677,6 +679,163 @@ def test_without_a_usable_anchor_the_camera_still_waits(synthetic_race, tmp_path
     assert result.get("calibration") is None and "自动校时失败" in result["error"]
     assert [item.kind for item in result["items"]] == [KIND_WAITING]
     assert not (config.resolved_output() / "video_clock_models.jsonl").exists()
+
+
+def test_video_model_runs_before_first_rider_calibration(synthetic_race, tmp_path, monkeypatch):
+    """A finish-line camera can be tested with a walking person before chips arrive."""
+
+    from realtime.target_crossing import TargetCrossingCheck
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    model = tmp_path / "camera-test.onnx"
+    model.write_bytes(b"test model")
+    config = replace(config, model_path=model, live=True)
+    monkeypatch.setattr(
+        problem_analysis,
+        "_verify_crossing_candidates",
+        lambda _config, _camera, _files, crossings, **_kwargs: {
+            crossing.key: TargetCrossingCheck("confirmed", "anchor_crossed_line", "pedestrian", .91)
+            for crossing in crossings
+        },
+    )
+
+    result = analyse_camera(config, workspace, 1, strips, reads=())
+
+    assert "error" not in result
+    assert result["calibration_pending"] is True
+    assert result["bike_status"]["state"] == "enabled"
+    assert any(item.evidence.get("bike", {}).get("label") == "pedestrian" for item in result["items"])
+    assert "first_rider_candidate" not in result  # A pedestrian is not the first rider.
+
+
+@pytest.mark.parametrize("state", ["confirmed", "not_crossed", "unverified"])
+def test_obstructed_line_events_need_verified_crossings_before_entering_the_queue(
+    synthetic_race, tmp_path, monkeypatch, state,
+):
+    from realtime.target_crossing import TargetCrossingCheck
+
+    _root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    detector = problem_analysis.detect_session_crossings
+
+    def obstructed(*args, **kwargs):
+        crossings, obstacles, coverage, raw = detector(*args, **kwargs)
+        return [replace(c, in_obstruction=True) for c in crossings], obstacles, coverage, raw
+
+    monkeypatch.setattr(problem_analysis, "detect_session_crossings", obstructed)
+    monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
+        c.key: TargetCrossingCheck(state, "test", "pedestrian", .91) for c in crossings
+    })
+    result = analyse_camera(replace(config, model_path=model, live=True), workspace, 1, strips, reads=())
+
+    assert result["analyzed_through_ms"] > START
+    assert result["calibration_pending"] and not result["auto_passed"]
+    assert result["crossings"] == (len(CROSSINGS_S) if state == "confirmed" else 0)
+    if state == "confirmed":
+        assert all(i.status == "disputed" and i.kind == KIND_NO_CHIP_CROSSING for i in result["items"])
+    elif state == "unverified":
+        assert all(i.kind == "line_activity" and i.evidence["frame"] for i in result["items"])
+        assert len(result["items"]) == len(CROSSINGS_S)
+    else:
+        assert result["items"] == []
+    saved = json.loads((config.resolved_output() / "crossings_camera1.json").read_text(encoding="utf-8"))
+    assert len(saved["crossings"]) == result["crossings"]
+    assert len(saved["line_events"]) == len(CROSSINGS_S)
+
+
+def test_crossing_gate_can_read_context_across_two_second_segments(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from realtime.problem_rules import CrossingRecord
+    from realtime.bike_check import Detection
+
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    files = []
+    for i in range(2):
+        video = tmp_path / f"part{i}.ts"
+        video.write_bytes(b"sealed")
+        files.append(problem_analysis._FileStrip(
+            tmp_path / f"part{i}.npz",
+            {"video_path": str(video), "session_id": "session", "line_digest": "line"},
+            i * 2000, np.arange(0, 2000, 40), SimpleNamespace(width=320, height=240),
+        ))
+    crossing = CrossingRecord(1, "session", "segment", str(tmp_path / "part0.ts"),
+                              1960, 49, 1960, 0, 0, 1, contact=(110, 100),
+                              segment_points=((0, 100), (300, 100)))
+    opened, requested = [], []
+
+    class Reader:
+        def __init__(self, path, threads):
+            self.path = path
+            opened.append(path)
+
+        def frames_at(self, positions):
+            requested.append((self.path, positions[0]))
+            return [(np.zeros((240, 320, 3), np.uint8), positions[0])]
+
+        def close(self):
+            pass
+
+    class Detector:
+        def __init__(self, *args):
+            self.i = 0
+
+        def detect(self, frame):
+            bottom = (120, 100, 80)[self.i]
+            self.i += 1
+            return [Detection(0, .91, 40, bottom - 60, 60, 60)]
+
+    monkeypatch.setattr(problem_analysis, "FrameReader", Reader)
+    monkeypatch.setattr(problem_analysis, "YoloxDetector", Detector)
+    config = AnalysisConfig(tmp_path, model_path=model)
+    result = problem_analysis._verify_crossing_candidates(
+        config, 1, files, [crossing], progress=lambda *a: None, checkpoint=None,
+    )
+    assert result[crossing.key].state == "confirmed"
+    assert opened == [str(tmp_path / "part0.ts"), str(tmp_path / "part1.ts")]
+    assert requested[-1] == (str(tmp_path / "part1.ts"), 560)
+    # A cached verified event does not repeat model inference.
+    monkeypatch.setattr(problem_analysis, "YoloxDetector", lambda *a: pytest.fail("cache missed"))
+    assert problem_analysis._verify_crossing_candidates(
+        config, 1, files, [crossing], progress=lambda *a: None, checkpoint=None,
+    )[crossing.key].state == "confirmed"
+    # A different line/profile cannot supply the missing neighbour.
+    files[1].meta["line_digest"] = "changed"
+    assert len(problem_analysis._verification_sources(files, crossing)) == 2
+
+
+@pytest.mark.parametrize("label", ["pedestrian", "vehicle"])
+def test_verified_non_bicycle_targets_cannot_be_auto_paired_to_chips(synthetic_race, tmp_path, monkeypatch, label):
+    from realtime.target_crossing import TargetCrossingCheck
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first)
+    workspace = AnalysisWorkspace(root)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
+        c.key: TargetCrossingCheck("confirmed", "anchor_crossed_line", label, .91) for c in crossings
+    })
+    result = analyse_camera(replace(config, model_path=model), workspace, 1, strips)
+    assert result["calibration"]["source"] == "manual_anchor"
+    assert not result["auto_passed"] and not result["late_pair_frames"]
+    assert result["pairing"]["auto_paired"] == 0
+
+
+def test_scanned_empty_video_advances_without_chips_or_clock_calibration(synthetic_race, tmp_path, monkeypatch):
+    _root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    monkeypatch.setattr(problem_analysis, "detect_session_crossings", lambda *a, **kw: (
+        [], [], [(START, START + 95_000, "session")], [],
+    ))
+    monkeypatch.setattr(problem_analysis, "YoloxDetector", lambda *a: pytest.fail("empty video invoked model"))
+    result = analyse_camera(replace(config, model_path=model, live=True), workspace, 1, strips, reads=())
+    assert result["analyzed_through_ms"] == START + 85_000
+    assert result["items"] == [] and result["crossings"] == 0
+    assert result["bike_status"]["state"] == "no_candidates"
 
 
 def test_an_anchor_of_another_recording_session_cannot_start_pairing(synthetic_race, tmp_path):
