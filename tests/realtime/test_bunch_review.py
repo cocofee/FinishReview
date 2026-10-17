@@ -209,6 +209,22 @@ def test_context_and_decoder_span_recording_files_using_actual_frame_times(synth
     assert all(p.read_bytes() == value for p, value in inputs.items())
 
 
+def test_video_only_candidate_opens_the_same_screen_without_chips(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    frame = dict(item.evidence['frame'], frame_index=50)
+    candidate = replace(
+        item, item_id='missed:synthetic', kind=KIND_NO_CHIP_CROSSING, bibs=(), event_ids=(),
+        evidence={'frame': frame, 'recorder_ms': T + 2500},
+    )
+
+    context = load_context(root, candidate)
+
+    assert context.chips == []
+    assert context.start_ms == T + 2500 - 2000
+    assert context.end_ms == T + 2500 + 2000
+    assert context.segments  # 同一个原录像窗口，判读屏照常打开
+
+
 def test_context_uses_recording_session_clock_offset_once(synthetic_bunch):
     root, item, _events = synthetic_bunch
     original = load_context(root, item)

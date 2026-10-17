@@ -177,7 +177,7 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
 
     workspace = Path(workspace)
     if item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
-        raise ValueError("本团证据已变化，请重新分析后再核对。")
+        raise ValueError("本条证据已变化，请重新分析后再核对。")
     source = AnalysisWorkspace(workspace, include_review_segments=True)
     frame = item.evidence.get("frame") or {}
     clocks = ClockModelStore(workspace / CLOCK_MODEL_FILENAME)
@@ -185,7 +185,7 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
     if camera is None and primary is None:
         candidates = [index for index in source.camera_indexes() if clocks.get(index, item.calibration_version)]
         if len(candidates) != 1:
-            raise ValueError("旧集团缺少机位证据，无法唯一确定原机位；请重新分析生成集团入口。")
+            raise ValueError("本条缺少机位证据，无法唯一确定原机位；请重新分析生成入口。")
         primary = candidates[0]
     camera = int(camera or primary)
     model = (clocks.get(camera, item.calibration_version) if primary is None or camera == int(primary)
@@ -211,15 +211,23 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
         chips.append(BunchChip(event_id, bib, read.chip_ms, int(model.to_recorder(read.chip_ms, session)),
                                latest.revision if latest else read.latest_revision, read.chip_id))
     chips.sort(key=lambda c: c.chip_ms)
-    if not chips:
-        raise ValueError("本团没有可核对的芯片记录。")
-    start, end = chips[0].recorder_ms - 1500, chips[-1].recorder_ms + 1500
+    if chips:
+        start, end = chips[0].recorder_ms - 1500, chips[-1].recorder_ms + 1500
+    else:
+        # 没有芯片也能看：视频里有、芯片没有的候选就以它自己的过线时刻为准。
+        # 这一处画面仍是同一张判读屏，操作员点人，自己判是不是选手。
+        anchor_ms = item.evidence.get("recorder_ms")
+        if anchor_ms is None:
+            anchor_ms = item.evidence.get("expected_recorder_ms")
+        if anchor_ms is None:
+            raise ValueError("本条缺少过线时刻，无法打开原录像。")
+        start, end = int(anchor_ms) - 2_000, int(anchor_ms) + 2_000
     if primary is not None and camera == int(primary):
         start = min(start, int(item.evidence.get("recorder_start_ms", start)))
         end = max(end, int(item.evidence.get("recorder_end_ms", end)))
     segments = tuple(s for s in archives if s.start_ms <= end and s.end_ms >= start)
     if not segments:
-        raise ValueError(f"机位 {camera} 的本团原录像缺失；未打开其他时段录像。")
+        raise ValueError(f"机位 {camera} 的本条原录像缺失；未打开其他时段录像。")
     config = config_from_workspace(workspace)
     anchor = next((segment for segment in segments if segment.segment.segment_id == frame.get("segment_id")), segments[0])
     line = dict((frame.get("line_config") if camera == frame.get("camera_index") else None)

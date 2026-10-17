@@ -293,7 +293,9 @@ def row_label(item: "ProblemItem") -> str:
     bike = item.evidence.get("bike") or {}
     if str(bike.get("decision", "")) == "disputed":
         return "分不清"
-    if item.status == STATUS_EXCLUDED or str(bike.get("decision", "")) == "exclude":
+    if item.status == STATUS_EXCLUDED:
+        # Only the operator's own exclusion earns this word; a model guess stays
+        # a hint on the candidate row, never a verdict on its own.
         return "非选手"
     if item.kind == KIND_AUTO_PASSED:
         return "单人"

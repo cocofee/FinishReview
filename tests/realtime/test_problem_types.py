@@ -185,7 +185,9 @@ def test_each_class_opens_its_own_tool_from_the_problem_itself(qapp, tmp_path):
     assert panel.missed_button.text() == "查看候选证据"
     assert panel.missed_button.isVisibleTo(panel)
     panel.missed_button.click()
-    assert jumps == [FRAME] and "保留待证据" in panel.hint.text()
+    # 漏读候选和集团用同一张判读屏：放大画面，点人计数，不用逐帧找。
+    assert jumps == [FRAME] and panel.big_view
+    assert "不用逐帧找" in panel.hint.text()
 
     select("bunch:1")
     # 集团的工具就是这一屏本身：按 F 点数，没有第二个窗口可开。

@@ -29,7 +29,7 @@ from realtime.problem_items import (
     KIND_TWO_CHIPS_ONE_CROSSING,
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
-    STATUS_EXCLUDED,
+    STATUS_OPEN,
 )
 from realtime.problem_rules import CrossingRecord, Obstruction, build_video_items
 
@@ -203,7 +203,7 @@ def test_unpaired_crossings_chips_and_repeated_spots():
     assert set(two.bibs) == {"6", "7"} and two.status == STATUS_CLOSED_UPSTREAM
 
 
-def test_manual_entry_closes_crossing_and_bike_verdicts_decide_exclusion():
+def test_manual_entry_closes_crossing_and_bike_verdicts_stay_hints():
     crossing = _crossing(T0 + 50_000)
     walker = _crossing(T0 + 70_000)
     unsure = _crossing(T0 + 90_000)
@@ -216,10 +216,14 @@ def test_manual_entry_closes_crossing_and_bike_verdicts_decide_exclusion():
         manual_entries=[_read("307", T0 + 49_300, manual=True)],
     )
 
-    statuses = {item.chip_time_ms: item.status for item in outcome.items}
-    assert statuses[T0 + 49_000] == STATUS_CLOSED_UPSTREAM
-    assert statuses[T0 + 69_000] == STATUS_EXCLUDED
-    assert statuses[T0 + 89_000] == STATUS_DISPUTED
+    by_time = {item.chip_time_ms: item for item in outcome.items}
+    assert by_time[T0 + 49_000].status == STATUS_CLOSED_UPSTREAM
+    # A confident pedestrian verdict is only a hint now: the operator looks at
+    # the frame and decides, so the candidate stays in the queue.
+    assert by_time[T0 + 69_000].status == STATUS_OPEN
+    assert "行人" in by_time[T0 + 69_000].status_note
+    assert "请确认" in by_time[T0 + 69_000].status_note
+    assert by_time[T0 + 89_000].status == STATUS_DISPUTED
 
 
 def test_bunches_and_obstructions_get_manual_check_items():

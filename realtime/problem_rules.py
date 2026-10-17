@@ -243,7 +243,7 @@ def build_video_items(
         return sum(abs(t - crossing.recorder_ms) < CROSSING_ISOLATION_MS for t in crossing_times) <= 1
 
     candidates: list[tuple[CrossingRecord, Optional[BikeVerdict]]] = []
-    excluded = []
+    model_non_rider = []
     before_race = []
     for crossing in video_only:
         if crossing.in_obstruction:
@@ -253,9 +253,11 @@ def build_video_items(
             continue
         verdict = verdicts.get(crossing.key)
         if verdict is not None and verdict.decision == DECISION_EXCLUDE:
-            excluded.append((crossing, verdict))
-            continue
-        candidates.append((crossing, verdict))
+            # 认车只是提示：行人、路人、汽车、摩托车也照样列出来，由操作员看原帧判。
+            # 它们不参与集团/站立的人数计算，免得旁观者把一团的统计撑大。
+            model_non_rider.append((crossing, verdict))
+        else:
+            candidates.append((crossing, verdict))
 
     resolved: set[str] = set()
     rest: list[tuple[CrossingRecord, Optional[BikeVerdict]]] = []
@@ -346,7 +348,9 @@ def build_video_items(
         status, note = STATUS_OPEN, ""
         if verdict is not None and verdict.decision == DECISION_DISPUTED:
             status, note = STATUS_DISPUTED, f"有争议：{LABEL_TEXT.get(label, label)}，{verdict.reason}"
-        elif verdict is not None and verdict.decision != DECISION_EXCLUDE and crowded(crossing.recorder_ms):
+        elif verdict is not None and verdict.decision == DECISION_EXCLUDE:
+            note = f"认车建议：{LABEL_TEXT.get(label, label)}（{verdict.score:.2f}），请确认是否选手"
+        elif verdict is not None and crowded(crossing.recorder_ms):
             note = "终点线拥挤时段"
         manual = [
             read for read in manual_entries
@@ -381,6 +385,31 @@ def build_video_items(
             evidence=evidence, calibration_version=version,
         ))
 
+    # 认车说“行人 / 车辆”的线上活动：不自动排除，单独列成一条待处理。
+    # 操作员在判读屏里看一眼：是选手就点人、补号；不是就按“不是选手”。
+    for crossing, verdict in model_non_rider:
+        chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
+        label = LABEL_TEXT.get(verdict.label, verdict.label)
+        manual = [
+            read for read in manual_entries
+            if read.active_now and abs(read.chip_ms - chip_time) <= MANUAL_MATCH_MS
+        ]
+        status, note = STATUS_OPEN, f"认车建议：{label}（{verdict.score:.2f}），请确认是否选手"
+        if manual:
+            status = STATUS_CLOSED_UPSTREAM
+            note = "CycleRace 已补录 " + "、".join(_chip_text(read) for read in manual)
+        outcome.items.append(ProblemItem(
+            item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
+            kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
+            detail=f"{format_chip_time(chip_time)} 线上活动，附近没有芯片读数（认车：{label}）"
+                   + (f"（{verdict.vehicle}）" if verdict.vehicle else ""),
+            chip_time_ms=chip_time, bibs=tuple(read.bib for read in manual),
+            event_ids=tuple(read.event_id for read in manual),
+            status=status, status_note=note, priority=10,
+            evidence=_crossing_evidence(crossing, version, verdict),
+            calibration_version=version,
+        ))
+
     # Extra changes beside a chip time that is already used by another crossing.
     # They are kept as one traceable question per chip; the nearby chip is an
     # association for the operator, not a reason to decide who crossed.
@@ -399,6 +428,8 @@ def build_video_items(
         status, note = STATUS_OPEN, ""
         if verdict is not None and verdict.decision == DECISION_DISPUTED:
             status, note = STATUS_DISPUTED, f"有争议：{LABEL_TEXT.get(label, label)}，{verdict.reason}"
+        elif verdict is not None and verdict.decision == DECISION_EXCLUDE:
+            note = f"认车建议：{LABEL_TEXT.get(label, label)}（{verdict.score:.2f}），请确认是否选手"
         elif crowded(crossing.recorder_ms):
             note = "终点线拥挤时段"
         manual = [
@@ -484,19 +515,6 @@ def build_video_items(
             calibration_version=version,
         ))
 
-    for crossing, verdict in excluded:
-        chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
-        outcome.items.append(ProblemItem(
-            item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
-            kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
-            detail=f"{format_chip_time(chip_time)} 线上活动，认车为{LABEL_TEXT.get(verdict.label, verdict.label)}"
-                   + (f"（{verdict.vehicle}）" if verdict.vehicle else ""),
-            chip_time_ms=chip_time, status=STATUS_EXCLUDED,
-            status_note=f"已排除：{LABEL_TEXT.get(verdict.label, verdict.label)} {verdict.score:.2f}",
-            priority=90, evidence=_crossing_evidence(crossing, version, verdict),
-            calibration_version=version,
-        ))
-
     for crossing in before_race:
         chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
         outcome.items.append(ProblemItem(
@@ -542,7 +560,8 @@ def build_video_items(
     outcome.items += _no_video_items(camera_index, no_video)
     outcome.stats = {
         "candidates": len(candidates),
-        "excluded": len(excluded),
+        "excluded": 0,
+        "model_non_rider": len(model_non_rider),
         "late_pairs": len(outcome.late_pairs),
         "duplicates": outcome.duplicates,
         "merged_fragments": len(outcome.fragments),

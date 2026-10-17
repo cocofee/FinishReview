@@ -64,9 +64,13 @@ from .problem_items import (
     STATUS_WAITING,
     KIND_AUTO_PASSED,
     KIND_BUNCH,
+    KIND_CHIP_NO_CROSSING,
     KIND_MANUAL_REVIEW,
+    KIND_NEAR_CROSSING,
+    KIND_NO_CHIP_CROSSING,
     KIND_NO_VIDEO,
     KIND_OBSTRUCTION,
+    KIND_STANDING,
     KIND_SYNC,
     KIND_TWO_CHIPS_ONE_CROSSING,
     KIND_WAITING,
@@ -94,6 +98,20 @@ from .problem_resolutions import (
 )
 
 
+# 判读屏不只属于集团：任何有原帧的过线候选都用同一张屏——上面是过线带和芯片
+# 刻度，下面点人计数。有芯片的人数对上就收尾；没芯片的操作员自己判是不是选手。
+_REVIEW_SCREEN_KINDS = frozenset((
+    KIND_BUNCH,
+    KIND_OBSTRUCTION,
+    KIND_NO_CHIP_CROSSING,
+    KIND_NEAR_CROSSING,
+    KIND_TWO_CHIPS_ONE_CROSSING,
+    KIND_CHIP_NO_CROSSING,
+    KIND_MANUAL_REVIEW,
+    KIND_STANDING,
+))
+
+
 def _progress_group(stage: str) -> str:
     """Which of sampling / clock / analysis a worker message belongs to."""
 
@@ -105,13 +123,16 @@ def _progress_group(stage: str) -> str:
 
 
 def _missed_entry(item: ProblemItem, batch, bunch_parent) -> bool:
-    """A missed-read candidate is entered through its evidence, not through a decision.
+    """Any crossing candidate is entered through the same judging screen.
 
-    Members handled inside a batch or bunch tool keep that tool as their entry.
+    A group keeps its own key/entry; a member already handled inside a batch or
+    a bunch tool keeps that tool as its entry.  Everything else with a source
+    frame opens the same picture-and-count screen.
     """
 
-    return (item.task_type == TYPE_MISSED and bool(item.evidence.get("frame"))
-            and item.status != STATUS_WAITING and batch is None and bunch_parent is None)
+    return (item.kind in _REVIEW_SCREEN_KINDS and item.kind not in (KIND_BUNCH, KIND_OBSTRUCTION)
+            and bool(item.evidence.get("frame")) and item.status != STATUS_WAITING
+            and batch is None and bunch_parent is None)
 
 
 # 待确认 keeps the row in the queue instead of deciding it: the operator looked and
@@ -119,7 +140,7 @@ def _missed_entry(item: ProblemItem, batch, bunch_parent) -> bool:
 PENDING_REASON = "路人 / 遮挡 / 看不清，先放着"
 
 # 判读集团时画面上面那条刻度的一句话图例：四种颜色各是什么，一眼就分得清。
-TIMELINE_HELP = "整团过线图 · 按时间从左到右过线 · 点刻度回看"
+TIMELINE_HELP = "过线图 · 按时间从左到右过线 · 点刻度回看"
 
 # The one token a row of the queue carries when its class does not already name it.
 SHORT_NOTES = {
@@ -426,7 +447,7 @@ class ProblemListPanel(QFrame):
         self.batch_button.hide()
         self.action_row.addWidget(self.batch_button)
         self.missed_button = QPushButton(TYPE_ENTRY_LABELS[TYPE_MISSED], self.decision_box)
-        self.missed_button.setToolTip("跳到候选过线的原帧，逐帧看这一处变化；认不出号码就保留待证据，不凭猜测排除")
+        self.missed_button.setToolTip("打开这一处的判读画面：点人计数，一个人直接确认，两个人点两个人，不用逐帧找")
         self.missed_button.setStyleSheet("font-weight:600;")
         self.missed_button.clicked.connect(self._open_missed)
         self.missed_button.hide()
@@ -1106,7 +1127,9 @@ class ProblemListPanel(QFrame):
         detail = item.detail + (f"\n{item.status_note}" if item.status_note else "")
         bike = item.evidence.get("bike")
         if bike:
-            detail += f"\n认车：{bike.get('label')} {bike.get('score')}" + (f"（{bike['reason']}）" if bike.get("reason") else "")
+            from .bike_check import LABEL_TEXT
+            label = LABEL_TEXT.get(str(bike.get("label", "")), str(bike.get("label", "")))
+            detail += f"\n认车：{label} {bike.get('score')}" + (f"（{bike['reason']}）" if bike.get("reason") else "")
         if item.calibration_version:
             detail += f"\n校时版本 v{item.calibration_version}"
         self.detail.setText(detail)
@@ -1208,8 +1231,13 @@ class ProblemListPanel(QFrame):
         item = self.current_item()
         if item is None or not item.evidence.get("frame"):
             return
-        self.jump_requested.emit(dict(item.evidence["frame"]))
-        self.hint.setText("已跳到候选过线的原帧：逐帧看这一处变化，认得出号码就补录；看不清就保留待证据，不凭猜测排除。")
+        if self._big_view:
+            self.jump_requested.emit(dict(item.evidence["frame"]))
+        else:
+            # 和集团核对同一张屏：过线带、芯片刻度、点人计数都在。
+            # 一个人就点一下确认，两个人就点两个人，不再一帧一帧找。
+            self.toggle_big_view()
+        self.hint.setText("看这一处画面：点每位压线的人；一个人直接确认，两个人就点两个人，不用逐帧找。")
 
     # ----- working the queue by keyboard ---------------------------------
     def keyPressEvent(self, event) -> None:
@@ -1374,7 +1402,8 @@ class ProblemListPanel(QFrame):
 
     def _inline_context(self):
         item = self.current_item()
-        if item is None or item.kind not in (KIND_BUNCH, KIND_OBSTRUCTION) or self.workspace_dir is None:
+        if (item is None or item.kind not in _REVIEW_SCREEN_KINDS
+                or not item.evidence.get("frame") or self.workspace_dir is None):
             return None
         key = repr(item.to_payload())
         if key != self._group_context_id:
