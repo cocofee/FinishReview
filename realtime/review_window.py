@@ -2487,6 +2487,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.set_frame_provider(
             lambda: self._frame_for_problem_count(self._problem_pane())
         )
+        self.problem_panel.confirmation_preparing.connect(self._pause_arrival_confirmation)
         self.results_panel.layout().insertWidget(1, self.problem_panel)
         self.problem_panel.hide()
         self.problem_panel.set_events_provider(
@@ -2554,11 +2555,17 @@ class FinishReviewWindow(PassageReviewSurface):
                 self._return_to_problem()
             self._refresh_crossing_cards()
             self._problem_count_mode_changed(True)
+
         # 表里点到的是一条自动对应的记录：那是在复查这条过线，点画面不算新建待处理。
         # 放在 _return_to_problem 之后，因为回看问题本身会清掉这个标记。
         from .problem_items import KIND_AUTO_PASSED
         if item is not None and item.kind == KIND_AUTO_PASSED:
             self._opened_normal_crossing = item.item_id
+
+    def _pause_arrival_confirmation(self):
+        # Freeze the displayed frame without seeking to a playback clock estimate.
+        self._set_sync_playing(False, seek_final=False)
+        self._problem_pane().set_playing(False)
 
     def _problem_big_view_changed(self, big: bool) -> None:
         """Give the enlarged picture the room of the rail, and fit the frame to it.
@@ -2741,6 +2748,8 @@ class FinishReviewWindow(PassageReviewSurface):
         pane.video_view.set_identity_badge_visible(False)
         pane.active_badge.hide()
         pane.status_label.hide()
+        if getattr(self.problem_panel, "quick_review", False):
+            self.problem_panel._sync_arrival_confirmation()
         if pane is not self._active_playback_pane():
             return
         item = self.problem_panel.current_item()

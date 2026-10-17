@@ -380,10 +380,14 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         window.problem_panel.table.setCurrentCell(0, 0)
         qapp.processEvents()
         window.problem_panel.set_browsing(True)
+        pane_height = window.regular_pane.video_view.height()
         window._toggle_maximized_pane(window.regular_pane)
         qapp.processEvents()
         assert window._maximized_window is None
-        assert not window.problem_panel._big_view
+        assert window.problem_panel._big_view
+        assert not window.preview_panel.isVisibleTo(window)
+        assert window.regular_pane.video_view.height() > pane_height
+        assert window.problem_panel.quick_toolbar.isVisibleTo(window.problem_panel)
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
@@ -399,12 +403,31 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.preview_panel.isVisibleTo(window)
+
+        view = window.regular_pane.video_view
+        view.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(view.viewport(), Qt.Key_F)
+        qapp.processEvents()
+        assert window.problem_panel.big_view
+        assert not window.preview_panel.isVisibleTo(window)
+        QTest.keyClick(view.viewport(), Qt.Key_Escape)
+        qapp.processEvents()
+        assert not window.problem_panel.big_view
+        assert window.preview_panel.isVisibleTo(window)
+
+        window.regular_pane.maximize_btn.click()
+        qapp.processEvents()
+        assert window.problem_panel.big_view
+        window.regular_pane.maximize_btn.click()
+        qapp.processEvents()
+        assert not window.problem_panel.big_view
     finally:
         window.close()
 
 
-def test_picture_clicks_do_not_count_and_number_row_saves_current_frame(qapp, tmp_path):
-    """Classify with 1, then identify a rider by clicking their existing event row."""
+def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp, tmp_path):
+    """Choose the athlete, locate the finish-line frame, then confirm explicitly."""
 
     import json
     from PyQt5.QtCore import QPoint
@@ -458,10 +481,16 @@ def test_picture_clicks_do_not_count_and_number_row_saves_current_frame(qapp, tm
         qapp.processEvents()
         QTest.mouseClick(window.problem_panel.table.viewport(), Qt.LeftButton,
                          pos=window.problem_panel.table.visualItemRect(cell).center())
+        assert not any(row.decision for row in window.problem_panel._arrival_rows)
+        assert window.problem_panel.confirm_arrival_button.isEnabled()
+        assert pane._current_frame_index == 51
+        # Only explicit confirmation saves the frame, after the operator steps forward.
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2250, 56)
+        window.problem_panel.confirm_arrival_button.click()
         confirmed = [row for row in window.problem_panel._arrival_rows if row.decision]
         assert len(confirmed) == 1 and confirmed[0].bib == "321"
-        assert confirmed[0].decision["frame"]["frame_index"] == 51
-        assert confirmed[0].decision["frame"]["recorder_ms"] == start + 2050
+        assert confirmed[0].decision["frame"]["frame_index"] == 56
+        assert confirmed[0].decision["frame"]["recorder_ms"] == start + 2250
     finally:
         window.close()
 
@@ -658,8 +687,10 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         qapp.processEvents()
         QTest.keyClick(rail.canvas.viewport(), Qt.Key_F)
         qapp.processEvents()
-        assert not panel.big_view
+        assert panel.big_view
         assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isHidden()
+        assert not window.preview_panel.isVisibleTo(window)
+        assert panel.quick_toolbar.isVisibleTo(panel)
         panel.toggle_big_view()
         qapp.processEvents()
 
@@ -668,7 +699,7 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         qapp.processEvents()
         QTest.keyClick(window.recheck_button, Qt.Key_F)
         qapp.processEvents()
-        assert not panel.big_view
+        assert panel.big_view
         panel.toggle_big_view()
         qapp.processEvents()
 
