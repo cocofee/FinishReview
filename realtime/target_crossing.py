@@ -16,6 +16,7 @@ from .bike_check import BICYCLE, PERSON, VEHICLES, Detection
 
 
 VERIFICATION_OFFSETS_MS = (-600, 0, 600)
+VERIFICATION_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ def check_target_tracks(
     for stamp, boxes in observations:
         boxes = [box for box in boxes if box.score >= 0.35 and box.w > 0 and box.h > 0]
         pairs = []
+        competing = [[] for _ in boxes]
         for ti, track in enumerate(tracks):
             before_ms, before = track[-1]
             if stamp - before_ms > 850:
@@ -92,9 +94,14 @@ def check_target_tracks(
                 overlap = _iou(before, box) if before.cls == box.cls else 0.0
                 if overlap >= 0.15:
                     matches.append(overlap)
+                    competing[bi].append(overlap)
                     pairs.append((overlap, ti, bi))
             if len(matches) > 1 and sorted(matches)[-1] - sorted(matches)[-2] < 0.08:
                 ambiguous = True
+        # Occlusion can merge two previous targets into one box, too.
+        if any(len(scores) > 1 and sorted(scores)[-1] - sorted(scores)[-2] < 0.08
+               for scores in competing):
+            ambiguous = True
         used_tracks, used_boxes = set(), set()
         for _overlap, ti, bi in sorted(pairs, reverse=True):
             if ti not in used_tracks and bi not in used_boxes:
@@ -136,7 +143,7 @@ def check_target_tracks(
         return TargetCrossingCheck("confirmed", "anchor_crossed_line", label, score, vehicle, direction, observed)
     if clipped:
         reason = "clipped_target"
-    elif any(len(track) == len(observations) for track in tracks):
+    elif tracks and all(len(track) == len(observations) for track in tracks):
         return TargetCrossingCheck("not_crossed", "no_side_change", observed_ms=observed)
     else:
         reason = "insufficient_track"

@@ -314,11 +314,28 @@ def test_live_scheduler_serializes_pauses_and_drains_last_segment(qapp, tmp_path
     panel.live_tick(True)
     assert panel._process is process
     panel._analysis_done(0)
+    import time
+    assert panel._next_analysis - time.monotonic() < 1
     panel._next_analysis = 0
     panel.live_tick(False)
     assert panel._process is not None
     assert "--live-problems" not in panel._process.arguments()
     assert "--finish-live-problems" in panel._process.arguments()
+    panel.stop_analysis()
+
+
+def test_incremental_publication_refreshes_before_worker_finishes(qapp, tmp_path, monkeypatch):
+    from PyQt5.QtCore import QProcess
+    monkeypatch.setattr(QProcess, "start", lambda self: None)
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel._start_analysis()
+    process = panel._process
+    refreshed = []
+    monkeypatch.setattr(panel, "refresh", lambda: refreshed.append(True))
+    panel._consume_progress((json.dumps({"stage": "清单已发布", "done": 1, "total": 1}) + "\n").encode("utf-8"))
+    assert refreshed == [True]
+    assert panel._process is process
     panel.stop_analysis()
 
 

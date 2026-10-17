@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ DEFAULT_DECODE_THREADS = 2
 SNAP_SEARCH_PX = 80
 SNAP_FRAMES = 7
 STRIP_SCHEMA_VERSION = 1
+logger = logging.getLogger("FinishReview.LineSampling")
 
 
 class LineSamplingError(RuntimeError):
@@ -193,6 +195,8 @@ class LineStrip:
     decode_seconds: float = 0.0
     cpu_seconds: float = 0.0
     meta: Optional[dict] = None
+    stage_seconds: Optional[dict] = None
+    decode_backend: str = "opencv"
 
     @property
     def frame_count(self) -> int:
@@ -232,14 +236,18 @@ def sample_video_file(
     snap: bool = False,
     checkpoint: Optional[Callable[[], None]] = None,
     cancelled: Callable[[], bool] = lambda: False,
+    fast_decode: bool = True,
 ) -> LineStrip:
     """Decode every frame once and keep only the finish-line band."""
 
     path = Path(path)
-    capture = _open_capture(path, threads)
     started_wall, started_cpu = time.perf_counter(), time.process_time()
+    capture = _open_capture(path, threads)
+    stages = {"open": time.perf_counter() - started_wall, "read": 0.0, "sample": 0.0, "checkpoint": 0.0}
     try:
+        started = time.perf_counter()
         ok, frame = capture.read()
+        stages["read"] += time.perf_counter() - started
         if not ok or frame is None:
             raise LineSamplingError(f"录像没有可解码的画面：{path}")
         # Use decoded (orientation-corrected) pixels, not container dimensions.
@@ -252,6 +260,35 @@ def sample_video_file(
             geometry = snapped or geometry
             capture = _open_capture(path, threads)
             ok, frame = capture.read()
+        if fast_decode and path.suffix.lower() in (".ts", ".mkv", ".mp4", ".mov") and not cancelled():
+            from .line_sampling_ffmpeg import sample_roi
+            from .stream_recorder import find_ffmpeg_executable
+
+            executable = find_ffmpeg_executable()
+            if executable is not None:
+                expected = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                first_pts = float(capture.get(cv2.CAP_PROP_POS_MSEC))
+                orientation = float(capture.get(cv2.CAP_PROP_ORIENTATION_META))
+                if orientation % 360 == 0:
+                    capture.release()
+                    try:
+                        strip, pts, roi_stages = sample_roi(
+                            path, geometry, executable, threads=threads, checkpoint=checkpoint,
+                            cancelled=cancelled, expected_frames=expected, first_pts=first_pts,
+                        )
+                        return LineStrip(
+                            strip=strip, pts_ms=pts, geometry=geometry, video_path=str(path), fps=fps,
+                            decode_seconds=time.perf_counter() - started_wall,
+                            cpu_seconds=time.process_time() - started_cpu,
+                            stage_seconds=dict(roi_stages, probe=round(stages["open"] + stages["read"], 4)),
+                            decode_backend="ffmpeg_roi",
+                        )
+                    except InterruptedError:
+                        raise
+                    except Exception as error:
+                        logger.info("ROI decode unavailable for %s; use full-frame decoder: %s", path.name, error)
+                        capture = _open_capture(path, threads)
+                        ok, frame = capture.read()
         mapx, mapy = geometry.remap_maps()
         columns: list[np.ndarray] = []
         pts: list[float] = []
@@ -259,10 +296,16 @@ def sample_video_file(
             if not ok or frame is None:
                 break
             pts.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)))
+            started = time.perf_counter()
             columns.append(cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR).mean(axis=1).astype(np.uint8))
+            stages["sample"] += time.perf_counter() - started
             if checkpoint is not None:
+                started = time.perf_counter()
                 checkpoint()
+                stages["checkpoint"] += time.perf_counter() - started
+            started = time.perf_counter()
             ok, frame = capture.read()
+            stages["read"] += time.perf_counter() - started
     finally:
         capture.release()
     if not columns:
@@ -276,6 +319,7 @@ def sample_video_file(
         fps=fps,
         decode_seconds=time.perf_counter() - started_wall,
         cpu_seconds=time.process_time() - started_cpu,
+        stage_seconds={key: round(value, 4) for key, value in stages.items()},
     )
 
 
@@ -309,6 +353,8 @@ def save_strip(path: str | Path, strip: LineStrip, meta: Mapping[str, Any]) -> N
         geometry_digest=hashlib.sha256(strip.geometry.xs.tobytes() + strip.geometry.ys.tobytes()).hexdigest(),
         decode_seconds=round(strip.decode_seconds, 2),
         cpu_seconds=round(strip.cpu_seconds, 2),
+        stage_seconds=strip.stage_seconds or {},
+        decode_backend=strip.decode_backend,
     )
     # Keep the small actual geometry even when the large sampling cache is
     # replaced. Historical decisions must not lose their snapped line.
@@ -352,6 +398,8 @@ def load_strip(path: str | Path) -> LineStrip:
             fps=float(meta.get("fps", 0.0)),
             decode_seconds=float(meta.get("decode_seconds", 0.0)),
             cpu_seconds=float(meta.get("cpu_seconds", 0.0)),
+            stage_seconds=meta.get("stage_seconds", {}),
+            decode_backend=meta.get("decode_backend", "opencv"),
             meta=meta,
         )
 

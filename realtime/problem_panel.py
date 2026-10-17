@@ -786,11 +786,14 @@ class ProblemListPanel(QFrame):
             statuses = []
             for camera, value in cameras.items():
                 detail = value.get('error') or value.get('bike_status', {}).get('message', '')
-                for key, label in (("sealed_through_ms", "本轮封存至"), ("analyzed_through_ms", "分析至")):
+                for key, label in (("sealed_through_ms", "本轮封存至"), ("scanned_through_ms", "扫描至"),
+                                   ("analyzed_through_ms", "分析至")):
                     if value.get(key) is not None:
                         detail += f"；{label} {format_chip_time(value[key], date=True)}"
                 if value.get("missing_line_segments"):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
+                if value.get("pending_segments"):
+                    detail += f"；{value['pending_segments']} 个片段排队中"
                 statuses.append(f"机位 {camera}：{detail}")
             self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
         # A manual count of several people becomes one independent crossing per
@@ -2492,6 +2495,10 @@ class ProblemListPanel(QFrame):
             if message.get("stage") == "skipped":
                 self._skip_message = str(message.get("message", ""))
                 continue
+            if message.get("stage") == "清单已发布":
+                self.refresh()
+                self.analysis_finished.emit()
+                continue
             total = message.get("total") or 0
             self.analysis_status = f"后台分析：{message.get('stage')} {message.get('done')}/{total}"
             self.stage_health[_progress_group(str(message.get("stage", "")))] = (
@@ -2504,7 +2511,7 @@ class ProblemListPanel(QFrame):
         error = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")[-400:] if process else ""
         if process is not None:
             process.deleteLater()
-        self._next_analysis = time.monotonic() + 10
+        self._next_analysis = time.monotonic() + (5 if _args and _args[0] != 0 else 0.25)
         if _args and _args[0] != 0:
             self._last_live_signature = None
             self._final_analysis_pending = self._finalizing_live
