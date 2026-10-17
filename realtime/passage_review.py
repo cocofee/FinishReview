@@ -1327,6 +1327,7 @@ class PassageEvidencePane(QFrame):
         self._pending_marker_unknown = False
         self._pending_marker_label = ""
         self._marking_enabled = False
+        self._identity_marker_enabled = True
         self._identity = ""
         self._worker: Optional[object] = None
         self._idle_prefetch_enabled = False
@@ -1798,6 +1799,9 @@ class PassageEvidencePane(QFrame):
         return f"正在定位{source}"
 
     def _render_marker(self) -> None:
+        if not self._identity_marker_enabled:
+            self.video_view.clear_marker()
+            return
         marker = self._pending_marker
         if self.is_auyat_rgb:
             self.video_view.clear_identity_cue()
@@ -1848,6 +1852,11 @@ class PassageEvidencePane(QFrame):
                 )
                 return
         self.video_view.clear_marker()
+
+    def set_identity_marker_enabled(self, enabled: bool) -> None:
+        self._identity_marker_enabled = bool(enabled)
+        if not self._identity_marker_enabled:
+            self.video_view.clear_marker()
 
     def _association_is_visible(
         self,

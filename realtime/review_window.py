@@ -2711,20 +2711,13 @@ class FinishReviewWindow(PassageReviewSurface):
         """Every decoded regular-camera picture can record a crossing, large or small."""
 
         active = getattr(self, "_problem_workbench_active", False)
+        quick_review = bool(getattr(self.problem_panel, "quick_review", False))
         for pane in self.evidence_panes:
-            pane.video_view.set_count_mode(active and not getattr(self.problem_panel, "quick_review", False)
+            pane.set_identity_marker_enabled(not (active and quick_review))
+            pane.video_view.set_count_mode(active
+                                           and (not quick_review or pane is self._active_playback_pane())
                                            and pane.source_kind == "regular"
                                            and pane.location is not None and pane._current_frame_index >= 0)
-            selected = (self.problem_panel._selected_arrival()
-                        if getattr(self.problem_panel, "quick_review", False) else None)
-            quick_click = bool(selected and selected.event is not None
-                               and selected.event.is_active and selected.bib
-                               and selected.decision is None and not selected.stale)
-            if active and quick_click and pane is self._active_playback_pane():
-                pane.video_view.set_count_mode(
-                    pane.source_kind == "regular" and pane.location is not None
-                    and pane._current_frame_index >= 0
-                )
 
     def _frame_for_problem_count(self, pane):
         if (pane is None or pane.location is None or pane._current_frame_index < 0
@@ -2747,12 +2740,8 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = self._frame_for_problem_count(pane)
         if frame is None:
             return
-        selected = (self.problem_panel._selected_arrival()
-                    if getattr(self.problem_panel, "quick_review", False) else None)
-        if (selected is not None and selected.event is not None and selected.event.is_active
-                and selected.bib and selected.decision is None and not selected.stale
-                and not self._opened_normal_crossing):
-            self._quick_review_mark_arrival(frame, x_normalized, y_normalized)
+        if getattr(self.problem_panel, "quick_review", False) and not self._opened_normal_crossing:
+            self._quick_review_mark_arrival(frame, x_normalized, y_normalized, pane)
             return
         item = self.problem_panel.current_item()
         context = self.problem_panel._inline_context()
@@ -2794,21 +2783,19 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_crossing_cards()
         self.problem_panel.setFocus()
 
-    def _quick_review_mark_arrival(self, frame, x_normalized, y_normalized) -> None:
+    def _quick_review_mark_arrival(self, frame, x_normalized, y_normalized, pane) -> None:
         """Use the operator's picture click as the bicycle cue, not a final ruling."""
 
         panel = self.problem_panel
         row = panel._selected_arrival()
-        if (row is None or row.event is None or not row.event.is_active or not row.bib
-                or row.decision is not None or row.stale):
-            panel.hint.setText("请先在左侧选择要确认的有效芯片记录，再点自行车与终点线位置。")
+        if row is not None and (row.decision is not None or row.stale):
+            panel.hint.setText("该记录已确认或证据已变化，请先撤销或重新打开原帧。")
             return
         frame = dict(frame, marker_x_normalized=float(x_normalized),
                      marker_y_normalized=float(y_normalized))
-        selected_key = row.key
+        selected_key = row.key if row is not None and row.event is not None else None
         self._pause_arrival_confirmation()
         try:
-            pane = self._active_playback_pane()
             location = self._persist_filmstrip_location(pane.location)
             pane._location = location
             frame.update(segment_id=location.segment.segment_id, video_path=str(location.video_path))
@@ -2833,8 +2820,10 @@ class FinishReviewWindow(PassageReviewSurface):
             panel._active_item = item
             panel.table.setCurrentCell(index, 0)
             panel._sync_arrival_confirmation()
+        self._problem_count_mode_changed(True)
         panel.hint.setText(
-            f"已标记 {row.bib} 对应画面中的自行车/终点线位置；请核对是前轮压线帧，再点‘确认过线’。"
+            f"已标记 {row.bib} 的压线位置；核对原帧后点‘确认过线’。"
+            if selected_key else "已圈出自行车压线位置；请选择左侧对应芯片记录，再点‘确认过线’。"
         )
 
     def _problem_marks_changed(self, _marks) -> None:
@@ -2847,6 +2836,9 @@ class FinishReviewWindow(PassageReviewSurface):
     def _continuous_marker_overlays(self, pane):
         """The counted people ride along with the crossing markers of the same frame."""
 
+        if (getattr(self, "_problem_workbench_active", False)
+                and getattr(self.problem_panel, "quick_review", False)):
+            return self._problem_count_overlays(pane)
         overlays = list(super()._continuous_marker_overlays(pane))
         overlays.extend(self._problem_count_overlays(pane))
         return tuple(overlays)

@@ -391,7 +391,7 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
-        assert window.problem_panel.table.columnCount() == 4
+        assert window.problem_panel.table.columnCount() == 5
         assert window.problem_panel._browsing
         window._return_to_problem()
         assert not window.problem_panel._browsing
@@ -462,12 +462,14 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         qapp.processEvents()
         window.problem_panel.toggle_big_view()  # F: the picture takes the clicks
         qapp.processEvents()
-        assert not pane.video_view._count_mode
+        assert pane.video_view._count_mode
 
         target = view.viewport().rect().center()
         QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
         qapp.processEvents()
-        assert not window.problem_panel.current_marks()
+        assert len(window.problem_panel.current_marks()) == 1
+        assert window.problem_panel._category()["action"] == "bicycle"
+        assert not window.problem_panel.confirm_arrival_button.isEnabled()
         target_event = _event(event_id="read-321", bib="321", passage_timestamp_ms=start + 1900)
         window.passage_store.append(target_event)
         window.problem_panel.refresh()
@@ -559,6 +561,11 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         qapp.processEvents()
 
         assert pane.video_view._count_mode
+        pane._identity = "待补录"
+        pane._pending_marker = (.55, .62, 50, 2000)
+        pane._on_detail_requested()
+        pane._worker.full_resolution_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert pane.video_view._marker is None
         window._problem_count_clicked(0.55, 0.62, pane)
         qapp.processEvents()
 
@@ -4833,7 +4840,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.25.2 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.25.3 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -4847,7 +4854,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.25.2"
+    assert window.product_title_label.text() == "FinishReview v0.25.3"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()

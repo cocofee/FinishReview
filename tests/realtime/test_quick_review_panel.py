@@ -42,8 +42,8 @@ def row(panel, bib):
 
 
 def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
-    assert panel.table.columnCount() == 4
-    assert [panel.table.horizontalHeaderItem(i).text() for i in range(4)] == ["顺序", "号码", "时间", "状态"]
+    assert panel.table.columnCount() == 5
+    assert [panel.table.horizontalHeaderItem(i).text() for i in range(5)] == ["顺序", "号码", "时间", "状态", "类别"]
     assert all("参考" not in panel.table.item(row_index, 2).text() for row_index in range(panel.table.rowCount()))
     for index, entry in enumerate(panel._arrival_rows):
         assert panel.table.item(index, 1).text() == entry.bib
@@ -207,6 +207,60 @@ def test_exclude_and_hold_are_manual_and_do_not_delete_chip_events(panel):
     QTest.keyClick(panel, Qt.Key_Backspace)
     QTest.keyClick(panel, Qt.Key_3)
     assert panel._arrival_store.active(SCOPE)[-1]["action"] == "held"
+
+
+def test_manual_confirmation_replaces_candidate_row_and_keeps_explicit_category(panel):
+    from realtime.problem_items import STATUS_WAITING
+
+    path = panel.problem_dir / "problem_list.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["items"][0]["status"] = STATUS_WAITING
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    panel.refresh()
+    manual = panel.add_manual_problem(FRAME, recorder_ms=FRAME["recorder_ms"])
+    panel.select_item(manual.item_id)
+    panel._confirm_bicycle()
+    candidate_index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.item.item_id == manual.item_id)
+    assert panel.table.item(candidate_index, 4).text() == "运动员"
+    panel._arrival_clicked(row(panel, "321"))
+    panel.confirm_arrival_button.click()
+    panel.refresh()
+
+    target = panel._arrival_rows[row(panel, "321")]
+    assert target.decision and target.item.item_id == manual.item_id
+    assert panel.table.item(row(panel, "321"), 3).text() == "已确认"
+    assert panel.table.item(row(panel, "321"), 4).text() == "运动员"
+    assert not any(entry.event is None and entry.item.item_id == manual.item_id for entry in panel._arrival_rows)
+    assert panel._selected_arrival().bib == "321"
+    panel._undo_arrival()
+    assert any(entry.event is None and entry.item.item_id == manual.item_id for entry in panel._arrival_rows)
+
+
+def test_non_rider_category_is_explicit_and_preserved_after_refresh(panel):
+    panel._classify("not_rider")
+    panel.refresh()
+    assert all(panel.table.item(i, 4).text() == "非运动员" for i in range(panel.table.rowCount()))
+    assert all(panel.table.item(i, 3).text() == "已排除" for i in range(panel.table.rowCount()))
+    assert all(panel.table.item(i, 0).text() == "" for i in range(panel.table.rowCount()))
+    assert all(target.is_active for target in panel.events)
+
+
+def test_numbers_follow_chip_order_even_when_video_times_cross_and_candidates_are_added(panel):
+    panel.events[0] = replace(panel.events[0], sequence=2)
+    panel.events[1] = replace(panel.events[1], sequence=1)
+    panel.refresh()
+    manual = panel.add_manual_problem(FRAME, recorder_ms=FRAME["recorder_ms"])
+    manual_row = next(i for i, entry in enumerate(panel._arrival_rows) if entry.event is None)
+    assert panel.table.item(manual_row, 0).text() == ""
+    assert [entry.bib for entry in panel._arrival_rows[:2]] == ["258", "321"]
+    assert [panel.table.item(i, 0).text() for i in range(2)] == ["1", "2"]
+    panel.select_item(manual.item_id)
+    panel._confirm_bicycle()
+    panel._arrival_clicked(row(panel, "321"))
+    panel.frame = dict(FRAME, recorder_ms=FRAME["recorder_ms"] - 3000)
+    panel.confirm_arrival_button.click()
+    assert [entry.bib for entry in panel._arrival_rows] == ["258", "321"]
+    assert [panel.table.item(i, 0).text() for i in range(2)] == ["1", "2"]
 
 
 def test_csv_uses_bib_and_actual_frame_not_official_chip_time(panel):

@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication, QAbstractSpinBox, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit,
     QMenu, QPlainTextEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget,
@@ -62,9 +63,9 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
         self.table.cellDoubleClicked.connect(lambda index, _column: self._open_row(index))
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态"])
-        for column, width in enumerate((42, 66, 137)):
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "类别"])
+        for column, width in enumerate((42, 56, 132, 88)):
             self.table.setColumnWidth(column, width)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
@@ -74,8 +75,9 @@ class QuickReviewPanel(ProblemListPanel):
         bar.setContentsMargins(2, 3, 2, 3)
         self.quick_title = QLabel("到达记录", self.quick_toolbar)
         bar.addWidget(self.quick_title, 1)
-        self.bicycle_button = QPushButton("1  有自行车", self.quick_toolbar)
-        self.non_rider_button = QPushButton("2  非选手", self.quick_toolbar)
+        self.bicycle_button = QPushButton("1  运动员", self.quick_toolbar)
+        self.bicycle_button.setToolTip("判定画面中是参赛运动员；选择对应芯片后确认过线")
+        self.non_rider_button = QPushButton("2  非运动员", self.quick_toolbar)
         self.defer_button = QPushButton("3  暂放", self.quick_toolbar)
         self.confirm_arrival_button = QPushButton("确认过线", self.quick_toolbar)
         self.confirm_arrival_button.setToolTip(
@@ -243,25 +245,43 @@ class QuickReviewPanel(ProblemListPanel):
                     if (not row.stale and previous["action"] == "confirm" and row.event.is_active
                             and not row.item.evidence.get("configuration_stale")):
                         row.decision = previous
+                        row.item = anchor
                         row.time_ms = previous["crossing_ms"]
                         row.reference = False
-        return sorted(rows, key=lambda row: (row.time_ms if row.time_ms is not None else 2**62, row.key))
+        assigned = Counter(row.decision["candidate_id"] for row in rows if row.decision)
+        rows = [row for row in rows if row.event is not None
+                or assigned[row.item.item_id] < max(1, len(self._marks.get(row.item.item_id, ())))]
+        # Official chip order remains stable when a corrected video time is saved.
+        return sorted(rows, key=lambda row: (
+            0 if row.event is not None else 1,
+            row.event.sequence if row.event is not None else 0,
+            int(row.event.timeline_timestamp_ms) if row.event is not None else
+            row.time_ms if row.time_ms is not None else 2**62,
+            row.key,
+        ))
 
     def _row_state(self, row):
         if row.event is not None and not row.event.is_active:
             return "已作废"
-        if (row.item.status == STATUS_WAITING or row.item.evidence.get("configuration_stale")
-                or row.item.evidence.get("superseded")):
-            return "待证据"
         if row.stale:
             return "待复核"
         if row.decision:
             simultaneous = self._simultaneous[row.time_ms] > 1
             return "已确认·同时" if simultaneous else "已确认"
+        if (row.item.status == STATUS_WAITING or row.item.evidence.get("configuration_stale")
+                or row.item.evidence.get("superseded")):
+            return "待证据"
         category = self._category(row.item)
         if category:
             return {"bicycle": "待认人", "held": "暂放", "not_rider": "已排除"}[category["action"]]
         return "待确认" if row.bib else "待匹配"
+
+    def _row_category(self, row):
+        if row.decision:
+            return "运动员"
+        category = self._category(row.item)
+        return ({"bicycle": "运动员", "not_rider": "非运动员"}.get(category["action"], "待判定")
+                if category and not row.stale else "待判定")
 
     def _render(self):
         if not self._quick_ready:
@@ -276,7 +296,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._simultaneous = Counter(row.time_ms for row in rows if row.decision)
         self.rows = [row.item for row in rows]
         signature = (self._arrival_scope, self._selected_key,
-                     tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row),
+                     tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
                             candidate_binding(row.item)) for row in rows))
         if signature == self._quick_render_signature:
             self._sync_arrival_confirmation()
@@ -286,13 +306,27 @@ class QuickReviewPanel(ProblemListPanel):
         scroll = self.table.verticalScrollBar().value()
         self.table.setRowCount(len(rows))
         selected = -1
+        chip_number = 0
         for index, row in enumerate(rows):
             state = self._row_state(row)
             time = format_chip_time(row.time_ms) if row.time_ms is not None else "—"
-            for column, text in enumerate((str(index + 1), row.bib or "—", time, state)):
+            category = self._row_category(row)
+            number = ""
+            if row.event is not None:
+                chip_number += 1
+                if category != "非运动员":
+                    number = str(chip_number)
+            for column, text in enumerate((number, row.bib or "—", time, state, category)):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
+                if column == 4:
+                    foreground, background = {"运动员": ("#126044", "#e5f4ec"),
+                                              "非运动员": ("#70431b", "#fbebd8"),
+                                              "待判定": ("#566274", "#edf0f4")}[category]
+                    cell.setForeground(QColor(foreground))
+                    cell.setBackground(QColor(background))
+                    cell.setTextAlignment(Qt.AlignCenter)
                 cell.setToolTip("点击回看保存原帧" if row.decision else
                                 "点击回看对应时段；已确认有自行车时单击只选择运动员，双击回看；不会自动确认过线")
                 self.table.setItem(index, column, cell)
@@ -388,7 +422,7 @@ class QuickReviewPanel(ProblemListPanel):
                            and frame.get("segment_id") and frame.get("video_path")
                            and frame.get("recorder_ms") is not None)
         if row is None or row.event is None or not row.event.is_active or not row.bib:
-            reason = "请先选择有有效芯片记录的运动员"
+            reason = "可先在画面点圈；确认过线前请选择对应芯片记录"
         elif row.decision is not None:
             reason = "该运动员已确认；修改前请先撤销"
         elif not valid_frame:
