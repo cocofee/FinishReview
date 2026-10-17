@@ -534,7 +534,8 @@ def test_raw_frame_can_be_classified_and_confirmed_without_analysis_or_f(qapp, t
         window.close()
 
 
-def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path):
+@pytest.mark.parametrize("save_action", ["key", "button"])
+def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path, save_action):
     from PyQt5.QtGui import QImage
 
     window = _window(tmp_path, workbench=True)
@@ -547,11 +548,11 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
             source_id="camera_01", camera_index=1, video_path=video,
             media_started_at_ms=start, media_duration_ms=6000,
             clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
-        target = _event(event_id="click-321", bib="321", passage_timestamp_ms=start + 2000)
+        target = _event(event_id="click-321", bib="21", passage_timestamp_ms=start + 2000)
         window.passage_store.append(target)
         panel = window.problem_panel
         panel.refresh()
-        row_index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "321")
+        row_index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
         panel._arrival_clicked(row_index)
         frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
                      position_ms=2000, frame_index=50)
@@ -569,7 +570,7 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         window._problem_count_clicked(0.55, 0.62, pane)
         qapp.processEvents()
 
-        assert panel._selected_arrival().bib == "321"
+        assert panel._selected_arrival().bib == "21"
         assert panel._selected_key == "event:click-321"
         assert panel.current_item().evidence["frame"]["marker_x_normalized"] == pytest.approx(0.55)
         assert panel.current_item().evidence["frame"]["marker_y_normalized"] == pytest.approx(0.62)
@@ -582,11 +583,21 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert overlays[0][1] == pytest.approx(0.62)
         assert overlays[0][5] is True
 
-        panel.confirm_arrival_button.click()
-        saved = next(row.decision for row in panel._arrival_rows if row.bib == "321")
+        assert panel.confirm_arrival_button.isHidden()
+        if save_action == "key":
+            QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        else:
+            panel.bicycle_button.click()
+        saved = next(row.decision for row in panel._arrival_rows if row.bib == "21")
         assert saved["frame"]["frame_index"] == 50
         assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.55)
         assert saved["frame"]["marker_y_normalized"] == pytest.approx(0.62)
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+        target_row = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
+        assert panel.table.item(target_row, 3).text() == "已确认"
+        assert panel.table.item(target_row, 4).text() == "运动员"
+        panel.bicycle_button.click()
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
     finally:
         window.close()
 

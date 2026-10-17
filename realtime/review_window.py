@@ -2822,8 +2822,8 @@ class FinishReviewWindow(PassageReviewSurface):
             panel._sync_arrival_confirmation()
         self._problem_count_mode_changed(True)
         panel.hint.setText(
-            f"已标记 {row.bib} 的压线位置；核对原帧后点‘确认过线’。"
-            if selected_key else "已圈出自行车压线位置；请选择左侧对应芯片记录，再点‘确认过线’。"
+            f"已标记 {row.bib} 的压线位置；按 1 保存过线。"
+            if selected_key else "已圈出自行车压线位置；请选择左侧对应芯片记录，再按 1 保存。"
         )
 
     def _problem_marks_changed(self, _marks) -> None:

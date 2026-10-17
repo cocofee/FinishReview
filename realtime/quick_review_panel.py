@@ -69,14 +69,14 @@ class QuickReviewPanel(ProblemListPanel):
             self.table.setColumnWidth(column, width)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
-        self.table.setToolTip("点击回看对应时段；已确认有自行车时单击只选运动员，双击仍可回看；定位压线原帧后点“确认过线”保存")
+        self.table.setToolTip("点击选择芯片记录，双击回看；在自行车压线位置点圈，再按 1 保存")
         self.quick_toolbar = QWidget(self)
         bar = QHBoxLayout(self.quick_toolbar)
         bar.setContentsMargins(2, 3, 2, 3)
         self.quick_title = QLabel("到达记录", self.quick_toolbar)
         bar.addWidget(self.quick_title, 1)
         self.bicycle_button = QPushButton("1  运动员", self.quick_toolbar)
-        self.bicycle_button.setToolTip("判定画面中是参赛运动员；选择对应芯片后确认过线")
+        self.bicycle_button.setToolTip("选中芯片记录，在自行车压线位置点圈，再按 1 保存过线")
         self.non_rider_button = QPushButton("2  非运动员", self.quick_toolbar)
         self.defer_button = QPushButton("3  暂放", self.quick_toolbar)
         self.confirm_arrival_button = QPushButton("确认过线", self.quick_toolbar)
@@ -87,6 +87,7 @@ class QuickReviewPanel(ProblemListPanel):
         for button in (self.bicycle_button, self.non_rider_button, self.defer_button,
                        self.confirm_arrival_button, self.quick_undo_button):
             bar.addWidget(button)
+        self.confirm_arrival_button.hide()
         self.bicycle_button.clicked.connect(self._confirm_bicycle)
         self.non_rider_button.clicked.connect(lambda: self._classify("not_rider"))
         self.defer_button.clicked.connect(lambda: self._classify("held"))
@@ -406,7 +407,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._selected_key = row.key
         self.table.setCurrentCell(index, 0)
         self._sync_arrival_confirmation()
-        self.hint.setText("已选中运动员。请停在前轮压终点线的一帧，再点“确认过线”。")
+        self.hint.setText("已选中运动员。请在自行车压线位置点圈，再按 1 保存。")
 
     def _selected_arrival(self):
         index = self.table.currentRow()
@@ -440,7 +441,7 @@ class QuickReviewPanel(ProblemListPanel):
             reason = ""
         self.confirm_arrival_button.setEnabled(not reason)
         self.confirm_arrival_button.setToolTip(reason or "保存所选运动员与当前显示的压线原帧；不会修改正式芯片时间")
-        self.confirmation_status.setText(reason or "已就绪：停在前轮压线帧后点“确认过线”")
+        self.confirmation_status.setText(reason or "已就绪：在前轮压线位置点圈，按 1 保存")
 
     def set_finish_line_status(self, configured):
         self.finish_line_status.setText("绿色实线：实际终点线" if configured else "终点线未设置：请先在实际画面上画线")
@@ -474,7 +475,29 @@ class QuickReviewPanel(ProblemListPanel):
         return next((row.item for row in self._arrival_rows if row.item.evidence.get("frame")), item)
 
     def _confirm_bicycle(self):
+        row = self._selected_arrival()
+        if row is not None and row.decision:
+            self.hint.setText(f"{row.bib} 已确认；修改前请先撤销。")
+            return
+        item = self.current_item()
+        clicked = (item.evidence.get("frame") or {}) if item else {}
+        has_circle = all(clicked.get(key) is not None
+                         for key in ("marker_x_normalized", "marker_y_normalized"))
+        if has_circle:
+            frame = self._frame_provider()
+            same_frame = bool(frame and frame.get("camera_index") == clicked.get("camera_index") and (
+                (frame.get("segment_id") == clicked.get("segment_id")
+                 and frame.get("frame_index") == clicked.get("frame_index"))
+                or (frame.get("recorder_ms") is not None
+                    and frame.get("recorder_ms") == clicked.get("recorder_ms"))))
+            if not same_frame:
+                self.hint.setText("画面已离开圆圈对应原帧，请重新点圈后按 1 保存。")
+                return
         self._classify("bicycle")
+        if has_circle and self.confirm_arrival_button.isEnabled():
+            self._confirm_selected_arrival()
+        else:
+            self.hint.setText("已标记运动员；选择对应芯片记录，在压线位置点圈后按 1 保存。")
 
     def _classify(self, action):
         if action != "held":
@@ -508,7 +531,7 @@ class QuickReviewPanel(ProblemListPanel):
             self.hint.setText(f"审核未保存：{error}")
             return
         self._render()
-        self.hint.setText("已确认有自行车；选择运动员，定位压线帧后点“确认过线”（F 可放大）。" if action == "bicycle"
+        self.hint.setText("已标记运动员；选择芯片，在压线位置点圈后按 1 保存（F 可放大）。" if action == "bicycle"
                           else "已暂放。" if action == "held" else "已排除此画面候选。")
         if action in ("held", "not_rider"):
             self._step(1)
@@ -616,10 +639,10 @@ class QuickReviewPanel(ProblemListPanel):
         self._sync_arrival_confirmation()
         self.count_mode_changed.emit(self._big_view)
         if self._big_view:
-            self.hint.setText("画面已放大：选择运动员，停在前轮压线的一帧，再点“确认过线”。F / Esc 返回。")
+            self.hint.setText("画面已放大：选择芯片，在自行车压线位置点圈，再按 1 保存。F / Esc 返回。")
             self.setFocus()
         else:
-            self.hint.setText("已返回胶卷视图；名单点击只选人，定位压线帧后点“确认过线”（F 可放大）。")
+            self.hint.setText("已返回胶卷视图；选择芯片，在压线位置点圈后按 1 保存（F 可放大）。")
             self.table.setFocus()
         self.big_view_changed.emit(self._big_view)
 
