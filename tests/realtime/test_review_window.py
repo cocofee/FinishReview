@@ -814,8 +814,13 @@ def test_ambiguous_legacy_workspace_requires_selection_and_remembers_it(qapp, tm
         assert not window._visible_events
         assert window._workspace_mode == "archive"
         assert not window.video_filmstrip.full_race.index.sources
-        assert window.event_name_label.text() == "请选择赛事"
-        assert not window.select_event_button.isHidden()
+        assert window.event_name_label.text() == "未确定赛事"
+        # Event switching is exposed from the modal settings dialog only;
+        # the workbench must not open a second, competing selector.
+        assert not any(
+            isinstance(widget, QPushButton) and widget.text() == "选择赛事"
+            for widget in window.findChildren(QPushButton)
+        )
         assert window._select_workspace_event("another-race", "stage-1")
         assert [item.event_id for item in window._visible_events] == ["second"]
     finally:
@@ -838,7 +843,10 @@ def test_single_event_workspace_hides_useless_event_picker(qapp, tmp_path):
     window = _window(tmp_path)
     try:
         assert window._current_metadata() is not None
-        assert window.select_event_button.isHidden()
+        assert not any(
+            isinstance(widget, QPushButton) and widget.text() == "选择赛事"
+            for widget in window.findChildren(QPushButton)
+        )
     finally:
         window.close()
 
@@ -2941,6 +2949,70 @@ def test_device_settings_expose_two_independent_rtsp_cameras(qapp, tmp_path):
     )
     assert dialog.minimumSizeHint().height() <= 680
     dialog.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows user-scoped password encryption")
+@pytest.mark.parametrize("save_button", ["rtsp_save_button", "secondary_rtsp_save_button"])
+def test_camera_credentials_save_buttons_persist_and_refill_after_restart(
+    qapp, tmp_path, monkeypatch, save_button,
+):
+    import json
+
+    from realtime.review_main import load_review_settings, save_review_settings
+
+    config_path = tmp_path / "camera_config.json"
+    credentials = (("camera user", "first@pass:#%"), ("second-user", "second@pass:#%"))
+
+    class _SaveCredentialsDialog(FinishReviewLaunchDialog):
+        def __init__(self, *args, **kwargs):
+            kwargs["device_provider"] = lambda: ()
+            super().__init__(*args, **kwargs)
+
+        def exec_(self):
+            self.rtsp_address_edit.setText("rtsp://192.0.2.101/live")
+            self.rtsp_username_edit.setText(credentials[0][0])
+            self.rtsp_password_edit.setText(credentials[0][1])
+            self.secondary_enabled_checkbox.setChecked(True)
+            self.secondary_source_type_combo.setCurrentIndex(
+                self.secondary_source_type_combo.findData("rtsp")
+            )
+            self.secondary_rtsp_address_edit.setText("rtsp://192.0.2.102/live")
+            self.secondary_rtsp_username_edit.setText(credentials[1][0])
+            self.secondary_rtsp_password_edit.setText(credentials[1][1])
+            getattr(self, save_button).click()
+            return self.result()
+
+    monkeypatch.setattr(review_window_module, "FinishReviewLaunchDialog", _SaveCredentialsDialog)
+    window = _window(tmp_path)
+    window._settings_saver = lambda settings: save_review_settings(config_path, settings)
+    try:
+        window._configure_devices()
+        saved_text = config_path.read_text(encoding="utf-8")
+        payload = json.loads(saved_text)
+        assert payload["source"] == "rtsp://192.0.2.101/live"
+        assert payload["secondary_source"] == "rtsp://192.0.2.102/live"
+        assert payload["rtsp_password_protected"].startswith("dpapi:v1:")
+        assert payload["secondary_rtsp_password_protected"].startswith("dpapi:v1:")
+        assert all(password not in saved_text for _username, password in credentials)
+
+        restored = load_review_settings(
+            config_path, output_dir=None, passage_host="127.0.0.1",
+            passage_port=18765, camera_index=1,
+        )
+        assert restored.source == window.source
+        assert restored.secondary_source == window.secondary_source
+        reopened = FinishReviewLaunchDialog(restored, device_provider=lambda: ())
+        try:
+            assert reopened.rtsp_username_edit.text() == credentials[0][0]
+            assert reopened.rtsp_password_edit.text() == credentials[0][1]
+            assert reopened.secondary_rtsp_username_edit.text() == credentials[1][0]
+            assert reopened.secondary_rtsp_password_edit.text() == credentials[1][1]
+            assert reopened.rtsp_password_edit.echoMode() == QLineEdit.Password
+            assert reopened.secondary_rtsp_password_edit.echoMode() == QLineEdit.Password
+        finally:
+            reopened.close()
+    finally:
+        window.close()
 
 
 def test_device_settings_allow_two_independent_usb_cameras(qapp, tmp_path):

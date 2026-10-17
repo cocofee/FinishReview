@@ -101,7 +101,7 @@ def _metadata_for_workspace(path: Path) -> RaceMetadata:
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise EventWorkspaceError(f"赛事信息无法读取：{error}") from error
     if metadata is None:
-        raise EventWorkspaceError("无法唯一确定赛事，请先在主界面选择赛事")
+        raise EventWorkspaceError("此目录包含多场赛事，无法唯一确定赛事；请打开赛事信息完整的目录")
     return metadata
 
 

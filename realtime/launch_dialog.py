@@ -631,6 +631,12 @@ class FinishReviewLaunchDialog(QDialog):
         self.rtsp_test_button = QPushButton("测试画面", self)
         self.rtsp_test_button.clicked.connect(self._test_rtsp_source)
         rtsp_credentials_row.addWidget(self.rtsp_test_button)
+        self.rtsp_save_button = QPushButton("保存账号密码", self)
+        self.rtsp_save_button.setToolTip(
+            "保存当前设置（含两个机位的账号密码），密码在本机加密保存，下次启动自动填回"
+        )
+        self.rtsp_save_button.clicked.connect(self._accept_settings)
+        rtsp_credentials_row.addWidget(self.rtsp_save_button)
         form.addRow("RTSP凭据", rtsp_credentials_row)
 
         secondary_device_row = QHBoxLayout()
@@ -713,6 +719,10 @@ class FinishReviewLaunchDialog(QDialog):
             self._test_secondary_rtsp_source
         )
         secondary_rtsp_credentials_row.addWidget(self.secondary_rtsp_test_button)
+        self.secondary_rtsp_save_button = QPushButton("保存账号密码", self)
+        self.secondary_rtsp_save_button.setToolTip(self.rtsp_save_button.toolTip())
+        self.secondary_rtsp_save_button.clicked.connect(self._accept_settings)
+        secondary_rtsp_credentials_row.addWidget(self.secondary_rtsp_save_button)
         form.addRow("机位2 RTSP凭据", secondary_rtsp_credentials_row)
 
         device_row = QHBoxLayout()

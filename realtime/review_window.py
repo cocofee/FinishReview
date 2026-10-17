@@ -1449,47 +1449,6 @@ class FinishReviewWindow(PassageReviewSurface):
     def _saved_event_workspaces(self) -> tuple[EventWorkspaceDescriptor, ...]:
         return discover_event_workspaces(self.workspace_root)
 
-    def _choose_workspace_event(self) -> None:
-        if not isinstance(self.metadata_store, EventWorkspaceMetadataStore):
-            return
-        candidates = self.metadata_store.candidates()
-        received = self._received_event_candidates()
-        events = self.passage_store.events()
-        counts = {}
-        for event in events:
-            scope = (event.race_id, event.stage_id)
-            counts[scope] = counts.get(scope, 0) + 1
-        labels = [f"历史目录 · {item.race_name} · {item.stage_name}"
-                  f"（{counts.get((item.race_id, item.stage_id), 0)} 条）"
-                  for index, item in enumerate(candidates)]
-        received_labels = [f"接入已收到的赛事 · {item.race_name} · {item.stage_name} [{item.race_id}]"
-                           for item in received]
-        labels = received_labels + labels
-        if not labels:
-            return
-        current = self._current_metadata()
-        index = next((i for i, item in enumerate(candidates) if current is not None
-                      and (item.race_id, item.stage_id) == (current.race_id, current.stage_id)), 0)
-        label, accepted = QInputDialog.getItem(self, "选择赛事", "接入实时赛事，或查看历史目录", labels,
-                                              0 if received else index, False)
-        if accepted:
-            index = labels.index(label)
-            if index < len(received):
-                item = received[index]
-                self._select_received_event(item.race_id, item.stage_id)
-            else:
-                item = candidates[index - len(received)]
-                self._select_workspace_event(item.race_id, item.stage_id)
-
-    def _workspace_event_selection_needed(self) -> bool:
-        """Only expose event switching when this directory is genuinely ambiguous."""
-        if not isinstance(self.metadata_store, EventWorkspaceMetadataStore):
-            return False
-        scopes = {(item.race_id, item.stage_id) for item in self.metadata_store.candidates()}
-        if self.timing_provider == "cyclerace":
-            scopes.update((item.race_id, item.stage_id) for item in self._received_event_candidates())
-        return len(scopes) > 1
-
     def _received_event_candidates(self):
         if self.timing_provider != "cyclerace":
             return ()
@@ -2332,10 +2291,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self.settings_button.setToolTip("设备与赛事设置")
         self.settings_button.clicked.connect(self._configure_devices)
         top_layout.addWidget(self.settings_button)
-        self.select_event_button = QPushButton("选择赛事", panel)
-        self.select_event_button.setFixedHeight(32)
-        self.select_event_button.clicked.connect(self._choose_workspace_event)
-        top_layout.addWidget(self.select_event_button)
         self.problem_list_button = QPushButton("问题清单", panel)
         self.problem_list_button.setObjectName("finishProblemListButton")
         self.problem_list_button.setFixedHeight(32)
@@ -2359,7 +2314,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self.settings_button.setStyleSheet(tool_button_style)
         self.problem_list_button.setStyleSheet(tool_button_style)
         self.passages_button.setStyleSheet(tool_button_style)
-        self.select_event_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.setMinimumWidth(88)
@@ -2449,10 +2403,9 @@ class FinishReviewWindow(PassageReviewSurface):
         self.event_path_label.setToolTip(
             f"{detail_text}\n{identity_text}赛事目录：{self.output_dir}"
         )
-        self.select_event_button.setVisible(self._workspace_event_selection_needed())
         if metadata is None and len({(item.race_id, item.stage_id)
                                      for item in self.passage_store.events()}) > 1:
-            self.event_name_label.setText("请选择赛事")
+            self.event_name_label.setText("未确定赛事")
             self.event_path_label.setText("此目录包含多场赛事")
         # The workbench top bar names the race it is reporting on.
         self._event_label = f"{race_name} · {stage_label}" if metadata is not None or event is not None else "未加载赛事"
@@ -4116,7 +4069,7 @@ class FinishReviewWindow(PassageReviewSurface):
             ):
                 self._capture_error = (
                     f"收到其他赛事：{event.race_name or event.race_id}。"
-                    "请点“选择赛事”接入，或等待 CycleRace 同步赛事信息。"
+                    "请在“设置”中打开对应赛事，或等待 CycleRace 同步赛事信息。"
                 )
                 self._update_runtime_status()
                 return
