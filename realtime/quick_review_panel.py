@@ -508,6 +508,10 @@ class QuickReviewPanel(ProblemListPanel):
             self.hint.setText("请先打开有效录像，停在该选手前轮压线的原帧。")
             return
         frame = dict(frame, calibration_version=item.calibration_version)
+        clicked = item.evidence.get("frame") or {}
+        for key in ("marker_x_normalized", "marker_y_normalized"):
+            if clicked.get(key) is not None:
+                frame[key] = clicked[key]
         crossing = recorder_crossing_time(frame.get("recorder_ms"), frame, self.workspace_dir)
         try:
             self._arrival_store.save(

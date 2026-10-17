@@ -532,6 +532,58 @@ def test_raw_frame_can_be_classified_and_confirmed_without_analysis_or_f(qapp, t
         window.close()
 
 
+def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path):
+    from PyQt5.QtGui import QImage
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.show()
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        target = _event(event_id="click-321", bib="321", passage_timestamp_ms=start + 2000)
+        window.passage_store.append(target)
+        panel = window.problem_panel
+        panel.refresh()
+        row_index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "321")
+        panel._arrival_clicked(row_index)
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        window._open_problem_frame(frame)
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+
+        assert pane.video_view._count_mode
+        window._problem_count_clicked(0.55, 0.62, pane)
+        qapp.processEvents()
+
+        assert panel._selected_arrival().bib == "321"
+        assert panel._selected_key == "event:click-321"
+        assert panel.current_item().evidence["frame"]["marker_x_normalized"] == pytest.approx(0.55)
+        assert panel.current_item().evidence["frame"]["marker_y_normalized"] == pytest.approx(0.62)
+        assert panel._category()["action"] == "bicycle"
+        assert panel.confirm_arrival_button.isEnabled()
+        assert not any(row.decision for row in panel._arrival_rows)
+        overlays = window._problem_count_overlays(pane)
+        assert len(overlays) == 1
+        assert overlays[0][0] == pytest.approx(0.55)
+        assert overlays[0][1] == pytest.approx(0.62)
+        assert overlays[0][5] is True
+
+        panel.confirm_arrival_button.click()
+        saved = next(row.decision for row in panel._arrival_rows if row.bib == "321")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.55)
+        assert saved["frame"]["marker_y_normalized"] == pytest.approx(0.62)
+    finally:
+        window.close()
+
+
 def test_real_finish_line_follows_session_time_and_clears_identity_guide(qapp, tmp_path):
     import json
     from PyQt5.QtGui import QImage

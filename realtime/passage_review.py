@@ -485,7 +485,7 @@ class EvidenceImageView(QGraphicsView):
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
-            tuple[float, float, str, bool, bool], ...
+            tuple[float, float, str, bool, bool, bool], ...
         ] = ()
         self._show_marker_label = True
         self._show_identity_badge = True
@@ -896,8 +896,10 @@ class EvidenceImageView(QGraphicsView):
                 str(label),
                 bool(confirmed),
                 bool(simple),
+                bool(marker[5]) if len(marker) > 5 else False,
             )
-            for x_normalized, y_normalized, label, confirmed, simple in markers
+            for marker in markers
+            for x_normalized, y_normalized, label, confirmed, simple in [marker[:5]]
         )
         self.viewport().update()
 
@@ -1122,7 +1124,7 @@ class EvidenceImageView(QGraphicsView):
                 for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
                     painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
                                      QPointF(b[0] * self._source_width, b[1] * self._source_height))
-        for index, (x_normalized, y_normalized, label, confirmed, simple) in enumerate(
+        for index, (x_normalized, y_normalized, label, confirmed, simple, dot) in enumerate(
             self._history_markers
         ):
             x = x_normalized * self._source_width
@@ -1133,7 +1135,11 @@ class EvidenceImageView(QGraphicsView):
             if not confirmed and not simple:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
-            painter.drawLine(int(x), 0, int(x), self._source_height)
+            if dot:
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(QPointF(x, y), 11.0 / scale, 11.0 / scale)
+            else:
+                painter.drawLine(int(x), 0, int(x), self._source_height)
             if not self._show_marker_label:
                 continue
             margin = 6.0 / scale

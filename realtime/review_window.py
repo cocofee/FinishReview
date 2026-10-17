@@ -2455,6 +2455,8 @@ class FinishReviewWindow(PassageReviewSurface):
     def _toggle_maximized_pane(self, pane):
         # Reopening a paused frame may not decode again. Refresh saved geometry
         # on every F entry as well as on frame changes, including popup judging.
+        # Force the read: two rapid saves can share Windows' coarse mtime.
+        self._review_line_signature = None
         self._refresh_problem_finish_lines()
         super()._toggle_maximized_pane(pane)
 
@@ -2713,6 +2715,16 @@ class FinishReviewWindow(PassageReviewSurface):
             pane.video_view.set_count_mode(active and not getattr(self.problem_panel, "quick_review", False)
                                            and pane.source_kind == "regular"
                                            and pane.location is not None and pane._current_frame_index >= 0)
+            selected = (self.problem_panel._selected_arrival()
+                        if getattr(self.problem_panel, "quick_review", False) else None)
+            quick_click = bool(selected and selected.event is not None
+                               and selected.event.is_active and selected.bib
+                               and selected.decision is None and not selected.stale)
+            if active and quick_click and pane is self._active_playback_pane():
+                pane.video_view.set_count_mode(
+                    pane.source_kind == "regular" and pane.location is not None
+                    and pane._current_frame_index >= 0
+                )
 
     def _frame_for_problem_count(self, pane):
         if (pane is None or pane.location is None or pane._current_frame_index < 0
@@ -2734,6 +2746,13 @@ class FinishReviewWindow(PassageReviewSurface):
         pane = pane or self._problem_pane()
         frame = self._frame_for_problem_count(pane)
         if frame is None:
+            return
+        selected = (self.problem_panel._selected_arrival()
+                    if getattr(self.problem_panel, "quick_review", False) else None)
+        if (selected is not None and selected.event is not None and selected.event.is_active
+                and selected.bib and selected.decision is None and not selected.stale
+                and not self._opened_normal_crossing):
+            self._quick_review_mark_arrival(frame, x_normalized, y_normalized)
             return
         item = self.problem_panel.current_item()
         context = self.problem_panel._inline_context()
@@ -2775,6 +2794,49 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_crossing_cards()
         self.problem_panel.setFocus()
 
+    def _quick_review_mark_arrival(self, frame, x_normalized, y_normalized) -> None:
+        """Use the operator's picture click as the bicycle cue, not a final ruling."""
+
+        panel = self.problem_panel
+        row = panel._selected_arrival()
+        if (row is None or row.event is None or not row.event.is_active or not row.bib
+                or row.decision is not None or row.stale):
+            panel.hint.setText("请先在左侧选择要确认的有效芯片记录，再点自行车与终点线位置。")
+            return
+        frame = dict(frame, marker_x_normalized=float(x_normalized),
+                     marker_y_normalized=float(y_normalized))
+        selected_key = row.key
+        self._pause_arrival_confirmation()
+        try:
+            pane = self._active_playback_pane()
+            location = self._persist_filmstrip_location(pane.location)
+            pane._location = location
+            frame.update(segment_id=location.segment.segment_id, video_path=str(location.video_path))
+            self._creating_manual_crossing = True
+            item = panel.add_manual_problem(
+                frame, reason="人工点选自行车与终点线位置，待确认芯片",
+                recorder_ms=frame["recorder_ms"], thumbnail=pane.video_view._pixmap_item.pixmap(),
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            panel.hint.setText(f"标记未保存：{error}")
+            return
+        finally:
+            self._creating_manual_crossing = False
+        if item is None:
+            return
+        panel.select_item(item.item_id)
+        panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
+        panel._classify("bicycle")
+        index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
+        if index is not None:
+            panel._selected_key = selected_key
+            panel._active_item = item
+            panel.table.setCurrentCell(index, 0)
+            panel._sync_arrival_confirmation()
+        panel.hint.setText(
+            f"已标记 {row.bib} 对应画面中的自行车/终点线位置；请核对是前轮压线帧，再点‘确认过线’。"
+        )
+
     def _problem_marks_changed(self, _marks) -> None:
         """Redraw the counted people on the frame that is being judged."""
 
@@ -2801,10 +2863,11 @@ class FinishReviewWindow(PassageReviewSurface):
         from .crossing_order import mark_order_labels, ordered_mark_indices
         marks = self.problem_panel.current_marks()
         labels = mark_order_labels(marks)
+        dot = bool(getattr(self.problem_panel, "quick_review", False))
         return tuple((float(marks[index]["x"]), float(marks[index]["y"]),
                       labels[index] + (f" {marks[index]['bib']}" if marks[index].get("bib") else "")
                       + (f" 已排除：{marks[index]['exclusion_reason']}" if is_excluded(marks[index]) else ""),
-                      True, False)
+                      True, False, dot)
                      for index in ordered_mark_indices(marks)
                      if mark_on_frame(marks[index], frame, frame["recorder_ms"]))
 
@@ -2883,7 +2946,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if getattr(self.problem_panel, "quick_review", False):
             # The red "待补录" identity guide is not the camera's finish line.
             pane.video_view.clear_marker()
-            pane.video_view.set_history_markers(())
+            pane.video_view.set_history_markers(self._problem_count_overlays(pane))
             self.problem_panel._sync_arrival_confirmation()
         if pane is not self._active_playback_pane():
             return
