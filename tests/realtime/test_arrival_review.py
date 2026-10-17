@@ -64,6 +64,22 @@ def test_event_changes_invalidate_old_binding(tmp_path):
         assert store.latest(SCOPE, "event:one", event_binding(changed)) is None
 
 
+def test_undo_groups_shortcut_classification_and_confirmation_after_restart(tmp_path):
+    path = tmp_path / "review.jsonl"
+    store = ArrivalReviewStore(path)
+    store.save(SCOPE, "candidate:older", "frame", "not_rider")
+    store.save(SCOPE, "candidate:one", "frame", "bicycle", operation_id="key-1")
+    target = event()
+    store.save(SCOPE, "event:one", event_binding(target), "confirm", event_id=target.event_id,
+               bib=target.bib, frame=FRAME, crossing_ms=FRAME["recorder_ms"], operation_id="key-1")
+    restarted = ArrivalReviewStore(path)
+    assert restarted.undo(SCOPE)["action"] == "confirm"
+    assert [entry["action"] for entry in restarted.active(SCOPE)] == ["not_rider"]
+    assert ArrivalReviewStore(path).latest(SCOPE, "event:one") is None
+    assert restarted.undo(SCOPE)["action"] == "not_rider"
+    assert restarted.active(SCOPE) == []
+
+
 def test_invalid_frame_and_failed_write_leave_no_confirmation(tmp_path, monkeypatch):
     import realtime.arrival_review as module
     store = ArrivalReviewStore(tmp_path / "review.jsonl")

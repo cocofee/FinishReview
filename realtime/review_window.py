@@ -2811,9 +2811,12 @@ class FinishReviewWindow(PassageReviewSurface):
             self._creating_manual_crossing = False
         if item is None:
             return
-        panel.select_item(item.item_id)
+        self._creating_manual_crossing = True
+        try:
+            panel.select_item(item.item_id)
+        finally:
+            self._creating_manual_crossing = False
         panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
-        panel._classify("bicycle")
         index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
         if index is not None:
             panel._selected_key = selected_key
@@ -2821,6 +2824,7 @@ class FinishReviewWindow(PassageReviewSurface):
             panel.table.setCurrentCell(index, 0)
             panel._sync_arrival_confirmation()
         self._problem_count_mode_changed(True)
+        self._problem_marks_changed(())
         panel.hint.setText(
             f"已标记 {row.bib} 的压线位置；按 1 保存过线。"
             if selected_key else "已圈出自行车压线位置；请选择左侧对应芯片记录，再按 1 保存。"
@@ -2857,7 +2861,8 @@ class FinishReviewWindow(PassageReviewSurface):
         labels = mark_order_labels(marks)
         dot = bool(getattr(self.problem_panel, "quick_review", False))
         return tuple((float(marks[index]["x"]), float(marks[index]["y"]),
-                      labels[index] + (f" {marks[index]['bib']}" if marks[index].get("bib") else "")
+                      (self.problem_panel.picture_mark_label(marks[index]) if dot else
+                       labels[index] + (f" {marks[index]['bib']}" if marks[index].get("bib") else ""))
                       + (f" 已排除：{marks[index]['exclusion_reason']}" if is_excluded(marks[index]) else ""),
                       True, False, dot)
                      for index in ordered_mark_indices(marks)

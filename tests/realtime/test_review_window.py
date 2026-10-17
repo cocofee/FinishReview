@@ -391,7 +391,7 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
-        assert window.problem_panel.table.columnCount() == 5
+        assert window.problem_panel.table.columnCount() == 4
         assert window.problem_panel._browsing
         window._return_to_problem()
         assert not window.problem_panel._browsing
@@ -468,7 +468,7 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
         qapp.processEvents()
         assert len(window.problem_panel.current_marks()) == 1
-        assert window.problem_panel._category()["action"] == "bicycle"
+        assert window.problem_panel._category() is None
         assert not window.problem_panel.confirm_arrival_button.isEnabled()
         target_event = _event(event_id="read-321", bib="321", passage_timestamp_ms=start + 1900)
         window.passage_store.append(target_event)
@@ -567,21 +567,25 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         pane._on_detail_requested()
         pane._worker.full_resolution_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         assert pane.video_view._marker is None
+        worker = pane._worker
         window._problem_count_clicked(0.55, 0.62, pane)
         qapp.processEvents()
+        assert pane._worker is worker
+        assert pane._current_frame_index == 50
 
         assert panel._selected_arrival().bib == "21"
         assert panel._selected_key == "event:click-321"
         assert panel.current_item().evidence["frame"]["marker_x_normalized"] == pytest.approx(0.55)
         assert panel.current_item().evidence["frame"]["marker_y_normalized"] == pytest.approx(0.62)
-        assert panel._category()["action"] == "bicycle"
-        assert panel.confirm_arrival_button.isEnabled()
+        assert panel._category() is None
         assert not any(row.decision for row in panel._arrival_rows)
         overlays = window._problem_count_overlays(pane)
         assert len(overlays) == 1
         assert overlays[0][0] == pytest.approx(0.55)
         assert overlays[0][1] == pytest.approx(0.62)
+        assert overlays[0][2] == "21"
         assert overlays[0][5] is True
+        assert pane.video_view._history_markers[0][2] == "21"
 
         assert panel.confirm_arrival_button.isHidden()
         if save_action == "key":
@@ -595,8 +599,23 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         target_row = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
         assert panel.table.item(target_row, 3).text() == "已确认"
-        assert panel.table.item(target_row, 4).text() == "运动员"
+        assert panel.table.item(target_row, 3).foreground().color().name() == "#126044"
+        assert window._problem_count_overlays(pane)[0][2] == "21"
+        panel.refresh()
+        panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21"))
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert pane.video_view._history_markers[0][2] == "21"
         panel.bicycle_button.click()
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_3)
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert panel._selected_arrival().bib == "21"
+        assert panel._category() is None
+        assert pane._worker is worker
+        assert pane._current_frame_index == 50
+        assert panel.table.item(panel.table.currentRow(), 3).text() == "待定"
+        assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#b42318"
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
     finally:
         window.close()
@@ -720,15 +739,15 @@ def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path)
 
         assert [panel.count_table.item(row, 0).text() for row in range(3)] == ["1 同时", "1 同时", "3"]
         overlays = window._problem_count_overlays(pane)
-        assert [(overlay[0], overlay[2]) for overlay in overlays] == [(.4, "1 同时"), (.6, "1 同时")]
+        assert [(overlay[0], overlay[2]) for overlay in overlays] == [(.4, "待选号码"), (.6, "待选号码")]
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 3000, 75)
-        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["3"]
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["待选号码"]
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
         assert not window._problem_count_overlays(pane)
 
         panel._exclude_mark(1, "工作人员")
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
-        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["排除 已排除：工作人员", "1"]
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["非运动员 已排除：工作人员", "待选号码"]
         assert [panel.count_table.item(row, 0).text() for row in range(3)] == ["排除", "1", "2"]
         assert [mark["recorder_ms"] for mark in panel.current_marks()] == [start + 3000, start + 2000, start + 2000]
     finally:
@@ -4851,7 +4870,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.25.3 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.25.4 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -4865,7 +4884,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.25.3"
+    assert window.product_title_label.text() == "FinishReview v0.25.4"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()

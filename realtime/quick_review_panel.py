@@ -6,6 +6,7 @@ import csv
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+import uuid
 
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
@@ -63,9 +64,9 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
         self.table.cellDoubleClicked.connect(lambda index, _column: self._open_row(index))
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "类别"])
-        for column, width in enumerate((42, 56, 132, 88)):
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态"])
+        for column, width in enumerate((42, 66, 137)):
             self.table.setColumnWidth(column, width)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
@@ -88,6 +89,9 @@ class QuickReviewPanel(ProblemListPanel):
                        self.confirm_arrival_button, self.quick_undo_button):
             bar.addWidget(button)
         self.confirm_arrival_button.hide()
+        self.defer_button.hide()
+        self.quick_undo_button.setText("3  撤销")
+        self.quick_undo_button.setToolTip("按 3 撤销上一次保存或排除，并回到对应画面")
         self.bicycle_button.clicked.connect(self._confirm_bicycle)
         self.non_rider_button.clicked.connect(lambda: self._classify("not_rider"))
         self.defer_button.clicked.connect(lambda: self._classify("held"))
@@ -95,6 +99,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.quick_undo_button.clicked.connect(self._undo_arrival)
         more = QPushButton("更多", self.quick_toolbar)
         menu = QMenu(more)
+        menu.addAction("暂放当前记录", lambda: self._classify("held"))
         menu.addAction("分析录像", self._toggle_analysis)
         menu.addAction("导出过线记录", self.export_arrivals)
         menu.addAction("导出交接清单", self.export)
@@ -263,19 +268,16 @@ class QuickReviewPanel(ProblemListPanel):
 
     def _row_state(self, row):
         if row.event is not None and not row.event.is_active:
-            return "已作废"
+            return "已排除"
         if row.stale:
-            return "待复核"
+            return "待定"
         if row.decision:
-            simultaneous = self._simultaneous[row.time_ms] > 1
-            return "已确认·同时" if simultaneous else "已确认"
+            return "已确认"
         if (row.item.status == STATUS_WAITING or row.item.evidence.get("configuration_stale")
                 or row.item.evidence.get("superseded")):
-            return "待证据"
+            return "待定"
         category = self._category(row.item)
-        if category:
-            return {"bicycle": "待认人", "held": "暂放", "not_rider": "已排除"}[category["action"]]
-        return "待确认" if row.bib else "待匹配"
+        return "已排除" if category and category["action"] == "not_rider" else "待定"
 
     def _row_category(self, row):
         if row.decision:
@@ -317,14 +319,14 @@ class QuickReviewPanel(ProblemListPanel):
                 chip_number += 1
                 if category != "非运动员":
                     number = str(chip_number)
-            for column, text in enumerate((number, row.bib or "—", time, state, category)):
+            for column, text in enumerate((number, row.bib or "—", time, state)):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
-                if column == 4:
-                    foreground, background = {"运动员": ("#126044", "#e5f4ec"),
-                                              "非运动员": ("#70431b", "#fbebd8"),
-                                              "待判定": ("#566274", "#edf0f4")}[category]
+                if column == 3:
+                    foreground, background = {"已确认": ("#126044", "#e5f4ec"),
+                                              "已排除": ("#1d4ed8", "#e6f0ff"),
+                                              "待定": ("#b42318", "#fdecec")}[state]
                     cell.setForeground(QColor(foreground))
                     cell.setBackground(QColor(background))
                     cell.setTextAlignment(Qt.AlignCenter)
@@ -372,6 +374,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._sync_timeline()
         self.current_changed.emit(row.item)
         self._sync_arrival_confirmation()
+        self.marks_changed.emit(tuple(self.current_marks()))
 
     def _sync_timeline(self):
         if not self._quick_ready:
@@ -400,18 +403,47 @@ class QuickReviewPanel(ProblemListPanel):
         # but do not strand a newly received chip on an unrelated/empty picture.
         category = self._category()
         frame = self._frame_provider()
-        if not (category and category.get("action") == "bicycle" and frame
+        item = self.current_item()
+        circle = bool(item and item.evidence.get("frame", {}).get("marker_x_normalized") is not None)
+        if not ((circle or category and category.get("action") == "bicycle") and frame
                 and frame.get("frame_index", -1) >= 0):
             self._open_row(index)
             return
         self._selected_key = row.key
         self.table.setCurrentCell(index, 0)
         self._sync_arrival_confirmation()
+        self.marks_changed.emit(tuple(self.current_marks()))
         self.hint.setText("已选中运动员。请在自行车压线位置点圈，再按 1 保存。")
 
     def _selected_arrival(self):
         index = self.table.currentRow()
         return self._arrival_rows[index] if 0 <= index < len(self._arrival_rows) else None
+
+    def picture_mark_label(self, mark):
+        """Use the saved identity for a circle; an unassigned circle has no count number."""
+        from .bunch_review import mark_on_frame
+
+        if mark.get("exclusion_reason"):
+            return "非运动员"
+        item = self.current_item()
+        for row in self._arrival_rows:
+            decision = row.decision
+            if (not decision or item is None or decision.get("candidate_id") != item.item_id
+                    or not mark_on_frame(mark, decision["frame"], decision["frame"].get("recorder_ms"))):
+                continue
+            frame = decision["frame"]
+            if frame.get("marker_x_normalized") is None and len(self.current_marks()) > 1:
+                continue
+            if (all(frame.get(key) is not None for key in ("marker_x_normalized", "marker_y_normalized"))
+                    and (abs(float(frame["marker_x_normalized"]) - mark["x"]) > .001
+                         or abs(float(frame["marker_y_normalized"]) - mark["y"]) > .001)):
+                continue
+            return row.bib
+        row = self._selected_arrival()
+        if (len(self.current_marks()) == 1 and row is not None and row.event is not None
+                and row.event.is_active and row.bib and not row.stale and row.decision is None):
+            return row.bib
+        return mark.get("bib") or "待选号码"
 
     def _sync_arrival_confirmation(self):
         row = self._selected_arrival()
@@ -493,11 +525,15 @@ class QuickReviewPanel(ProblemListPanel):
             if not same_frame:
                 self.hint.setText("画面已离开圆圈对应原帧，请重新点圈后按 1 保存。")
                 return
-        self._classify("bicycle")
-        if has_circle and self.confirm_arrival_button.isEnabled():
-            self._confirm_selected_arrival()
-        else:
-            self.hint.setText("已标记运动员；选择对应芯片记录，在压线位置点圈后按 1 保存。")
+        self._shortcut_operation = uuid.uuid4().hex
+        try:
+            self._classify("bicycle")
+            if has_circle and self.confirm_arrival_button.isEnabled():
+                self._confirm_selected_arrival()
+            else:
+                self.hint.setText("已标记运动员；选择对应芯片记录，在压线位置点圈后按 1 保存。")
+        finally:
+            self._shortcut_operation = None
 
     def _classify(self, action):
         if action != "held":
@@ -526,6 +562,7 @@ class QuickReviewPanel(ProblemListPanel):
                                      candidate_binding(item), action, candidate_id=item.item_id,
                                      frame=frame,
                                      analysis_signature=item.evidence.get("analysis_signature", ""),
+                                     operation_id=getattr(self, "_shortcut_operation", None),
                                      calibration_version=item.calibration_version)
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"审核未保存：{error}")
@@ -575,6 +612,7 @@ class QuickReviewPanel(ProblemListPanel):
                 self._arrival_scope, row.key, event_binding(event), "confirm", event_id=event.event_id,
                 bib=event.bib, candidate_id=item.item_id, candidate_binding=candidate_binding(item),
                 frame=frame, crossing_ms=crossing.value_ms if crossing else None,
+                operation_id=getattr(self, "_shortcut_operation", None),
                 calibration_version=item.calibration_version,
             )
         except (OSError, RuntimeError, ValueError) as error:
@@ -582,6 +620,7 @@ class QuickReviewPanel(ProblemListPanel):
             return
         self._selected_key = row.key
         self._render()
+        self.marks_changed.emit(tuple(self.current_marks()))
         self.hint.setText(f"已确认 {event.bib} 过线；继续看下一位。")
 
     def _undo_arrival(self):
@@ -589,11 +628,47 @@ class QuickReviewPanel(ProblemListPanel):
             return
         try:
             previous = self._arrival_store.undo(self._arrival_scope)
+            # Earlier builds logged picture clicks as classifications. Skip
+            # those internal entries so 3 reaches the operator's last ruling.
+            while previous and previous["action"] == "bicycle" and not previous.get("operation_id"):
+                candidate = next((item for item in self.items
+                                  if item.item_id == previous.get("candidate_id")), None)
+                if candidate is None or candidate.evidence.get("frame", {}).get("marker_x_normalized") is None:
+                    break
+                earlier = self._arrival_store.undo(self._arrival_scope)
+                if earlier is None:
+                    break
+                previous = earlier
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"撤销未保存：{error}")
             return
         self._render()
-        self.hint.setText("已撤销上一操作。" if previous else "没有可撤销的操作。")
+        if previous:
+            candidate_id = previous.get("candidate_id")
+            candidate = next((item for item in self.items if item.item_id == candidate_id), None)
+            index = next((i for i, row in enumerate(self._arrival_rows)
+                          if row.key == previous.get("key")), None)
+            if index is None:
+                index = next((i for i, row in enumerate(self._arrival_rows)
+                              if row.item.item_id == candidate_id), None)
+            if index is not None:
+                row = self._arrival_rows[index]
+                self._selected_key = row.key
+                self._active_item = candidate or row.item
+                self._shown_id = self._active_item.item_id
+                self.table.setCurrentCell(index, 0)
+            if previous.get("frame"):
+                current = self._frame_provider()
+                saved = previous["frame"]
+                same_frame = bool(current and current.get("camera_index") == saved.get("camera_index")
+                                  and current.get("segment_id") == saved.get("segment_id")
+                                  and current.get("frame_index") == saved.get("frame_index"))
+                if not same_frame:
+                    self.jump_requested.emit(dict(saved))
+            self._sync_arrival_confirmation()
+            self.marks_changed.emit(tuple(self.current_marks()))
+        self.hint.setText(f"已撤销 {previous.get('bib') or '上一'} 处理；可重新点圈后按 1 或 2。"
+                          if previous else "没有可撤销的操作。")
 
     def _step(self, delta):
         items = list(dict.fromkeys(row.item.item_id for row in self._arrival_rows))
@@ -618,7 +693,7 @@ class QuickReviewPanel(ProblemListPanel):
             self.toggle_big_view()
             return True
         actions = {Qt.Key_1: self._confirm_bicycle, Qt.Key_2: lambda: self._classify("not_rider"),
-                   Qt.Key_3: lambda: self._classify("held"), Qt.Key_Backspace: self._undo_arrival,
+                   Qt.Key_3: self._undo_arrival, Qt.Key_Backspace: self._undo_arrival,
                    Qt.Key_Return: self._confirm_selected_arrival, Qt.Key_Enter: self._confirm_selected_arrival,
                    Qt.Key_Up: lambda: self._step(-1), Qt.Key_Down: lambda: self._step(1),
                    Qt.Key_Left: lambda: self.frame_step_requested.emit(-1),

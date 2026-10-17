@@ -1149,7 +1149,7 @@ class EvidenceImageView(QGraphicsView):
             if tag_x + tag_width > self._source_width - margin:
                 tag_x = x - tag_width - margin
             tag_x = max(margin, min(tag_x, self._source_width - tag_width - margin))
-            tag_y = margin + index * (tag_height + margin)
+            tag_y = y + margin if dot else margin + index * (tag_height + margin)
             tag_y = min(tag_y, max(margin, self._source_height - tag_height - margin))
             tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
             painter.setPen(Qt.NoPen)

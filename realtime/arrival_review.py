@@ -131,6 +131,15 @@ class ArrivalReviewStore:
             if not active:
                 return None
             previous = active[-1]
-            self._append_locked(dict(id=uuid.uuid4().hex, scope=list(scope), action="undo",
-                                     target=previous["id"], saved_at_ms=int(time.time() * 1000)))
+            operation = previous.get("operation_id")
+            targets = ([entry for entry in active if entry.get("operation_id") == operation]
+                       if operation else [previous])
+            records = [dict(id=uuid.uuid4().hex, scope=list(scope), action="undo",
+                            target=entry["id"], saved_at_ms=int(time.time() * 1000)) for entry in targets]
+            append_jsonl_records(self.path, [json.dumps(entry, ensure_ascii=False).encode("utf-8")
+                                            for entry in records], description="arrival reviews",
+                                 already_locked=True)
+            self._entries.extend(records)
+            self._reindex()
+            self._update_stamp()
             return previous

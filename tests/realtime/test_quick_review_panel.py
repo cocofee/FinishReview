@@ -42,8 +42,8 @@ def row(panel, bib):
 
 
 def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
-    assert panel.table.columnCount() == 5
-    assert [panel.table.horizontalHeaderItem(i).text() for i in range(5)] == ["顺序", "号码", "时间", "状态", "类别"]
+    assert panel.table.columnCount() == 4
+    assert [panel.table.horizontalHeaderItem(i).text() for i in range(4)] == ["顺序", "号码", "时间", "状态"]
     assert all("参考" not in panel.table.item(row_index, 2).text() for row_index in range(panel.table.rowCount()))
     for index, entry in enumerate(panel._arrival_rows):
         assert panel.table.item(index, 1).text() == entry.bib
@@ -152,7 +152,7 @@ def test_upstream_change_invalidates_identity_and_restart_recovers(panel, tmp_pa
     panel.refresh()
     entry = panel._arrival_rows[row(panel, "322")]
     assert entry.stale and entry.decision is None
-    assert panel.table.item(row(panel, "322"), 3).text() == "待复核"
+    assert panel.table.item(row(panel, "322"), 3).text() == "待定"
     panel.events[0] = event()
     panel.refresh()
     restored = QuickReviewPanel()
@@ -204,8 +204,9 @@ def test_exclude_and_hold_are_manual_and_do_not_delete_chip_events(panel):
     assert panel._arrival_store.active(SCOPE)[-1]["action"] == "not_rider"
     assert all(target.is_active for target in panel.events)
     assert not any(entry.decision for entry in panel._arrival_rows)
-    QTest.keyClick(panel, Qt.Key_Backspace)
     QTest.keyClick(panel, Qt.Key_3)
+    assert not panel._arrival_store.active(SCOPE)
+    panel._classify("held")
     assert panel._arrival_store.active(SCOPE)[-1]["action"] == "held"
 
 
@@ -221,7 +222,7 @@ def test_manual_confirmation_replaces_candidate_row_and_keeps_explicit_category(
     panel.select_item(manual.item_id)
     panel._confirm_bicycle()
     candidate_index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.item.item_id == manual.item_id)
-    assert panel.table.item(candidate_index, 4).text() == "运动员"
+    assert panel.table.item(candidate_index, 3).text() == "待定"
     panel._arrival_clicked(row(panel, "321"))
     panel.confirm_arrival_button.click()
     panel.refresh()
@@ -229,7 +230,7 @@ def test_manual_confirmation_replaces_candidate_row_and_keeps_explicit_category(
     target = panel._arrival_rows[row(panel, "321")]
     assert target.decision and target.item.item_id == manual.item_id
     assert panel.table.item(row(panel, "321"), 3).text() == "已确认"
-    assert panel.table.item(row(panel, "321"), 4).text() == "运动员"
+    assert panel.table.item(row(panel, "321"), 3).foreground().color().name() == "#126044"
     assert not any(entry.event is None and entry.item.item_id == manual.item_id for entry in panel._arrival_rows)
     assert panel._selected_arrival().bib == "321"
     panel._undo_arrival()
@@ -239,7 +240,7 @@ def test_manual_confirmation_replaces_candidate_row_and_keeps_explicit_category(
 def test_non_rider_category_is_explicit_and_preserved_after_refresh(panel):
     panel._classify("not_rider")
     panel.refresh()
-    assert all(panel.table.item(i, 4).text() == "非运动员" for i in range(panel.table.rowCount()))
+    assert all(panel.table.item(i, 3).foreground().color().name() == "#1d4ed8" for i in range(panel.table.rowCount()))
     assert all(panel.table.item(i, 3).text() == "已排除" for i in range(panel.table.rowCount()))
     assert all(panel.table.item(i, 0).text() == "" for i in range(panel.table.rowCount()))
     assert all(target.is_active for target in panel.events)
@@ -261,6 +262,40 @@ def test_numbers_follow_chip_order_even_when_video_times_cross_and_candidates_ar
     panel.confirm_arrival_button.click()
     assert [entry.bib for entry in panel._arrival_rows] == ["258", "321"]
     assert [panel.table.item(i, 0).text() for i in range(2)] == ["1", "2"]
+
+
+def test_circle_uses_selected_bib_then_keeps_saved_bib_when_selection_changes(panel):
+    frame = dict(FRAME, marker_x_normalized=.4, marker_y_normalized=.6)
+    manual = panel.add_manual_problem(frame, recorder_ms=FRAME["recorder_ms"])
+    panel.select_item(manual.item_id)
+    panel.add_mark(.4, .6, FRAME["recorder_ms"], frame)
+    panel._classify("bicycle")
+    mark = panel.current_marks()[0]
+    assert panel.picture_mark_label(mark) == "待选号码"
+    panel._arrival_clicked(row(panel, "321"))
+    assert panel.picture_mark_label(mark) == "321"
+    panel._arrival_clicked(row(panel, "258"))
+    assert panel.picture_mark_label(mark) == "258"
+    panel._confirm_bicycle()
+    assert panel._selected_arrival().decision
+    panel._arrival_clicked(row(panel, "321"))
+    assert panel.picture_mark_label(mark) == "258"
+    panel.refresh()
+    assert panel.picture_mark_label(mark) == "258"
+
+
+def test_three_undoes_legacy_picture_entries_and_restores_the_last_confirmed_athlete(panel):
+    panel._confirm_bicycle()
+    panel._arrival_clicked(row(panel, "321"))
+    panel.confirm_arrival_button.click()
+    manual = panel.add_manual_problem(dict(FRAME, marker_x_normalized=.4, marker_y_normalized=.6),
+                                      recorder_ms=FRAME["recorder_ms"])
+    panel.select_item(manual.item_id)
+    panel._classify("bicycle")  # Old releases saved this automatically on a picture click.
+    QTest.keyClick(panel, Qt.Key_3)
+    assert not any(entry.decision for entry in panel._arrival_rows)
+    assert panel._selected_arrival().bib == "321"
+    assert panel.table.item(panel.table.currentRow(), 3).text() == "待定"
 
 
 def test_csv_uses_bib_and_actual_frame_not_official_chip_time(panel):
