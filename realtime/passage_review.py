@@ -433,6 +433,7 @@ class EvidenceImageView(QGraphicsView):
     # Counting a crossing: one click lands on one person, position only — the moment
     # comes from whoever knows which frame is on screen.
     count_mark_selected = pyqtSignal(float, float)
+    count_mark_cancelled = pyqtSignal(float, float)
     marker_confirm_requested = pyqtSignal()
     marker_cancel_requested = pyqtSignal()
     marker_delete_requested = pyqtSignal()
@@ -938,6 +939,11 @@ class EvidenceImageView(QGraphicsView):
         super().wheelEvent(event)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.RightButton and self._count_mode and self.has_frame:
+            if self._scene.sceneRect().contains(self.mapToScene(event.pos())):
+                self.count_mark_cancelled.emit(*self._normalized_position(event.pos()))
+            event.accept()
+            return
         if event.button() == Qt.MiddleButton and self.has_frame:
             self._pan_dragging = True
             self._pan_last_position = event.pos()
@@ -4455,6 +4461,20 @@ class PassageReviewSurface(QDialog):
 
     def _calibrated_clock_offset(self, camera_index: int, session_key: str) -> int:
         calibration = self.calibration_store.get(camera_index, session_key)
+        if calibration is None:
+            # Older versions keyed HLS calibrations by the generated window name.
+            aliases = []
+            for saved in self.calibration_store.calibrations():
+                if saved.camera_index != camera_index:
+                    continue
+                parts = saved.session_key.split("|", 2)
+                if len(parts) != 3:
+                    continue
+                path = Path(parts[1]) / (parts[2] + ".m3u8")
+                if path.is_file() and self._recording_session_key_from_path(parts[0], path) == session_key:
+                    aliases.append(saved)
+            if aliases:
+                calibration = max(aliases, key=lambda saved: saved.calibrated_at_ms)
         return int(
             self._continuous_clock_offsets.get(
                 (camera_index, session_key),
@@ -4619,7 +4639,8 @@ class PassageReviewSurface(QDialog):
 
     @staticmethod
     def _recording_session_key_from_path(source_id: str, video_path: Path) -> str:
-        path = Path(video_path).absolute()
+        from .runtime_paths import recording_session_path
+        path = recording_session_path(Path(video_path).absolute())
         stem = _ARCHIVE_SEGMENT_SUFFIX_RE.sub("", path.stem)
         match = re.fullmatch(
             r"(camera_\d+)_\d{8}_\d{6}_\d{6}(?:_review_\d+)?", stem,

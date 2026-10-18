@@ -358,3 +358,43 @@ def test_targeted_undo_restores_earlier_riders_circle_before_reconfirming(panel)
     assert panel._selected_arrival().decision["frame"]["marker_x_normalized"] == .4
 
 
+
+
+def test_cancel_unassigned_picture_mark_and_undo(panel):
+    panel.add_mark(.4, .6, FRAME["recorder_ms"], FRAME)
+    panel.add_mark(.8, .6, FRAME["recorder_ms"], FRAME)
+    assert not panel.cancel_picture_mark(.1, .1)
+    assert len(panel.current_marks()) == 2
+    assert panel.cancel_picture_mark(.4, .6)
+    assert [mark["x"] for mark in panel.current_marks()] == [.8]
+    panel._undo_arrival()
+    assert panel.current_marks() == []
+
+
+def test_cancel_confirmed_circle_also_undoes_identity(panel):
+    panel.add_mark(.4, .6, FRAME["recorder_ms"], FRAME)
+    panel._arrival_clicked(row(panel, "321"))
+    panel._confirm_bicycle()
+    assert panel._selected_arrival().decision is not None
+    assert panel.cancel_picture_mark(.4, .6)
+    assert panel.current_marks() == []
+    assert not any(entry.decision for entry in panel._arrival_rows)
+
+
+def test_live_calibration_shows_judgment_time_and_keeps_recorder_time_in_tooltip(panel, tmp_path):
+    from realtime.passage_evidence import VideoClockCalibrationStore
+
+    VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl").record(
+        camera_index=1, session_key="camera_01_review|videos|a", offset_ms=2138,
+        anchor_event_id="one", anchor_bib="321", calibrated_at_ms=1)
+    panel._classify("bicycle")
+    panel._arrival_clicked(row(panel, "321"))
+    panel.confirm_arrival_button.click()
+
+    index = row(panel, "321")
+    entry = panel._arrival_rows[index]
+    assert entry.time_ms == FRAME["recorder_ms"] - 2138
+    assert panel.table.item(index, 2).text() == format_chip_time(FRAME["recorder_ms"] - 2138)
+    tooltip = panel.table.item(index, 2).toolTip()
+    assert "录像原时刻" in tooltip
+    assert format_chip_time(FRAME["recorder_ms"]) in tooltip

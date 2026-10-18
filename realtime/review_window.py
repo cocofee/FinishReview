@@ -1654,9 +1654,18 @@ class FinishReviewWindow(PassageReviewSurface):
         if answer != QMessageBox.Yes:
             return
         self._invalidate_capture_refresh()
+        self._clear_selection_details()
+        self._filmstrip_prefetch_timer.stop()
+        self.playback_coordinator.shutdown()
+        for pane in self.all_evidence_panes:
+            pane.shutdown(wait=True)
+        self.video_filmstrip.clear()
         self.video_filmstrip.full_race.clear()
         if panel is not None:
             panel.reset_data()
+        # Retired decoders still own file handles until their reads finish.
+        from .thread_lifecycle import wait_for_retired_threads
+        wait_for_retired_threads(timeout_ms=5000)
         failures = self._remove_event_data(event_dir, root)
         for store, label in ((self.passage_store, "通过记录"), (self._receiver_passage_store, "收件箱")):
             try:
@@ -2498,6 +2507,7 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         self.problem_panel.confirmation_preparing.connect(self._pause_arrival_confirmation)
         self.problem_panel.candidate_preparing.connect(self._prepare_arrival_candidate)
+        self.problem_panel.sampling_preparing.connect(self._prepare_sampling_frame)
         self.problem_panel.sampling_configured.connect(self._refresh_problem_finish_lines)
         self.results_panel.layout().insertWidget(1, self.problem_panel)
         self.problem_panel.hide()
@@ -2625,7 +2635,7 @@ class FinishReviewWindow(PassageReviewSurface):
 
         if not hasattr(self, "problem_panel"):
             return
-        from .analysis_settings import CONFIG_PATH, normalized_points
+        from .analysis_settings import CONFIG_PATH, normalized_points, profile_scope_matches
         from .analysis_workspace import session_id_for_path
 
         paths = [self.output_dir / name for name in ("long_image_lines.json", "finish_lines.json", CONFIG_PATH)]
@@ -2652,8 +2662,10 @@ class FinishReviewWindow(PassageReviewSurface):
                 line = None
                 if frame and pane.source_kind == "regular":
                     session = re.sub(r"_review_\d+$", "", session_id_for_path(pane.location.video_path))
+                    scope_known = bool(scope[0] or scope[1])
                     matches = [p for p in profiles if int(p["camera_index"]) == pane.camera_index
-                               and p["session_id"] == session and (p["race_id"], p.get("stage_id", "")) == scope
+                               and p["session_id"] == session
+                               and (not scope_known or profile_scope_matches(p, *scope))
                                and int(p["effective_from_ms"]) <= frame["recorder_ms"]]
                     line = (max(matches, key=lambda p: (int(p["effective_from_ms"]), int(p["revision"])))
                             if matches else lines.get(pane.camera_index))
@@ -2733,6 +2745,24 @@ class FinishReviewWindow(PassageReviewSurface):
                 "video_path": str(pane.location.video_path), "frame_index": pane._current_frame_index,
                 "position_ms": pane._current_position_ms,
                 "recorder_ms": int(origin) + int(pane._current_position_ms)}
+
+    def _prepare_sampling_frame(self):
+        for pane in self.evidence_panes:
+            try:
+                locations = self._live_locations_for_filmstrip(pane)
+                location = locations[-1] if locations else pane.location
+                if location is not None:
+                    saved = self._persist_filmstrip_location(location)
+                    if location is pane.location:
+                        pane._location = saved
+            except (OSError, ValueError, RuntimeError) as error:
+                self.problem_panel.hint.setText(f"实时画面暂存失败，终点线仍可手工设置：{error}")
+
+    def _problem_count_cancelled(self, x, y, pane):
+        if (getattr(self, "_problem_workbench_active", False)
+                and getattr(self.problem_panel, "quick_review", False)
+                and pane is self._active_playback_pane()):
+            self.problem_panel.cancel_picture_mark(x, y)
 
     def _problem_count_clicked(self, x_normalized: float, y_normalized: float, pane=None) -> None:
         """A click records the displayed frame; an unreported crossing starts its own item."""
@@ -2919,24 +2949,36 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _open_chip_reference(self, item) -> bool:
         """Raw playback must not depend on detection, line setup or calibration."""
-        reference = item.evidence.get("reference_frame")
-        if reference and self._open_problem_frame(dict(reference, reference_only=True)):
-            return True
         events = [self.passage_store.get(event_id) for event_id in item.event_ids]
         event = next((event for event in events if event is not None and event.is_active), None)
         if event is None:
+            reference = item.evidence.get("reference_frame")
+            if reference:
+                return self._open_problem_frame(dict(reference, reference_only=True))
             return False
         timestamp = self._evidence_timestamp(event)
         if timestamp is None:
             return False
         timestamp = align_evidence_timestamp(timestamp, event.received_at_ms)
         camera = int(item.evidence.get("camera_index") or self._camera_one_pane().camera_index)
-        lookup = self.timeline_store.locate_passage(
-            timestamp, race_id=event.race_id, pre_roll_ms=0, prefer_continuous_media=True,
-        )
-        locations = [location for location in lookup.locations
-                     if location.status == "located" and location.segment.camera_index == camera
-                     and location.segment.clock_source == DEFAULT_CLOCK_SOURCE]
+        # A chip reference uses the same session calibration as normal playback.
+        # Rebuild it on every open: a cached reference predates later calibration.
+        offsets = {self._clock_offset_for_camera(camera)}
+        for segment in self.timeline_store.segments():
+            if segment.camera_index == camera and segment.clock_source == DEFAULT_CLOCK_SOURCE:
+                key = self._recording_session_key_from_path(
+                    segment.source_id, self.timeline_store.resolve_video_path(segment))
+                offsets.add(self._calibrated_clock_offset(camera, key))
+        locations = []
+        for offset in offsets:
+            lookup = self.timeline_store.locate_passage(
+                timestamp, clock_offset_ms=offset, race_id=event.race_id,
+                pre_roll_ms=0, prefer_continuous_media=True,
+            )
+            locations.extend(location for location in lookup.locations
+                             if location.status == "located" and location.segment.camera_index == camera
+                             and location.segment.clock_source == DEFAULT_CLOCK_SOURCE
+                             and self._continuous_offset_for_location(location) == offset)
         if not locations:
             return False
         # Immutable short clips are preferred, but a sealed archive can cover
@@ -3078,7 +3120,10 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         labels = [f"{event.bib} · {datetime.fromtimestamp(event.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]} · {event.event_id}"
                   for event in events]
-        label, ok = QInputDialog.getItem(self, "以当前帧校时", "当前画面压线的是哪位选手？", labels, 0, False)
+        selected = self.problem_panel._selected_arrival()
+        default = next((i for i, candidate in enumerate(events)
+                        if selected and selected.event and candidate.event_id == selected.event.event_id), 0)
+        label, ok = QInputDialog.getItem(self, "以当前帧校时", "当前画面压线的是哪位选手？", labels, default, False)
         if not ok or label not in labels:
             return
         event = events[labels.index(label)]
@@ -3261,6 +3306,9 @@ class FinishReviewWindow(PassageReviewSurface):
         # window knows which frame it landed on, and the panel keeps the count.
         pane.video_view.count_mark_selected.connect(
             lambda x, y, pane=pane: self._problem_count_clicked(x, y, pane)
+        )
+        pane.video_view.count_mark_cancelled.connect(
+            lambda x, y, pane=pane: self._problem_count_cancelled(x, y, pane)
         )
         self._problem_count_mode_changed(True)
 

@@ -886,7 +886,8 @@ def test_the_first_rider_calibration_keeps_the_original_chip_record(qapp, tmp_pa
 
 
 @pytest.mark.parametrize("days", [0, 1])
-def test_chip_click_opens_raw_reference_before_model_line_or_calibration(qapp, tmp_path, days):
+@pytest.mark.parametrize("offset", [0, 2714, -1500])
+def test_chip_click_opens_raw_reference_before_model_line_or_calibration(qapp, tmp_path, days, offset):
     from PyQt5.QtGui import QImage
 
     window = _window(tmp_path, workbench=True)
@@ -901,6 +902,9 @@ def test_chip_click_opens_raw_reference_before_model_line_or_calibration(qapp, t
         event = _event(passage_timestamp_ms=start + 2000 + days * 86_400_000,
                        received_at_ms=start + 2200)
         window.passage_store.append(event)
+        if offset:
+            key = window._recording_session_key_from_path(segment.source_id, video)
+            window._continuous_clock_offsets[(1, key)] = offset
         panel = window.problem_panel
         panel.refresh()
         index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == event.bib)
@@ -908,7 +912,7 @@ def test_chip_click_opens_raw_reference_before_model_line_or_calibration(qapp, t
         pane = window.regular_pane
         assert pane.location.segment.segment_id == segment.segment_id
         assert pane.location.video_path == video
-        assert pane.location.playback_position_ms == 2000
+        assert pane.location.playback_position_ms == 2000 + offset
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         assert "参考录像" in panel.hint.text() and "不代表已确认过线" in panel.hint.text()
         assert pane._reference_only is True
@@ -947,6 +951,31 @@ def test_chip_reference_does_not_borrow_unrelated_or_missing_video(qapp, tmp_pat
         window.problem_panel._arrival_clicked(index)
         assert window.regular_pane.location is None
         assert not window.problem_panel.confirm_arrival_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_hls_windows_share_first_rider_calibration_including_legacy_key(qapp, tmp_path):
+    from realtime.analysis_workspace import session_id_for_path
+    window = _window(tmp_path, workbench=True)
+    try:
+        folder = tmp_path / "review_buffer" / "camera_01"
+        folder.mkdir(parents=True)
+        session = "camera_01_20261018_104528_433517"
+        first = folder / "evidence_shared_first.m3u8"
+        second = folder / "evidence_shared_second.m3u8"
+        for index, path in enumerate((first, second)):
+            path.write_text(f"#EXTM3U\n{session}_review_{index:016d}.ts\n#EXT-X-ENDLIST\n", encoding="utf-8")
+        key = window._recording_session_key_from_path("camera_01_review", second)
+        assert key == window._recording_session_key_from_path("camera_01_review", first)
+        assert key == window._recording_session_key_from_path("camera_01_review", tmp_path / "videos" / (session + "_archive_0000.mkv"))
+        assert session_id_for_path(first) == session_id_for_path(second) == session
+        window.calibration_store.record(
+            camera_index=1, session_key=f"camera_01_review|{folder}|{first.stem}",
+            offset_ms=2525, anchor_event_id="first", anchor_bib="901", calibrated_at_ms=1000)
+        assert window._calibrated_clock_offset(1, key) == 2525
+        window._continuous_clock_offsets[(1, key)] = 2714
+        assert window._calibrated_clock_offset(1, key) == 2714
     finally:
         window.close()
 
@@ -2195,6 +2224,19 @@ def test_clearing_the_race_data_removes_test_readings_and_keeps_settings(qapp, t
             clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
             end_reason="test", race_id="race-live",
         )
+
+        released = set()
+        for pane in window.all_evidence_panes:
+            shutdown = pane.shutdown
+            def release(*, wait=True, pane=pane, shutdown=shutdown):
+                shutdown(wait=wait)
+                released.add(pane)
+            monkeypatch.setattr(pane, "shutdown", release)
+        remove_data = window._remove_event_data
+        def remove_after_release(event_dir, root):
+            assert released == set(window.all_evidence_panes)
+            return remove_data(event_dir, root)
+        monkeypatch.setattr(window, "_remove_event_data", remove_after_release)
 
         window.problem_panel.clear_data_button.click()
 
@@ -4896,7 +4938,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.25.5 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.25.6 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -4910,7 +4952,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.25.5"
+    assert window.product_title_label.text() == "FinishReview v0.25.6"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()

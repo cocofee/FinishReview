@@ -132,8 +132,10 @@ def test_settle_run_reports_a_chip_outside_the_recording_as_a_coverage_gap(synth
         PassageEvent(event_id=f"{RACE}-stage-1-passage-90", race_id=RACE, stage_id="stage-1", group_id="1",
                      sequence=90, bib="900", passage_time_ms=after - DAY, lap=0, passage_timestamp_ms=after,
                      received_at_ms=after + 300, group_name="男子组"),
+        # Sequence follows crossing order in the real feed; keep this synthetic
+        # feed consistent so the earlier read is not mistaken for a manual entry.
         PassageEvent(event_id=f"{RACE}-stage-1-passage-91", race_id=RACE, stage_id="stage-1", group_id="1",
-                     sequence=91, bib="901", passage_time_ms=before - DAY, lap=0, passage_timestamp_ms=before,
+                     sequence=89, bib="901", passage_time_ms=before - DAY, lap=0, passage_timestamp_ms=before,
                      received_at_ms=before + 300, group_name="男子组"),
     ])
     reads = (*workspace.reads, *outside)
@@ -782,11 +784,11 @@ def test_obstructed_line_events_need_verified_crossings_before_entering_the_queu
 
     assert result["analyzed_through_ms"] > START
     assert result["calibration_pending"] and not result["auto_passed"]
-    assert result["crossings"] == (len(CROSSINGS_S) if state == "confirmed" else 0)
-    if state == "confirmed":
+    assert result["crossings"] == (0 if state == "not_crossed" else len(CROSSINGS_S))
+    if state in ("confirmed", "unverified"):
+        # Both are real line changes awaiting a clock; an unverified track is
+        # kept once as a crossing candidate, not duplicated as line_activity.
         assert all(i.status == "disputed" and i.kind == KIND_NO_CHIP_CROSSING for i in result["items"])
-    elif state == "unverified":
-        assert all(i.kind == "line_activity" and i.evidence["frame"] for i in result["items"])
         assert len(result["items"]) == len(CROSSINGS_S)
     else:
         assert result["items"] == []

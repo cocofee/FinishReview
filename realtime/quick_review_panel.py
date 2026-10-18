@@ -34,6 +34,7 @@ class ArrivalRow:
     bib: str = ""
     event: object = None
     time_ms: int | None = None
+    recorder_ms: int | None = None
     reference: bool = True
     decision: dict | None = None
     stale: bool = False
@@ -44,6 +45,7 @@ class QuickReviewPanel(ProblemListPanel):
     confirmation_preparing = pyqtSignal()
     candidate_preparing = pyqtSignal()
     sampling_configured = pyqtSignal()
+    sampling_preparing = pyqtSignal()
 
     def __init__(self, parent=None):
         self._quick_ready = False
@@ -66,6 +68,9 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.cellDoubleClicked.connect(lambda index, _column: self._open_row(index))
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态"])
+        self.table.horizontalHeaderItem(2).setToolTip(
+            "校时后的芯片域时间；悬浮单元格可看录像原时刻"
+        )
         for column, width in enumerate((42, 66, 137)):
             self.table.setColumnWidth(column, width)
         self.table.setMinimumWidth(340)
@@ -213,12 +218,15 @@ class QuickReviewPanel(ProblemListPanel):
             pairs += list(zip(item.event_ids, item.bibs))
             if item.grouped in by_id:
                 item = by_id[item.grouped]
+            evidence_frame = item.evidence.get("frame") or {}
+            raw_recorder_ms = item.evidence.get("recorder_ms", evidence_frame.get("recorder_ms"))
             if not pairs:
                 if raw.grouped:
                     continue
                 crossing = item_crossing_time(item, self.workspace_dir, clocks=clocks)
                 rows.append(ArrivalRow("candidate:" + item.item_id, item,
                                        time_ms=crossing.value_ms if crossing else None,
+                                       recorder_ms=raw_recorder_ms,
                                        reference=crossing is None or crossing.source in ("expected", "chip")))
             for event_id, bib in pairs:
                 if not event_id or event_id in represented:
@@ -230,7 +238,8 @@ class QuickReviewPanel(ProblemListPanel):
                 crossing = item_crossing_time(item, self.workspace_dir, clocks=clocks)
                 rows.append(ArrivalRow("event:" + event_id, item, bib, event,
                                        int(event.timeline_timestamp_ms) if event else
-                                       crossing.value_ms if crossing else None))
+                                       crossing.value_ms if crossing else None,
+                                       recorder_ms=raw_recorder_ms))
         for event_id, event in events.items():
             if event_id in represented or not event.is_active:
                 continue
@@ -252,7 +261,21 @@ class QuickReviewPanel(ProblemListPanel):
                             and not row.item.evidence.get("configuration_stale")):
                         row.decision = previous
                         row.item = anchor
-                        row.time_ms = previous["crossing_ms"]
+                        frame = previous.get("frame") or {}
+                        raw_recorder_ms = frame.get("recorder_ms")
+                        row.recorder_ms = raw_recorder_ms
+                        # New confirmations store the already-calibrated crossing
+                        # time; older ones stored the raw recorder time. Convert
+                        # only the latter, so a live calibration is never applied
+                        # twice.
+                        stored_ms = previous["crossing_ms"]
+                        if raw_recorder_ms is None or int(stored_ms) == int(raw_recorder_ms):
+                            crossing = recorder_crossing_time(
+                                stored_ms, frame, self.workspace_dir, clocks=clocks,
+                            )
+                            row.time_ms = crossing.value_ms if crossing is not None else stored_ms
+                        else:
+                            row.time_ms = stored_ms
                         row.reference = False
         assigned = Counter(row.decision["candidate_id"] for row in rows if row.decision)
         rows = [row for row in rows if row.event is not None
@@ -330,8 +353,13 @@ class QuickReviewPanel(ProblemListPanel):
                     cell.setForeground(QColor(foreground))
                     cell.setBackground(QColor(background))
                     cell.setTextAlignment(Qt.AlignCenter)
-                cell.setToolTip("点击回看保存原帧" if row.decision else
-                                "点击回看对应时段；已确认有自行车时单击只选择运动员，双击回看；不会自动确认过线")
+                tooltip = ("点击回看保存原帧" if row.decision else
+                           "点击回看对应时段；已确认有自行车时单击只选择运动员，双击回看；不会自动确认过线")
+                if (column == 2 and row.recorder_ms is not None and row.time_ms is not None
+                        and int(row.recorder_ms) != int(row.time_ms)):
+                    tooltip = (f"判读时间（校时后）：{format_chip_time(row.time_ms)}\n"
+                               f"录像原时刻：{format_chip_time(row.recorder_ms)}\n" + tooltip)
+                cell.setToolTip(tooltip)
                 self.table.setItem(index, column, cell)
             if row.key == self._selected_key:
                 selected = index
@@ -484,6 +512,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.finish_line_status.setStyleSheet("color:#17675b;" if configured else "color:#9a5b12;")
 
     def _configure_sampling(self):
+        self.sampling_preparing.emit()
         super()._configure_sampling()
         self.sampling_configured.emit()
 
@@ -614,7 +643,46 @@ class QuickReviewPanel(ProblemListPanel):
         self.marks_changed.emit(tuple(self.current_marks()))
         self.hint.setText(f"已确认 {event.bib} 过线；继续看下一位。")
 
+    def cancel_picture_mark(self, x=None, y=None):
+        marks = self.current_marks()
+        frame = self._frame_provider()
+        from .bunch_review import mark_on_frame
+        candidates = [i for i, mark in enumerate(marks)
+                      if frame and mark_on_frame(mark, frame, frame.get("recorder_ms"))]
+        if x is not None:
+            candidates = [i for i in candidates
+                          if (marks[i]["x"] - x) ** 2 + (marks[i]["y"] - y) ** 2 <= .04 ** 2]
+        index = (min(candidates, key=lambda i: (marks[i]["x"] - x) ** 2 + (marks[i]["y"] - y) ** 2)
+                 if candidates and x is not None else candidates[-1] if candidates else None)
+        if index is None:
+            return False
+        mark = marks[index]
+        item = self.current_item()
+        for row_index, row in enumerate(self._arrival_rows):
+            saved = (row.decision or {}).get("frame", {})
+            if (row.decision and item and row.decision.get("candidate_id") == item.item_id
+                    and mark_on_frame(mark, saved, saved.get("recorder_ms"))
+                    and abs(saved.get("marker_x_normalized", -1) - mark["x"]) <= .001
+                    and abs(saved.get("marker_y_normalized", -1) - mark["y"]) <= .001):
+                self.table.setCurrentCell(row_index, 0)
+                self._undo_arrival()
+                break
+        # Undo may have re-rendered the table and moved the active item; remove
+        # the circle from the item it was drawn on, not from whatever is current.
+        owned = self._marks.get(item.item_id, []) if item is not None else []
+        if 0 <= index < len(owned):
+            owned.pop(index)
+            self._editing_mark = min(index, len(owned) - 1)
+            self._marks_updated()
+        self._sync_arrival_confirmation()
+        self.marks_changed.emit(tuple(self.current_marks()))
+        self.hint.setText("已取消这个待选标记；左键可重新点选，右键取消。")
+        return True
+
     def _undo_arrival(self):
+        row = self._selected_arrival()
+        if (row is None or not row.decision) and self.cancel_picture_mark():
+            return
         if self._arrival_store is None:
             return
         row = self._selected_arrival()

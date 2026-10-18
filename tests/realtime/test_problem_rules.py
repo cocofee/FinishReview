@@ -326,6 +326,22 @@ def test_line_activity_before_the_first_rider_is_excluded_not_listed():
     assert outcome.stats["before_race"] == 1
 
 
+def test_a_manual_entry_is_included_in_the_bunch_head_count():
+    """A 补录 rider is one of the people the operator must count."""
+
+    reads = [_read(str(index), T0 + 10_000 + index * 500) for index in range(4)]
+    matched = [(_crossing(read.chip_ms + 1_000), read, 0.0) for read in reads]
+    outcome = _rules(
+        matched=matched,
+        manual_entries=[_read("6", T0 + 11_200, manual=True)],
+    )
+
+    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
+    assert bunch.evidence["chip_count"] == 5
+    assert bunch.evidence["manual_bibs"] == ["6"]
+    assert "含补录 6" in bunch.detail and "6" in bunch.bibs
+
+
 def test_items_inside_bunches_and_crowded_periods_are_folded_into_the_group():
     reads = [_read(str(index), T0 + 10_000 + index * 400) for index in range(5)]
     matched = [(_crossing(read.chip_ms + 1_000), read, 0.0) for read in reads[:4]]

@@ -533,13 +533,15 @@ def build_video_items(
             entry["merged_fragments"] = fragments_of[read.event_id]
         outcome.auto_passed.append(entry)
 
-    bunches = _bunch_items(camera_index, model, matched, chip_only, rest, version, near_candidates)
+    bunches = _bunch_items(camera_index, model, matched, chip_only, rest, version, near_candidates,
+                           manual_entries=manual_entries)
     race_periods = [
         (start, end) for start, end in periods if race_start_ms is None or end >= race_start_ms
     ]
     records = sorted([m[0] for m in matched] + list(video_only), key=lambda crossing: crossing.recorder_ms)
     crowds = _obstruction_items(
         camera_index, model, race_periods, matched, chip_only, version, unverified, records,
+        manual_entries=manual_entries,
     )
     outcome.items = _group_members(outcome.items, bunches, crowds, expected)
     outcome.items += _no_video_items(camera_index, no_video)
@@ -653,14 +655,31 @@ def merge_obstructions(obstructions: Sequence[Obstruction]) -> list[tuple[int, i
     return [(start, end) for start, end, total in periods if total >= OBSTRUCTION_MIN_MS]
 
 
-def _bunch_items(camera_index, model, matched, chip_only, rest, version, near=()) -> list[ProblemItem]:
-    reads = sorted([m[1] for m in matched] + list(chip_only), key=lambda read: read.chip_ms)
-    groups: list[list[ChipRead]] = []
-    for read in reads:
-        if groups and read.chip_ms - groups[-1][-1].chip_ms <= BUNCH_GAP_MS:
-            groups[-1].append(read)
+def _bunch_items(camera_index, model, matched, chip_only, rest, version, near=(),
+                 manual_entries=()) -> list[ProblemItem]:
+    automatic = sorted([m[1] for m in matched] + list(chip_only), key=lambda read: read.chip_ms)
+    manual = sorted(
+        (read for read in manual_entries if read.active_now and not read.excluded),
+        key=lambda read: read.chip_ms,
+    )
+    # A manual entry is a rider too: the group count must include the one the
+    # chip system missed and an operator entered later, or the operator is told
+    # to look for one more rider than actually exists. It never replaces an
+    # automatic read of the same bib in the same group.
+    groups: list[list[tuple[ChipRead, bool]]] = []
+    for read, is_manual in sorted(
+        [(read, False) for read in automatic] + [(read, True) for read in manual],
+        key=lambda item: item[0].chip_ms,
+    ):
+        if groups and read.chip_ms - groups[-1][-1][0].chip_ms <= BUNCH_GAP_MS:
+            group = groups[-1]
+            if is_manual and any(not other_manual and other.bib == read.bib
+                                 for other, other_manual in group):
+                continue
+            group.append((read, is_manual))
         else:
-            groups.append([read])
+            groups.append([(read, is_manual)])
+    reads = [read for group in groups for read, _is_manual in group]
     records = sorted([m[0] for m in matched] + [crossing for crossing, _verdict in rest]
                      + [value.crossing for value in near], key=lambda c: c.recorder_ms)
     crossings = [record.recorder_ms for record in records]
@@ -669,22 +688,28 @@ def _bunch_items(camera_index, model, matched, chip_only, rest, version, near=()
     for group in groups:
         if len(group) < BUNCH_MIN:
             continue
-        start = model.to_recorder(group[0].chip_ms) - BUNCH_MARGIN_MS
-        end = model.to_recorder(group[-1].chip_ms) + BUNCH_MARGIN_MS
+        manual_reads = [read for read, is_manual in group if is_manual]
+        start = model.to_recorder(group[0][0].chip_ms) - BUNCH_MARGIN_MS
+        end = model.to_recorder(group[-1][0].chip_ms) + BUNCH_MARGIN_MS
         windows.append((start, end))
         video = sum(start <= value <= end for value in crossings)
         evidence = {"camera_index": camera_index, "recorder_start_ms": int(start), "recorder_end_ms": int(end), "video_count": video,
                     "chip_count": len(group), "source": "chip"}
+        if manual_reads:
+            evidence["manual_bibs"] = [read.bib for read in manual_reads]
+            evidence["manual_event_ids"] = [read.event_id for read in manual_reads]
         evidence.update(_period_anchor(records, start, end, version))
         items.append(ProblemItem(
-            item_id=stable_item_id(KIND_BUNCH, camera_index, *(read.read_id for read in group)),
+            item_id=stable_item_id(KIND_BUNCH, camera_index, *(read.read_id for read, _manual in group)),
             kind=KIND_BUNCH, category=CATEGORY_VIDEO,
             detail=(
-                f"{format_chip_time(group[0].chip_ms)} 起 {len(group)} 条芯片通过记录相隔 2 秒以内："
+                f"{format_chip_time(group[0][0].chip_ms)} 起 {len(group)} 条芯片通过记录相隔 2 秒以内："
                 f"自动计数 {video} 次" + ("（不一致）" if video != len(group) else "")
+                + (f"；含补录 {'、'.join(read.bib for read in manual_reads)}，请核对补录是否对应其中一次过线"
+                   if manual_reads else "")
             ),
-            chip_time_ms=group[0].chip_ms, bibs=tuple(read.bib for read in group),
-            event_ids=tuple(read.event_id for read in group), status=STATUS_OPEN, priority=50,
+            chip_time_ms=group[0][0].chip_ms, bibs=tuple(read.bib for read, _manual in group),
+            event_ids=tuple(read.event_id for read, _manual in group), status=STATUS_OPEN, priority=50,
             evidence=evidence, calibration_version=version,
         ))
     # The other direction: the video shows a group with fewer chips than riders.
@@ -735,9 +760,12 @@ def _period_anchor(records: Sequence[CrossingRecord], start: int, end: int, vers
 
 def _obstruction_items(
     camera_index, model, periods, matched, chip_only, version, unverified=frozenset(), records=(),
+    manual_entries=(),
 ) -> list[ProblemItem]:
     items = []
-    reads = [m[1] for m in matched] + list(chip_only)
+    reads = [m[1] for m in matched] + list(chip_only) + [
+        read for read in manual_entries if read.active_now and not read.excluded
+    ]
     for start, end in periods:
         inside = [read for read in reads if start - 5_000 <= model.to_recorder(read.chip_ms) <= end + 5_000]
         weak = [read.bib for read in inside if read.read_id in unverified]

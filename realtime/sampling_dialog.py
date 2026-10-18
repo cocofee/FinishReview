@@ -185,10 +185,13 @@ class SamplingSettingsDialog(QDialog):
     def __init__(self, workspace, parent=None, *, race_id="", stage_id=""):
         super().__init__(parent)
         self.root = Path(workspace)
-        self.source = AnalysisWorkspace(self.root, race_id=race_id, stage_id=stage_id, include_review_segments=True)
+        self.source = AnalysisWorkspace(
+            self.root, race_id=race_id, stage_id=stage_id,
+            include_review_segments=True, allow_empty_scope=True,
+        )
         self.store = AnalysisSettingsStore(self.root)
         self.config = config_from_workspace(self.root)
-        self.segments = sorted(self.source.archive_segments(), key=lambda s: (s.camera_index, s.start_ms))
+        self.segments = sorted(self.source.archive_segments(for_configuration=True), key=lambda s: (s.camera_index, s.start_ms))
         self.worker = None
         self.probe = None
         self._closing = False
@@ -196,16 +199,22 @@ class SamplingSettingsDialog(QDialog):
         self._selected = None
         self.position_ms = 0
         self._frame_ready = False
-        self.setWindowTitle("实际终点线与认车配置（只读封存录像）")
+        self.setWindowTitle("实际终点线与认车配置（录制中也可设置）")
         self.resize(1000, 760)
         layout = QVBoxLayout(self)
-        self.scope = QLabel(f"赛事：{self.source.race_id} / {self.source.stage_id}")
+        self.scope = QLabel(self._scope_text())
         self.scope.setWordWrap(True)
         layout.addWidget(self.scope)
+        segment_row = QHBoxLayout()
         self.segment_combo = QComboBox()
         for segment in self.segments:
             self.segment_combo.addItem(f"机位 {segment.camera_index} · {format_chip_time(segment.start_ms, date=True)} · {segment.session_id}")
-        layout.addWidget(self.segment_combo)
+        segment_row.addWidget(self.segment_combo, 1)
+        self.refresh_button = QPushButton("刷新画面")
+        self.refresh_button.setToolTip("录像刚开始或还没有短段时点一下；不用停止录像，也不用等芯片过线")
+        self.refresh_button.clicked.connect(self._reload_segments)
+        segment_row.addWidget(self.refresh_button)
+        layout.addLayout(segment_row)
         instructions = QLabel("左键依次加点（两点即直线）；拖动节点调整；Shift+单击在线段间插点；右键删除节点。\n"
                               "坐标按原始解码画面归一化，黑边不可落点；绿线为配置取样位置，自动贴线后的修正另存于分析证据。")
         instructions.setWordWrap(True)
@@ -223,8 +232,9 @@ class SamplingSettingsDialog(QDialog):
         self.geometry_label = QLabel()
         layout.addWidget(self.geometry_label)
         self.view.changed.connect(self._geometry_changed)
-        self.apply_scope = QLabel("仅保存当前选中机位：从所选片段起，同一录制会话内生效，直到下一条配置。\n"
-                                  "之前片段和其他会话不变；相机移动发生在片段内时，请选移动后的首个完整片段。")
+        self.apply_scope = QLabel("保存为当前机位的终点线：从所选片段起生效，并成为该机位的默认线。\n"
+                                  "之后新开的录像会话（重启、换版本、双开）自动沿用，比赛开始画一次即可。\n"
+                                  "只有移动相机或换机位时才需要重画；相机在片段内移动时，请选移动后的首个完整片段。")
         self.apply_scope.setWordWrap(True)
         layout.addWidget(self.apply_scope)
         model_row = QHBoxLayout()
@@ -246,7 +256,7 @@ class SamplingSettingsDialog(QDialog):
         layout.addWidget(self.model_status)
         self.model_path.textChanged.connect(self._model_changed)
         self.crop.currentTextChanged.connect(self._model_changed)
-        self.notice = QLabel("模型为赛事分析共用；取景方式按机位保存。不会改变录像或正式成绩。")
+        self.notice = QLabel("模型为赛事分析共用；终点线和取景方式按机位保存并作为默认沿用。不会改变录像或正式成绩。")
         self.notice.setWordWrap(True)
         layout.addWidget(self.notice)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -260,9 +270,42 @@ class SamplingSettingsDialog(QDialog):
             if self.worker is None:
                 self._select(self.segment_combo.currentIndex())
         else:
-            self.notice.setText("等待已封存录像：请先录制并等待首个短段封存，不需要停止录像。")
+            self.notice.setText("还没有可用画面：请先开始录像，2 秒后点「刷新画面」；"
+                                "不必等芯片过线，也不用停止录像。")
             self.buttons.button(QDialogButtonBox.Save).setEnabled(False)
             self.probe_button.setEnabled(False)
+
+    def _scope_text(self):
+        if self.source.race_id:
+            return f"赛事：{self.source.race_id} / {self.source.stage_id}"
+        return "赛事：尚未收到（不影响画线；开赛后同一录像会话自动沿用）"
+
+    def _reload_segments(self):
+        """Pick up short segments that were sealed while this dialog was open."""
+
+        if self.worker is not None:
+            self.notice.setText("画面仍在读取，请稍候再刷新。")
+            return
+        segments = sorted(self.source.archive_segments(for_configuration=True),
+                          key=lambda s: (s.camera_index, s.start_ms))
+        if not segments:
+            self.notice.setText("还没有可用画面：请确认录像已开始，2 秒后再点「刷新画面」。")
+            return
+        self._selected = None
+        self._drafts = {}
+        self._frame_ready = False
+        self.segments = segments
+        self.segment_combo.blockSignals(True)
+        self.segment_combo.clear()
+        for segment in segments:
+            self.segment_combo.addItem(
+                f"机位 {segment.camera_index} · {format_chip_time(segment.start_ms, date=True)} · {segment.session_id}")
+        index = default_segment_index(segments, self.race_end_ms())
+        self.segment_combo.setCurrentIndex(index)
+        self.segment_combo.blockSignals(False)
+        self._select(index)
+        self.scope.setText(self._scope_text())
+        self.notice.setText("已刷新画面；左键在画面上画终点线。")
 
     def race_end_ms(self):
         """The last chip read this race itself produced, if any."""
@@ -383,12 +426,35 @@ class SamplingSettingsDialog(QDialog):
             process.deleteLater()
             self._geometry_changed()
 
+    def _session_start_ms(self, segment):
+        """A line drawn from a live 2 s segment must cover the whole recording.
+
+        The archive rotates every five minutes; the session manifest (or the
+        earliest segment of that session) gives the moment the recorder started,
+        so the very first archive is sampled with this line too.
+        """
+
+        manifest = self.root / "videos" / f"{segment.session_id}_archive_session.json"
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            started = int(payload["session_started_at_ms"])
+            if started > 0:
+                return started
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        starts = [item.start_ms for item in self.segments
+                  if item.camera_index == segment.camera_index
+                  and item.session_id == segment.session_id]
+        return min(starts) if starts else segment.start_ms
+
     def _save(self):
         try:
             line = {"points": self.view.points, "snap": self.snap.isChecked()}
             LineGeometry.from_config(line, self.view.width_px, self.view.height_px)
+            segment = self.segments[self._selected]
             self.store.save(race_id=self.source.race_id, stage_id=self.source.stage_id,
-                            segment=self.segments[self._selected], line=line,
+                            segment=segment, line=line,
+                            effective_from_ms=self._session_start_ms(segment),
                             model_path=self.model_path.text(), crop_mode=self.crop.currentText())
         except (OSError, ValueError, KeyError) as error:
             self.notice.setText(f"配置未保存：{error}")

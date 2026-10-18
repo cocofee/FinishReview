@@ -46,6 +46,7 @@ from .bike_check import (
     DECISION_KEEP,
     LABEL_TEXT,
     LABEL_PEDESTRIAN,
+    LABEL_UNCHECKED,
     LABEL_VEHICLE,
     BikeVerdict,
     CropPlan,
@@ -175,16 +176,26 @@ def extract_strips(
 
     output_dir = config.resolved_output()
     if config.sampling_profiles and not config.race_id:
-        scope = AnalysisWorkspace(config.workspace)
+        scope = AnalysisWorkspace(config.workspace, allow_empty_scope=True)
         config = replace(config, race_id=scope.race_id, stage_id=scope.stage_id)
     paths = []
+    legacy = None
     for index, segment in enumerate(segments):
         if cancelled():
             break
         if crosses_profile_boundary(config.sampling_profiles, segment, config.race_id, config.stage_id):
             continue
-        effective = profile_for_segment(config.sampling_profiles, segment, config.race_id, config.stage_id) or line_config
-        if not effective:
+        effective = profile_for_segment(config.sampling_profiles, segment, config.race_id, config.stage_id)
+        if effective is None:
+            effective = line_config
+            if effective is not None and not line_covers_segment(effective, segment):
+                # The drawn-once default begins at the save session; earlier
+                # recordings keep using the workspace's legacy line.
+                if legacy is None:
+                    legacy = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
+                                               allow_empty_scope=True)
+                effective = legacy.finish_lines().get(segment.camera_index)
+        if not effective or not line_covers_segment(effective, segment):
             continue
         digest = line_config_digest(effective)
         target = strip_path(output_dir, segment)
@@ -223,17 +234,38 @@ def extract_strips(
     return paths
 
 
+def default_line_for_camera(config: AnalysisConfig, workspace: AnalysisWorkspace, camera: int):
+    line = config.finish_lines.get(camera)
+    # The saved line is the camera default for later sessions and stages too:
+    # an empty race (the pre-race draw) matches any scope, while a line from
+    # another race in the same folder must not leak into this one.  A stage
+    # that moves the camera gets a new save, which replaces this default.
+    if line and (not line.get("race_id") or line.get("race_id") == workspace.race_id):
+        return line
+    return None
+
+
 def line_for_camera(config: AnalysisConfig, workspace: AnalysisWorkspace, camera: int) -> Optional[Mapping[str, Any]]:
-    if camera in config.finish_lines:
-        return config.finish_lines[camera]
-    return workspace.finish_lines().get(camera)
+    return default_line_for_camera(config, workspace, camera) or workspace.finish_lines().get(camera)
+
+
+def line_covers_segment(line, segment) -> bool:
+    """A drawn-once default starts at its save session; older recordings keep theirs."""
+
+    effective = line.get("effective_from_ms") if isinstance(line, Mapping) else None
+    return effective is None or int(effective) <= segment.start_ms
 
 
 def line_for_segment(config, workspace, segment):
     if crosses_profile_boundary(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id):
         return None
-    return (profile_for_segment(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id)
-            or line_for_camera(config, workspace, segment.camera_index))
+    profile = profile_for_segment(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id)
+    if profile:
+        return profile
+    line = default_line_for_camera(config, workspace, segment.camera_index)
+    if line is None or not line_covers_segment(line, segment):
+        line = workspace.finish_lines().get(segment.camera_index)
+    return line if line and line_covers_segment(line, segment) else None
 
 
 def load_line_overrides(path: Optional[Path]) -> dict[int, dict]:
@@ -977,15 +1009,28 @@ def analyse_camera(
         crossing_checks = _verify_crossing_candidates(
             config, camera, files, line_candidates, progress=progress, checkpoint=checkpoint, runtime=runtime,
         )
-        crossings = [c for c in line_candidates if crossing_checks[c.key].state == "confirmed"]
+        # A line change the tracker cannot follow (bunch, shadow, occlusion) is
+        # still evidence that somebody crossed.  Dropping those candidates made
+        # the whole main bunch unpaired and left hundreds of "line activity"
+        # rows with no answer; only a clearly absent target is discarded.
+        crossings = [c for c in line_candidates
+                     if crossing_checks[c.key].state != "not_crossed"
+                     and crossing_checks[c.key].reason != "model_failed"]
         verified_verdicts = {}
         periods = merge_obstructions(obstructions)
         for crossing in crossings:
             check = crossing_checks[crossing.key]
             crowded = crossing.in_obstruction or any(a - 5_000 <= crossing.recorder_ms <= b + 5_000 for a, b in periods)
+            if check.state == "confirmed":
+                reason = ("遮挡时段，目标跨线已验证，仍需人工确认" if crowded
+                          else "目标轨迹跨线已验证；不自动判定选手身份")
+                decision = DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP
+            else:
+                reason = "目标轨迹不足，按芯片时间参与配对，仍需人工确认"
+                decision = DECISION_DISPUTED
             verified_verdicts[crossing.key] = BikeVerdict(
-                check.label, check.score, DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP,
-                "遮挡时段，目标跨线已验证，仍需人工确认" if crowded else "目标轨迹跨线已验证；不自动判定选手身份",
+                check.label if check.state == "confirmed" else LABEL_UNCHECKED,
+                check.score, decision, reason,
                 len(check.observed_ms), vehicle=check.vehicle,
             )
         for entry in raw:
@@ -994,14 +1039,23 @@ def analyse_camera(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"crossings_camera{camera}.json").write_text(json.dumps(
         {"schema_version": 1, "camera_index": camera,
-         "crossings": [entry for entry in raw if not crossing_checks or entry["crossing_check"]["state"] == "confirmed"],
+         # Group counting needs every line change the camera saw; an
+         # "unverified" track is still a person-sized crossing.  Only a target
+         # the model positively ruled out is dropped from this list.
+         "crossings": [entry for entry in raw if not crossing_checks
+                       or (entry["crossing_check"]["state"] != "not_crossed"
+                           and entry["crossing_check"].get("reason") != "model_failed")],
          "line_events": raw,
          "coverage": [list(item) for item in coverage],
          "obstructions": [[item.start_ms, item.end_ms] for item in obstructions]},
         ensure_ascii=False,
     ), encoding="utf-8")
 
+    # A confirmed non-bicycle target (pedestrian, vehicle) must never absorb a
+    # chip.  An unverified candidate, on the other hand, is exactly the rider
+    # the model lost track of, so it stays eligible for time pairing.
     pairing_crossings = [c for c in crossings if verified_verdicts is None
+                         or crossing_checks[c.key].state != "confirmed"
                          or verified_verdicts[c.key].label == "bicycle"]
     calibration = calibrate_evidence_clock(
         [ClockCrossing(item.recorder_ms, item.session_id) for item in pairing_crossings],
@@ -1095,7 +1149,13 @@ def analyse_camera(
                     state="failed",
                     message=f"认车加载/推理失败，候选保留：{error}",
                 )
-            result["items"] = video_items + _unchecked_line_items(line_candidates, crossing_checks, camera)
+            # Candidates already rendered from ``crossings`` must not appear
+            # again as a second "line activity" row; only a candidate excluded
+            # from pairing (e.g. the model failed on it) remains here.
+            paired_keys = {item.key for item in crossings}
+            result["items"] = video_items + _unchecked_line_items(
+                [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera,
+            )
             for item in video_items:
                 frame = item.evidence.get("frame", {})
                 key = f"{camera}|{frame.get('video_path')}|{frame.get('frame_index')}|{item.evidence.get('row')}"
@@ -1192,7 +1252,11 @@ def analyse_camera(
         matched += pairing.matched
         video_only += pairing.video_only
         if verified_verdicts is not None:
+            # Confirmed pedestrians/vehicles stay listed even if a chip time is
+            # nearby.  Unverified crossings already arrive through
+            # ``pairing.video_only``; adding them again would double-count.
             video_only += [c for c in crossings if c.session_id == session
+                           and crossing_checks[c.key].state == "confirmed"
                            and verified_verdicts[c.key].label != "bicycle"]
         chip_only += pairing.chip_only
     uncalibrated_sessions = sorted({
@@ -1316,7 +1380,13 @@ def analyse_camera(
     result["fragments"] = outcome.fragments
     result["near_crossings"] = outcome.near_crossings
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
-    result["items"] = list(outcome.items) + _unchecked_line_items(line_candidates, crossing_checks, camera, model)
+    # Once calibrated, an unverified crossing is paired or listed as a
+    # video-only rider; only a candidate excluded from pairing (model failure)
+    # still needs its own "line changed, not verified" row.
+    paired_keys = {item.key for item in crossings}
+    result["items"] = list(outcome.items) + _unchecked_line_items(
+        [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera, model,
+    )
     result["auto_passed"] = outcome.auto_passed
     recognition = result["bike_status"]
     evidence_signature = hashlib.sha256(json.dumps([line_signature, recognition], sort_keys=True).encode()).hexdigest()
@@ -1513,7 +1583,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                     # First-rider anchors and late chips must take effect at the
                     # next publication, not after an entire historical backlog.
                     workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
-                                                  include_review_segments=True)
+                                                  include_review_segments=True, allow_empty_scope=True)
                     inputs = latest_inputs
                 camera, pending = job["camera"], job["pending"]
                 if not first_round and not pending:
@@ -1594,7 +1664,7 @@ def run_offline_analysis(
     """
 
     workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
-                                  include_review_segments=True)
+                                  include_review_segments=True, allow_empty_scope=True)
     config = replace(config, race_id=workspace.race_id, stage_id=workspace.stage_id)
     summary: dict = {"race_id": workspace.race_id, "cameras": {}}
     free = available_memory_mb()
