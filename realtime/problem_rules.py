@@ -1,11 +1,10 @@
 """Merge rules that turn pairing results into finish problem items (plan 7.2/7.3).
 
 Rules, in order:
-1. an unpaired crossing near a chip-only read is that read arriving late
-   (0.8 s; 1.5 s when both sides are isolated);
+1. an unpaired crossing near a chip-only read remains a review candidate
+   (0.8 s; 1.5 s when both sides are isolated), never an automatic match;
 2. an extra crossing beside a chip that is already matched to another crossing
-   is only merged when it belongs to the same passage: the same moment or an
-   adjacent frame of the same session. The merged piece stays in that rider's
+   is only merged when it is an identical detection record. The copy stays in that rider's
    evidence. Anything else becomes one "附近可能另有过线" item per chip, never
    a silent drop and never a task per fragment (plan step 5);
 3. repeated activity at the same spot within 90 s becomes one "standing" item;
@@ -67,8 +66,7 @@ STANDING_ROWS = 50
 STANDING_WINDOW_MS = 90_000
 STANDING_MIN = 3
 SIMULTANEOUS_MS = 300
-SAME_CROSSING_MS = 150
-SAME_CROSSING_FRAMES = 2
+RULES_VERSION = 2
 BUNCH_GAP_MS = 2_000
 BUNCH_MIN = 4
 SMALL_GROUP_MIN = 3
@@ -121,10 +119,11 @@ class Obstruction:
 
 @dataclass(frozen=True)
 class NearCrossing:
-    """An extra crossing beside a chip that is already matched elsewhere.
+    """A crossing near a chip, without enough evidence to associate them.
 
     ``read`` is the nearby chip the operator should compare against; it is a
-    candidate association, never a decision about who crossed.
+    candidate association, never a decision about who crossed. ``anchor`` is
+    absent when the chip itself was left unmatched by the strict alignment.
     """
 
     crossing: CrossingRecord
@@ -138,6 +137,8 @@ class NearCrossing:
 class RuleOutcome:
     items: list[ProblemItem] = field(default_factory=list)
     auto_passed: list[dict] = field(default_factory=list)
+    # Retain the legacy output shape; wide-window candidates never populate
+    # these automatic-closure fields.
     late_pairs: list[tuple[str, int]] = field(default_factory=list)
     late_pair_frames: list[dict] = field(default_factory=list)
     duplicates: int = 0
@@ -158,22 +159,10 @@ def _closed_note(reads: Sequence[ChipRead]) -> tuple[str, str]:
 
 
 def same_passage(extra: CrossingRecord, anchor: Optional[CrossingRecord]) -> tuple[bool, str]:
-    """Whether an extra change is part of an already detected crossing.
+    """Only deduplicate identical observations; proximity does not prove identity."""
 
-    Only the geometry the detector itself merges on: the same moment, or an
-    adjacent frame of the same session. Rows along the line are not used, so a
-    second rider is never merged just because the chip time is close; at the
-    same moment one rider cannot be two riders, and the strip already merges
-    pieces within ``same_start_ms``. Everything wider stays a candidate.
-    """
-
-    if anchor is None or extra.session_id != anchor.session_id:
-        return False, ""
-    if abs(extra.recorder_ms - anchor.recorder_ms) <= SAME_CROSSING_MS:
-        return True, "同一时刻的两处变化属于同一次过线"
-    if (extra.video_path == anchor.video_path
-            and abs(extra.frame_index - anchor.frame_index) <= SAME_CROSSING_FRAMES):
-        return True, "相邻帧上的两处变化属于同一次过线（前后轮或影子）"
+    if anchor is not None and extra == anchor:
+        return True, "同一原帧、位置和时刻的重复检测记录"
     return False, ""
 
 
@@ -257,7 +246,6 @@ def build_video_items(
             continue
         candidates.append((crossing, verdict))
 
-    resolved: set[str] = set()
     rest: list[tuple[CrossingRecord, Optional[BikeVerdict]]] = []
     near_candidates: list[NearCrossing] = []
     anchor_of: dict[str, CrossingRecord] = {read.read_id: crossing for crossing, read, _residual in matched}
@@ -269,7 +257,7 @@ def build_video_items(
             continue  # A nearby chip cannot turn a non-bicycle target into a rider.
         late = [
             read for read in chip_only
-            if read.read_id not in resolved and (
+            if (
                 abs(crossing.recorder_ms - expected[read.read_id]) <= LATE_PAIR_MS
                 or (
                     abs(crossing.recorder_ms - expected[read.read_id]) <= ISOLATED_LATE_PAIR_MS
@@ -279,11 +267,10 @@ def build_video_items(
         ]
         if late:
             read = min(late, key=lambda item: abs(crossing.recorder_ms - expected[item.read_id]))
-            resolved.add(read.read_id)
             residual = int(crossing.recorder_ms - expected[read.read_id])
-            outcome.late_pairs.append((read.bib, residual))
-            outcome.late_pair_frames.append(dict(_auto_passed(read, crossing, residual, version, late=True)))
-            outcome.auto_passed.append(_auto_passed(read, crossing, residual, version, late=True))
+            # The strict alignment already declined this pair. A wider window
+            # is useful for navigation, not evidence to remove either doubt.
+            near_candidates.append(NearCrossing(crossing, read, None, residual, verdict))
             continue
         neighbor = _nearest_expected(crossing, expected, DUPLICATE_MS)
         if neighbor is None:
@@ -384,7 +371,7 @@ def build_video_items(
             evidence=evidence, calibration_version=version,
         ))
 
-    # Extra changes beside a chip time that is already used by another crossing.
+    # Extra changes beside a chip time, including rejected wide-window pairs.
     # They are kept as one traceable question per chip; the nearby chip is an
     # association for the operator, not a reason to decide who crossed.
     near_groups: list[list[NearCrossing]] = []
@@ -433,6 +420,9 @@ def build_video_items(
                 f"{best.gap_ms:+d} ms（认车：{LABEL_TEXT.get(label, label)}）；"
                 "可能另有一位漏读选手，也可能只是同一人的后轮或影子，请按原帧判断"
                 + (f"；同一芯片附近另有 {len(group) - 1} 处变化，见证据" if len(group) > 1 else "")
+            ) if best.anchor is not None else (
+                f"{format_chip_time(chip_time)} 过线与芯片 {_chip_text(read)} 预期时刻相差 "
+                f"{best.gap_ms:+d} ms；时间对应不确定，仅作候选关联，请核对原帧和芯片，不能据此自动通过"
             ),
             chip_time_ms=chip_time, status=status, status_note=note, priority=15,
             evidence=dict(
@@ -440,14 +430,13 @@ def build_video_items(
                 near_read={"bib": read.bib, "event_id": read.event_id, "chip_ms": read.chip_ms,
                            "expected_recorder_ms": int(expected[read.read_id])},
                 gap_ms=int(best.gap_ms), members=members,
+                association_only=best.anchor is None,
             ),
             calibration_version=version,
         ))
 
     paired_crossings = [m[0] for m in matched]
     for read in chip_only:
-        if read.read_id in resolved:
-            continue
         expected_ms = expected[read.read_id]
         partners = [
             (crossing, chip) for crossing, chip, _residual in matched

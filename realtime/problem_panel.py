@@ -348,7 +348,7 @@ class ProblemListPanel(QFrame):
         images.addWidget(self.filmstrip, 1)
         detail_layout.addLayout(images)
         # 同一张表按过线先后放画面与芯片；修正操作只跟着选中的人出现。
-        self.big_help = QLabel("按过线先后看 · 点人计数 · 人数对上自动完成", detail)
+        self.big_help = QLabel("逐人点数并认号 · 数量一致不代表无异常 · 核对后确认", detail)
         self.big_help.setWordWrap(True)
         self.big_help.setStyleSheet("color:#667085; font-size:9pt;")
         self.big_help.hide()
@@ -868,7 +868,8 @@ class ProblemListPanel(QFrame):
             from .bunch_review import load_context
             try:
                 context = load_context(self.workspace_dir, item, record["camera"])
-                if self.bunch_store.get(context) is None:
+                record = self.bunch_store.get(context)
+                if record is None:
                     return STATE_STALE
             except (ValueError, OSError):
                 return STATE_STALE
@@ -1317,27 +1318,6 @@ class ProblemListPanel(QFrame):
         self._editing_mark = len(marks) - 1
         self._marks_updated()
         self.hint.setText(f"已点 {rider_count(marks)} 人；按过线时间排序，点错按退格撤销。")
-        # 数到的人数正好等于芯片条数：这一团自己收尾，不用再按确认。
-        self._auto_close_group(item)
-
-    def _auto_close_group(self, item) -> bool:
-        """人数与芯片条数相等，就是这一团成立的判据：当场核清，不留一步确认。
-
-        只有人数真的往上走到相等的那一下才收尾（新点一位，或把一位恢复为选手）。
-        重新打开一条已核清的集团时恢复出来的点数不会再自己合上，否则重开就白按了。
-        """
-
-        context = self._inline_context()
-        if item is None or context is None or item.kind not in (KIND_BUNCH, KIND_OBSTRUCTION):
-            return False
-        from .bunch_review import rider_count
-        counted = rider_count(self.current_marks())
-        if not counted or counted != len(context.chips):
-            return False
-        if self.state(item).startswith((STATE_RESOLVED, STATE_HANDOFF)):
-            return False
-        self._confirm_bunch_count(item, counted)
-        return True
 
     def undo_mark(self) -> None:
         item = self.current_item()
@@ -1552,7 +1532,7 @@ class ProblemListPanel(QFrame):
         if context is None:
             return text + (f" · {self._group_context_error}" if self._group_context_error else "")
         if counted and counted == len(chips):
-            text += " · 人数已对上"
+            text += " · 数量一致，仍须逐人核对"
         elif counted < len(chips):
             text += f" · 还差 {len(chips) - counted} 人"
         else:
@@ -1719,9 +1699,6 @@ class ProblemListPanel(QFrame):
         self._editing_mark = index
         self._marks_updated()
         self.hint.setText("已记为非选手，证据保留。" if reason else "已恢复为选手计数。")
-        if not reason:
-            # 恢复回来的这一位也可能刚好把人数补到与芯片条数相等。
-            self._auto_close_group(self.current_item())
 
     def _remove_mark(self, index):
         item = self.current_item()

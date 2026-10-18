@@ -96,7 +96,7 @@ from .problem_items import (
     ProblemItem,
     sort_items,
 )
-from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
+from .problem_rules import RULES_VERSION, CrossingRecord, Obstruction, build_video_items, merge_obstructions
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, check_target_tracks
 
 
@@ -1207,7 +1207,8 @@ def analyse_camera(
     result["items"] = list(outcome.items) + _unchecked_line_items(line_candidates, crossing_checks, camera, model)
     result["auto_passed"] = outcome.auto_passed
     recognition = result["bike_status"]
-    evidence_signature = hashlib.sha256(json.dumps([line_signature, recognition], sort_keys=True).encode()).hexdigest()
+    evidence_signature = hashlib.sha256(
+        json.dumps([RULES_VERSION, line_signature, recognition], sort_keys=True).encode()).hexdigest()
     by_segment = {item.meta.get("segment_id"): dict(item.meta, geometry_path=str(item.path.parent / item.meta["geometry_file"])
                                                   if item.meta.get("geometry_file") else "") for item in files}
 

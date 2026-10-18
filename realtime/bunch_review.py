@@ -40,6 +40,7 @@ from .problem_items import (
 
 
 JOURNAL_NAME = "bunch_reviews.jsonl"
+COMPLETION_POLICY_VERSION = 2
 PROBLEM_LIST_NAME = "finish_problems/problem_list.json"
 CROSSINGS_NAME = "finish_problems/crossings_camera{}.json"
 
@@ -532,12 +533,7 @@ def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: in
 
 
 def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) -> str:
-    """What still stands between this count and a closed group.
-
-    数到的人数就是判据：画面点到的人和芯片记录一一对上（多少对多少，不看前后
-    顺序），这一团就成立。剩下要填的是为了把漏读的人交给 CycleRace——多出来
-    的那位必须有号码，才补得进去。
-    """
+    """Require identified riders, not equal totals or provisional time matches."""
 
     active = [mark for mark in marks if not is_excluded(mark)]
     if not active:
@@ -545,12 +541,29 @@ def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) ->
     bibs = [m.get("bib", "").strip() for m in active if m.get("bib", "").strip()]
     if len(bibs) != len(set(bibs)):
         return "同一号码被填写在多人上，请先核对并修正。"
-    if len(active) == len(chips):
-        return ""  # 总数已对上；逐人时间对应只作参考，不另设完成门槛。
     if result["missing"]:
         return "仍有芯片没有对应的计数，请补查原帧；无法确认时保存进度，保留待处理。"
     if any(not e["bib"] or e["chip_time_ms"] is None for e in result["extras"]):
         return "多出的人须看清号码，且前后都有参考过线者才能估算补录时间；否则保存进度。"
+    if len(bibs) != len(active):
+        return "仍有选手未认号；人数相等或时间对应不能排除漏读与双芯片，请逐人核对，或保存进度。"
+    return ""
+
+
+def review_completion_issue(context, marks, result, viewed_ranges) -> str:
+    """One completion gate for both UIs, saved reviews and exports."""
+
+    if context.gaps:
+        return "原录像存在缺口，不能确认本团已完整核对。"
+    issue = completion_issue(context.chips, marks, result)
+    if issue:
+        return issue
+    if uncovered_intervals(context.start_ms, context.end_ms, viewed_ranges or [], tolerance=100):
+        return "仍有未查看范围；不能只查看候选就关闭整团，请继续查看原录像或保存进度。"
+    if pending_member_decisions(context):
+        return "仍有成员待 CycleRace 处理、暂存或需要重查，请处理后重新核对。"
+    if unresolved_crossing_conflicts(context, marks, result):
+        return "仍有过线或芯片疑点未处理；人数相等不能关闭这些疑点。"
     return ""
 
 
@@ -577,7 +590,19 @@ class BunchReviewStore:
 
     def get(self, context: BunchContext) -> dict | None:
         record = self.latest.get((context.item.item_id, context.camera))
-        return record if record and record.get("signature") == context.signature else None
+        if not record or record.get("signature") != context.signature:
+            return None
+        if record.get("completed"):
+            issue = ("旧核对记录仅按旧判据完成，请保留点数并重新核对。"
+                     if record.get("completion_policy_version") != COMPLETION_POLICY_VERSION else
+                     review_completion_issue(context, record["marks"],
+                                             align_counts(context.chips, record["marks"],
+                                                          record.get("fallback_bias_ms", 0)),
+                                             record.get("viewed_ranges")))
+            if issue:
+                # Reopen in memory; do not rewrite the operator's audit trail.
+                return dict(record, completed=False, completion_issue=issue)
+        return record
 
     def latest_for(self, item: ProblemItem) -> dict | None:
         records = [record for (item_id, _camera), record in self.latest.items() if item_id == item.item_id]
@@ -587,14 +612,11 @@ class BunchReviewStore:
              fully_viewed=False, fallback_bias_ms=0, viewed_ranges=None, visited_candidates=()) -> dict:
         result = align_counts(context.chips, marks, fallback_bias_ms)
         if completed:
-            if context.gaps:
-                raise ValueError("原录像存在缺口，不能确认本团已完整核对。")
-            # 人数对上就是对的：孩子疑点（双芯片、漏读）各自是表里的一行，
-            # 由操作员在那一行上判，不再拦住这一团的确认。
-            issue = completion_issue(context.chips, marks, result)
+            issue = review_completion_issue(context, marks, result, viewed_ranges)
             if issue:
                 raise ValueError(issue)
         record = {"schema_version": 1, "item_id": context.item.item_id, "signature": context.signature,
+                  "completion_policy_version": COMPLETION_POLICY_VERSION,
                   "item_snapshot": context.item.to_payload(), "chips": [asdict(chip) for chip in context.chips],
                   "camera": context.camera, "calibration_version": context.model.version,
                   "marks": marks, "seconds": round(seconds, 1), "completed": completed,
@@ -627,20 +649,14 @@ class BunchReviewStore:
                 context = load_context(workspace, by_id[item_id], record["camera"])
             except (ValueError, OSError):
                 continue
-            if self.get(context) is None:
-                continue  # changed chips, calibration, geometry or evidence: ask again
-            if pending_member_decisions(context):
-                continue
-            if context.gaps or ("viewed_ranges" in record and uncovered_intervals(
-                    context.start_ms, context.end_ms, record["viewed_ranges"], tolerance=100)):
+            checked = self.get(context)
+            if checked is None or not checked.get("completed"):
                 continue
             # Recompute from the saved evidence so stale cached extras cannot
             # reintroduce an excluded person or an incomplete group's suggestions.
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
             if completion_issue(context.chips, record["marks"], result):
                 continue
-            if rider_count(record["marks"]) == len(context.chips):
-                continue  # 数量相等的集团只完成点数，不把暂未对上的时间参考导出成漏读。
             for extra in result["extras"]:
                 mark = record["marks"][extra["mark"]]
                 # Every missed rider keeps its own frame, time and bracketing
