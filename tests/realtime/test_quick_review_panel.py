@@ -308,3 +308,53 @@ def test_csv_uses_bib_and_actual_frame_not_official_chip_time(panel):
     assert "321" in text and "a.mkv,5,0" in text
 
 
+def test_three_undoes_selected_210_after_later_confirmations_and_restart(panel, tmp_path):
+    panel.events = [replace(panel.events[0], bib="210"), replace(panel.events[1], bib="218"),
+                    event("212", "three", FRAME["recorder_ms"] + 1000)]
+    panel.refresh()
+    for bib in ("210", "218", "212"):
+        panel._arrival_clicked(row(panel, bib))
+        panel._confirm_bicycle()
+    assert sum(entry.decision is not None for entry in panel._arrival_rows) == 3
+    panel._arrival_store.save(SCOPE, "candidate:later", "frame", "not_rider")
+    restored = QuickReviewPanel()
+    restored.set_events_provider(lambda: panel.events)
+    restored.set_frame_provider(lambda: dict(FRAME))
+    restored.set_workspace(tmp_path)
+    restored.set_scope(*SCOPE)
+    restored.show()
+    restored._arrival_clicked(row(restored, "210"))
+    original_number = restored.table.item(row(restored, "210"), 0).text()
+    other_ids = {entry.bib: entry.decision["id"] for entry in restored._arrival_rows if entry.bib != "210"}
+    QTest.keyClick(restored.table, Qt.Key_3)
+    assert restored._selected_arrival().bib == "210"
+    assert restored._selected_arrival().decision is None
+    assert restored.table.item(row(restored, "210"), 3).text() == "待定"
+    assert restored.table.item(row(restored, "210"), 3).foreground().color().name() == "#b42318"
+    assert restored.table.item(row(restored, "210"), 0).text() == original_number
+    assert {entry.bib: entry.decision["id"] for entry in restored._arrival_rows
+            if entry.decision} == other_ids
+    assert restored._arrival_store.latest(SCOPE, "candidate:later")["action"] == "not_rider"
+
+
+def test_targeted_undo_restores_earlier_riders_circle_before_reconfirming(panel):
+    frame = dict(FRAME, marker_x_normalized=.4, marker_y_normalized=.6)
+    manual = panel.add_manual_problem(frame, recorder_ms=FRAME["recorder_ms"])
+    panel.select_item(manual.item_id)
+    panel.add_mark(.4, .6, FRAME["recorder_ms"], frame)
+    panel.add_mark(.8, .6, FRAME["recorder_ms"], frame)
+    panel._arrival_clicked(row(panel, "321"))
+    panel._editing_mark = 0
+    panel._confirm_bicycle()
+    panel._arrival_clicked(row(panel, "258"))
+    panel._editing_mark = 1
+    panel._confirm_bicycle()
+    panel._arrival_clicked(row(panel, "321"))
+    QTest.keyClick(panel, Qt.Key_3)
+    assert panel._editing_mark == 0
+    assert panel._selected_arrival().decision is None
+    assert panel._arrival_rows[row(panel, "258")].decision is not None
+    panel._confirm_bicycle()
+    assert panel._selected_arrival().decision["frame"]["marker_x_normalized"] == .4
+
+

@@ -80,6 +80,37 @@ def test_undo_groups_shortcut_classification_and_confirmation_after_restart(tmp_
     assert restarted.active(SCOPE) == []
 
 
+def test_targeted_undo_removes_older_legacy_confirmation_only_after_restart(tmp_path):
+    path = tmp_path / "review.jsonl"
+    store = ArrivalReviewStore(path)
+    first = confirm(store, event("210", "one"))
+    second = confirm(store, event("218", "two"))
+    third = confirm(store, event("212", "three"))
+    later = store.save(SCOPE, "candidate:later", "frame", "not_rider")
+    restarted = ArrivalReviewStore(path)
+    assert restarted.undo(SCOPE, key="event:one")["id"] == first["id"]
+    assert restarted.latest(SCOPE, "event:one") is None
+    assert [entry["id"] for entry in restarted.active(SCOPE)] == [second["id"], third["id"], later["id"]]
+    assert restarted.undo(SCOPE, key="event:missing") is None
+
+
+def test_targeted_undo_clears_old_versions_without_removing_shared_classification(tmp_path):
+    store = ArrivalReviewStore(tmp_path / "review.jsonl")
+    category = store.save(SCOPE, "candidate:group", "frame", "bicycle",
+                          candidate_id="group", operation_id="first")
+    first = event("210", "one")
+    for binding in ("old", "new"):
+        store.save(SCOPE, "event:one", event_binding(first), "confirm", event_id=first.event_id,
+                   bib=first.bib, frame=FRAME, crossing_ms=FRAME["recorder_ms"], candidate_id="group",
+                   candidate_binding=binding, operation_id="first")
+    other = event("218", "two")
+    second = store.save(SCOPE, "event:two", event_binding(other), "confirm", event_id=other.event_id,
+                        bib=other.bib, frame=FRAME, crossing_ms=FRAME["recorder_ms"], candidate_id="group")
+    store.undo(SCOPE, key="event:one")
+    assert store.latest(SCOPE, "event:one") is None
+    assert [entry["id"] for entry in store.active(SCOPE)] == [category["id"], second["id"]]
+
+
 def test_invalid_frame_and_failed_write_leave_no_confirmation(tmp_path, monkeypatch):
     import realtime.arrival_review as module
     store = ArrivalReviewStore(tmp_path / "review.jsonl")

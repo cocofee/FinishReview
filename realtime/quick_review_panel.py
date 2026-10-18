@@ -91,7 +91,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.confirm_arrival_button.hide()
         self.defer_button.hide()
         self.quick_undo_button.setText("3  撤销")
-        self.quick_undo_button.setToolTip("按 3 撤销上一次保存或排除，并回到对应画面")
+        self.quick_undo_button.setToolTip("选中已确认记录后按 3 撤销该条；其他情况撤销上一次处理")
         self.bicycle_button.clicked.connect(self._confirm_bicycle)
         self.non_rider_button.clicked.connect(lambda: self._classify("not_rider"))
         self.defer_button.clicked.connect(lambda: self._classify("held"))
@@ -617,8 +617,10 @@ class QuickReviewPanel(ProblemListPanel):
     def _undo_arrival(self):
         if self._arrival_store is None:
             return
+        row = self._selected_arrival()
+        target_key = row.key if row is not None and row.decision else None
         try:
-            previous = self._arrival_store.undo(self._arrival_scope)
+            previous = self._arrival_store.undo(self._arrival_scope, key=target_key)
             # Earlier builds logged picture clicks as classifications. Skip
             # those internal entries so 3 reaches the operator's last ruling.
             while previous and previous["action"] == "bicycle" and not previous.get("operation_id"):
@@ -651,6 +653,13 @@ class QuickReviewPanel(ProblemListPanel):
             if previous.get("frame"):
                 current = self._frame_provider()
                 saved = previous["frame"]
+                from .bunch_review import mark_on_frame
+                self._editing_mark = next((i for i, mark in enumerate(self.current_marks())
+                                           if saved.get("marker_x_normalized") is not None
+                                           and saved.get("marker_y_normalized") is not None
+                                           and abs(mark["x"] - saved["marker_x_normalized"]) <= .001
+                                           and abs(mark["y"] - saved["marker_y_normalized"]) <= .001
+                                           and mark_on_frame(mark, saved, saved.get("recorder_ms"))), -1)
                 same_frame = bool(current and current.get("camera_index") == saved.get("camera_index")
                                   and current.get("segment_id") == saved.get("segment_id")
                                   and current.get("frame_index") == saved.get("frame_index"))
