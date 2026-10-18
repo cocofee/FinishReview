@@ -2591,6 +2591,9 @@ class FinishReviewWindow(PassageReviewSurface):
             if item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
                 return
             original = item.evidence.get("frame")
+            from .bunch_review import mark_on_frame
+            if any(mark_on_frame(mark, frame, frame["recorder_ms"]) for mark in panel.current_marks()):
+                return
             if original and self._shows_the_problem_frame(pane, frame["position_ms"], original):
                 return
         selected_key = panel._selected_key
@@ -2794,16 +2797,24 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = dict(frame, marker_x_normalized=float(x_normalized),
                      marker_y_normalized=float(y_normalized))
         selected_key = row.key if row is not None and row.event is not None else None
+        item = panel.current_item()
+        original = item.evidence.get("frame", {}) if item else {}
+        reuse = bool(item and item.kind == "manual_review" and not item.evidence.get("superseded")
+                     and not item.evidence.get("configuration_stale")
+                     and original.get("camera_index") == frame["camera_index"]
+                     and original.get("recorder_ms") is not None
+                     and abs(original["recorder_ms"] - frame["recorder_ms"]) <= 10000)
         self._pause_arrival_confirmation()
         try:
             location = self._persist_filmstrip_location(pane.location)
             pane._location = location
             frame.update(segment_id=location.segment.segment_id, video_path=str(location.video_path))
             self._creating_manual_crossing = True
-            item = panel.add_manual_problem(
-                frame, reason="人工点选自行车与终点线位置，待确认芯片",
-                recorder_ms=frame["recorder_ms"], thumbnail=pane.video_view._pixmap_item.pixmap(),
-            )
+            if not reuse:
+                item = panel.add_manual_problem(
+                    frame, reason="人工点选自行车与终点线位置，待确认芯片",
+                    recorder_ms=frame["recorder_ms"], thumbnail=pane.video_view._pixmap_item.pixmap(),
+                )
         except (OSError, ValueError, RuntimeError) as error:
             panel.hint.setText(f"标记未保存：{error}")
             return
@@ -2816,13 +2827,22 @@ class FinishReviewWindow(PassageReviewSurface):
             panel.select_item(item.item_id)
         finally:
             self._creating_manual_crossing = False
-        panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
+        from .bunch_review import mark_on_frame
+        existing = next((i for i, mark in enumerate(panel.current_marks())
+                         if mark_on_frame(mark, frame, frame["recorder_ms"])
+                         and (mark["x"] - x_normalized) ** 2 + (mark["y"] - y_normalized) ** 2 < .02 ** 2), None)
+        if existing is None:
+            panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
+        else:
+            panel._editing_mark = existing
         index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
         if index is not None:
             panel._selected_key = selected_key
             panel._active_item = item
             panel.table.setCurrentCell(index, 0)
             panel._sync_arrival_confirmation()
+        panel._quick_render_signature = None
+        panel._render()
         self._problem_count_mode_changed(True)
         self._problem_marks_changed(())
         panel.hint.setText(

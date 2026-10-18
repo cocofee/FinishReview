@@ -51,8 +51,8 @@ def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
     assert panel.detail_scroll.isHidden() and panel.header.isHidden()
     for _ in range(5):
         QTest.keyClick(panel.table, Qt.Key_1)
-    assert not any(entry.decision for entry in panel._arrival_rows)
-    assert [entry["action"] for entry in panel._arrival_store.active(SCOPE)] == ["bicycle"]
+    assert sum(entry.decision is not None for entry in panel._arrival_rows) == 1
+    assert [entry["action"] for entry in panel._arrival_store.active(SCOPE)] == ["bicycle", "confirm"]
     for i in range(panel.table.rowCount()):
         assert "自行车" not in " ".join(panel.table.item(i, j).text() for j in range(4))
 
@@ -76,7 +76,7 @@ def test_unclassified_chip_click_requests_playback_but_classified_picture_is_pre
     assert changes and panel.current_item() == panel._selected_arrival().item
     assert not any(entry.decision for entry in panel._arrival_rows)
 
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     changes = QSignalSpy(panel.current_changed)
     panel._arrival_clicked(row(panel, "321"))
     assert not changes  # Identity assignment must not seek away from a judged frame.
@@ -99,7 +99,7 @@ def test_f_enlarges_evidence_and_escape_restores_arrival_table(panel):
 
 
 def test_selecting_athlete_does_not_confirm_until_explicit_finish_line_action(panel):
-    QTest.keyClick(panel, Qt.Key_1)
+    panel._classify("bicycle")
     panel._arrival_clicked(row(panel, "321"))
     assert not any(entry.decision for entry in panel._arrival_rows)
     assert panel._selected_arrival().bib == "321"
@@ -129,7 +129,7 @@ def test_selecting_athlete_does_not_confirm_until_explicit_finish_line_action(pa
 
 
 def test_backtracking_sorts_actual_times_and_undo_restores_reference(panel):
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     panel.toggle_big_view()
     panel._arrival_clicked(row(panel, "258"))
     panel.confirm_arrival_button.click()
@@ -144,7 +144,7 @@ def test_backtracking_sorts_actual_times_and_undo_restores_reference(panel):
 
 
 def test_upstream_change_invalidates_identity_and_restart_recovers(panel, tmp_path):
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     panel.toggle_big_view()
     panel._arrival_clicked(row(panel, "321"))
     panel.confirm_arrival_button.click()
@@ -164,13 +164,13 @@ def test_upstream_change_invalidates_identity_and_restart_recovers(panel, tmp_pa
 
 def test_no_picture_no_confirmation_and_no_automatic_identity(panel):
     panel.frame = None
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     panel.toggle_big_view()
     panel._arrival_clicked(row(panel, "321"))
     panel.confirm_arrival_button.click()
     assert panel._arrival_store.active(SCOPE) == []
     panel.frame = dict(FRAME)
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     panel.frame = None
     panel._arrival_clicked(row(panel, "321"))
     assert not panel.confirm_arrival_button.isEnabled()
@@ -181,7 +181,7 @@ def test_no_picture_no_confirmation_and_no_automatic_identity(panel):
 def test_confirmation_explains_missing_classification_and_works_without_f(panel):
     assert not panel.confirm_arrival_button.isEnabled()
     assert "1" in panel.confirmation_status.text()
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     assert not panel.big_view
     assert panel.confirm_arrival_button.isEnabled()
     QTest.keyClick(panel, Qt.Key_Return)
@@ -193,7 +193,7 @@ def test_athlete_waiting_for_analysis_does_not_block_manual_candidate(panel):
     panel._arrival_rows[0].item = replace(panel._arrival_rows[0].item, status=STATUS_WAITING)
     # The source candidate remains usable; the chip row's automatic-analysis status is separate.
     panel._active_item = panel.items[0]
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     assert panel.confirm_arrival_button.isEnabled()
     panel.confirm_arrival_button.click()
     assert sum(row.decision is not None for row in panel._arrival_rows) == 1
@@ -220,7 +220,7 @@ def test_manual_confirmation_replaces_candidate_row_and_keeps_explicit_category(
     panel.refresh()
     manual = panel.add_manual_problem(FRAME, recorder_ms=FRAME["recorder_ms"])
     panel.select_item(manual.item_id)
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     candidate_index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.item.item_id == manual.item_id)
     assert panel.table.item(candidate_index, 3).text() == "待定"
     panel._arrival_clicked(row(panel, "321"))
@@ -256,7 +256,7 @@ def test_numbers_follow_chip_order_even_when_video_times_cross_and_candidates_ar
     assert [entry.bib for entry in panel._arrival_rows[:2]] == ["258", "321"]
     assert [panel.table.item(i, 0).text() for i in range(2)] == ["1", "2"]
     panel.select_item(manual.item_id)
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     panel._arrival_clicked(row(panel, "321"))
     panel.frame = dict(FRAME, recorder_ms=FRAME["recorder_ms"] - 3000)
     panel.confirm_arrival_button.click()
@@ -285,7 +285,7 @@ def test_circle_uses_selected_bib_then_keeps_saved_bib_when_selection_changes(pa
 
 
 def test_three_undoes_legacy_picture_entries_and_restores_the_last_confirmed_athlete(panel):
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     panel._arrival_clicked(row(panel, "321"))
     panel.confirm_arrival_button.click()
     manual = panel.add_manual_problem(dict(FRAME, marker_x_normalized=.4, marker_y_normalized=.6),
@@ -299,7 +299,7 @@ def test_three_undoes_legacy_picture_entries_and_restores_the_last_confirmed_ath
 
 
 def test_csv_uses_bib_and_actual_frame_not_official_chip_time(panel):
-    panel._confirm_bicycle()
+    panel._classify("bicycle")
     panel.toggle_big_view()
     panel._arrival_clicked(row(panel, "321"))
     panel.confirm_arrival_button.click()

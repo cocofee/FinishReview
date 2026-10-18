@@ -497,7 +497,7 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         window.close()
 
 
-def test_raw_frame_can_be_classified_and_confirmed_without_analysis_or_f(qapp, tmp_path):
+def test_raw_frame_can_be_confirmed_with_one_without_a_circle(qapp, tmp_path):
     from PyQt5.QtGui import QImage
     window = _window(tmp_path, workbench=True)
     try:
@@ -520,16 +520,21 @@ def test_raw_frame_can_be_classified_and_confirmed_without_analysis_or_f(qapp, t
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         assert "1" in panel.confirmation_status.text()
-        panel._confirm_bicycle()
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert panel._selected_arrival().bib == "321"
         assert panel.current_item().item_id.startswith("manual:")
         assert not panel.big_view
-        assert panel.confirm_arrival_button.isEnabled(), panel.confirmation_status.text()
         assert pane._current_frame_index == 50
-        panel.confirm_arrival_button.click()
         saved = next(row.decision for row in panel._arrival_rows if row.bib == "321")
         assert saved["frame"]["frame_index"] == 50
         assert saved["frame"]["segment_id"] == segment.segment_id
+        assert not panel.current_marks()
+        assert "marker_x_normalized" not in saved["frame"]
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_3)
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert panel._selected_arrival().bib == "321"
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
     finally:
         window.close()
 
@@ -617,6 +622,29 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#b42318"
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+        # Several circles count several vehicles on this same picture. Re-click
+        # a circle to assign the next chip without adding a duplicate vehicle.
+        for bib in ("22", "23"):
+            window.passage_store.append(_event(event_id="click-" + bib, bib=bib,
+                                               passage_timestamp_ms=start + 2000 + int(bib)))
+        panel.refresh()
+        panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "22"))
+        candidate_id = panel.current_item().item_id
+        window._problem_count_clicked(.7, .62, pane)
+        window._problem_count_clicked(.8, .62, pane)
+        assert len(panel.current_marks()) == 3
+        assert panel.current_item().item_id == candidate_id
+        window._problem_count_clicked(.7, .62, pane)
+        assert len(panel.current_marks()) == 3
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "23"))
+        window._problem_count_clicked(.8, .62, pane)
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 3
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_3)
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 2
+        assert panel._selected_arrival().bib == "23"
     finally:
         window.close()
 
@@ -893,8 +921,6 @@ def test_chip_click_opens_raw_reference_before_model_line_or_calibration(qapp, t
         # Reference playback remains usable for the explicit manual workflow.
         panel._confirm_bicycle()
         assert panel.current_item().evidence.get("frame")
-        assert panel.confirm_arrival_button.isEnabled()
-        panel.confirm_arrival_button.click()
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
     finally:
         window.close()
