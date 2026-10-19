@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import statistics
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
@@ -40,7 +41,7 @@ from .problem_items import (
 
 
 JOURNAL_NAME = "bunch_reviews.jsonl"
-COMPLETION_POLICY_VERSION = 2
+COMPLETION_POLICY_VERSION = 3
 PROBLEM_LIST_NAME = "finish_problems/problem_list.json"
 CROSSINGS_NAME = "finish_problems/crossings_camera{}.json"
 
@@ -48,16 +49,18 @@ CROSSINGS_NAME = "finish_problems/crossings_camera{}.json"
 # retained copy of the same actual frame (extra metadata, a rebuilt stamp) also
 # counts. Neighboring frames are 50 ms apart, so the moment stays unambiguous.
 MARK_TIME_TOLERANCE_MS = 20
+# Operator positions are stored in normalized coordinates rounded to 4 decimals.
+# This is rounding tolerance, not a rider-sized proximity window.
+MARK_POSITION_TOLERANCE = 0.0001
 
 # The doubts a group's children can carry, and the operator's own answers to
 # them. Only the answers below close one: equal totals never can, and "confirm
 # the crossing, number later" leaves the question open on purpose.
 CHILD_ANSWERS = {
     KIND_TWO_CHIPS_ONE_CROSSING: (ACTION_DELETE_EXTRA_CHIP, ACTION_SIDE_BY_SIDE),
-    KIND_CHIP_NO_CROSSING: (ACTION_DELETE_CHIP, ACTION_KEEP, ACTION_INSUFFICIENT),
+    KIND_CHIP_NO_CROSSING: (ACTION_DELETE_CHIP, ACTION_KEEP),
     KIND_NO_CHIP_CROSSING: (ACTION_RECORD_BIB, ACTION_NOT_RIDER, ACTION_RIDE_BACK),
-    KIND_NEAR_CROSSING: (ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK,
-                         ACTION_INSUFFICIENT),
+    KIND_NEAR_CROSSING: (ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK),
 }
 RESOLVED_STATUSES = (STATUS_CLOSED_UPSTREAM, STATUS_EXCLUDED, STATUS_INFO)
 
@@ -317,22 +320,45 @@ def pending_member_decisions(context):
                for member in batch.evidence["batch_members"])
 
 
-def counted_person_on_child_frame(child, marks) -> bool:
-    """A person was counted on the child's own frame; the crossing is accounted.
+def _normalized_position(value):
+    """Only explicit normalized operator positions share the marks' coordinates."""
 
-    The number may stay unread: one counted person at that moment is the
-    operator's answer that the line change was a rider, not a total that happens
-    to match. The frame comparison tolerates the extra metadata and retained
-    copies that saved marks carry.
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    try:
+        point = tuple(float(coordinate) for coordinate in value)
+    except (TypeError, ValueError):
+        return None
+    return point if all(math.isfinite(coordinate) and 0 <= coordinate <= 1 for coordinate in point) else None
+
+
+def counted_person_on_child_frame(child, marks) -> bool:
+    """Require the child's frame AND position, never just a person on that frame.
+
+    Detector ``contact`` pixels and strip ``row`` values are not normalized
+    operator positions. Missing geometry and aggregate candidates need an
+    explicit child decision instead of guessing which person was counted.
     """
 
+    position = _normalized_position(child.evidence.get("position"))
+    if position is None or child.evidence.get("members"):
+        return False
     frame = child.evidence.get("frame") or {}
     stamp = child.evidence.get("recorder_ms")
     if stamp is None:
         stamp = child.evidence.get("expected_recorder_ms")
-    if stamp is None:
+    if stamp is None or frame.get("camera_index") is None:
         return False
-    return any(not is_excluded(mark) and mark_on_frame(mark, frame, int(stamp)) for mark in marks)
+    for mark in marks:
+        marked = _normalized_position((mark.get("x"), mark.get("y")))
+        if (is_excluded(mark) or marked is None
+                or (mark.get("frame") or {}).get("camera_index") is None):
+            continue
+        if (mark_on_frame(mark, frame, int(stamp))
+                and all(math.isclose(left, right, rel_tol=0, abs_tol=MARK_POSITION_TOLERANCE)
+                        for left, right in zip(marked, position))):
+            return True
+    return False
 
 
 def chip_answered_by_count(context, child, marks, result) -> bool:
@@ -396,7 +422,7 @@ def unresolved_crossing_conflicts(context, marks, result):
     chip, never by the count: two physical chips are not two wrong records by
     themselves. A chip whose crossing was not seen needs its number read on a
     counted person, or the chip kept/deleted in the member flow, and a crossing
-    with no chip is answered by a counted person on its own frame. Children are
+    with no chip needs a counted person at its own frame and position. Children are
     read from the current problem list, so a conflict that appeared after the
     draft was opened still blocks.
     """
@@ -412,6 +438,11 @@ def unresolved_crossing_conflicts(context, marks, result):
         if answers is None or child.status in RESOLVED_STATUSES:
             continue
         decision, stale = store.state(child)
+        if decision is not None and not stale and decision.action == ACTION_INSUFFICIENT:
+            # An explicit current hold overrides even a matching count or a
+            # previous per-chip answer. Only a new decision can lift this hold.
+            conflicts.append(child)
+            continue
         if decision is not None and not stale and decision.action in answers:
             continue
         if child.kind in (KIND_CHIP_NO_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING):

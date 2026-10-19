@@ -48,6 +48,7 @@ from .problem_items import (
     ACTION_CONFIRM_CROSSING,
     ACTION_DELETE_CHIP,
     ACTION_DELETE_EXTRA_CHIP,
+    ACTION_INSUFFICIENT,
     ACTION_LABELS,
     ACTION_NOT_RIDER,
     ACTION_REASON_PRESETS,
@@ -883,7 +884,7 @@ class ProblemListPanel(QFrame):
         if self.store is not None:
             resolution, stale = self.store.state(item)
             if resolution is not None:
-                if not stale and resolution.action == ACTION_CONFIRM_CROSSING:
+                if not stale and resolution.action in (ACTION_CONFIRM_CROSSING, ACTION_INSUFFICIENT):
                     return STATE_PENDING
                 if not stale and resolution.action in (ACTION_RECORD_BIB, ACTION_DELETE_CHIP, ACTION_DELETE_EXTRA_CHIP, ACTION_CHANGE):
                     return f"{STATE_HANDOFF}：{resolution.label}"
