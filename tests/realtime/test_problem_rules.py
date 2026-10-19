@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from realtime.analysis_resources import CpuMonitor, ResourceGovernor
 from realtime.bike_check import (
@@ -20,6 +21,7 @@ from realtime.bike_check import (
 )
 from realtime.chip_history import ChipRead
 from realtime.clock_sync import ClockModel
+from realtime.crossing_pairing import pair_crossings
 from realtime.problem_items import (
     KIND_BUNCH,
     KIND_CHIP_NO_CROSSING,
@@ -64,7 +66,41 @@ def _rules(**kwargs):
     return build_video_items(**defaults)
 
 
-def test_late_chip_is_paired_and_a_crossing_beside_a_chip_time_stays_a_candidate():
+@pytest.mark.parametrize("delay_ms", [0, 50, 100, 150])
+def test_near_simultaneous_rider_at_another_position_is_never_a_fragment(delay_ms):
+    read = _read("10", T0 + 120_000)
+    first = _crossing(T0 + 121_000, row=150)
+    other = replace(_crossing(first.recorder_ms + delay_ms, row=450), contact=(350.0, 200.0))
+    outcome = _rules(matched=[(first, read, 0.0)], video_only=[other])
+    assert outcome.duplicates == 0 and not outcome.fragments
+    candidate = next(item for item in outcome.items if item.kind == KIND_NEAR_CROSSING)
+    assert candidate.pending
+    assert candidate.evidence["members"][0]["row"] == 450
+    assert candidate.evidence["frame"] == other.frame_payload(MODEL.version)
+
+
+def test_adjacent_frame_at_same_position_is_not_proof_of_same_rider():
+    read = _read("10", T0 + 120_000)
+    first = _crossing(T0 + 121_000)
+    second = _crossing(T0 + 121_050)
+    outcome = _rules(matched=[(first, read, 0)], video_only=[second])
+    assert not outcome.fragments
+    assert any(item.kind == KIND_NEAR_CROSSING and item.pending for item in outcome.items)
+
+
+@pytest.mark.parametrize("residual_ms", [480, 700, 1_400])
+def test_rules_do_not_turn_rejected_dp_pair_into_auto_pass(residual_ms):
+    read = _read("10", T0 + 120_000)
+    crossing = _crossing(T0 + 121_000 + residual_ms)
+    pairing = pair_crossings([crossing], [crossing.recorder_ms], [read], [MODEL.to_recorder(read.chip_ms)])
+    assert not pairing.matched
+    outcome = _rules(matched=pairing.matched, video_only=pairing.video_only, chip_only=pairing.chip_only)
+    assert not outcome.auto_passed and not outcome.late_pair_frames
+    assert any(item.kind == KIND_NEAR_CROSSING and item.pending for item in outcome.items)
+    assert any(item.kind == KIND_CHIP_NO_CROSSING and item.pending for item in outcome.items)
+
+
+def test_wide_pair_and_a_crossing_beside_a_chip_time_stay_candidates():
     late = _read("88", T0 + 60_000)
     paired = _read("10", T0 + 120_000)
     outcome = _rules(
@@ -73,30 +109,31 @@ def test_late_chip_is_paired_and_a_crossing_beside_a_chip_time_stays_a_candidate
         chip_only=[late],
     )
 
-    assert outcome.late_pairs == [("88", 480)]
+    assert not outcome.late_pairs and not outcome.late_pair_frames
     # Time proximity to a chip is an association, not a verdict: the extra
     # crossing 600 ms after the chip's crossing is a traceable candidate.
     assert outcome.duplicates == 0 and outcome.fragments == []
     near = [item for item in outcome.items if item.kind == KIND_NEAR_CROSSING]
-    assert len(near) == 1 and near[0].pending and near[0].evidence["gap_ms"] == 600
-    assert near[0].evidence["near_read"]["bib"] == "10"
-    assert {item["bib"] for item in outcome.auto_passed} == {"88", "10"}
+    assert len(near) == 2 and all(item.pending for item in near)
+    by_bib = {item.evidence["near_read"]["bib"]: item for item in near}
+    assert by_bib["10"].evidence["gap_ms"] == 600
+    assert by_bib["88"].evidence["association_only"]
+    assert any(item.kind == KIND_CHIP_NO_CROSSING and item.bibs == ("88",) for item in outcome.items)
+    assert {item["bib"] for item in outcome.auto_passed} == {"10"}
     assert all(item["source"] == "auto" for item in outcome.auto_passed)
 
 
-def test_same_passage_pieces_are_merged_with_a_reason_in_the_rider_evidence():
+def test_identical_detection_is_deduplicated_with_a_reason_in_the_rider_evidence():
     paired = _read("10", T0 + 120_000)
     anchor = _crossing(T0 + 121_000)
-    rear_wheel = replace(anchor, recorder_ms=T0 + 121_040, frame_index=anchor.frame_index,
-                         row=300, r0=280, r1=320)
-    outcome = _rules(matched=[(anchor, paired, 0.0)], video_only=[rear_wheel])
+    outcome = _rules(matched=[(anchor, paired, 0.0)], video_only=[replace(anchor)])
 
     assert outcome.duplicates == 1 and len(outcome.fragments) == 1
     fragment = outcome.fragments[0]
-    assert fragment["bib"] == "10" and "同一次过线" in fragment["reason"]
+    assert fragment["bib"] == "10" and "重复检测" in fragment["reason"]
     assert [item.kind for item in outcome.items] == []
     entry = next(item for item in outcome.auto_passed if item["bib"] == "10")
-    assert entry["merged_fragments"][0]["gap_ms"] == 40
+    assert entry["merged_fragments"][0]["gap_ms"] == 0
     assert entry["merged_fragments"][0]["frame"]["frame_index"] == anchor.frame_index
 
 
@@ -177,10 +214,14 @@ def test_a_candidate_inside_a_bunch_is_folded_into_the_group():
     assert outcome.stats["merged_fragments"] == outcome.stats["duplicates"] == 0
 
 
-def test_isolated_late_chip_gets_the_wider_window():
+def test_isolated_wide_pair_is_only_a_candidate():
     outcome = _rules(video_only=[_crossing(T0 + 62_400)], chip_only=[_read("744", T0 + 60_000)])
 
-    assert outcome.late_pairs == [("744", 1_400)]
+    assert not outcome.late_pairs and not outcome.auto_passed and not outcome.late_pair_frames
+    near = next(item for item in outcome.items if item.kind == KIND_NEAR_CROSSING)
+    assert near.pending and near.evidence["gap_ms"] == 1_400
+    assert near.evidence["association_only"]
+    assert any(item.kind == KIND_CHIP_NO_CROSSING for item in outcome.items)
 
 
 def test_unpaired_crossings_chips_and_repeated_spots():

@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .bunch_review import (BunchContext, BunchReviewStore, align_counts, completion_issue, detected_crossings,
+from .bunch_review import (BunchContext, BunchReviewStore, align_counts, review_completion_issue, detected_crossings,
                            is_excluded, load_context, add_viewed, uncovered_intervals, review_candidates,
                            group_member_batch)
 from .bunch_timeline import BunchTimeline, group_strip, pixmap_of
@@ -282,7 +282,7 @@ class BunchReviewDialog(QDialog):
         self.next_candidate.clicked.connect(lambda: self.navigate_candidate(1))
         attention.addWidget(self.previous_candidate)
         attention.addWidget(self.next_candidate)
-        self.candidate_label = QLabel("候选定位不是已找全漏读；本团仍须完整点数。")
+        self.candidate_label = QLabel("数量一致不能排除漏读与双芯片；须看完整团、逐人认号并处理疑点。")
         self.candidate_label.setWordWrap(True)
         attention.addWidget(self.candidate_label, 1)
         layout.addLayout(attention)
@@ -710,10 +710,7 @@ class BunchReviewDialog(QDialog):
         self.view.flush_click()
         result = align_counts(self.context.chips, self.marks, self.bias.value())
         if completed:
-            if self.context.gaps or uncovered_intervals(self.context.start_ms, self.context.end_ms, self.viewed_ranges, tolerance=100):
-                self.notice.setText("仍有未查看范围或原录像缺口；不能只查看候选就关闭整团。")
-                return False
-            issue = completion_issue(self.context.chips, self.marks, result)
+            issue = review_completion_issue(self.context, self.marks, result, self.viewed_ranges)
             if issue:
                 self.notice.setText(issue)
                 return False

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import statistics
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
@@ -40,6 +41,7 @@ from .problem_items import (
 
 
 JOURNAL_NAME = "bunch_reviews.jsonl"
+COMPLETION_POLICY_VERSION = 3
 PROBLEM_LIST_NAME = "finish_problems/problem_list.json"
 CROSSINGS_NAME = "finish_problems/crossings_camera{}.json"
 
@@ -47,16 +49,18 @@ CROSSINGS_NAME = "finish_problems/crossings_camera{}.json"
 # retained copy of the same actual frame (extra metadata, a rebuilt stamp) also
 # counts. Neighboring frames are 50 ms apart, so the moment stays unambiguous.
 MARK_TIME_TOLERANCE_MS = 20
+# Operator positions are stored in normalized coordinates rounded to 4 decimals.
+# This is rounding tolerance, not a rider-sized proximity window.
+MARK_POSITION_TOLERANCE = 0.0001
 
 # The doubts a group's children can carry, and the operator's own answers to
 # them. Only the answers below close one: equal totals never can, and "confirm
 # the crossing, number later" leaves the question open on purpose.
 CHILD_ANSWERS = {
     KIND_TWO_CHIPS_ONE_CROSSING: (ACTION_DELETE_EXTRA_CHIP, ACTION_SIDE_BY_SIDE),
-    KIND_CHIP_NO_CROSSING: (ACTION_DELETE_CHIP, ACTION_KEEP, ACTION_INSUFFICIENT),
+    KIND_CHIP_NO_CROSSING: (ACTION_DELETE_CHIP, ACTION_KEEP),
     KIND_NO_CHIP_CROSSING: (ACTION_RECORD_BIB, ACTION_NOT_RIDER, ACTION_RIDE_BACK),
-    KIND_NEAR_CROSSING: (ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK,
-                         ACTION_INSUFFICIENT),
+    KIND_NEAR_CROSSING: (ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK),
 }
 RESOLVED_STATUSES = (STATUS_CLOSED_UPSTREAM, STATUS_EXCLUDED, STATUS_INFO)
 
@@ -316,22 +320,45 @@ def pending_member_decisions(context):
                for member in batch.evidence["batch_members"])
 
 
-def counted_person_on_child_frame(child, marks) -> bool:
-    """A person was counted on the child's own frame; the crossing is accounted.
+def _normalized_position(value):
+    """Only explicit normalized operator positions share the marks' coordinates."""
 
-    The number may stay unread: one counted person at that moment is the
-    operator's answer that the line change was a rider, not a total that happens
-    to match. The frame comparison tolerates the extra metadata and retained
-    copies that saved marks carry.
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    try:
+        point = tuple(float(coordinate) for coordinate in value)
+    except (TypeError, ValueError):
+        return None
+    return point if all(math.isfinite(coordinate) and 0 <= coordinate <= 1 for coordinate in point) else None
+
+
+def counted_person_on_child_frame(child, marks) -> bool:
+    """Require the child's frame AND position, never just a person on that frame.
+
+    Detector ``contact`` pixels and strip ``row`` values are not normalized
+    operator positions. Missing geometry and aggregate candidates need an
+    explicit child decision instead of guessing which person was counted.
     """
 
+    position = _normalized_position(child.evidence.get("position"))
+    if position is None or child.evidence.get("members"):
+        return False
     frame = child.evidence.get("frame") or {}
     stamp = child.evidence.get("recorder_ms")
     if stamp is None:
         stamp = child.evidence.get("expected_recorder_ms")
-    if stamp is None:
+    if stamp is None or frame.get("camera_index") is None:
         return False
-    return any(not is_excluded(mark) and mark_on_frame(mark, frame, int(stamp)) for mark in marks)
+    for mark in marks:
+        marked = _normalized_position((mark.get("x"), mark.get("y")))
+        if (is_excluded(mark) or marked is None
+                or (mark.get("frame") or {}).get("camera_index") is None):
+            continue
+        if (mark_on_frame(mark, frame, int(stamp))
+                and all(math.isclose(left, right, rel_tol=0, abs_tol=MARK_POSITION_TOLERANCE)
+                        for left, right in zip(marked, position))):
+            return True
+    return False
 
 
 def chip_answered_by_count(context, child, marks, result) -> bool:
@@ -395,7 +422,7 @@ def unresolved_crossing_conflicts(context, marks, result):
     chip, never by the count: two physical chips are not two wrong records by
     themselves. A chip whose crossing was not seen needs its number read on a
     counted person, or the chip kept/deleted in the member flow, and a crossing
-    with no chip is answered by a counted person on its own frame. Children are
+    with no chip needs a counted person at its own frame and position. Children are
     read from the current problem list, so a conflict that appeared after the
     draft was opened still blocks.
     """
@@ -411,6 +438,11 @@ def unresolved_crossing_conflicts(context, marks, result):
         if answers is None or child.status in RESOLVED_STATUSES:
             continue
         decision, stale = store.state(child)
+        if decision is not None and not stale and decision.action == ACTION_INSUFFICIENT:
+            # An explicit current hold overrides even a matching count or a
+            # previous per-chip answer. Only a new decision can lift this hold.
+            conflicts.append(child)
+            continue
         if decision is not None and not stale and decision.action in answers:
             continue
         if child.kind in (KIND_CHIP_NO_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING):
@@ -532,12 +564,7 @@ def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: in
 
 
 def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) -> str:
-    """What still stands between this count and a closed group.
-
-    数到的人数就是判据：画面点到的人和芯片记录一一对上（多少对多少，不看前后
-    顺序），这一团就成立。剩下要填的是为了把漏读的人交给 CycleRace——多出来
-    的那位必须有号码，才补得进去。
-    """
+    """Require identified riders, not equal totals or provisional time matches."""
 
     active = [mark for mark in marks if not is_excluded(mark)]
     if not active:
@@ -545,12 +572,29 @@ def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) ->
     bibs = [m.get("bib", "").strip() for m in active if m.get("bib", "").strip()]
     if len(bibs) != len(set(bibs)):
         return "同一号码被填写在多人上，请先核对并修正。"
-    if len(active) == len(chips):
-        return ""  # 总数已对上；逐人时间对应只作参考，不另设完成门槛。
     if result["missing"]:
         return "仍有芯片没有对应的计数，请补查原帧；无法确认时保存进度，保留待处理。"
     if any(not e["bib"] or e["chip_time_ms"] is None for e in result["extras"]):
         return "多出的人须看清号码，且前后都有参考过线者才能估算补录时间；否则保存进度。"
+    if len(bibs) != len(active):
+        return "仍有选手未认号；人数相等或时间对应不能排除漏读与双芯片，请逐人核对，或保存进度。"
+    return ""
+
+
+def review_completion_issue(context, marks, result, viewed_ranges) -> str:
+    """One completion gate for both UIs, saved reviews and exports."""
+
+    if context.gaps:
+        return "原录像存在缺口，不能确认本团已完整核对。"
+    issue = completion_issue(context.chips, marks, result)
+    if issue:
+        return issue
+    if uncovered_intervals(context.start_ms, context.end_ms, viewed_ranges or [], tolerance=100):
+        return "仍有未查看范围；不能只查看候选就关闭整团，请继续查看原录像或保存进度。"
+    if pending_member_decisions(context):
+        return "仍有成员待 CycleRace 处理、暂存或需要重查，请处理后重新核对。"
+    if unresolved_crossing_conflicts(context, marks, result):
+        return "仍有过线或芯片疑点未处理；人数相等不能关闭这些疑点。"
     return ""
 
 
@@ -577,7 +621,19 @@ class BunchReviewStore:
 
     def get(self, context: BunchContext) -> dict | None:
         record = self.latest.get((context.item.item_id, context.camera))
-        return record if record and record.get("signature") == context.signature else None
+        if not record or record.get("signature") != context.signature:
+            return None
+        if record.get("completed"):
+            issue = ("旧核对记录仅按旧判据完成，请保留点数并重新核对。"
+                     if record.get("completion_policy_version") != COMPLETION_POLICY_VERSION else
+                     review_completion_issue(context, record["marks"],
+                                             align_counts(context.chips, record["marks"],
+                                                          record.get("fallback_bias_ms", 0)),
+                                             record.get("viewed_ranges")))
+            if issue:
+                # Reopen in memory; do not rewrite the operator's audit trail.
+                return dict(record, completed=False, completion_issue=issue)
+        return record
 
     def latest_for(self, item: ProblemItem) -> dict | None:
         records = [record for (item_id, _camera), record in self.latest.items() if item_id == item.item_id]
@@ -587,14 +643,11 @@ class BunchReviewStore:
              fully_viewed=False, fallback_bias_ms=0, viewed_ranges=None, visited_candidates=()) -> dict:
         result = align_counts(context.chips, marks, fallback_bias_ms)
         if completed:
-            if context.gaps:
-                raise ValueError("原录像存在缺口，不能确认本团已完整核对。")
-            # 人数对上就是对的：孩子疑点（双芯片、漏读）各自是表里的一行，
-            # 由操作员在那一行上判，不再拦住这一团的确认。
-            issue = completion_issue(context.chips, marks, result)
+            issue = review_completion_issue(context, marks, result, viewed_ranges)
             if issue:
                 raise ValueError(issue)
         record = {"schema_version": 1, "item_id": context.item.item_id, "signature": context.signature,
+                  "completion_policy_version": COMPLETION_POLICY_VERSION,
                   "item_snapshot": context.item.to_payload(), "chips": [asdict(chip) for chip in context.chips],
                   "camera": context.camera, "calibration_version": context.model.version,
                   "marks": marks, "seconds": round(seconds, 1), "completed": completed,
@@ -627,20 +680,14 @@ class BunchReviewStore:
                 context = load_context(workspace, by_id[item_id], record["camera"])
             except (ValueError, OSError):
                 continue
-            if self.get(context) is None:
-                continue  # changed chips, calibration, geometry or evidence: ask again
-            if pending_member_decisions(context):
-                continue
-            if context.gaps or ("viewed_ranges" in record and uncovered_intervals(
-                    context.start_ms, context.end_ms, record["viewed_ranges"], tolerance=100)):
+            checked = self.get(context)
+            if checked is None or not checked.get("completed"):
                 continue
             # Recompute from the saved evidence so stale cached extras cannot
             # reintroduce an excluded person or an incomplete group's suggestions.
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
             if completion_issue(context.chips, record["marks"], result):
                 continue
-            if rider_count(record["marks"]) == len(context.chips):
-                continue  # 数量相等的集团只完成点数，不把暂未对上的时间参考导出成漏读。
             for extra in result["extras"]:
                 mark = record["marks"][extra["mark"]]
                 # Every missed rider keeps its own frame, time and bracketing
