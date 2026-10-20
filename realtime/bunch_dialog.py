@@ -16,9 +16,9 @@ from PyQt5.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .bunch_review import (BunchContext, BunchReviewStore, align_counts, completion_issue, detected_crossings,
+from .bunch_review import (BunchContext, BunchReviewStore, align_counts, detected_crossings,
                            is_excluded, load_context, add_viewed, uncovered_intervals, review_candidates,
-                           group_member_batch)
+                           group_member_batch, review_completion_issue)
 from .bunch_timeline import BunchTimeline, group_strip, pixmap_of
 from .chip_history import format_chip_time
 from .line_sampling import load_strip, line_config_digest
@@ -710,10 +710,8 @@ class BunchReviewDialog(QDialog):
         self.view.flush_click()
         result = align_counts(self.context.chips, self.marks, self.bias.value())
         if completed:
-            if self.context.gaps or uncovered_intervals(self.context.start_ms, self.context.end_ms, self.viewed_ranges, tolerance=100):
-                self.notice.setText("仍有未查看范围或原录像缺口；不能只查看候选就关闭整团。")
-                return False
-            issue = completion_issue(self.context.chips, self.marks, result)
+            issue = review_completion_issue(self.context, self.marks, result, self.viewed_ranges,
+                                            self.fully_viewed.isChecked())
             if issue:
                 self.notice.setText(issue)
                 return False

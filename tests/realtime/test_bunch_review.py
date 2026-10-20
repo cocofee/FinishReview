@@ -14,13 +14,13 @@ from realtime.bunch_dialog import BunchDecoder, BunchReviewDialog, CountView
 from realtime.bunch_review import (
     BunchChip, BunchReviewStore, align_counts, completion_issue, detected_crossings, load_context,
     add_viewed, uncovered_intervals, review_candidates, group_member_batch,
-    mark_on_frame, unresolved_crossing_conflicts,
+    mark_on_frame, review_completion_issue, unresolved_crossing_conflicts,
 )
 from realtime.clock_sync import ClockModel, ClockModelStore
 from realtime.passage_receiver import PassageEvent
 from realtime.problem_items import (
-    ACTION_KEEP, ACTION_SIDE_BY_SIDE, CATEGORY_VIDEO, KIND_BUNCH, KIND_CHIP_NO_CROSSING, KIND_NEAR_CROSSING,
-    KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
+    ACTION_KEEP, ACTION_RECORD_BIB, ACTION_SIDE_BY_SIDE, CATEGORY_VIDEO, KIND_BUNCH, KIND_CHIP_NO_CROSSING,
+    KIND_NEAR_CROSSING, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
 )
 from realtime.problem_panel import ProblemListPanel
 from realtime.problem_resolutions import ProblemResolutionStore, export_lists
@@ -228,7 +228,7 @@ def test_drafts_roundtrip_and_completed_export_has_multiple_individual_frames(sy
     store.save(context, counts, 12.5)
     assert BunchReviewStore(root / 'finish_problems').get(context)['marks'] == counts
     assert store.manual_entries([item], root) == []
-    store.save(context, counts, 18.2, completed=True, fully_viewed=True)
+    store.save(context, counts, 18.2, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     assert len(store.manual_entries([item], root)) == 2
     resolutions = ProblemResolutionStore(root / 'finish_problems' / 'problem_resolutions.jsonl')
     result = export_lists([item], resolutions, root / 'exports')
@@ -270,13 +270,14 @@ def test_incomplete_group_stays_pending_and_group_has_no_one_click_checked(synth
     _detections(root, 1, [{'recorder_ms': context.start_ms + 900, 'in_obstruction': False},
                           {'recorder_ms': context.start_ms + 4200, 'in_obstruction': False}])
     panel._sync_sidebar()
-    assert panel.side_notice.text() == '画面 0 人 · 芯片 4 条 · 还差 4 人'
+    span = (context.end_ms - context.start_ms) / 1000
+    assert panel.side_notice.text() == f'画面 0 人 · 芯片 4 条 · 还差 4 人 · 整团还有 {span:.1f} 秒没看'
     store = BunchReviewStore(directory)
     store.save(context, [mark(2300, '101')], 10)
     panel.refresh()
     assert panel.state(item) == '待处理'
     counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
-    store.save(context, counts, 20, completed=True, fully_viewed=True)
+    store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     panel.refresh()
     assert panel.state(item).startswith('已处理')
     store.save(context, counts[:-1], 23)
@@ -315,11 +316,19 @@ def test_the_group_is_counted_and_closed_on_the_problem_itself(synthetic_bunch):
     assert panel.table.item(row, 2).text() == '3 人 / 4 条'
     assert panel.table.item(row, 2).foreground().color().name() == '#8a8f98'
 
-    # 数到的人数正好等于芯片条数：这一团当场自己收尾，不用再按确认。
+    # 数到的人数等于芯片条数也不自己收尾：画面里可能还有没点到的人。
     panel.add_mark(0.7, 0.6, context.chips[3].recorder_ms, frame_at(context, context.chips[3].recorder_ms))
+    assert len(panel.current_marks()) == 4
+    assert not BunchReviewStore(directory).latest_for(item)['completed']
+    assert '与芯片条数相同' in panel.hint.text()
+    assert panel.state(item) == '待处理'
+    assert panel.side_notice.text() == '画面 4 人 · 芯片 4 条 · 人数一致 · 已看完整团，回车确认'
+    # 整团看完，回车就是操作员确认：本团看完了、人数对过了。
+    panel._confirm_pending()
     record = BunchReviewStore(directory).latest_for(item)
-    assert record['counted_riders'] == 4 and record['completed']
-    assert panel.state(item).startswith('已处理：集团人工核对')
+    assert record['counted_riders'] == 4 and record['completed'] and record['fully_viewed']
+    assert panel.hint.text().startswith('本集团已完整查看并完成人数对照：画面 4 人 / 芯片 4 条')
+    assert panel.state(item) == '已处理：集团人工核对'
     assert not panel.current_marks()
     app.processEvents()
 
@@ -333,7 +342,8 @@ def test_reopening_a_completed_group_keeps_crossing_order_and_original_marks(syn
     directory = root / 'finish_problems'
     directory.mkdir()
     (directory / 'problem_list.json').write_text(json.dumps({'items': [item.to_payload()]}), encoding='utf-8')
-    BunchReviewStore(directory).save(context, counts, 12, completed=True)
+    BunchReviewStore(directory).save(context, counts, 12, completed=True, fully_viewed=True,
+                                     viewed_ranges=full_view(context))
     panel = ProblemListPanel()
     try:
         panel.set_workspace(root)
@@ -349,12 +359,17 @@ def test_reopening_a_completed_group_keeps_crossing_order_and_original_marks(syn
         assert not BunchReviewStore(directory).latest_for(item)['completed']
         panel.queue_filter.setCurrentIndex(0)
         assert panel.current_item().item_id == item.item_id
-        assert panel.current_marks() == counts  # 切回待处理也不会立刻再次自动关闭。
+        assert panel.current_marks() == counts  # 切回待处理也不会自己关闭。
         panel.count_table.setCurrentCell(0, 0)
         assert panel._editing_mark == 3
         panel.exclude_button.click()
         assert panel.state(item) == '待处理'
         panel.restore_button.click()
+        # 恢复后人数又与芯片相同，仍等操作员确认；看过的范围随记录保留，回车即可。
+        record = BunchReviewStore(directory).latest_for(item)
+        assert not record['completed']
+        assert [value['recorder_ms'] for value in record['marks']] == [value['recorder_ms'] for value in counts]
+        panel._confirm_pending()
         record = BunchReviewStore(directory).latest_for(item)
         assert record['completed']
         assert [value['recorder_ms'] for value in record['marks']] == [value['recorder_ms'] for value in counts]
@@ -363,7 +378,7 @@ def test_reopening_a_completed_group_keeps_crossing_order_and_original_marks(syn
         app.processEvents()
 
 
-def test_equal_counts_finish_even_when_time_reference_cannot_match_every_rider(synthetic_bunch):
+def test_equal_counts_confirm_even_when_time_reference_cannot_match_every_rider(synthetic_bunch):
     app = QApplication.instance() or QApplication([])
     root, item, _events = synthetic_bunch
     directory = root / 'finish_problems'
@@ -372,10 +387,15 @@ def test_equal_counts_finish_even_when_time_reference_cannot_match_every_rider(s
     panel = ProblemListPanel()
     panel.set_workspace(root)
     context = load_context(root, item)
-    # 点在各自过线原帧，校时参考相差较多也不把数清人数变成第二次配对作业。
+    for timestamp in range(context.start_ms, context.end_ms + 1, 50):
+        panel.record_viewed_frame(item.evidence['frame'], timestamp)
+    # 点在各自过线原帧，校时参考相差较多也不把数清人数变成第二次配对作业：
+    # 没认号的人按时间对不上芯片只作参考，回车照样能确认。
     stamps = [context.start_ms + 100 + i * 100 for i in range(4)]
     for stamp in reversed(stamps):
         panel.add_mark(.3, .5, stamp, frame_at(context, stamp))
+    assert BunchReviewStore(directory).latest_for(item) is None   # 点数还在手里，没有确认
+    panel._confirm_pending()
     record = BunchReviewStore(directory).latest_for(item)
     assert record['completed'] and record['counted_riders'] == 4
     assert [mark['recorder_ms'] for mark in record['marks']] == list(reversed(stamps))
@@ -390,7 +410,7 @@ def test_exclusion_reason_and_evidence_roundtrip_without_exporting_cached_extras
     counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
     counts += [dict(mark(2800, '888'), exclusion_reason='行人'), mark(4000, '550')]
     store = BunchReviewStore(root / 'finish_problems')
-    record = store.save(context, counts, 18, completed=True, fully_viewed=True)
+    record = store.save(context, counts, 18, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     assert [e['bib'] for e in record['extras']] == ['550']
     restored = BunchReviewStore(root / 'finish_problems')
     assert restored.get(context)['marks'][4] == counts[4]
@@ -401,13 +421,20 @@ def test_exclusion_reason_and_evidence_roundtrip_without_exporting_cached_extras
     assert len(rows) == 1 and rows[0][0] == '550'
     assert '81' in rows[0][2]  # original mark index 5, frame 4000 / 50 displayed one-based
     counts[0]['exclusion_reason'] = '工作人员'
-    # 排除后剩四人、四条芯片，人数已对上；时间参考没有配上不另设门槛，
-    # 也不能把数量相等的记录误导出为补录。
-    assert store.save(context, counts, 20, completed=True, fully_viewed=True)['completed']
+    # 排除后剩四人、四条芯片，总数相等；可 550 不在本团芯片里、101 也没有对上的人——
+    # 这是身份差异，总数相等也不能收尾，前一次确认的补录单不变。
+    seen = full_view(context)
+    with pytest.raises(ValueError, match='不在本团芯片'):
+        store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=seen)
+    on_disk = BunchReviewStore(root / 'finish_problems')
+    assert [row[0] for row in on_disk.manual_entries([item], root)] == ['550']
+    # 没认出号码的人只是按时间对不上芯片：只作参考，不另设门槛，也不导出补录。
+    unread = [dict(value, bib='') if value['bib'] == '550' else value for value in counts]
+    assert store.save(context, unread, 20, completed=True, fully_viewed=True, viewed_ranges=seen)['completed']
     assert store.manual_entries([item], root) == []
     counts[1]['exclusion_reason'] = '行人'
     with pytest.raises(ValueError, match='没有对应'):
-        store.save(context, counts, 20, completed=True, fully_viewed=True)
+        store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=seen)
     store.save(context, counts, 20)
     assert store.manual_entries([item], root) == []
 
@@ -571,8 +598,8 @@ def test_legacy_group_without_frame_uses_only_unique_calibrated_camera(synthetic
     assert load_context(root, replace(legacy, evidence={'camera_index': 2})).camera == 2
 
 
-def test_viewed_ranges_are_recorded_but_do_not_block_the_count(synthetic_bunch):
-    """看过哪几段仍然记着，但判据是人数对上芯片，不是每一帧都看过。"""
+def test_equal_counts_confirm_only_after_the_whole_group_was_viewed(synthetic_bunch):
+    """人数对上芯片还不够：团首到团尾每一刻都上过屏，操作员也确认看完了。"""
 
     root, item, _events = synthetic_bunch
     context = load_context(root, item)
@@ -581,10 +608,16 @@ def test_viewed_ranges_are_recorded_but_do_not_block_the_count(synthetic_bunch):
     result = align_counts(context.chips, counts)
     assert not result['missing'] and not result['extras']
     store = BunchReviewStore(root / 'finish_problems')
-    saved = store.save(context, counts, 10, completed=True, viewed_ranges=ranges,
-                       visited_candidates=['count_difference'])
-    assert saved['completed'] and saved['viewed_ranges'] == ranges
+    with pytest.raises(ValueError, match='没看过'):
+        store.save(context, counts, 10, completed=True, fully_viewed=True, viewed_ranges=ranges)
+    saved = store.save(context, counts, 10, viewed_ranges=ranges, visited_candidates=['count_difference'])
+    assert not saved['completed'] and saved['viewed_ranges'] == ranges
     assert saved['visited_candidates'] == ['count_difference']
+    seen = full_view(context)
+    with pytest.raises(ValueError, match='看完整团'):
+        store.save(context, counts, 10, completed=True, viewed_ranges=seen)
+    saved = store.save(context, counts, 10, completed=True, fully_viewed=True, viewed_ranges=seen)
+    assert saved['completed'] and saved['viewed_ranges'] == seen
 
 
 def test_normal_complete_count_does_not_require_names(synthetic_bunch):
@@ -640,9 +673,9 @@ def test_member_deletion_in_group_exports_one_record_and_blocks_completion(synth
     rows = list(csv.DictReader((root / 'exports/建议删除清单.csv').open(encoding='utf-8-sig')))
     assert rows[0]['事件ID'] == context.chips[0].event_id
     counts = [mark(c.recorder_ms-T) for c in context.chips]
-    # 成员建议交给 CycleRace，人数对上这一团本身就成立。
+    # 成员建议交给 CycleRace，整团看完、人数对上，这一团本身就能确认。
     assert BunchReviewStore(root / 'finish_problems').save(
-        context, counts, 30, completed=True)['completed']
+        context, counts, 30, completed=True, fully_viewed=True, viewed_ranges=full_view(context))['completed']
 
 
 def test_group_context_revision_changes_invalidate_draft(synthetic_bunch):
@@ -809,7 +842,7 @@ def test_later_member_hold_reopens_group_and_suppresses_manual_export(synthetic_
     context = load_context(root, item)
     counts = [mark(c.recorder_ms-T) for c in context.chips] + [mark(2800, '319')]
     store = BunchReviewStore(root / 'finish_problems')
-    store.save(context, counts, 20, completed=True, fully_viewed=True)
+    store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     assert len(store.manual_entries([item], root)) == 1
     BatchDecisionStore(root / 'finish_problems').save(
         group_member_batch(context), [context.chips[0].event_id], 'hold', 'needs another camera')
@@ -834,7 +867,7 @@ def test_obstruction_and_two_unread_counts_remain_pending(synthetic_bunch):
     saved = store.save(context, counts, 20, viewed_ranges=[[context.start_ms, context.end_ms]])
     assert saved['counted_riders'] == 6 and saved['identified_riders'] == 0
     with pytest.raises(ValueError, match='号码'):
-        store.save(context, counts, 20, completed=True, fully_viewed=True)
+        store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     assert store.manual_entries([context.item], root) == []
 
 
@@ -928,7 +961,8 @@ def test_a_doubt_added_later_is_a_row_of_its_own(synthetic_bunch):
     counts = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
     counts.append(counted(context, context.chips[1].recorder_ms - 400, '319'))
     store = BunchReviewStore(root / 'finish_problems')
-    record = store.save(context, counts, 20, completed=True)  # old records carry no viewed ranges
+    seen = full_view(context)
+    record = store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=seen)
     assert len(store.manual_entries([item], root)) == 1
     third, last = context.chips[2], context.chips[3]
     child = crossing_child(item, KIND_TWO_CHIPS_ONE_CROSSING, 'e-2-e-3', recorder_ms=third.recorder_ms,
@@ -937,7 +971,7 @@ def test_a_doubt_added_later_is_a_row_of_its_own(synthetic_bunch):
     write_children(root, item, [child])
     marks = record['marks']
     assert store.get(context) is not None  # the parent evidence did not change...
-    assert store.save(context, marks, 20, completed=True)['completed']
+    assert store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=seen)['completed']
     assert len(store.manual_entries([item], root)) == 1
     # 那一行还等着操作员：留哪一块芯片，或在那一帧上认号。
     assert [c.item_id for c in unresolved_crossing_conflicts(context, marks,
@@ -981,7 +1015,7 @@ def test_a_generic_checked_mark_never_answers_a_group_child(synthetic_bunch):
 
 
 def test_equal_counts_close_the_group_and_the_double_chip_is_its_own_row(synthetic_bunch):
-    """数到的人数就是判据：双芯片是表里自己的一行，由操作员在那一行上判。"""
+    """整团看完、人数对上就能确认：双芯片是表里自己的一行，由操作员在那一行上判。"""
 
     root, item, _events = synthetic_bunch
     context = load_context(root, item)
@@ -993,9 +1027,9 @@ def test_equal_counts_close_the_group_and_the_double_chip_is_its_own_row(synthet
     marks = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
     result = align_counts(context.chips, marks)
     assert len(result['pairs']) == 4 and not result['missing'] and not result['extras']
-    # 四人对四条芯片，前后顺序不看，这一团就成立。
+    # 四人对四条芯片、整团看完，前后顺序不看，这一团就能确认。
     saved = BunchReviewStore(root / 'finish_problems').save(
-        context, marks, 20, completed=True, viewed_ranges=full_view(context))
+        context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     assert saved['completed'] and saved['counted_riders'] == 4 and saved['identified_riders'] == 4
     # 双芯片还是一条待判的行，等操作员说留哪一块、还是两个人。
     assert [c.item_id for c in unresolved_crossing_conflicts(context, marks, result)] == [child.item_id]
@@ -1012,10 +1046,133 @@ def test_a_missed_crossing_is_a_row_of_its_own_not_a_blocker(synthetic_bunch):
     write_children(root, item, [child])
     counts = [counted(context, chip.recorder_ms) for chip in context.chips]
     store = BunchReviewStore(root / 'finish_problems')
-    saved = store.save(context, counts, 20, completed=True, viewed_ranges=full_view(context))
+    saved = store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     assert saved['completed'] and saved['counted_riders'] == 4
     # 连同漏读的那位一起数进来，他就走本团的补录清单。
     counts = [*counts, counted(context, missed_ms, '319')]
-    saved = store.save(context, counts, 20, completed=True, viewed_ranges=full_view(context))
+    saved = store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
     assert saved['completed'] and saved['counted_riders'] == 5 and saved['identified_riders'] == 1
     assert [row[0] for row in store.manual_entries([item], root)] == ['319']
+
+
+def test_the_confirm_gate_checks_gaps_coverage_count_and_the_operators_word(synthetic_bunch):
+    """确认本团只有一道门槛：录像无缺口、整团看过、人数对过、操作员确认看完。"""
+
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
+    result = align_counts(context.chips, counts)
+    seen = full_view(context)
+    assert review_completion_issue(context, counts, result, seen, True) == ''
+    partial = add_viewed([], context.start_ms, context.start_ms, context.end_ms)
+    assert '没看过' in review_completion_issue(context, counts, result, partial, True)
+    assert '没看过' in review_completion_issue(context, counts, result, None, True)
+    assert '看完整团' in review_completion_issue(context, counts, result, seen, False)
+    short = counts[:-1]
+    assert '没有对应' in review_completion_issue(context, short, align_counts(context.chips, short), seen, True)
+    gapped = replace(context, gaps=[[context.start_ms + 100, context.start_ms + 600]])
+    assert '缺口' in review_completion_issue(gapped, counts, result, seen, True)
+
+
+def test_equal_totals_do_not_hide_a_number_outside_the_group():
+    """总数相等也可能是一人漏读、一块芯片多余：认出的号码不在本团芯片里就不能收尾。"""
+
+    cc = chips(1000, 2000, 3000)
+    counts = [mark(1300, '101'), mark(2300, '102'), mark(3300, '550')]
+    result = align_counts(cc, counts)
+    assert result['missing'] == [2] and [extra['bib'] for extra in result['extras']] == ['550']
+    issue = completion_issue(cc, counts, result)
+    assert '550' in issue and '不在本团芯片' in issue
+    # 没认出号码、只是按时间对不上芯片的人，可能只是校时偏差：只作参考。
+    unread = [mark(1300, '101'), mark(2300, '102'), mark(3900)]
+    assert completion_issue(cc, unread, align_counts(cc, unread)) == ''
+
+
+def test_a_group_closed_under_the_old_rule_reopens_without_rewriting_its_record(synthetic_bunch):
+    """旧规则「人数相等即完成」关过的团回到待处理：原点数保留，日志一个字不改。"""
+
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    write_children(root, item, [])
+    counts = [mark(c.recorder_ms - T) for c in context.chips] + [mark(2800, '319')]
+    BunchReviewStore(root / 'finish_problems').save(context, counts, 20, completed=True, fully_viewed=True,
+                                                    viewed_ranges=full_view(context))
+    journal = root / 'finish_problems' / 'bunch_reviews.jsonl'
+    old = json.loads(journal.read_text(encoding='utf-8').splitlines()[-1])
+    del old['completion_policy_version']   # written before the confirm rule existed
+    journal.write_text(json.dumps(old, ensure_ascii=False) + '\n', encoding='utf-8')
+    before = journal.read_bytes()
+    store = BunchReviewStore(root / 'finish_problems')
+    reopened = store.get(context)
+    assert not reopened['completed'] and '旧规则' in reopened['completion_issue']
+    assert reopened['marks'] == counts
+    assert store.manual_entries([item], root) == []   # 重新确认之前不交补录单
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(root)
+        assert panel.state(item) == '待处理'
+        assert [entry.item_id for entry in panel.rows] == [item.item_id]
+    finally:
+        panel.close()
+        app.processEvents()
+    assert journal.read_bytes() == before
+
+
+def test_a_confirmed_group_lists_the_doubts_it_still_holds_as_rows(synthetic_bunch):
+    """确认本团只说明整团看过、人数对过；还没答的疑点单独成行，答完也留在表里可查。"""
+
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    first, second = context.chips[0], context.chips[1]
+    child = crossing_child(item, KIND_TWO_CHIPS_ONE_CROSSING, 'e-0-e-1', recorder_ms=first.recorder_ms,
+                           frame=frame_at(context, first.recorder_ms), bibs=(first.bib, second.bib),
+                           event_ids=(first.event_id, second.event_id), chip_time_ms=T + 2000)
+    write_children(root, item, [child])
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(root)
+        # 本团没确认之前，疑点在团里看，不另占一行。
+        assert [entry.item_id for entry in panel.rows] == [item.item_id]
+        marks = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
+        BunchReviewStore(root / 'finish_problems').save(context, marks, 20, completed=True, fully_viewed=True,
+                                                        viewed_ranges=full_view(context))
+        panel.refresh()
+        assert panel.state(item) == '已处理：集团人工核对 · 组内疑点 1 条另列'
+        assert [entry.item_id for entry in panel.rows] == [child.item_id]
+        released = panel.rows[0]
+        assert panel.state(released) == '待处理'
+        panel.store.resolve(released, ACTION_SIDE_BY_SIDE)
+        panel.refresh()
+        assert panel.state(item) == '已处理：集团人工核对'
+        assert panel.state(released).startswith('已处理')
+        assert panel.rows == []
+        panel.queue_filter.setCurrentIndex(3)
+        assert {entry.item_id for entry in panel.rows} == {item.item_id, child.item_id}
+    finally:
+        panel.close()
+        app.processEvents()
+
+
+def test_a_released_doubt_never_exports_a_number_the_group_already_exports(synthetic_bunch):
+    """漏读的人已在本团数进来、认了号：疑点那一行再认同一个号，补录单里也只有一条。"""
+
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    missed_ms = context.chips[1].recorder_ms + 400
+    child = crossing_child(item, KIND_NO_CHIP_CROSSING, 'crossing', recorder_ms=missed_ms,
+                           frame=frame_at(context, missed_ms), chip_time_ms=missed_ms - 300)
+    write_children(root, item, [child])
+    # 点在检测那一帧的下一帧：团里数到了，疑点本身却没被这一下回答。
+    counts = [counted(context, chip.recorder_ms) for chip in context.chips]
+    counts.append(counted(context, missed_ms + 50, '319'))
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, counts, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
+    assert store.open_doubts(context) == [child.item_id]
+    resolutions = ProblemResolutionStore(root / 'finish_problems/problem_resolutions.jsonl')
+    resolutions.resolve(child, ACTION_RECORD_BIB, bib='319')
+    assert export_lists([item, child], resolutions, root / 'exports')['补录清单.csv'] == 1
+    # 认的是另一个号，就是另一个人，照常导出。
+    resolutions.resolve(child, ACTION_RECORD_BIB, bib='320')
+    assert export_lists([item, child], resolutions, root / 'exports')['补录清单.csv'] == 2

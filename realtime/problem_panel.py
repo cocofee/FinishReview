@@ -191,6 +191,8 @@ class ProblemListPanel(QFrame):
         # the positions; the moments inside them align the count with the chips.
         self._marks: dict[str, list] = {}
         self._viewed: dict[str, dict] = {}
+        # Confirmed group -> the doubts it still holds; filled by state().
+        self._open_doubts: dict[str, frozenset] = {}
         self._group_context = None
         self._group_context_id = None
         self._group_context_error = ""
@@ -348,7 +350,7 @@ class ProblemListPanel(QFrame):
         images.addWidget(self.filmstrip, 1)
         detail_layout.addLayout(images)
         # 同一张表按过线先后放画面与芯片；修正操作只跟着选中的人出现。
-        self.big_help = QLabel("按过线先后看 · 点人计数 · 人数对上自动完成", detail)
+        self.big_help = QLabel("按过线先后看 · 点人计数 · 看完整团后回车确认", detail)
         self.big_help.setWordWrap(True)
         self.big_help.setStyleSheet("color:#667085; font-size:9pt;")
         self.big_help.hide()
@@ -589,6 +591,7 @@ class ProblemListPanel(QFrame):
         self._browsing = False
         self._next_analysis = 0.0
         self._drafts, self._held, self._marks, self._operator_items, self._viewed = {}, {}, {}, {}, {}
+        self._open_doubts = {}
         self._group_context, self._group_context_id = None, None
         self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self._final_analysis_pending = False
@@ -627,6 +630,7 @@ class ProblemListPanel(QFrame):
         self._finalizing_live = False
         self._drafts, self._held = {}, {}
         self._marks, self._viewed, self._operator_items = {}, {}, {}
+        self._open_doubts = {}
         self._group_context, self._group_context_id = None, None
         self._editing_mark = -1
         self._shown_id = None
@@ -841,6 +845,7 @@ class ProblemListPanel(QFrame):
         return all(event is not None and not event.is_active for event in involved)
 
     def state(self, item: ProblemItem) -> str:
+        self._open_doubts.pop(item.item_id, None)  # set again below, only for a confirmed group
         if item.kind == KIND_AUTO_PASSED:
             return STATE_AUTO
         if item.status == STATUS_WAITING:
@@ -868,7 +873,8 @@ class ProblemListPanel(QFrame):
             from .bunch_review import load_context
             try:
                 context = load_context(self.workspace_dir, item, record["camera"])
-                if self.bunch_store.get(context) is None:
+                checked = self.bunch_store.get(context)
+                if checked is None:
                     return STATE_STALE
             except (ValueError, OSError):
                 return STATE_STALE
@@ -878,7 +884,16 @@ class ProblemListPanel(QFrame):
                 if event is not None and (not event.is_active or event.bib != chip["bib"]
                                           or int(event.timeline_timestamp_ms) != chip["chip_ms"]):
                     return STATE_STALE
-            return f"{STATE_RESOLVED}：集团人工核对" if record.get("completed") else STATE_PENDING
+            if not checked.get("completed"):
+                return STATE_PENDING  # a draft, or a completion the current gate reopened
+            try:
+                doubts = self.bunch_store.open_doubts(context)
+            except (ValueError, OSError):
+                return f"{STATE_RESOLVED}：集团人工核对 · 组内疑点读取失败"
+            # Confirming the count never answers the doubts inside the group:
+            # those still open are left on rows of their own.
+            self._open_doubts[item.item_id] = frozenset(doubts)
+            return f"{STATE_RESOLVED}：集团人工核对" + (f" · 组内疑点 {len(doubts)} 条另列" if doubts else "")
         if self.store is not None:
             resolution, stale = self.store.state(item)
             if resolution is not None:
@@ -897,7 +912,7 @@ class ProblemListPanel(QFrame):
         if self.payload is None and not self.items:
             return "问题清单：尚未分析录像"
         states = [self.state(item) for item in self.items
-                  if not item.grouped and item.kind != KIND_AUTO_PASSED]
+                  if self._is_row(item) and item.kind != KIND_AUTO_PASSED]
         pending = sum(self.is_pending_state(state) for state in states)
         done = sum(state.startswith(STATE_RESOLVED) or state == STATE_UPSTREAM for state in states)
         summary = (self.payload or {}).get("summary", {})
@@ -923,9 +938,9 @@ class ProblemListPanel(QFrame):
         mode = self.queue_filter.currentIndex()
         self.rows = []
         for item in self.items:
-            # Members of a batch or a group are worked inside their tool, never as
+            # Members of a batch or a group are worked inside their tool, not as
             # rows of their own: the queue holds what the operator decides by hand.
-            if item.grouped:
+            if not self._is_row(item):
                 continue
             state = self.state(item)
             # 自动对应的单人不是待处理：它只在「全部」里，作为这场比赛的过线记录。
@@ -1007,13 +1022,34 @@ class ProblemListPanel(QFrame):
             return QColor("#8a8f98")
         return None
 
+    def _is_row(self, item: ProblemItem) -> bool:
+        """Whether the item is a row of the queue.
+
+        Members of a batch or a group are worked inside their tool. Once a group
+        is confirmed, a doubt it still holds — or one already answered on its own
+        row — is a row of its own: confirming the count never answers it.
+        """
+
+        if not item.grouped:
+            return True
+        doubts = self._open_doubts.get(item.grouped)
+        if doubts is None:
+            return False
+        if item.item_id in doubts:
+            return True
+        decision, _stale = self.store.state(item) if self.store is not None else (None, False)
+        return decision is not None
+
     def _in_progress(self, item: ProblemItem) -> bool:
-        """A group half counted: its record is saved but the group is not closed."""
+        """A group already worked on but not closed: a draft, or a completion
+        saved under an older rule and reopened."""
 
         if self.bunch_store is None:
             return False
+        from .bunch_review import COMPLETION_POLICY_VERSION
         record = self.bunch_store.latest_for(item)
-        return bool(record) and not record.get("completed")
+        return bool(record) and not (record.get("completed")
+                                     and record.get("completion_policy_version") == COMPLETION_POLICY_VERSION)
 
     def _class_matches(self, item: ProblemItem) -> bool:
         return not self._class_filter or problem_class(item) == self._class_filter
@@ -1316,28 +1352,12 @@ class ProblemListPanel(QFrame):
                       "bib": "", "exclusion_reason": "", "frame": ref})
         self._editing_mark = len(marks) - 1
         self._marks_updated()
-        self.hint.setText(f"已点 {rider_count(marks)} 人；按过线时间排序，点错按退格撤销。")
-        # 数到的人数正好等于芯片条数：这一团自己收尾，不用再按确认。
-        self._auto_close_group(item)
-
-    def _auto_close_group(self, item) -> bool:
-        """人数与芯片条数相等，就是这一团成立的判据：当场核清，不留一步确认。
-
-        只有人数真的往上走到相等的那一下才收尾（新点一位，或把一位恢复为选手）。
-        重新打开一条已核清的集团时恢复出来的点数不会再自己合上，否则重开就白按了。
-        """
-
+        # 人数等于芯片条数也不收尾：实际可能多一位没读到芯片的人，要看完整团再确认。
         context = self._inline_context()
-        if item is None or context is None or item.kind not in (KIND_BUNCH, KIND_OBSTRUCTION):
-            return False
-        from .bunch_review import rider_count
-        counted = rider_count(self.current_marks())
-        if not counted or counted != len(context.chips):
-            return False
-        if self.state(item).startswith((STATE_RESOLVED, STATE_HANDOFF)):
-            return False
-        self._confirm_bunch_count(item, counted)
-        return True
+        if context is not None and rider_count(marks) == len(context.chips):
+            self.hint.setText(f"已点 {rider_count(marks)} 人，与芯片条数相同；看完整团、确认没有漏点再按回车。")
+        else:
+            self.hint.setText(f"已点 {rider_count(marks)} 人；按过线时间排序，点错按退格撤销。")
 
     def undo_mark(self) -> None:
         item = self.current_item()
@@ -1541,9 +1561,9 @@ class ProblemListPanel(QFrame):
         return sorted(chips, key=lambda chip: chip.chip_ms if chip.chip_ms is not None else 2 ** 62)
 
     def _sidebar_notice(self, item, marks, chips) -> str:
-        """计数只说人数差；逐人时间参考不增加集团完成门槛。"""
+        """人数差、整团看了多少；逐人时间参考只提醒，不增加集团完成门槛。"""
 
-        from .bunch_review import rider_count
+        from .bunch_review import rider_count, uncovered_intervals
         if item is None:
             return ""
         counted = rider_count(marks)
@@ -1552,14 +1572,22 @@ class ProblemListPanel(QFrame):
         if context is None:
             return text + (f" · {self._group_context_error}" if self._group_context_error else "")
         if counted and counted == len(chips):
-            text += " · 人数已对上"
+            text += " · 人数一致"
+            # 「待看」是按时间没对上人的芯片：可能只是校时偏差，也可能是漏读加多余芯片。
+            waiting = sum(row["mark_index"] is None for row in self._crossing_rows)
+            if waiting:
+                text += f"（{waiting} 条芯片按时间未对上，仅参考）"
         elif counted < len(chips):
             text += f" · 还差 {len(chips) - counted} 人"
         else:
-            text += f" · 多出 {counted - len(chips)} 人待核"
+            text += f" · 多出 {counted - len(chips)} 人（疑似漏读）待核"
         if context.gaps:
-            text += f" · 录像缺口 {len(context.gaps)} 处"
-        return text
+            return text + f" · 录像缺口 {len(context.gaps)} 处，不能确认完整"
+        unseen = sum(right - left for left, right in uncovered_intervals(
+            context.start_ms, context.end_ms, self._view_state(context)["ranges"], tolerance=100))
+        if unseen:
+            return text + f" · 整团还有 {unseen / 1000:.1f} 秒没看"
+        return text + (" · 已看完整团，回车确认" if counted else " · 已看完整团")
 
     def _fill_count_table(self, marks) -> None:
         """过线顺序、过线时间、认出号码与芯片时间在同一行里。"""
@@ -1719,9 +1747,6 @@ class ProblemListPanel(QFrame):
         self._editing_mark = index
         self._marks_updated()
         self.hint.setText("已记为非选手，证据保留。" if reason else "已恢复为选手计数。")
-        if not reason:
-            # 恢复回来的这一位也可能刚好把人数补到与芯片条数相等。
-            self._auto_close_group(self.current_item())
 
     def _remove_mark(self, index):
         item = self.current_item()
@@ -1840,7 +1865,12 @@ class ProblemListPanel(QFrame):
             self.hint.setText(f"逐人过线未全部保存，现有点数已保留：{error}")
 
     def _confirm_bunch_count(self, item: ProblemItem, counted: int) -> None:
-        """Close the group on the counted people, or keep the count as progress."""
+        """Confirm the group as fully viewed and counted, or keep the count as progress.
+
+        Enter on a group is the operator's statement that the whole group was on
+        screen and nobody crossing in it was left uncounted; the gate still checks
+        that every moment of it was actually viewed and that the count settles.
+        """
 
         if self.workspace_dir is None or self.bunch_store is None:
             return
@@ -1860,8 +1890,7 @@ class ProblemListPanel(QFrame):
         view_state = self._view_state(context)
         completed = False
         try:
-            record = self.bunch_store.save(context, marks, seconds, completed=True,
-                                           fully_viewed=view_state.get("fully_viewed", False),
+            record = self.bunch_store.save(context, marks, seconds, completed=True, fully_viewed=True,
                                            viewed_ranges=view_state["ranges"])
             completed = bool(record.get("completed"))
         except (ValueError, OSError) as error:
@@ -1876,7 +1905,7 @@ class ProblemListPanel(QFrame):
                 return
             self.hint.setText(f"{error} 已先记住这 {counted} 人。")
         else:
-            self.hint.setText(f"集团 {counted} 人已核对。")
+            self.hint.setText(f"本集团已完整查看并完成人数对照：画面 {counted} 人 / 芯片 {len(context.chips)} 条。")
         if completed:
             # The group is closed and its people live in the record now; an unfinished
             # one keeps its count in hand, ready for the next rider pointed at.
@@ -1884,6 +1913,13 @@ class ProblemListPanel(QFrame):
         self._pending_action = ""
         self.save_drafts()
         self._load_bunch_store()
+        if completed and self.bunch_store is not None:
+            try:
+                doubts = self.bunch_store.open_doubts(context)
+            except (ValueError, OSError):
+                doubts = []
+            if doubts:
+                self.hint.setText(self.hint.text() + f" 组内另有 {len(doubts)} 条疑点，已单独列入待处理。")
         self._render()
         (self.setFocus if self._big_view else self.table.setFocus)()
 
@@ -1972,7 +2008,7 @@ class ProblemListPanel(QFrame):
 
         counts = dict.fromkeys(CLASS_ORDER, 0)
         for item in self.items:
-            if item.grouped:
+            if not self._is_row(item):
                 continue  # members are handled inside their batch or group
             state = self.state(item)
             if self._is_waiting_work(item, state) or self.is_pending_state(state):
@@ -2026,7 +2062,7 @@ class ProblemListPanel(QFrame):
 
     def evidence_gap_text(self) -> str:
         summary = (self.payload or {}).get("summary", {})
-        waiting = sum(1 for item in self.items if not item.grouped and self._is_waiting_work(item))
+        waiting = sum(1 for item in self.items if self._is_row(item) and self._is_waiting_work(item))
         unverifiable = int(summary.get("unverifiable", 0))
         if not waiting and not unverifiable:
             return "证据缺口 无"
