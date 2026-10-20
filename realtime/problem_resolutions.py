@@ -317,6 +317,7 @@ def export_lists(
     manual, deletions, changes = [], [], []
     from .bunch_review import BunchReviewStore
     bunches = BunchReviewStore(store.journal_path.parent)
+    group_bibs: dict[str, set] = {}  # group id -> numbers its own confirmed count exports
     for resolution in sorted(store.resolutions(), key=lambda value: value.chip_time_ms or 0):
         item = by_id.get(resolution.item_id)
         if item is None:
@@ -331,6 +332,14 @@ def export_lists(
             continue
         title = KIND_TITLES.get(item.kind, item.kind)
         if resolution.action == ACTION_RECORD_BIB:
+            if parent is not None and parent.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
+                if parent.item_id not in group_bibs:
+                    group_bibs[parent.item_id] = {row[0] for row in bunches.manual_entries(
+                        [parent], store.journal_path.parent.parent)}
+                if resolution.bib in group_bibs[parent.item_id]:
+                    # A doubt left open by its confirmed group, answered with a
+                    # number the group count already exports: one rider, one entry.
+                    continue
             manual.append((
                 resolution.bib, format_chip_time(resolution.chip_time_ms), _frame_text(resolution.frame),
                 resolution.frame.get("camera_index", ""), resolution.calibration_version,
@@ -358,7 +367,6 @@ def export_lists(
             ))
     from .batch_review import BatchDecisionStore, member_key
     from .bunch_review import group_member_batch, load_context
-    from .problem_items import KIND_BUNCH, KIND_OBSTRUCTION
     batch_store = BatchDecisionStore(store.journal_path.parent)
     exported = set()
     for item in items:

@@ -43,6 +43,12 @@ JOURNAL_NAME = "bunch_reviews.jsonl"
 PROBLEM_LIST_NAME = "finish_problems/problem_list.json"
 CROSSINGS_NAME = "finish_problems/crossings_camera{}.json"
 
+# The rule a saved completion was confirmed under. Version 2: the whole period
+# from before the first to after the last crosser was on screen and the operator
+# confirmed it; equal totals alone no longer close a group. A completion saved
+# under an older rule is reopened in memory only — the journal keeps it as saved.
+COMPLETION_POLICY_VERSION = 2
+
 # A counted person is on the frame when the camera and the moment agree; a
 # retained copy of the same actual frame (extra metadata, a rebuilt stamp) also
 # counts. Neighboring frames are 50 ms apart, so the moment stays unambiguous.
@@ -532,11 +538,12 @@ def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: in
 
 
 def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) -> str:
-    """What still stands between this count and a closed group.
+    """What the count itself still owes before the group can be confirmed.
 
-    数到的人数就是判据：画面点到的人和芯片记录一一对上（多少对多少，不看前后
-    顺序），这一团就成立。剩下要填的是为了把漏读的人交给 CycleRace——多出来
-    的那位必须有号码，才补得进去。
+    人数相等不等于身份对上：读出来的号码不在本团芯片里，就是漏读、双芯片或备用
+    芯片的迹象，总数相等也要留着待核。没认号的人按时间先后对芯片只作参考，不另设
+    门槛。多出来的人必须有号码、前后都有参考过线者，才补得进 CycleRace。看没看
+    完整团由 ``review_completion_issue`` 判断。
     """
 
     active = [mark for mark in marks if not is_excluded(mark)]
@@ -546,7 +553,13 @@ def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) ->
     if len(bibs) != len(set(bibs)):
         return "同一号码被填写在多人上，请先核对并修正。"
     if len(active) == len(chips):
-        return ""  # 总数已对上；逐人时间对应只作参考，不另设完成门槛。
+        # A read number left unpaired has no chip in this group: an identity
+        # difference that equal totals would otherwise hide.
+        unknown = [extra["bib"].strip() for extra in result["extras"] if extra["bib"].strip()]
+        if unknown:
+            return (f"号码 {'、'.join(unknown)} 不在本团芯片里：人数相等也可能有漏读或双芯片，"
+                    "请核对号码；无法确认时保存进度。")
+        return ""
     if result["missing"]:
         return "仍有芯片没有对应的计数，请补查原帧；无法确认时保存进度，保留待处理。"
     if any(not e["bib"] or e["chip_time_ms"] is None for e in result["extras"]):
@@ -554,10 +567,55 @@ def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) ->
     return ""
 
 
+def review_completion_issue(context: BunchContext, marks: list[dict], result: dict,
+                            viewed_ranges, fully_viewed: bool) -> str:
+    """The one gate for confirming a group: both review surfaces, every saved
+    completion and the export apply it.
+
+    Confirming says "本集团已完整查看并完成人数对照": the recording has no gap,
+    every moment from before the first to after the last crosser was on screen,
+    the count owes nothing, and the operator said so. Equal totals never close a
+    group by themselves. The doubts folded into the group are not answered by
+    the confirmation; they stay open on their own (see ``open_doubts``).
+    """
+
+    if context.gaps:
+        return "原录像存在缺口，不能确认本团已完整核对。"
+    unseen = uncovered_intervals(context.start_ms, context.end_ms, viewed_ranges or [], tolerance=100)
+    if unseen:
+        seconds = sum(right - left for left, right in unseen) / 1000
+        return f"本团还有 {seconds:.1f} 秒画面没看过：请从团首看到团尾再确认，或先保存进度。"
+    issue = completion_issue(context.chips, marks, result)
+    if issue:
+        return issue
+    if not fully_viewed:
+        return "请确认已看完整团，范围内没有未计入的过线者。"
+    return ""
+
+
+def _decision_stamp(workspace: Path) -> tuple:
+    """When a group's children, or the answers given to them, last changed on disk."""
+
+    from .batch_review import BATCH_DECISIONS
+    from .problem_resolutions import RESOLUTIONS_FILENAME
+
+    stamps = []
+    for path in (Path(workspace) / PROBLEM_LIST_NAME, Path(workspace) / "finish_problems" / RESOLUTIONS_FILENAME,
+                 Path(workspace) / "finish_problems" / BATCH_DECISIONS):
+        try:
+            stat = path.stat()
+            stamps.append((stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            stamps.append(None)
+    return tuple(stamps)
+
+
 class BunchReviewStore:
     def __init__(self, directory: Path):
         self.path = Path(directory) / JOURNAL_NAME
         self.latest = {}
+        # (item_id, camera) -> (record, decision stamp, open doubt ids)
+        self._doubts = {}
         if self.path.is_file():
             lines = self.path.read_bytes().splitlines(keepends=True)
             for number, line in enumerate(lines):
@@ -576,8 +634,48 @@ class BunchReviewStore:
                     raise ValueError("集团核对记录损坏，未覆盖原记录。")
 
     def get(self, context: BunchContext) -> dict | None:
+        """The review saved for exactly this evidence, its completion re-checked.
+
+        A completion saved under an older rule, or one the gate no longer
+        accepts, comes back reopened: the marks and viewed ranges are kept and
+        ``completion_issue`` says why. Only this copy changes; the journal keeps
+        what the operator saved.
+        """
+
         record = self.latest.get((context.item.item_id, context.camera))
-        return record if record and record.get("signature") == context.signature else None
+        if not record or record.get("signature") != context.signature:
+            return None
+        if not record.get("completed"):
+            return record
+        if record.get("completion_policy_version") != COMPLETION_POLICY_VERSION:
+            issue = "这一团按旧规则（人数相等即完成）关闭过；原点数保留，请看完整团后重新确认。"
+        else:
+            result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
+            issue = review_completion_issue(context, record["marks"], result, record.get("viewed_ranges"),
+                                            record.get("fully_viewed", False))
+        return dict(record, completed=False, completion_issue=issue) if issue else record
+
+    def open_doubts(self, context: BunchContext) -> list[str]:
+        """The doubts folded into this group that its confirmation left open.
+
+        Confirming a group settles its count, not its children: a double chip, a
+        chip nobody was seen with, or a crossing without a chip stays a question
+        until the operator answers it — on the counted person's own frame or
+        number, or on its own row. Children and answers are read from disk and
+        re-read whenever one of those files changes.
+        """
+
+        record = self.get(context)
+        if not record or not record.get("completed"):
+            return []
+        key = (context.item.item_id, context.camera)
+        stamp = _decision_stamp(context.workspace)
+        cached = self._doubts.get(key)
+        if cached is None or cached[0] is not record or cached[1] != stamp:
+            result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
+            doubts = [child.item_id for child in unresolved_crossing_conflicts(context, record["marks"], result)]
+            cached = self._doubts[key] = (record, stamp, doubts)
+        return list(cached[2])
 
     def latest_for(self, item: ProblemItem) -> dict | None:
         records = [record for (item_id, _camera), record in self.latest.items() if item_id == item.item_id]
@@ -587,17 +685,14 @@ class BunchReviewStore:
              fully_viewed=False, fallback_bias_ms=0, viewed_ranges=None, visited_candidates=()) -> dict:
         result = align_counts(context.chips, marks, fallback_bias_ms)
         if completed:
-            if context.gaps:
-                raise ValueError("原录像存在缺口，不能确认本团已完整核对。")
-            # 人数对上就是对的：孩子疑点（双芯片、漏读）各自是表里的一行，
-            # 由操作员在那一行上判，不再拦住这一团的确认。
-            issue = completion_issue(context.chips, marks, result)
+            issue = review_completion_issue(context, marks, result, viewed_ranges, fully_viewed)
             if issue:
                 raise ValueError(issue)
         record = {"schema_version": 1, "item_id": context.item.item_id, "signature": context.signature,
                   "item_snapshot": context.item.to_payload(), "chips": [asdict(chip) for chip in context.chips],
                   "camera": context.camera, "calibration_version": context.model.version,
                   "marks": marks, "seconds": round(seconds, 1), "completed": completed,
+                  "completion_policy_version": COMPLETION_POLICY_VERSION,
                   "fully_viewed": fully_viewed, "fallback_bias_ms": fallback_bias_ms,
                   "extras": result["extras"]}
         if viewed_ranges is not None:
@@ -627,18 +722,14 @@ class BunchReviewStore:
                 context = load_context(workspace, by_id[item_id], record["camera"])
             except (ValueError, OSError):
                 continue
-            if self.get(context) is None:
-                continue  # changed chips, calibration, geometry or evidence: ask again
+            checked = self.get(context)
+            if checked is None or not checked.get("completed"):
+                continue  # changed evidence, or a completion the current gate reopens: ask again
             if pending_member_decisions(context):
-                continue
-            if context.gaps or ("viewed_ranges" in record and uncovered_intervals(
-                    context.start_ms, context.end_ms, record["viewed_ranges"], tolerance=100)):
                 continue
             # Recompute from the saved evidence so stale cached extras cannot
             # reintroduce an excluded person or an incomplete group's suggestions.
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
-            if completion_issue(context.chips, record["marks"], result):
-                continue
             if rider_count(record["marks"]) == len(context.chips):
                 continue  # 数量相等的集团只完成点数，不把暂未对上的时间参考导出成漏读。
             for extra in result["extras"]:
