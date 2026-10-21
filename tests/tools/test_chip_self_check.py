@@ -65,10 +65,13 @@ def _race_db(path, passages):
 
 
 def test_self_check_without_cyclerace_data_lists_missing_inputs(tmp_path):
+    # Both 550 passages were appended after the later automatic read of 601,
+    # out of CycleRace's crossing order: one rider entered manually twice.
     events = [
-        _event(1, "550", GUN + 6_000_000, delay=420_000),
-        _event(2, "550", GUN + 6_000_652, delay=1_213_000),
-        _event(3, "901", GUN - 600_000, group="测试组"),
+        _event(1, "601", GUN + 6_500_000),
+        _event(2, "550", GUN + 6_000_000, delay=420_000),
+        _event(3, "550", GUN + 6_000_652, delay=1_213_000),
+        _event(4, "901", GUN - 600_000, group="测试组"),
     ]
     report = run_self_check(_workspace(tmp_path, events), tmp_path / "out")
 

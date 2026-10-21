@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -113,6 +113,35 @@ def dominant_race_date(events: Iterable[PassageEvent]) -> str:
     return counter.most_common(1)[0][0] if counter else ""
 
 
+def _manual_flags(reads, sequences, receipt_manual, late_manual_ms: int) -> list[bool]:
+    """Prefer CycleRace's own insertion order over the receipt delay.
+
+    A late outbox flush delivers automatic reads hours after the race, so
+    receipt delay alone labels the whole main group as manual (补录).  CycleRace
+    still assigns ``sequence`` in crossing order; a passage appended later with
+    an earlier chip time is the actual manual entry.  When sequences carry no
+    order (older feeds, tests), keep the receipt-delay fallback per day.
+    """
+
+    manual = set()
+    by_day: dict[str, list] = {}
+    for read in reads:
+        by_day.setdefault(local_date(read.chip_ms), []).append(read)
+    for day_reads in by_day.values():
+        ordered = all(sequences.get(read.read_id, 0) > 0 for read in day_reads)
+        ordered = ordered and len({sequences[read.read_id] for read in day_reads}) > 1
+        if not ordered:
+            manual.update(read.read_id for read in day_reads if receipt_manual.get(read.read_id))
+            continue
+        latest = None
+        for read in sorted(day_reads, key=lambda item: (sequences[item.read_id], item.chip_ms)):
+            if latest is not None and read.chip_ms < latest - int(late_manual_ms):
+                manual.add(read.read_id)
+            else:
+                latest = read.chip_ms if latest is None else max(latest, read.chip_ms)
+    return [read.read_id in manual for read in reads]
+
+
 def chip_reads(
     history: Sequence[PassageEvent],
     *,
@@ -126,10 +155,11 @@ def chip_reads(
 
     A read uses the first revision that was active, i.e. what the
     finish saw when the read arrived. ``active_now`` reflects the latest
-    revision and local deletions. CycleRace does not send a manual-entry flag,
-    so a passage received more than ``late_manual_ms`` after its evidence time
-    is treated as a manual entry (补录), not as a chip read. Only an explicit
-    ``race_date`` restricts dates; metadata dates never imply a filter.
+    revision and local deletions. CycleRace does not send a manual-entry flag:
+    a passage inserted out of crossing order is treated as a manual entry
+    (补录), and only when the feed has no usable sequence does the receipt
+    delay fallback apply. Only an explicit ``race_date`` restricts dates;
+    metadata dates never imply a filter.
     """
 
     scoped = [
@@ -142,6 +172,8 @@ def chip_reads(
     for event in scoped:
         by_event.setdefault(event.event_id, []).append(event)
     reads = []
+    sequences: dict[str, int] = {}
+    receipt_manual: dict[str, bool] = {}
     for event_id, revisions in by_event.items():
         ordered = sorted(revisions, key=lambda item: (item.revision, item.received_at_ms))
         latest = ordered[-1]
@@ -168,6 +200,11 @@ def chip_reads(
             current = version[-1] is latest
             chip_ms = int(first.timeline_timestamp_ms)
             received = int(first.received_at_ms or 0)
+            read_id = f"{event_id}#{int(first.revision)}"
+            sequences[read_id] = int(getattr(first, "sequence", 0) or 0)
+            receipt_manual[read_id] = bool(received) and (
+                received - align_evidence_timestamp(chip_ms, received) > int(late_manual_ms)
+            )
             reads.append(
                 ChipRead(
                     event_id=event_id,
@@ -183,15 +220,15 @@ def chip_reads(
                     revision=int(first.revision),
                     latest_revision=int(latest.revision),
                     active_now=current and bool(latest.is_active) and event_id not in deleted,
-                    manual_entry=bool(received) and (
-                        received - align_evidence_timestamp(chip_ms, received) > int(late_manual_ms)
-                    ),
+                    manual_entry=False,
                     excluded=group_exclusion(first.group_name),
                     latest_bib=latest_identity[0],
                     latest_chip_ms=int(latest.timeline_timestamp_ms),
                     replaced=not current,
                 )
             )
+    flags = _manual_flags(reads, sequences, receipt_manual, late_manual_ms)
+    reads = [replace(read, manual_entry=flag) for read, flag in zip(reads, flags)]
     reads.sort(key=lambda item: (item.chip_ms, item.event_id, item.revision))
     return tuple(reads)
 

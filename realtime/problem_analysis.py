@@ -21,6 +21,7 @@ import json
 import hashlib
 import logging
 import time
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -35,9 +36,9 @@ from .analysis_resources import (
     lower_process_priority,
     peak_memory_mb,
 )
-from .analysis_workspace import AnalysisWorkspace, ArchiveSegment
+from .analysis_workspace import AnalysisWorkspace, ArchiveSegment, uncovered_ranges
 from .analysis_settings import (read_settings, resolved_model_path, settings_token, model_fingerprint,
-                                profile_for_segment, crosses_profile_boundary)
+                                profile_for_segment, crosses_profile_boundary, inherited_profile)
 from .batch_review import (BATCH_IDENTITY_FILENAME, aggregate_batches, identity_chain, previous_items,
                            read_snapshots, save_identity, unambiguous_auto_passed)
 from .bike_check import (
@@ -45,6 +46,7 @@ from .bike_check import (
     DECISION_KEEP,
     LABEL_TEXT,
     LABEL_PEDESTRIAN,
+    LABEL_UNCHECKED,
     LABEL_VEHICLE,
     BikeVerdict,
     CropPlan,
@@ -97,7 +99,7 @@ from .problem_items import (
     sort_items,
 )
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
-from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, check_target_tracks
+from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
 
 
 logger = logging.getLogger("FinishReview.ProblemAnalysis")
@@ -127,6 +129,7 @@ class AnalysisConfig:
     evidence_delay_ms: int = 10_000
     sampling_profiles: tuple[dict, ...] = ()
     settings_token: str = ""
+    fast_decode: bool = True
 
     def resolved_output(self) -> Path:
         return Path(self.output_dir) if self.output_dir else Path(self.workspace) / OUTPUT_DIRNAME
@@ -173,16 +176,28 @@ def extract_strips(
 
     output_dir = config.resolved_output()
     if config.sampling_profiles and not config.race_id:
-        scope = AnalysisWorkspace(config.workspace)
+        scope = AnalysisWorkspace(config.workspace, allow_empty_scope=True)
         config = replace(config, race_id=scope.race_id, stage_id=scope.stage_id)
     paths = []
+    legacy = None
     for index, segment in enumerate(segments):
         if cancelled():
             break
         if crosses_profile_boundary(config.sampling_profiles, segment, config.race_id, config.stage_id):
             continue
-        effective = profile_for_segment(config.sampling_profiles, segment, config.race_id, config.stage_id) or line_config
-        if not effective:
+        effective = (profile_for_segment(config.sampling_profiles, segment, config.race_id, config.stage_id)
+                     or inherited_profile(config.sampling_profiles, segment.camera_index, segment.start_ms,
+                                          config.race_id))
+        if effective is None:
+            effective = line_config
+            if effective is not None and not line_covers_segment(effective, segment):
+                # The drawn-once default begins at the save session; earlier
+                # recordings keep using the workspace's legacy line.
+                if legacy is None:
+                    legacy = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
+                                               allow_empty_scope=True)
+                effective = legacy.finish_lines().get(segment.camera_index)
+        if not effective or not line_covers_segment(effective, segment):
             continue
         digest = line_config_digest(effective)
         target = strip_path(output_dir, segment)
@@ -193,9 +208,11 @@ def extract_strips(
                 segment.path, effective,
                 samples=config.samples, threads=config.decode_threads,
                 snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
+                fast_decode=config.fast_decode,
             )
             if cancelled():
                 break
+            save_started = time.perf_counter()
             save_strip(target, strip, {
                 "line_digest": digest,
                 "line_config": dict(effective),
@@ -209,25 +226,50 @@ def extract_strips(
                 "excluded_ranges": [list(value) for value in segment.excluded_ranges],
             })
             logger.info(
-                "sampled %s: %d frames in %.0f s (%s line)",
+                "sampled %s: %d frames in %.3f s (%s line); stages=%s save=%.3fs size=%dx%d backend=%s",
                 segment.path.name, strip.frame_count, time.perf_counter() - started, strip.geometry.source,
+                strip.stage_seconds, time.perf_counter() - save_started, strip.geometry.width, strip.geometry.height,
+                strip.decode_backend,
             )
         paths.append(target)
     progress("线取样", len(paths), len(segments))
     return paths
 
 
+def default_line_for_camera(config: AnalysisConfig, workspace: AnalysisWorkspace, camera: int):
+    line = config.finish_lines.get(camera)
+    # The saved line is the camera default for later sessions and stages too:
+    # an empty race (the pre-race draw) matches any scope, while a line from
+    # another race in the same folder must not leak into this one.  A stage
+    # that moves the camera gets a new save, which replaces this default.
+    if line and (not line.get("race_id") or line.get("race_id") == workspace.race_id):
+        return line
+    return None
+
+
 def line_for_camera(config: AnalysisConfig, workspace: AnalysisWorkspace, camera: int) -> Optional[Mapping[str, Any]]:
-    if camera in config.finish_lines:
-        return config.finish_lines[camera]
-    return workspace.finish_lines().get(camera)
+    return default_line_for_camera(config, workspace, camera) or workspace.finish_lines().get(camera)
+
+
+def line_covers_segment(line, segment) -> bool:
+    """A drawn-once default starts at its save session; older recordings keep theirs."""
+
+    effective = line.get("effective_from_ms") if isinstance(line, Mapping) else None
+    return effective is None or int(effective) <= segment.start_ms
 
 
 def line_for_segment(config, workspace, segment):
     if crosses_profile_boundary(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id):
         return None
-    return (profile_for_segment(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id)
-            or line_for_camera(config, workspace, segment.camera_index))
+    profile = (profile_for_segment(config.sampling_profiles, segment, workspace.race_id, workspace.stage_id)
+               or inherited_profile(config.sampling_profiles, segment.camera_index, segment.start_ms,
+                                    workspace.race_id))
+    if profile:
+        return profile
+    line = default_line_for_camera(config, workspace, segment.camera_index)
+    if line is None or not line_covers_segment(line, segment):
+        line = workspace.finish_lines().get(segment.camera_index)
+    return line if line and line_covers_segment(line, segment) else None
 
 
 def load_line_overrides(path: Optional[Path]) -> dict[int, dict]:
@@ -256,12 +298,53 @@ CONTEXT_MS = 5_000
 CONTIGUOUS_MS = 1_500
 COVERAGE_MARGIN_MS = 2_000
 PRE_RACE_MARGIN_MS = 120_000
+LIVE_BATCH_MS = 6_000
 
 
-def _load_file_strips(paths: list[Path]) -> list[_FileStrip]:
+class _VerificationRuntime:
+    """Bounded resources shared by incremental publications in one worker."""
+
+    def __init__(self):
+        self.detector = None
+        self.model_key = None
+        self.readers = OrderedDict()
+        self.detections = OrderedDict()
+        self.files = {}
+        self.line_detections = {}
+
+    def reader(self, path, threads):
+        path = Path(path)
+        stamp = path.stat()
+        key = (str(path), stamp.st_size, stamp.st_mtime_ns, threads)
+        if key not in self.readers:
+            for previous in list(self.readers):
+                if previous[0] == key[0]:
+                    self.readers.pop(previous).close()
+            self.readers[key] = FrameReader(key[0], threads)
+        self.readers.move_to_end(key)
+        while len(self.readers) > 2:
+            self.readers.popitem(last=False)[1].close()
+        return self.readers[key]
+
+    def close(self):
+        for reader in self.readers.values():
+            reader.close()
+        self.readers.clear()
+        self.detections.clear()
+        self.files.clear()
+        self.line_detections.clear()
+        self.detector = None
+
+
+def _load_file_strips(paths: list[Path], runtime=None) -> list[_FileStrip]:
     files = []
     for path in paths:
         if not path.is_file():
+            continue
+        stamp = (path.stat().st_mtime_ns, path.stat().st_size)
+        saved = runtime.files.get(path) if runtime is not None else None
+        if saved is not None and saved[0] == stamp:
+            files.append(saved[1])
             continue
         # Do not decompress every historical image strip on each live tick.
         with np.load(path) as data:
@@ -270,6 +353,8 @@ def _load_file_strips(paths: list[Path]) -> list[_FileStrip]:
                                     data["xs"], data["ys"], data["nx"], data["ny"],
                                     meta.get("line_source", "configured"), meta.get("snap_offset_px", 0.0))
             files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), data["pts_ms"], geometry))
+        if runtime is not None:
+            runtime.files[path] = (stamp, files[-1])
     files.sort(key=lambda item: item.start_ms)
     return files
 
@@ -279,18 +364,6 @@ def _segment_points(geometry, r0: int, r1: int) -> tuple[tuple[float, float], ..
     return tuple(geometry.point(int(row)) for row in rows)
 
 
-def uncovered_ranges(start, end, excluded):
-    cursor = start
-    for left, right in sorted(excluded):
-        if right <= cursor or left >= end:
-            continue
-        if left > cursor:
-            yield cursor, min(left, end)
-        cursor = max(cursor, right)
-    if cursor < end:
-        yield cursor, end
-
-
 def detect_session_crossings(
     files: list[_FileStrip],
     camera_index: int,
@@ -298,6 +371,7 @@ def detect_session_crossings(
     *,
     checkpoint: Optional[Callable[[], None]] = None,
     cache: bool = False,
+    memory_cache: Optional[dict] = None,
 ) -> tuple[list[CrossingRecord], list[Obstruction], list[tuple[int, int, str]], list[dict]]:
     """Detect crossings file by file with a few seconds of neighbour context."""
 
@@ -345,7 +419,10 @@ def detect_session_crossings(
         ]} if cache else None
         cache_path = item.path.with_suffix(".detections.json")
         result = None
-        if cache:
+        remembered = memory_cache.get(item.path) if memory_cache is not None else None
+        if cache and remembered is not None and remembered[0] == signature:
+            result = remembered[1]
+        if cache and result is None:
             try:
                 saved = json.loads(cache_path.read_text(encoding="utf-8"))
                 if saved["signature"] == signature:
@@ -368,6 +445,10 @@ def detect_session_crossings(
                 temporary.write_text(json.dumps(dict(signature=signature, crossings=[asdict(c) for c in result.crossings],
                                                       obstructions=result.obstructions)), encoding="utf-8")
                 temporary.replace(cache_path)
+        if cache and memory_cache is not None:
+            memory_cache[item.path] = (signature, result)
+            if len(memory_cache) > 512:
+                memory_cache.pop(next(iter(memory_cache)))
         total = len(item.pts)
         for crossing in result.crossings:
             column = crossing.c0 - offsets
@@ -562,7 +643,7 @@ def _verification_sources(files, crossing):
     return sources
 
 
-def _verify_crossing_candidates(config, camera, files, crossings, *, progress, checkpoint):
+def _verify_crossing_candidates(config, camera, files, crossings, *, progress, checkpoint, runtime=None):
     """Run the target gate only in short windows triggered by line changes."""
     cache_path = config.resolved_output() / f"target_crossings_camera{camera}.json"
     try:
@@ -575,6 +656,11 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
     except (OSError, ValueError) as error:
         logger.warning("crossing verification model unavailable: %s", error)
         return {c.key: TargetCrossingCheck("unverified", "model_failed") for c in crossings}
+    if runtime is not None:
+        if runtime.model_key != model_key:
+            runtime.close()
+            runtime.model_key = model_key
+        detector = runtime.detector
     for index, crossing in enumerate(crossings):
         sources = _verification_sources(files, crossing)
         signature = []
@@ -587,7 +673,7 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
                 stamp = None
             signature.append([str(path), position, stamp, item.meta.get("geometry_digest"),
                               item.meta.get("line_digest"), item.meta.get("excluded_ranges", [])])
-        key = hashlib.sha256(json.dumps([1, model_key, crossing.key, crossing.segment_points,
+        key = hashlib.sha256(json.dumps([VERIFICATION_VERSION, model_key, crossing.key, crossing.segment_points,
                                         signature], sort_keys=True).encode()).hexdigest()
         saved = cache.get(key)
         if saved is not None:
@@ -602,6 +688,8 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
         try:
             if detector is None:
                 detector = YoloxDetector(config.model_path, config.model_input)
+                if runtime is not None:
+                    runtime.detector = detector
             width, height = sources[0][0].geometry.width, sources[0][0].geometry.height
             cx, cy = crossing.contact
             size = min(1200, width, height)
@@ -611,7 +699,16 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
                 if checkpoint is not None:
                     checkpoint()
                 path = item.meta["video_path"]
-                if reader is None or str(reader.path) != str(Path(path)):
+                stamp = Path(path).stat()
+                detection_key = (str(Path(path)), stamp.st_size, stamp.st_mtime_ns,
+                                 item.start_ms, position, x0, y0, size, width, height)
+                if runtime is not None and detection_key in runtime.detections:
+                    runtime.detections.move_to_end(detection_key)
+                    observations.append(runtime.detections[detection_key])
+                    continue
+                if runtime is not None:
+                    reader = runtime.reader(path, config.decode_threads)
+                elif reader is None or str(reader.path) != str(Path(path)):
                     if reader is not None:
                         reader.close()
                     reader = FrameReader(path, config.decode_threads)
@@ -626,6 +723,10 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
                 boxes = [replace(d, x=d.x + x0, y=d.y + y0) for d in detections
                          if d.x > 2 and d.y > 2 and d.x + d.w < size - 3 and d.y + d.h < size - 3]
                 observations.append((item.start_ms + pts, boxes))
+                if runtime is not None:
+                    runtime.detections[detection_key] = observations[-1]
+                    while len(runtime.detections) > 256:
+                        runtime.detections.popitem(last=False)
             check = check_target_tracks(observations, crossing.segment_points, frame_size=(width, height))
         except Exception as error:
             logger.warning("crossing verification unavailable for %s: %s", crossing.key, error)
@@ -633,7 +734,7 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
             if detector is None:
                 return {c.key: checks.get(c.key, check) for c in crossings}
         finally:
-            if reader is not None:
+            if reader is not None and runtime is None:
                 reader.close()
         checks[crossing.key] = check
         if check.reason != "model_failed":
@@ -875,6 +976,7 @@ def analyse_camera(
     checkpoint: Optional[Callable[[], None]] = None,
     reads: Optional[tuple[ChipRead, ...]] = None,
     params: Optional[DetectionParams] = None,
+    runtime: Optional[_VerificationRuntime] = None,
 ) -> dict:
     """Crossings, calibration, pairing, bicycle check and rules for one camera.
 
@@ -883,27 +985,44 @@ def analyse_camera(
 
     output_dir = config.resolved_output()
     reads = workspace.reads if reads is None else reads
-    files = _load_file_strips(strip_paths)
+    files = _load_file_strips(strip_paths, runtime)
+    detection_started = time.perf_counter()
     progress("过线检测", 0, len(files))
     crossings, obstructions, coverage, raw = detect_session_crossings(
         files, camera, params, checkpoint=checkpoint, cache=config.live,
+        memory_cache=runtime.line_detections if runtime is not None else None,
     )
     line_candidates = list(crossings)
+    detection_seconds = time.perf_counter() - detection_started
+    verification_started = time.perf_counter()
     crossing_checks = {}
     verified_verdicts = None
     if config.model_path:
         crossing_checks = _verify_crossing_candidates(
-            config, camera, files, line_candidates, progress=progress, checkpoint=checkpoint,
+            config, camera, files, line_candidates, progress=progress, checkpoint=checkpoint, runtime=runtime,
         )
-        crossings = [c for c in line_candidates if crossing_checks[c.key].state == "confirmed"]
+        # A line change the tracker cannot follow (bunch, shadow, occlusion) is
+        # still evidence that somebody crossed.  Dropping those candidates made
+        # the whole main bunch unpaired and left hundreds of "line activity"
+        # rows with no answer; only a clearly absent target is discarded.
+        crossings = [c for c in line_candidates
+                     if crossing_checks[c.key].state != "not_crossed"
+                     and crossing_checks[c.key].reason != "model_failed"]
         verified_verdicts = {}
         periods = merge_obstructions(obstructions)
         for crossing in crossings:
             check = crossing_checks[crossing.key]
             crowded = crossing.in_obstruction or any(a - 5_000 <= crossing.recorder_ms <= b + 5_000 for a, b in periods)
+            if check.state == "confirmed":
+                reason = ("遮挡时段，目标跨线已验证，仍需人工确认" if crowded
+                          else "目标轨迹跨线已验证；不自动判定选手身份")
+                decision = DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP
+            else:
+                reason = "目标轨迹不足，按芯片时间参与配对，仍需人工确认"
+                decision = DECISION_DISPUTED
             verified_verdicts[crossing.key] = BikeVerdict(
-                check.label, check.score, DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP,
-                "遮挡时段，目标跨线已验证，仍需人工确认" if crowded else "目标轨迹跨线已验证；不自动判定选手身份",
+                check.label if check.state == "confirmed" else LABEL_UNCHECKED,
+                check.score, decision, reason,
                 len(check.observed_ms), vehicle=check.vehicle,
             )
         for entry in raw:
@@ -912,14 +1031,23 @@ def analyse_camera(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"crossings_camera{camera}.json").write_text(json.dumps(
         {"schema_version": 1, "camera_index": camera,
-         "crossings": [entry for entry in raw if not crossing_checks or entry["crossing_check"]["state"] == "confirmed"],
+         # Group counting needs every line change the camera saw; an
+         # "unverified" track is still a person-sized crossing.  Only a target
+         # the model positively ruled out is dropped from this list.
+         "crossings": [entry for entry in raw if not crossing_checks
+                       or (entry["crossing_check"]["state"] != "not_crossed"
+                           and entry["crossing_check"].get("reason") != "model_failed")],
          "line_events": raw,
          "coverage": [list(item) for item in coverage],
          "obstructions": [[item.start_ms, item.end_ms] for item in obstructions]},
         ensure_ascii=False,
     ), encoding="utf-8")
 
+    # A confirmed non-bicycle target (pedestrian, vehicle) must never absorb a
+    # chip.  An unverified candidate, on the other hand, is exactly the rider
+    # the model lost track of, so it stays eligible for time pairing.
     pairing_crossings = [c for c in crossings if verified_verdicts is None
+                         or crossing_checks[c.key].state != "confirmed"
                          or verified_verdicts[c.key].label == "bicycle"]
     calibration = calibrate_evidence_clock(
         [ClockCrossing(item.recorder_ms, item.session_id) for item in pairing_crossings],
@@ -936,11 +1064,14 @@ def analyse_camera(
     warnings = [*calibration.warnings, *choice.warnings]
     result: dict = {
         "camera_index": camera,
+        "stage_seconds": {"line_detection": round(detection_seconds, 3),
+                          "crossing_verification": round(time.perf_counter() - verification_started, 3)},
         "files": len(files),
         "crossings": len(crossings),
         "line_candidates": len(line_candidates),
         "crossing_verification": {
-            "state": "enabled" if config.model_path else "not_configured",
+            "state": ("not_configured" if not config.model_path else
+                      "enabled" if line_candidates else "no_candidates"),
             "confirmed": sum(c.state == "confirmed" for c in crossing_checks.values()),
             "not_crossed": sum(c.state == "not_crossed" for c in crossing_checks.values()),
             "unverified": sum(c.state == "unverified" for c in crossing_checks.values()),
@@ -954,6 +1085,7 @@ def analyse_camera(
                         "crop_mode": config.crop_modes.get(camera, "up")},
     }
     if any(check.reason == "model_failed" for check in crossing_checks.values()):
+        result["crossing_verification"]["state"] = "failed"
         result["bike_status"].update(state="failed", message="跨线模型运行失败；线事件保留待核，不自动配对")
     if choice.model is None:
         # A clock is required for chip pairing, but not for the independent
@@ -968,6 +1100,29 @@ def analyse_camera(
                 f"{len(changed_anchors)} 个人工校时锚点对应的芯片记录已作废、替换或已变更，不能用于本次配对"
             )
         result["calibration_warnings"] = warnings
+
+        # A chip can be opened before video clock calibration.  The receipt
+        # timestamp is only a calendar hint, so the resulting frame is marked
+        # as reference-only and is never used for pairing or auto-pass.
+        reference_locator = None
+        if coverage:
+            locate_reference = _chip_locator(files, 0)
+
+            def reference_locator(read: ChipRead):
+                evidence_ms = align_evidence_timestamp(
+                    int(read.chip_ms), int(getattr(read, "received_at_ms", 0) or 0),
+                )
+                located = locate_reference(read, evidence_ms)
+                if not located:
+                    return None
+                frame = dict(located.get("frame", {}))
+                frame["reference_only"] = True
+                frame["date_aligned"] = int(evidence_ms) != int(read.chip_ms)
+                return {
+                    "reference_frame": frame,
+                    "reference_reason": "按芯片接收日期定位；尚未完成视频校时，不代表已确认过线",
+                    "evidence_timestamp_ms": int(evidence_ms),
+                }
         if config.model_path and coverage:
             try:
                 video_items, verdicts = _uncalibrated_video_items(
@@ -986,7 +1141,13 @@ def analyse_camera(
                     state="failed",
                     message=f"认车加载/推理失败，候选保留：{error}",
                 )
-            result["items"] = video_items + _unchecked_line_items(line_candidates, crossing_checks, camera)
+            # Candidates already rendered from ``crossings`` must not appear
+            # again as a second "line activity" row; only a candidate excluded
+            # from pairing (e.g. the model failed on it) remains here.
+            paired_keys = {item.key for item in crossings}
+            result["items"] = video_items + _unchecked_line_items(
+                [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera,
+            )
             for item in video_items:
                 frame = item.evidence.get("frame", {})
                 key = f"{camera}|{frame.get('video_path')}|{frame.get('frame_index')}|{item.evidence.get('row')}"
@@ -1017,7 +1178,8 @@ def analyse_camera(
             # waiting for the first anchor. Both remain visible in the queue.
             if reads:
                 result["items"] += waiting_items(
-                    reads, camera, "等待第一名原始帧校时后进行芯片配对"
+                    reads, camera, "等待第一名原始帧校时后进行芯片配对",
+                    evidence_factory=reference_locator,
                 )
             by_segment = {f.meta.get("segment_id"): f for f in files}
             for item in result["items"]:
@@ -1036,7 +1198,9 @@ def analyse_camera(
         # Without a configured detector there is no independent video result.
         result["error"] = "自动校时失败：" + "；".join(warnings)
         if config.live:
-            result["items"] = waiting_items(reads, camera, result["error"])
+            result["items"] = waiting_items(
+                reads, camera, result["error"], evidence_factory=reference_locator,
+            )
         return result
     store = ClockModelStore(config.clock_model_path or output_dir / CLOCK_MODEL_FILENAME)
     line_signature = hashlib.sha256(json.dumps(sorted({(item.meta.get("line_digest", ""), item.meta.get("geometry_digest", ""))
@@ -1080,7 +1244,11 @@ def analyse_camera(
         matched += pairing.matched
         video_only += pairing.video_only
         if verified_verdicts is not None:
+            # Confirmed pedestrians/vehicles stay listed even if a chip time is
+            # nearby.  Unverified crossings already arrive through
+            # ``pairing.video_only``; adding them again would double-count.
             video_only += [c for c in crossings if c.session_id == session
+                           and crossing_checks[c.key].state == "confirmed"
                            and verified_verdicts[c.key].label != "bicycle"]
         chip_only += pairing.chip_only
     uncalibrated_sessions = sorted({
@@ -1174,7 +1342,7 @@ def analyse_camera(
         verdicts = verified_verdicts if verified_verdicts is not None else _bike_verdicts(
             config, camera, to_check, crowded, progress=progress, checkpoint=checkpoint,
         )
-        if config.model_path:
+        if config.model_path and result["bike_status"]["state"] != "failed":
             result["bike_status"].update(state="enabled" if to_check else "no_candidates",
                                          message="认车已启用（含有效缓存）" if to_check else "已配置；本轮无待认车候选",
                                          model_digest=model_fingerprint(config.model_path, config.model_input))
@@ -1204,7 +1372,13 @@ def analyse_camera(
     result["fragments"] = outcome.fragments
     result["near_crossings"] = outcome.near_crossings
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
-    result["items"] = list(outcome.items) + _unchecked_line_items(line_candidates, crossing_checks, camera, model)
+    # Once calibrated, an unverified crossing is paired or listed as a
+    # video-only rider; only a candidate excluded from pairing (model failure)
+    # still needs its own "line changed, not verified" row.
+    paired_keys = {item.key for item in crossings}
+    result["items"] = list(outcome.items) + _unchecked_line_items(
+        [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera, model,
+    )
     result["auto_passed"] = outcome.auto_passed
     recognition = result["bike_status"]
     evidence_signature = hashlib.sha256(json.dumps([line_signature, recognition], sort_keys=True).encode()).hexdigest()
@@ -1259,11 +1433,27 @@ def analyse_camera(
     return result
 
 
-def waiting_items(reads, camera, reason):
-    return [ProblemItem(stable_item_id(KIND_WAITING, camera, read.read_id), KIND_WAITING,
-                        CATEGORY_VIDEO, reason, chip_time_ms=read.chip_ms,
-                        bibs=(read.bib,), event_ids=(read.event_id,), status=STATUS_WAITING)
-            for read in reads if not read.excluded and not read.manual_entry]
+def waiting_items(reads, camera, reason, *, evidence_factory=None):
+    """Build pending-chip rows, optionally retaining a safe reference frame."""
+    items = []
+    for read in reads:
+        if read.excluded or read.manual_entry:
+            continue
+        evidence = {}
+        if evidence_factory is not None:
+            try:
+                located = evidence_factory(read)
+            except (OSError, RuntimeError, ValueError, TypeError):
+                located = None
+            if located:
+                evidence.update(located)
+        items.append(ProblemItem(
+            stable_item_id(KIND_WAITING, camera, read.read_id), KIND_WAITING,
+            CATEGORY_VIDEO, reason, chip_time_ms=read.chip_ms,
+            bibs=(read.bib,), event_ids=(read.event_id,), status=STATUS_WAITING,
+            evidence=evidence,
+        ))
+    return items
 
 
 ANALYSIS_CONFIG_FILENAME = "analysis_config.json"
@@ -1298,6 +1488,184 @@ def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
     )
 
 
+def missing_line_ranges(missing) -> list[list[int]]:
+    """When the camera recorded but nothing was detected, as merged clock ranges."""
+
+    spans = sorted(span for segment in missing
+                   for span in uncovered_ranges(segment.start_ms, segment.end_ms, segment.excluded_ranges))
+    merged: list[list[int]] = []
+    for left, right in spans:
+        if merged and left - merged[-1][1] <= COVERAGE_MARGIN_MS:
+            merged[-1][1] = max(merged[-1][1], right)
+        else:
+            merged.append([left, right])
+    return merged
+
+
+def missing_line_item(camera: int, missing) -> ProblemItem:
+    """A recording without a finish line was never looked at: say when, and what to do."""
+
+    ranges = missing_line_ranges(missing)
+    shown = "、".join(f"{format_chip_time(left)[:8]}–{format_chip_time(right)[:8]}" for left, right in ranges[:3])
+    more = f" 等 {len(ranges)} 段" if len(ranges) > 3 else ""
+    return ProblemItem(
+        stable_item_id(KIND_WAITING, camera, "missing_line"), KIND_WAITING, CATEGORY_VIDEO,
+        f"录像 {shown}{more} 没有终点线或跨改线边界，这段时间未检测，不能算核清；"
+        "请在「终点线 / 模型」里给这段录像画线",
+        status=STATUS_WAITING,
+        evidence={"segments": [segment.segment.segment_id for segment in missing], "ranges": ranges})
+
+
+def _live_progress(result, segments, pending, missing, config, reads):
+    """Do not turn an unfinished batch (or a cache hole) into missing evidence."""
+    pending_ranges = [list(span) for segment in pending for span in uncovered_ranges(
+        segment.start_ms, segment.end_ms, segment.excluded_ranges)]
+    result["sealed_through_ms"] = max((s.end_ms for s in segments), default=None)
+    result["pending_video_ranges"] = pending_ranges
+    result["pending_segments"] = len(pending)
+    result["missing_line_segments"] = [s.segment.segment_id for s in missing]
+    result["missing_line_ranges"] = missing_line_ranges(missing)
+    coverage = result.get("coverage", [])
+    scanned = max((end for _start, end, _session in coverage), default=None)
+    # Coverage remains explicit; the headline never jumps over an unscanned hole.
+    blocked_ranges = list(pending_ranges)
+    blocked_ranges.extend([s.start_ms, s.end_ms] for s in missing)
+    if scanned is not None:
+        frontier = min([scanned, *(left for left, _right in blocked_ranges)])
+        result["scanned_through_ms"] = frontier
+        previous = result.get("analyzed_through_ms")
+        if previous is not None:
+            result["analyzed_through_ms"] = min(previous, frontier - config.evidence_delay_ms)
+    model = result.get("model")
+    if model is not None and blocked_ranges:
+        deferred = []
+        for item in result["items"]:
+            expected = model.to_recorder(item.chip_time_ms) if item.chip_time_ms is not None else None
+            if item.kind == KIND_NO_VIDEO and expected is not None and any(
+                left - COVERAGE_MARGIN_MS <= expected <= right + COVERAGE_MARGIN_MS
+                for left, right in blocked_ranges
+            ):
+                deferred.extend(waiting_items(
+                    [read for read in reads if read.event_id in item.event_ids],
+                    result["camera_index"], "录像已封存，等待分析或终点线配置，暂不判定缺少录像",
+                ))
+            else:
+                deferred.append(item)
+        result["items"] = deferred
+    if missing:
+        result["items"].append(missing_line_item(result["camera_index"], missing))
+
+
+def _run_live_batches(config, workspace, cameras, governor, summary, progress, cancelled):
+    """Publish cumulative evidence every few seconds of new media, round-robin."""
+    jobs, results = [], {}
+    for camera in cameras:
+        segments = workspace.archive_segments(camera)
+        ready, pending, missing = [], deque(), []
+        for segment in segments:
+            effective = line_for_segment(config, workspace, segment)
+            if effective is None:
+                missing.append(segment)
+                continue
+            path = strip_path(config.resolved_output(), segment)
+            if _strip_is_current(path, segment, line_config_digest(effective), config.samples):
+                ready.append(path)
+            else:
+                pending.append(segment)
+        jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing))
+    runtime = _VerificationRuntime()
+
+    def input_stamp():
+        values = []
+        for name in ("cyclerace_passage_events.jsonl", "cyclerace_passage_events_deleted.json",
+                     "video_clock_calibrations.jsonl", "cyclerace_race_metadata.json"):
+            path = workspace.root / name
+            try:
+                stat = path.stat()
+                values.append((name, stat.st_size, stat.st_mtime_ns))
+            except FileNotFoundError:
+                pass
+        return values
+
+    inputs = input_stamp()
+    started = time.perf_counter()
+    batches, new_video_seconds = 0, 0.0
+    try:
+        first_round = True
+        while first_round or any(job["pending"] for job in jobs):
+            for job in jobs:
+                if cancelled():
+                    return
+                latest_inputs = input_stamp()
+                if latest_inputs != inputs:
+                    # First-rider anchors and late chips must take effect at the
+                    # next publication, not after an entire historical backlog.
+                    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
+                                                  include_review_segments=True, allow_empty_scope=True)
+                    inputs = latest_inputs
+                camera, pending = job["camera"], job["pending"]
+                if not first_round and not pending:
+                    continue
+                batch_started = time.perf_counter()
+                batch, duration_ms = [], 0
+                while pending and duration_ms < LIVE_BATCH_MS - 100:
+                    segment = pending.popleft()
+                    batch.append(segment)
+                    duration_ms += sum(end - start for start, end in uncovered_ranges(
+                        segment.start_ms, segment.end_ms, segment.excluded_ranges))
+                sample_started = time.perf_counter()
+                job["ready"].extend(extract_strips(
+                    config, tuple(batch), line_for_camera(config, workspace, camera) or {}, progress=progress,
+                    checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
+                ))
+                sampling_seconds = time.perf_counter() - sample_started
+                if cancelled():
+                    return
+                # A stop/settle run may remove the chip delay only once its entire
+                # snapshot is sampled. Intermediate batches are not final gaps.
+                current_config = replace(config, evidence_delay_ms=max(10_000, config.evidence_delay_ms)) if pending else config
+                analysis_started = time.perf_counter()
+                if job["ready"]:
+                    result = analyse_camera(
+                        current_config, workspace, camera, job["ready"], progress=progress,
+                        checkpoint=lambda: governor.checkpoint(cancelled), runtime=runtime,
+                    )
+                else:
+                    reason = "等待已封存录像" if not job["segments"] else "等待实际终点线或不跨改线边界的封存片段"
+                    result = dict(camera_index=camera, error=reason, items=waiting_items(workspace.reads, camera, reason),
+                                  auto_passed=[], waiting_reason="recording" if not job["segments"] else "finish_line")
+                _live_progress(result, job["segments"], pending, job["missing"], current_config, workspace.reads)
+                result["performance"] = dict(
+                    new_video_seconds=round(duration_ms / 1000, 3),
+                    sampling_seconds=round(sampling_seconds, 3),
+                    analysis_seconds=round(time.perf_counter() - analysis_started, 3),
+                )
+                results[camera] = result
+                new_video_seconds += duration_ms / 1000
+                # Do not temporarily erase another camera from a combined list.
+                if len(results) == len(jobs) and not cancelled():
+                    publication_started = time.perf_counter()
+                    path = write_problem_list(config, workspace, list(results.values()), progress=progress)
+                    publication_seconds = time.perf_counter() - publication_started
+                    batches += 1
+                    summary["problem_list"] = str(path)
+                    summary["summary"] = json.loads(path.read_text(encoding="utf-8"))["summary"]
+                    progress("清单已发布", batches, len(jobs))
+                    logger.info("live batch camera=%s video=%.2fs sampling=%.3fs analysis=%.3fs publish=%.3fs total=%.3fs pending=%d",
+                                camera, duration_ms / 1000, sampling_seconds, result["performance"]["analysis_seconds"],
+                                publication_seconds, time.perf_counter() - batch_started, len(pending))
+                summary["cameras"][camera] = {
+                    key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")
+                }
+            first_round = False
+        elapsed = time.perf_counter() - started
+        summary["performance"] = dict(new_video_seconds=round(new_video_seconds, 3), elapsed_seconds=round(elapsed, 3),
+                                      processing_ratio=round(elapsed / new_video_seconds, 3) if new_video_seconds else None,
+                                      publications=batches)
+    finally:
+        runtime.close()
+
+
 def run_offline_analysis(
     config: AnalysisConfig,
     *,
@@ -1314,7 +1682,7 @@ def run_offline_analysis(
     """
 
     workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
-                                  include_review_segments=True)
+                                  include_review_segments=True, allow_empty_scope=True)
     config = replace(config, race_id=workspace.race_id, stage_id=workspace.stage_id)
     summary: dict = {"race_id": workspace.race_id, "cameras": {}}
     free = available_memory_mb()
@@ -1339,6 +1707,11 @@ def run_offline_analysis(
         if peak is not None:
             memory["stage_peaks_mb"][stage_name] = peak
         outer_progress(stage_name, done, total)
+    if config.live and stage != "strips":
+        _run_live_batches(config, workspace, cameras, governor, summary, progress, cancelled)
+        summary["paused_seconds"] = round(governor.paused_seconds, 1)
+        memory["peak_mb"] = peak_memory_mb()
+        return summary
     results = []
     for camera in cameras:
         line = line_for_camera(config, workspace, camera)
@@ -1348,6 +1721,7 @@ def run_offline_analysis(
             reason = "等待已封存录像" if not segments else "等待实际终点线或不跨改线边界的封存片段"
             result = {"camera_index": camera, "error": reason, "items": waiting_items(workspace.reads, camera, reason),
                       "auto_passed": [], "waiting_reason": "recording" if not segments else "finish_line",
+                      "missing_line_ranges": missing_line_ranges(missing),
                       "sealed_through_ms": max((segment.end_ms for segment in segments), default=None)}
             results.append(result)
             summary["cameras"][camera] = {"skipped": reason}
@@ -1364,12 +1738,10 @@ def run_offline_analysis(
             checkpoint=lambda: governor.checkpoint(cancelled),
         )
         result["missing_line_segments"] = [segment.segment.segment_id for segment in missing]
+        result["missing_line_ranges"] = missing_line_ranges(missing)
         result["sealed_through_ms"] = max(segment.end_ms for segment in segments)
         if missing:
-            result["items"].append(ProblemItem(
-                stable_item_id(KIND_WAITING, camera, "missing_line"), KIND_WAITING, CATEGORY_VIDEO,
-                f"{len(missing)} 个封存片段缺线或跨改线边界，等待分段验证，不能视为已核清", status=STATUS_WAITING,
-                evidence={"segments": result["missing_line_segments"]}))
+            result["items"].append(missing_line_item(camera, missing))
         results.append(result)
         summary["cameras"][camera] = {
             key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")

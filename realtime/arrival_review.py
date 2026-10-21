@@ -124,13 +124,36 @@ class ArrivalReviewStore:
                          binding=binding, action=action, saved_at_ms=int(time.time() * 1000))
             return self._append_locked(entry)
 
-    def undo(self, scope):
+    def undo(self, scope, *, key=None):
         with locked_jsonl(self.path):
             self._read_locked()
             active = self.active(scope)
             if not active:
                 return None
-            previous = active[-1]
-            self._append_locked(dict(id=uuid.uuid4().hex, scope=list(scope), action="undo",
-                                     target=previous["id"], saved_at_ms=int(time.time() * 1000)))
+            subject = [entry for entry in active if entry["key"] == key] if key is not None else active[-1:]
+            if not subject:
+                return None
+            previous = subject[-1]
+            operation = previous.get("operation_id")
+            if key is None:
+                targets = ([entry for entry in active if entry.get("operation_id") == operation]
+                           if operation else [previous])
+            else:
+                operations = {entry["operation_id"] for entry in subject if entry.get("operation_id")}
+                targets = [entry for entry in active if entry["key"] == key or
+                           (entry["action"] != "confirm" and entry.get("operation_id") in operations)]
+            target_ids = {entry["id"] for entry in targets}
+            shared_candidates = {entry.get("candidate_id") for entry in active
+                                 if entry["action"] == "confirm" and entry["id"] not in target_ids}
+            targets = [entry for entry in targets if not
+                       (entry["action"] == "bicycle" and entry.get("candidate_id")
+                        and entry["candidate_id"] in shared_candidates)]
+            records = [dict(id=uuid.uuid4().hex, scope=list(scope), action="undo",
+                            target=entry["id"], saved_at_ms=int(time.time() * 1000)) for entry in targets]
+            append_jsonl_records(self.path, [json.dumps(entry, ensure_ascii=False).encode("utf-8")
+                                            for entry in records], description="arrival reviews",
+                                 already_locked=True)
+            self._entries.extend(records)
+            self._reindex()
+            self._update_stamp()
             return previous

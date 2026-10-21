@@ -271,6 +271,15 @@ class ProblemListPanel(QFrame):
         self.clear_data_button.clicked.connect(self.clear_data_requested.emit)
         controls.addWidget(self.clear_data_button)
         header_layout.addLayout(controls)
+        # A recording nobody drew a line for was never looked at.  That blind spot
+        # must be seen at a glance, not found in a tooltip or a waiting row.
+        self.coverage_alert = QLabel("", self.header)
+        self.coverage_alert.setWordWrap(True)
+        self.coverage_alert.setStyleSheet(
+            "background:#fdecea; color:#b42318; border:1px solid #f04438; border-radius:4px;"
+            " padding:4px 6px; font-weight:600;")
+        self.coverage_alert.hide()
+        header_layout.addWidget(self.coverage_alert)
         # The four classes are the filter: one row of tabs, each carrying how much of
         # that class is still open, so the queue is narrowed without a second control.
         class_row = QHBoxLayout()
@@ -781,8 +790,10 @@ class ProblemListPanel(QFrame):
             self.stage_health["取样"] = "配置已变更，等待重新取样"
             self.stage_health["校时"] = "配置已变更，等待重新校时"
             self.stage_detail = "配置已变更：旧视频结论不可提交，等待重新取样、校时与认车；芯片自检继续。"
+            self._set_coverage_alert({})
         elif token != "invalid":
             cameras = (self.payload or {}).get("cameras", {})
+            self._set_coverage_alert(cameras)
             missing_lines = sum(len(value.get("missing_line_segments") or ()) for value in cameras.values())
             self.stage_health["取样"] = (f"{missing_lines} 个片段缺线或跨改线边界" if missing_lines
                                          else "已按机位配置" if cameras else "等待已封存录像")
@@ -790,11 +801,14 @@ class ProblemListPanel(QFrame):
             statuses = []
             for camera, value in cameras.items():
                 detail = value.get('error') or value.get('bike_status', {}).get('message', '')
-                for key, label in (("sealed_through_ms", "本轮封存至"), ("analyzed_through_ms", "分析至")):
+                for key, label in (("sealed_through_ms", "本轮封存至"), ("scanned_through_ms", "扫描至"),
+                                   ("analyzed_through_ms", "分析至")):
                     if value.get(key) is not None:
                         detail += f"；{label} {format_chip_time(value[key], date=True)}"
                 if value.get("missing_line_segments"):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
+                if value.get("pending_segments"):
+                    detail += f"；{value['pending_segments']} 个片段排队中"
                 statuses.append(f"机位 {camera}：{detail}")
             self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
         # A manual count of several people becomes one independent crossing per
@@ -2068,6 +2082,20 @@ class ProblemListPanel(QFrame):
             return "证据缺口 无"
         return f"证据缺口 {waiting} 条待证据" + (f" · {unverifiable} 人无录像可核" if unverifiable else "")
 
+    def _set_coverage_alert(self, cameras) -> None:
+        parts = []
+        for camera, value in sorted(cameras.items(), key=lambda pair: str(pair[0])):
+            ranges = value.get("missing_line_ranges") or []
+            if ranges:
+                shown = "、".join(f"{format_chip_time(left)[:8]}–{format_chip_time(right)[:8]}"
+                                 for left, right in ranges[:3])
+                parts.append(f"机位 {camera} 录像 {shown}" + (f" 等 {len(ranges)} 段" if len(ranges) > 3 else ""))
+            elif value.get("missing_line_segments"):
+                parts.append(f"机位 {camera} 有 {len(value['missing_line_segments'])} 段录像")
+        self.coverage_alert.setText("⚠ 未检测，不能算核清：" + "；".join(parts)
+                                    + " 没有终点线。点「终点线 / 模型」给这段录像画线。" if parts else "")
+        self.coverage_alert.setVisible(bool(parts))
+
     def health_text(self) -> str:
         parts = [f"{name} {self.stage_health.get(name) or '—'}" for name in ("接收", "录制", "取样", "校时", "分析")]
         return " · ".join(parts) + (f" · {self.stage_detail}" if self.stage_detail else "")
@@ -2528,6 +2556,10 @@ class ProblemListPanel(QFrame):
             if message.get("stage") == "skipped":
                 self._skip_message = str(message.get("message", ""))
                 continue
+            if message.get("stage") == "清单已发布":
+                self.refresh()
+                self.analysis_finished.emit()
+                continue
             total = message.get("total") or 0
             self.analysis_status = f"后台分析：{message.get('stage')} {message.get('done')}/{total}"
             self.stage_health[_progress_group(str(message.get("stage", "")))] = (
@@ -2540,7 +2572,7 @@ class ProblemListPanel(QFrame):
         error = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")[-400:] if process else ""
         if process is not None:
             process.deleteLater()
-        self._next_analysis = time.monotonic() + 10
+        self._next_analysis = time.monotonic() + (5 if _args and _args[0] != 0 else 0.25)
         if _args and _args[0] != 0:
             self._last_live_signature = None
             self._final_analysis_pending = self._finalizing_live

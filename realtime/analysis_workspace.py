@@ -43,6 +43,8 @@ FINISH_LINE_FILES = ("finish_lines.json", "long_image_lines.json")
 _ARCHIVE_SUFFIX_RE = re.compile(r"_archive_\d+$", re.IGNORECASE)
 _VIDEO_SUFFIXES = {".mkv", ".mp4", ".mov", ".avi", ".ts"}
 RACE_CLOCK_MARGIN_MS = 3 * 60 * 60 * 1000
+# Clock jitter between back-to-back sessions is not a second recording.
+SESSION_OVERLAP_TOLERANCE_MS = 200
 
 
 def race_clock_window(reads) -> Optional[tuple[int, int]]:
@@ -83,7 +85,60 @@ class ArchiveSegment:
 
 
 def session_id_for_path(path: Path) -> str:
-    return _ARCHIVE_SUFFIX_RE.sub("", Path(path).stem)
+    from .runtime_paths import recording_session_path
+    return re.sub(r"_review_\d+$", "", _ARCHIVE_SUFFIX_RE.sub("", recording_session_path(Path(path)).stem))
+
+
+def uncovered_ranges(start, end, excluded):
+    cursor = start
+    for left, right in sorted(excluded):
+        if right <= cursor or left >= end:
+            continue
+        if left > cursor:
+            yield cursor, min(left, end)
+        cursor = max(cursor, right)
+    if cursor < end:
+        yield cursor, end
+
+
+def _one_recording_at_a_time(segments: list[ArchiveSegment]) -> list[ArchiveSegment]:
+    """Two recorder instances on one camera must not report every rider twice.
+
+    When recordings overlap (a second instance, or a build switch while the
+    first still records), the session that started later takes over from its
+    start; an earlier session keeps only the moments no later one covers.
+    """
+
+    started: dict[tuple[int, str], int] = {}
+    for item in segments:
+        key = (item.camera_index, item.session_id)
+        started[key] = min(started.get(key, item.start_ms), item.start_ms)
+    claimed: dict[int, list[tuple[int, int]]] = {}
+    kept = []
+    for key in sorted(started, key=lambda key: (started[key], key[1]), reverse=True):
+        taken = claimed.setdefault(key[0], [])
+        mine = []
+        for item in segments:
+            if (item.camera_index, item.session_id) != key:
+                continue
+            overlap = [(max(item.start_ms, left), min(item.end_ms, right)) for left, right in taken
+                       if min(item.end_ms, right) - max(item.start_ms, left) > SESSION_OVERLAP_TOLERANCE_MS]
+            if overlap:
+                excluded = tuple(sorted(set(item.excluded_ranges) | set(overlap)))
+                if next(uncovered_ranges(item.start_ms, item.end_ms, excluded), None) is None:
+                    continue
+                item = replace(item, excluded_ranges=excluded)
+            mine.append(item)
+        kept.extend(mine)
+        spans = sorted([*taken, *(span for item in mine
+                                  for span in uncovered_ranges(item.start_ms, item.end_ms, item.excluded_ranges))])
+        taken.clear()
+        for left, right in spans:
+            if taken and left <= taken[-1][1]:
+                taken[-1] = (taken[-1][0], max(taken[-1][1], right))
+            else:
+                taken.append((left, right))
+    return kept
 
 
 def _read_json(path: Path):
@@ -133,9 +188,11 @@ class AnalysisWorkspace:
         race_date: str = "",
         as_of_ms: Optional[int] = None,
         include_review_segments: bool = False,
+        allow_empty_scope: bool = False,
     ):
         self.root = Path(root).expanduser().absolute()
         self.include_review_segments = include_review_segments
+        self.allow_empty_scope = bool(allow_empty_scope)
         self.history: tuple[PassageEvent, ...] = read_passage_history(self.root / PASSAGE_JOURNAL)
         if as_of_ms is not None:
             # Replay: only what FinishReview had received by then.
@@ -174,6 +231,11 @@ class AnalysisWorkspace:
             return metadata.race_id, metadata.stage_id
         counter = Counter((event.race_id, event.stage_id) for event in self.history if event.is_active)
         if not counter:
+            # Drawing the finish line before the race is allowed: the geometry
+            # belongs to the recording session, not to a chip event.  The race
+            # scope is filled in later by the callers that need one.
+            if self.allow_empty_scope:
+                return "", ""
             raise ValueError(f"no CycleRace passages in {self.root}")
         return counter.most_common(1)[0][0]
 
@@ -199,7 +261,7 @@ class AnalysisWorkspace:
             )
         return self._timeline
 
-    def archive_segments(self, camera_index: Optional[int] = None) -> tuple[ArchiveSegment, ...]:
+    def archive_segments(self, camera_index: Optional[int] = None, *, for_configuration: bool = False) -> tuple[ArchiveSegment, ...]:
         """Closed long-form recordings of this race, oldest first.
 
         A recording outside the race clock window belongs to another visit of
@@ -213,7 +275,7 @@ class AnalysisWorkspace:
         store = self.timeline()
         window = race_clock_window(self.reads)
         problem_sessions = {
-            (segment.camera_index, re.sub(r"_review_\d+$", "", Path(segment.video_path).stem))
+            (segment.camera_index, session_id_for_path(store.resolve_video_path(segment)))
             for segment in store.segments() if segment.end_reason == "retained_problem_segment"
         }
         seen = set()
@@ -227,11 +289,11 @@ class AnalysisWorkspace:
             if segment.race_id and segment.race_id != self.race_id:
                 continue
             path = store.resolve_video_path(segment)
-            short_session = re.sub(r"_review_\d+$", "", path.stem)
+            short_session = session_id_for_path(path)
             short = self.include_review_segments and (
                 segment.end_reason == "retained_problem_segment" or (
                     segment.end_reason == "retained_filmstrip_segment"
-                    and (segment.camera_index, short_session) in problem_sessions
+                    and (for_configuration or (segment.camera_index, short_session) in problem_sessions)
                 )
             )
             if path.suffix.lower() not in _VIDEO_SUFFIXES or (not short and "archive" not in path.stem.lower()):
@@ -240,7 +302,7 @@ class AnalysisWorkspace:
             if key in seen or not path.is_file():
                 continue
             seen.add(key)
-            session = re.sub(r"_review_\d+$", "", path.stem) if short else session_id_for_path(path)
+            session = session_id_for_path(path)
             segments.append(ArchiveSegment(segment, path, session))
         # Prefer retained immutable short segments; never detect a rider twice
         # when their long archive is published. Non-overlapping history remains.
@@ -263,6 +325,7 @@ class AnalysisWorkspace:
                     # discard the rest of an otherwise usable archive.
                     selected.append(replace(item, excluded_ranges=tuple(overlap)))
             segments = selected
+        segments = _one_recording_at_a_time(segments)
         segments.sort(key=lambda item: (item.camera_index, item.start_ms))
         if window is not None:
             inside = [item for item in segments
@@ -340,7 +403,9 @@ class AnalysisWorkspace:
                     offset_ms=int(calibration.offset_ms),
                     kind="manual_calibration",
                     label=calibration.anchor_bib,
-                    reference=calibration.session_key.rsplit("|", 1)[-1],
+                    reference=session_id_for_path(Path(calibration.session_key.split("|", 2)[1]) /
+                                                  (calibration.session_key.rsplit("|", 1)[-1] + ".m3u8"))
+                    if calibration.session_key.count("|") == 2 else calibration.session_key.rsplit("|", 1)[-1],
                 )
             )
         return tuple(anchors)

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from realtime.line_sampling import (
     LineGeometry,
@@ -55,3 +56,68 @@ def test_strip_round_trip_keeps_frames_geometry_and_metadata(tmp_path):
     assert loaded.meta["segment_id"] == "s1" and loaded.meta["media_started_at_ms"] == 1_000
     assert np.allclose(loaded.geometry.xs, geometry.xs)
     assert line_config_digest({"x1": 1}) != line_config_digest({"x1": 1, "snap": True})
+
+
+@pytest.fixture
+def sealed_h264_video(tmp_path):
+    import cv2
+    import subprocess
+    from realtime.stream_recorder import find_ffmpeg_executable
+
+    executable = find_ffmpeg_executable()
+    if executable is None:
+        pytest.skip("FFmpeg is not installed")
+    source = tmp_path / "source.avi"
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"MJPG"), 25, (640, 360))
+    for index in range(30):
+        frame = np.full((360, 640, 3), (30, 80, 160), np.uint8)
+        cv2.rectangle(frame, (index * 15, 100), (index * 15 + 50, 300), (200, 30, 60), -1)
+        writer.write(frame)
+    writer.release()
+    target = tmp_path / "sealed video.mkv"
+    result = subprocess.run([str(executable), "-hide_banner", "-loglevel", "error", "-i", str(source),
+                             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", str(target)], capture_output=True)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    return target
+
+
+def test_roi_fast_path_preserves_frames_timestamps_and_original_coordinates(sealed_h264_video):
+    from realtime.line_sampling import sample_video_file
+
+    line = {"points": [[.01, .64], [.99, .67]]}
+    reference = sample_video_file(sealed_h264_video, line, fast_decode=False)
+    fast = sample_video_file(sealed_h264_video, line)
+    assert fast.decode_backend == "ffmpeg_roi"
+    assert fast.frame_count == reference.frame_count == 30
+    np.testing.assert_allclose(fast.pts_ms, reference.pts_ms, atol=.02)
+    np.testing.assert_array_equal(fast.geometry.xs, reference.geometry.xs)
+    np.testing.assert_array_equal(fast.geometry.ys, reference.geometry.ys)
+    delta = np.abs(fast.strip.astype(np.int16) - reference.strip.astype(np.int16))
+    assert np.percentile(delta, 99) <= 6
+    assert fast.stage_seconds["ffmpeg_total"] > 0
+
+
+def test_failed_roi_decode_falls_back_without_losing_first_frame(sealed_h264_video, monkeypatch):
+    from realtime.line_sampling import sample_video_file
+    from realtime import line_sampling_ffmpeg
+
+    def fail(*args, **kwargs):
+        raise ValueError("test decoder failure")
+
+    monkeypatch.setattr(line_sampling_ffmpeg, "sample_roi", fail)
+    line = {"points": [[.1, .5], [.9, .5]]}
+    reference = sample_video_file(sealed_h264_video, line, fast_decode=False)
+    fallback = sample_video_file(sealed_h264_video, line)
+    assert fallback.decode_backend == "opencv"
+    np.testing.assert_array_equal(fallback.strip, reference.strip)
+    np.testing.assert_allclose(fallback.pts_ms, reference.pts_ms)
+
+
+def test_roi_rejects_wrong_frame_count(sealed_h264_video):
+    from realtime.line_sampling_ffmpeg import sample_roi
+    from realtime.stream_recorder import find_ffmpeg_executable
+
+    geometry = LineGeometry.from_config({"points": [[.1, .5], [.9, .5]]}, 640, 360)
+    with pytest.raises(ValueError, match="frame count"):
+        sample_roi(sealed_h264_video, geometry, find_ffmpeg_executable(), threads=1,
+                   checkpoint=None, cancelled=lambda: False, expected_frames=31)

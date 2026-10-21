@@ -433,6 +433,7 @@ class EvidenceImageView(QGraphicsView):
     # Counting a crossing: one click lands on one person, position only — the moment
     # comes from whoever knows which frame is on screen.
     count_mark_selected = pyqtSignal(float, float)
+    count_mark_cancelled = pyqtSignal(float, float)
     marker_confirm_requested = pyqtSignal()
     marker_cancel_requested = pyqtSignal()
     marker_delete_requested = pyqtSignal()
@@ -485,7 +486,7 @@ class EvidenceImageView(QGraphicsView):
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
-            tuple[float, float, str, bool, bool], ...
+            tuple[float, float, str, bool, bool, bool], ...
         ] = ()
         self._show_marker_label = True
         self._show_identity_badge = True
@@ -896,8 +897,10 @@ class EvidenceImageView(QGraphicsView):
                 str(label),
                 bool(confirmed),
                 bool(simple),
+                bool(marker[5]) if len(marker) > 5 else False,
             )
-            for x_normalized, y_normalized, label, confirmed, simple in markers
+            for marker in markers
+            for x_normalized, y_normalized, label, confirmed, simple in [marker[:5]]
         )
         self.viewport().update()
 
@@ -936,6 +939,11 @@ class EvidenceImageView(QGraphicsView):
         super().wheelEvent(event)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.RightButton and self._count_mode and self.has_frame:
+            if self._scene.sceneRect().contains(self.mapToScene(event.pos())):
+                self.count_mark_cancelled.emit(*self._normalized_position(event.pos()))
+            event.accept()
+            return
         if event.button() == Qt.MiddleButton and self.has_frame:
             self._pan_dragging = True
             self._pan_last_position = event.pos()
@@ -1122,7 +1130,7 @@ class EvidenceImageView(QGraphicsView):
                 for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
                     painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
                                      QPointF(b[0] * self._source_width, b[1] * self._source_height))
-        for index, (x_normalized, y_normalized, label, confirmed, simple) in enumerate(
+        for index, (x_normalized, y_normalized, label, confirmed, simple, dot) in enumerate(
             self._history_markers
         ):
             x = x_normalized * self._source_width
@@ -1133,7 +1141,11 @@ class EvidenceImageView(QGraphicsView):
             if not confirmed and not simple:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
-            painter.drawLine(int(x), 0, int(x), self._source_height)
+            if dot:
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(QPointF(x, y), 11.0 / scale, 11.0 / scale)
+            else:
+                painter.drawLine(int(x), 0, int(x), self._source_height)
             if not self._show_marker_label:
                 continue
             margin = 6.0 / scale
@@ -1143,7 +1155,7 @@ class EvidenceImageView(QGraphicsView):
             if tag_x + tag_width > self._source_width - margin:
                 tag_x = x - tag_width - margin
             tag_x = max(margin, min(tag_x, self._source_width - tag_width - margin))
-            tag_y = margin + index * (tag_height + margin)
+            tag_y = y + margin if dot else margin + index * (tag_height + margin)
             tag_y = min(tag_y, max(margin, self._source_height - tag_height - margin))
             tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
             painter.setPen(Qt.NoPen)
@@ -1321,6 +1333,7 @@ class PassageEvidencePane(QFrame):
         self._pending_marker_unknown = False
         self._pending_marker_label = ""
         self._marking_enabled = False
+        self._identity_marker_enabled = True
         self._identity = ""
         self._worker: Optional[object] = None
         self._idle_prefetch_enabled = False
@@ -1792,6 +1805,9 @@ class PassageEvidencePane(QFrame):
         return f"正在定位{source}"
 
     def _render_marker(self) -> None:
+        if not self._identity_marker_enabled:
+            self.video_view.clear_marker()
+            return
         marker = self._pending_marker
         if self.is_auyat_rgb:
             self.video_view.clear_identity_cue()
@@ -1842,6 +1858,11 @@ class PassageEvidencePane(QFrame):
                 )
                 return
         self.video_view.clear_marker()
+
+    def set_identity_marker_enabled(self, enabled: bool) -> None:
+        self._identity_marker_enabled = bool(enabled)
+        if not self._identity_marker_enabled:
+            self.video_view.clear_marker()
 
     def _association_is_visible(
         self,
@@ -4440,6 +4461,20 @@ class PassageReviewSurface(QDialog):
 
     def _calibrated_clock_offset(self, camera_index: int, session_key: str) -> int:
         calibration = self.calibration_store.get(camera_index, session_key)
+        if calibration is None:
+            # Older versions keyed HLS calibrations by the generated window name.
+            aliases = []
+            for saved in self.calibration_store.calibrations():
+                if saved.camera_index != camera_index:
+                    continue
+                parts = saved.session_key.split("|", 2)
+                if len(parts) != 3:
+                    continue
+                path = Path(parts[1]) / (parts[2] + ".m3u8")
+                if path.is_file() and self._recording_session_key_from_path(parts[0], path) == session_key:
+                    aliases.append(saved)
+            if aliases:
+                calibration = max(aliases, key=lambda saved: saved.calibrated_at_ms)
         return int(
             self._continuous_clock_offsets.get(
                 (camera_index, session_key),
@@ -4604,7 +4639,8 @@ class PassageReviewSurface(QDialog):
 
     @staticmethod
     def _recording_session_key_from_path(source_id: str, video_path: Path) -> str:
-        path = Path(video_path).absolute()
+        from .runtime_paths import recording_session_path
+        path = recording_session_path(Path(video_path).absolute())
         stem = _ARCHIVE_SEGMENT_SUFFIX_RE.sub("", path.stem)
         match = re.fullmatch(
             r"(camera_\d+)_\d{8}_\d{6}_\d{6}(?:_review_\d+)?", stem,

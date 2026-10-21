@@ -6,8 +6,10 @@ import csv
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+import uuid
 
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication, QAbstractSpinBox, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit,
     QMenu, QPlainTextEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget,
@@ -32,6 +34,7 @@ class ArrivalRow:
     bib: str = ""
     event: object = None
     time_ms: int | None = None
+    recorder_ms: int | None = None
     reference: bool = True
     decision: dict | None = None
     stale: bool = False
@@ -42,6 +45,7 @@ class QuickReviewPanel(ProblemListPanel):
     confirmation_preparing = pyqtSignal()
     candidate_preparing = pyqtSignal()
     sampling_configured = pyqtSignal()
+    sampling_preparing = pyqtSignal()
 
     def __init__(self, parent=None):
         self._quick_ready = False
@@ -61,20 +65,25 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.currentCellChanged.disconnect()
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
+        self.table.cellDoubleClicked.connect(lambda index, _column: self._open_row(index))
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态"])
+        self.table.horizontalHeaderItem(2).setToolTip(
+            "校时后的芯片域时间；悬浮单元格可看录像原时刻"
+        )
         for column, width in enumerate((42, 66, 137)):
             self.table.setColumnWidth(column, width)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
-        self.table.setToolTip("点击只选择运动员；在放大画面定位压线原帧后，点“确认过线”保存")
+        self.table.setToolTip("点击选择芯片记录，双击回看；单人直接按 1 保存，多人可点圈数车")
         self.quick_toolbar = QWidget(self)
         bar = QHBoxLayout(self.quick_toolbar)
         bar.setContentsMargins(2, 3, 2, 3)
         self.quick_title = QLabel("到达记录", self.quick_toolbar)
         bar.addWidget(self.quick_title, 1)
-        self.bicycle_button = QPushButton("1  有自行车", self.quick_toolbar)
-        self.non_rider_button = QPushButton("2  非选手", self.quick_toolbar)
+        self.bicycle_button = QPushButton("1  运动员", self.quick_toolbar)
+        self.bicycle_button.setToolTip("选中芯片记录，在压线原帧按 1 保存；画圈可选，多人时用于数车")
+        self.non_rider_button = QPushButton("2  非运动员", self.quick_toolbar)
         self.defer_button = QPushButton("3  暂放", self.quick_toolbar)
         self.confirm_arrival_button = QPushButton("确认过线", self.quick_toolbar)
         self.confirm_arrival_button.setToolTip(
@@ -84,6 +93,10 @@ class QuickReviewPanel(ProblemListPanel):
         for button in (self.bicycle_button, self.non_rider_button, self.defer_button,
                        self.confirm_arrival_button, self.quick_undo_button):
             bar.addWidget(button)
+        self.confirm_arrival_button.hide()
+        self.defer_button.hide()
+        self.quick_undo_button.setText("3  撤销")
+        self.quick_undo_button.setToolTip("选中已确认记录后按 3 撤销该条；其他情况撤销上一次处理")
         self.bicycle_button.clicked.connect(self._confirm_bicycle)
         self.non_rider_button.clicked.connect(lambda: self._classify("not_rider"))
         self.defer_button.clicked.connect(lambda: self._classify("held"))
@@ -91,6 +104,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.quick_undo_button.clicked.connect(self._undo_arrival)
         more = QPushButton("更多", self.quick_toolbar)
         menu = QMenu(more)
+        menu.addAction("暂放当前记录", lambda: self._classify("held"))
         menu.addAction("分析录像", self._toggle_analysis)
         menu.addAction("导出过线记录", self.export_arrivals)
         menu.addAction("导出交接清单", self.export)
@@ -204,12 +218,15 @@ class QuickReviewPanel(ProblemListPanel):
             pairs += list(zip(item.event_ids, item.bibs))
             if item.grouped in by_id:
                 item = by_id[item.grouped]
+            evidence_frame = item.evidence.get("frame") or {}
+            raw_recorder_ms = item.evidence.get("recorder_ms", evidence_frame.get("recorder_ms"))
             if not pairs:
                 if raw.grouped:
                     continue
                 crossing = item_crossing_time(item, self.workspace_dir, clocks=clocks)
                 rows.append(ArrivalRow("candidate:" + item.item_id, item,
                                        time_ms=crossing.value_ms if crossing else None,
+                                       recorder_ms=raw_recorder_ms,
                                        reference=crossing is None or crossing.source in ("expected", "chip")))
             for event_id, bib in pairs:
                 if not event_id or event_id in represented:
@@ -221,7 +238,8 @@ class QuickReviewPanel(ProblemListPanel):
                 crossing = item_crossing_time(item, self.workspace_dir, clocks=clocks)
                 rows.append(ArrivalRow("event:" + event_id, item, bib, event,
                                        int(event.timeline_timestamp_ms) if event else
-                                       crossing.value_ms if crossing else None))
+                                       crossing.value_ms if crossing else None,
+                                       recorder_ms=raw_recorder_ms))
         for event_id, event in events.items():
             if event_id in represented or not event.is_active:
                 continue
@@ -242,25 +260,54 @@ class QuickReviewPanel(ProblemListPanel):
                     if (not row.stale and previous["action"] == "confirm" and row.event.is_active
                             and not row.item.evidence.get("configuration_stale")):
                         row.decision = previous
-                        row.time_ms = previous["crossing_ms"]
+                        row.item = anchor
+                        frame = previous.get("frame") or {}
+                        raw_recorder_ms = frame.get("recorder_ms")
+                        row.recorder_ms = raw_recorder_ms
+                        # New confirmations store the already-calibrated crossing
+                        # time; older ones stored the raw recorder time. Convert
+                        # only the latter, so a live calibration is never applied
+                        # twice.
+                        stored_ms = previous["crossing_ms"]
+                        if raw_recorder_ms is None or int(stored_ms) == int(raw_recorder_ms):
+                            crossing = recorder_crossing_time(
+                                stored_ms, frame, self.workspace_dir, clocks=clocks,
+                            )
+                            row.time_ms = crossing.value_ms if crossing is not None else stored_ms
+                        else:
+                            row.time_ms = stored_ms
                         row.reference = False
-        return sorted(rows, key=lambda row: (row.time_ms if row.time_ms is not None else 2**62, row.key))
+        assigned = Counter(row.decision["candidate_id"] for row in rows if row.decision)
+        rows = [row for row in rows if row.event is not None
+                or assigned[row.item.item_id] < max(1, len(self._marks.get(row.item.item_id, ())))]
+        # Official chip order remains stable when a corrected video time is saved.
+        return sorted(rows, key=lambda row: (
+            0 if row.event is not None else 1,
+            row.event.sequence if row.event is not None else 0,
+            int(row.event.timeline_timestamp_ms) if row.event is not None else
+            row.time_ms if row.time_ms is not None else 2**62,
+            row.key,
+        ))
 
     def _row_state(self, row):
         if row.event is not None and not row.event.is_active:
-            return "已作废"
+            return "已排除"
+        if row.stale:
+            return "待定"
+        if row.decision:
+            return "已确认"
         if (row.item.status == STATUS_WAITING or row.item.evidence.get("configuration_stale")
                 or row.item.evidence.get("superseded")):
-            return "待证据"
-        if row.stale:
-            return "待复核"
-        if row.decision:
-            simultaneous = self._simultaneous[row.time_ms] > 1
-            return "已确认·同时" if simultaneous else "已确认"
+            return "待定"
         category = self._category(row.item)
-        if category:
-            return {"bicycle": "待认人", "held": "暂放", "not_rider": "已排除"}[category["action"]]
-        return "待确认" if row.bib else "待匹配"
+        return "已排除" if category and category["action"] == "not_rider" else "待定"
+
+    def _row_category(self, row):
+        if row.decision:
+            return "运动员"
+        category = self._category(row.item)
+        return ({"bicycle": "运动员", "not_rider": "非运动员"}.get(category["action"], "待判定")
+                if category and not row.stale else "待判定")
 
     def _render(self):
         if not self._quick_ready:
@@ -275,7 +322,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._simultaneous = Counter(row.time_ms for row in rows if row.decision)
         self.rows = [row.item for row in rows]
         signature = (self._arrival_scope, self._selected_key,
-                     tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row),
+                     tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
                             candidate_binding(row.item)) for row in rows))
         if signature == self._quick_render_signature:
             self._sync_arrival_confirmation()
@@ -285,14 +332,34 @@ class QuickReviewPanel(ProblemListPanel):
         scroll = self.table.verticalScrollBar().value()
         self.table.setRowCount(len(rows))
         selected = -1
+        chip_number = 0
         for index, row in enumerate(rows):
             state = self._row_state(row)
             time = format_chip_time(row.time_ms) if row.time_ms is not None else "—"
-            for column, text in enumerate((str(index + 1), row.bib or "—", time, state)):
+            category = self._row_category(row)
+            number = ""
+            if row.event is not None:
+                chip_number += 1
+                if category != "非运动员":
+                    number = str(chip_number)
+            for column, text in enumerate((number, row.bib or "—", time, state)):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
-                cell.setToolTip("点击回看保存原帧" if row.decision else "点击只选择；定位压线原帧后再点“确认过线”")
+                if column == 3:
+                    foreground, background = {"已确认": ("#126044", "#e5f4ec"),
+                                              "已排除": ("#1d4ed8", "#e6f0ff"),
+                                              "待定": ("#b42318", "#fdecec")}[state]
+                    cell.setForeground(QColor(foreground))
+                    cell.setBackground(QColor(background))
+                    cell.setTextAlignment(Qt.AlignCenter)
+                tooltip = ("点击回看保存原帧" if row.decision else
+                           "点击回看对应时段；已确认有自行车时单击只选择运动员，双击回看；不会自动确认过线")
+                if (column == 2 and row.recorder_ms is not None and row.time_ms is not None
+                        and int(row.recorder_ms) != int(row.time_ms)):
+                    tooltip = (f"判读时间（校时后）：{format_chip_time(row.time_ms)}\n"
+                               f"录像原时刻：{format_chip_time(row.recorder_ms)}\n" + tooltip)
+                cell.setToolTip(tooltip)
                 self.table.setItem(index, column, cell)
             if row.key == self._selected_key:
                 selected = index
@@ -335,6 +402,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._sync_timeline()
         self.current_changed.emit(row.item)
         self._sync_arrival_confirmation()
+        self.marks_changed.emit(tuple(self.current_marks()))
 
     def _sync_timeline(self):
         if not self._quick_ready:
@@ -359,15 +427,53 @@ class QuickReviewPanel(ProblemListPanel):
             self._open_row(index)
             self.jump_requested.emit(dict(row.decision["frame"]))
             return
-        # Select the identity without seeking away from the frame being judged.
+        # Preserve a deliberately classified picture while assigning identities,
+        # but do not strand a newly received chip on an unrelated/empty picture.
+        category = self._category()
+        frame = self._frame_provider()
+        item = self.current_item()
+        circle = bool(item and item.evidence.get("frame", {}).get("marker_x_normalized") is not None)
+        if not ((circle or category and category.get("action") == "bicycle") and frame
+                and frame.get("frame_index", -1) >= 0):
+            self._open_row(index)
+            return
         self._selected_key = row.key
         self.table.setCurrentCell(index, 0)
         self._sync_arrival_confirmation()
-        self.hint.setText("已选中运动员。请停在前轮压终点线的一帧，再点“确认过线”。")
+        self.marks_changed.emit(tuple(self.current_marks()))
+        self.hint.setText("已选中运动员；停在压线原帧按 1 保存，多人可点圈数车。")
 
     def _selected_arrival(self):
         index = self.table.currentRow()
         return self._arrival_rows[index] if 0 <= index < len(self._arrival_rows) else None
+
+    def picture_mark_label(self, mark):
+        """Use the saved identity for a circle; an unassigned circle has no count number."""
+        from .bunch_review import mark_on_frame
+
+        if mark.get("exclusion_reason"):
+            return "非运动员"
+        item = self.current_item()
+        for row in self._arrival_rows:
+            decision = row.decision
+            if (not decision or item is None or decision.get("candidate_id") != item.item_id
+                    or not mark_on_frame(mark, decision["frame"], decision["frame"].get("recorder_ms"))):
+                continue
+            frame = decision["frame"]
+            if frame.get("marker_x_normalized") is None and len(self.current_marks()) > 1:
+                continue
+            if (all(frame.get(key) is not None for key in ("marker_x_normalized", "marker_y_normalized"))
+                    and (abs(float(frame["marker_x_normalized"]) - mark["x"]) > .001
+                         or abs(float(frame["marker_y_normalized"]) - mark["y"]) > .001)):
+                continue
+            return row.bib
+        row = self._selected_arrival()
+        marks = self.current_marks()
+        editing = marks[self._editing_mark] if 0 <= self._editing_mark < len(marks) else None
+        if ((len(marks) == 1 or mark == editing) and row is not None and row.event is not None
+                and row.event.is_active and row.bib and not row.stale and row.decision is None):
+            return row.bib
+        return mark.get("bib") or "待选号码"
 
     def _sync_arrival_confirmation(self):
         row = self._selected_arrival()
@@ -379,7 +485,7 @@ class QuickReviewPanel(ProblemListPanel):
                            and frame.get("segment_id") and frame.get("video_path")
                            and frame.get("recorder_ms") is not None)
         if row is None or row.event is None or not row.event.is_active or not row.bib:
-            reason = "请先选择有有效芯片记录的运动员"
+            reason = "可先在画面点圈；确认过线前请选择对应芯片记录"
         elif row.decision is not None:
             reason = "该运动员已确认；修改前请先撤销"
         elif not valid_frame:
@@ -397,13 +503,16 @@ class QuickReviewPanel(ProblemListPanel):
             reason = ""
         self.confirm_arrival_button.setEnabled(not reason)
         self.confirm_arrival_button.setToolTip(reason or "保存所选运动员与当前显示的压线原帧；不会修改正式芯片时间")
-        self.confirmation_status.setText(reason or "已就绪：停在前轮压线帧后点“确认过线”")
+        count = sum(not mark.get("exclusion_reason") for mark in self.current_marks())
+        self.confirmation_status.setText((reason or "已就绪：按 1 保存，2 排除，3 撤销")
+                                         + (f" · 已圈 {count} 辆" if count else ""))
 
     def set_finish_line_status(self, configured):
         self.finish_line_status.setText("绿色实线：实际终点线" if configured else "终点线未设置：请先在实际画面上画线")
         self.finish_line_status.setStyleSheet("color:#17675b;" if configured else "color:#9a5b12;")
 
     def _configure_sampling(self):
+        self.sampling_preparing.emit()
         super()._configure_sampling()
         self.sampling_configured.emit()
 
@@ -431,7 +540,19 @@ class QuickReviewPanel(ProblemListPanel):
         return next((row.item for row in self._arrival_rows if row.item.evidence.get("frame")), item)
 
     def _confirm_bicycle(self):
-        self._classify("bicycle")
+        row = self._selected_arrival()
+        if row is not None and row.decision:
+            self.hint.setText(f"{row.bib} 已确认；修改前请先撤销。")
+            return
+        self._shortcut_operation = uuid.uuid4().hex
+        try:
+            self._classify("bicycle")
+            if self.confirm_arrival_button.isEnabled():
+                self._confirm_selected_arrival()
+            else:
+                self.hint.setText("已标记运动员；请选择对应芯片记录，再按 1 保存。")
+        finally:
+            self._shortcut_operation = None
 
     def _classify(self, action):
         if action != "held":
@@ -460,12 +581,13 @@ class QuickReviewPanel(ProblemListPanel):
                                      candidate_binding(item), action, candidate_id=item.item_id,
                                      frame=frame,
                                      analysis_signature=item.evidence.get("analysis_signature", ""),
+                                     operation_id=getattr(self, "_shortcut_operation", None),
                                      calibration_version=item.calibration_version)
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"审核未保存：{error}")
             return
         self._render()
-        self.hint.setText("已确认有自行车；选择运动员，定位压线帧后点“确认过线”（F 可放大）。" if action == "bicycle"
+        self.hint.setText("选择芯片，停在压线原帧按 1 保存；多人可点圈数车（F 可放大）。" if action == "bicycle"
                           else "已暂放。" if action == "held" else "已排除此画面候选。")
         if action in ("held", "not_rider"):
             self._step(1)
@@ -499,12 +621,18 @@ class QuickReviewPanel(ProblemListPanel):
             self.hint.setText("请先打开有效录像，停在该选手前轮压线的原帧。")
             return
         frame = dict(frame, calibration_version=item.calibration_version)
+        from .bunch_review import mark_on_frame
+        marks = self.current_marks()
+        mark = marks[self._editing_mark] if 0 <= self._editing_mark < len(marks) else None
+        if mark and mark_on_frame(mark, frame, frame.get("recorder_ms")) and not mark.get("exclusion_reason"):
+            frame.update(marker_x_normalized=mark["x"], marker_y_normalized=mark["y"])
         crossing = recorder_crossing_time(frame.get("recorder_ms"), frame, self.workspace_dir)
         try:
             self._arrival_store.save(
                 self._arrival_scope, row.key, event_binding(event), "confirm", event_id=event.event_id,
                 bib=event.bib, candidate_id=item.item_id, candidate_binding=candidate_binding(item),
                 frame=frame, crossing_ms=crossing.value_ms if crossing else None,
+                operation_id=getattr(self, "_shortcut_operation", None),
                 calibration_version=item.calibration_version,
             )
         except (OSError, RuntimeError, ValueError) as error:
@@ -512,18 +640,103 @@ class QuickReviewPanel(ProblemListPanel):
             return
         self._selected_key = row.key
         self._render()
+        self.marks_changed.emit(tuple(self.current_marks()))
         self.hint.setText(f"已确认 {event.bib} 过线；继续看下一位。")
 
+    def cancel_picture_mark(self, x=None, y=None):
+        marks = self.current_marks()
+        frame = self._frame_provider()
+        from .bunch_review import mark_on_frame
+        candidates = [i for i, mark in enumerate(marks)
+                      if frame and mark_on_frame(mark, frame, frame.get("recorder_ms"))]
+        if x is not None:
+            candidates = [i for i in candidates
+                          if (marks[i]["x"] - x) ** 2 + (marks[i]["y"] - y) ** 2 <= .04 ** 2]
+        index = (min(candidates, key=lambda i: (marks[i]["x"] - x) ** 2 + (marks[i]["y"] - y) ** 2)
+                 if candidates and x is not None else candidates[-1] if candidates else None)
+        if index is None:
+            return False
+        mark = marks[index]
+        item = self.current_item()
+        for row_index, row in enumerate(self._arrival_rows):
+            saved = (row.decision or {}).get("frame", {})
+            if (row.decision and item and row.decision.get("candidate_id") == item.item_id
+                    and mark_on_frame(mark, saved, saved.get("recorder_ms"))
+                    and abs(saved.get("marker_x_normalized", -1) - mark["x"]) <= .001
+                    and abs(saved.get("marker_y_normalized", -1) - mark["y"]) <= .001):
+                self.table.setCurrentCell(row_index, 0)
+                self._undo_arrival()
+                break
+        # Undo may have re-rendered the table and moved the active item; remove
+        # the circle from the item it was drawn on, not from whatever is current.
+        owned = self._marks.get(item.item_id, []) if item is not None else []
+        if 0 <= index < len(owned):
+            owned.pop(index)
+            self._editing_mark = min(index, len(owned) - 1)
+            self._marks_updated()
+        self._sync_arrival_confirmation()
+        self.marks_changed.emit(tuple(self.current_marks()))
+        self.hint.setText("已取消这个待选标记；左键可重新点选，右键取消。")
+        return True
+
     def _undo_arrival(self):
+        row = self._selected_arrival()
+        if (row is None or not row.decision) and self.cancel_picture_mark():
+            return
         if self._arrival_store is None:
             return
+        row = self._selected_arrival()
+        target_key = row.key if row is not None and row.decision else None
         try:
-            previous = self._arrival_store.undo(self._arrival_scope)
+            previous = self._arrival_store.undo(self._arrival_scope, key=target_key)
+            # Earlier builds logged picture clicks as classifications. Skip
+            # those internal entries so 3 reaches the operator's last ruling.
+            while previous and previous["action"] == "bicycle" and not previous.get("operation_id"):
+                candidate = next((item for item in self.items
+                                  if item.item_id == previous.get("candidate_id")), None)
+                if candidate is None or candidate.evidence.get("frame", {}).get("marker_x_normalized") is None:
+                    break
+                earlier = self._arrival_store.undo(self._arrival_scope)
+                if earlier is None:
+                    break
+                previous = earlier
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"撤销未保存：{error}")
             return
         self._render()
-        self.hint.setText("已撤销上一操作。" if previous else "没有可撤销的操作。")
+        if previous:
+            candidate_id = previous.get("candidate_id")
+            candidate = next((item for item in self.items if item.item_id == candidate_id), None)
+            index = next((i for i, row in enumerate(self._arrival_rows)
+                          if row.key == previous.get("key")), None)
+            if index is None:
+                index = next((i for i, row in enumerate(self._arrival_rows)
+                              if row.item.item_id == candidate_id), None)
+            if index is not None:
+                row = self._arrival_rows[index]
+                self._selected_key = row.key
+                self._active_item = candidate or row.item
+                self._shown_id = self._active_item.item_id
+                self.table.setCurrentCell(index, 0)
+            if previous.get("frame"):
+                current = self._frame_provider()
+                saved = previous["frame"]
+                from .bunch_review import mark_on_frame
+                self._editing_mark = next((i for i, mark in enumerate(self.current_marks())
+                                           if saved.get("marker_x_normalized") is not None
+                                           and saved.get("marker_y_normalized") is not None
+                                           and abs(mark["x"] - saved["marker_x_normalized"]) <= .001
+                                           and abs(mark["y"] - saved["marker_y_normalized"]) <= .001
+                                           and mark_on_frame(mark, saved, saved.get("recorder_ms"))), -1)
+                same_frame = bool(current and current.get("camera_index") == saved.get("camera_index")
+                                  and current.get("segment_id") == saved.get("segment_id")
+                                  and current.get("frame_index") == saved.get("frame_index"))
+                if not same_frame:
+                    self.jump_requested.emit(dict(saved))
+            self._sync_arrival_confirmation()
+            self.marks_changed.emit(tuple(self.current_marks()))
+        self.hint.setText(f"已撤销 {previous.get('bib') or '上一'} 处理；可直接按 1 或 2 重判。"
+                          if previous else "没有可撤销的操作。")
 
     def _step(self, delta):
         items = list(dict.fromkeys(row.item.item_id for row in self._arrival_rows))
@@ -548,7 +761,7 @@ class QuickReviewPanel(ProblemListPanel):
             self.toggle_big_view()
             return True
         actions = {Qt.Key_1: self._confirm_bicycle, Qt.Key_2: lambda: self._classify("not_rider"),
-                   Qt.Key_3: lambda: self._classify("held"), Qt.Key_Backspace: self._undo_arrival,
+                   Qt.Key_3: self._undo_arrival, Qt.Key_Backspace: self._undo_arrival,
                    Qt.Key_Return: self._confirm_selected_arrival, Qt.Key_Enter: self._confirm_selected_arrival,
                    Qt.Key_Up: lambda: self._step(-1), Qt.Key_Down: lambda: self._step(1),
                    Qt.Key_Left: lambda: self.frame_step_requested.emit(-1),
@@ -569,10 +782,10 @@ class QuickReviewPanel(ProblemListPanel):
         self._sync_arrival_confirmation()
         self.count_mode_changed.emit(self._big_view)
         if self._big_view:
-            self.hint.setText("画面已放大：选择运动员，停在前轮压线的一帧，再点“确认过线”。F / Esc 返回。")
+            self.hint.setText("选择芯片，停在压线原帧按 1 保存；多人可点圈数车。2 排除，3 撤销。F / Esc 返回。")
             self.setFocus()
         else:
-            self.hint.setText("已返回胶卷视图；名单点击只选人，定位压线帧后点“确认过线”（F 可放大）。")
+            self.hint.setText("已返回胶卷视图；单人直接按 1 保存，多人可点圈数车。2 排除，3 撤销。")
             self.table.setFocus()
         self.big_view_changed.emit(self._big_view)
 
