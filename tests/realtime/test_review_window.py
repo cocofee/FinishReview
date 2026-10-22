@@ -498,7 +498,79 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         window.close()
 
 
-def test_raw_frame_can_be_confirmed_with_one_without_a_circle(qapp, tmp_path):
+def test_group_count_picture_drag_scrubs_active_pane_without_counting(qapp, tmp_path):
+    """The main counting picture takes a horizontal drag; it never becomes a mark."""
+
+    from PyQt5.QtCore import QEvent, QPoint, QPointF
+    from PyQt5.QtGui import QImage, QMouseEvent
+    from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
+    import json
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        start = 1_789_600_000_000
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test",
+                           evidence={"frame": frame})
+        path = tmp_path / "finish_problems/problem_list.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
+        window.problem_panel.refresh()
+        window.problem_panel.table.setCurrentCell(0, 0)
+        window._open_problem_frame(frame)
+        qapp.processEvents()
+
+        pane = window.regular_pane
+        view = pane.video_view
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+        window.problem_panel.toggle_big_view()
+        qapp.processEvents()
+        assert view._count_mode
+
+        worker = pane._worker
+        seeks = []
+        worker.seek = seeks.append
+        worker.seek_preview = seeks.append
+        marks_before = list(window.problem_panel.current_marks())
+
+        center = view.viewport().rect().center()
+        move = center + QPoint(90, 0)
+        for event_type, position, pressed, buttons in (
+            (QEvent.MouseButtonPress, center, Qt.LeftButton, Qt.LeftButton),
+            (QEvent.MouseMove, move, Qt.NoButton, Qt.LeftButton),
+        ):
+            QApplication.sendEvent(
+                view.viewport(),
+                QMouseEvent(event_type, QPointF(position), pressed, buttons, Qt.NoModifier),
+            )
+        QTest.qWait(120)  # let the pane's 80 ms preview timer fire once
+        assert seeks
+        QApplication.sendEvent(
+            view.viewport(),
+            QMouseEvent(QEvent.MouseButtonRelease, QPointF(move),
+                        Qt.LeftButton, Qt.NoButton, Qt.NoModifier),
+        )
+        QTest.qWait(10)
+
+        assert window.problem_panel.current_marks() == marks_before
+        assert seeks[-1] != 2000  # The release committed the frame-relative scrub.
+        assert pane._video_scrubbing is False
+    finally:
+        window.close()
+
+
+
     from PyQt5.QtGui import QImage
     window = _window(tmp_path, workbench=True)
     try:

@@ -298,6 +298,8 @@ def _manual_time_source(item: ProblemItem) -> str:
 
     if item.kind == KIND_MANUAL_REVIEW or item.chip_time_ms is None:
         return "未换算：按原帧人工判断"
+    if item.evidence.get("time_source"):
+        return str(item.evidence["time_source"])
     if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION):
         return "集团内前后过线芯片之间插值"
     return "校时换算（视频原帧）"

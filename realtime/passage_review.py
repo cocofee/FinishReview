@@ -149,6 +149,12 @@ UI_INFO_PANEL_MIN_WIDTH = 300
 UI_INFO_PANEL_MAX_WIDTH = 380
 UI_INFO_PANEL_DEFAULT_WIDTH = 330
 _ARCHIVE_SEGMENT_SUFFIX_RE = re.compile(r"_archive_\d+$", re.IGNORECASE)
+# The counting surface says the two gestures it accepts; the timeline under the
+# picture is too thin to steer frame by frame on a moving group.
+COUNT_MODE_HELP = (
+    "单击画面里的一位过线者就是一个人；"
+    "按住左键横向拖动回看前后帧；左右方向键逐帧"
+)
 
 
 def format_passage_time(timestamp_ms: int) -> str:
@@ -446,6 +452,10 @@ class EvidenceImageView(QGraphicsView):
 
     MIN_SCALE = 0.25
     MAX_SCALE = 8.0
+    # A click that counts a person is a click, not a drag.  Past this many pixels
+    # the left button means "scrub the picture", so the two never fire together.
+    CLICK_SLOP_PX = 4
+    SCRUB_START_PX = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -840,26 +850,38 @@ class EvidenceImageView(QGraphicsView):
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        self.setToolTip(
-            "单击放置判读线；Shift + 左键拖动判读线；"
-            "中键拖动缩放后的画面"
-            if self._marker_mode
-            else ""
-        )
+        if self._marker_mode:
+            self.setToolTip(
+                "单击放置判读线；Shift + 左键拖动判读线；"
+                "中键拖动缩放后的画面"
+            )
+        elif self._count_mode:
+            self.setToolTip(COUNT_MODE_HELP)
+        else:
+            self.setToolTip("滚轮放大后，中键拖动查看号码")
 
     def set_count_mode(self, enabled: bool) -> None:
         """A click counts a person instead of placing the identity line.
 
         The frame is what the operator is looking at; counting must not make them
-        reach for another window, so the picture itself takes the click.
+        reach for another window, so the picture itself takes the click.  Dragging
+        the same button horizontally scrubs the frames around it, which is easier
+        to steer than the thin timeline under the picture.
         """
 
         self._count_mode = bool(enabled) and self.has_frame
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._count_mode and not self._marker_mode:
-            self.setToolTip("单击画面里的一位过线者就是一个人；左右方向键逐帧")
+        if self._marker_mode:
+            self.setToolTip(
+                "单击放置判读线；Shift + 左键拖动判读线；"
+                "中键拖动缩放后的画面"
+            )
+        elif self._count_mode:
+            self.setToolTip(COUNT_MODE_HELP)
+        else:
+            self.setToolTip("滚轮放大后，中键拖动查看号码")
 
     def set_marker(
         self,
@@ -985,7 +1007,8 @@ class EvidenceImageView(QGraphicsView):
             return
         if (
             self._mouse_press_position is not None
-            and (event.pos() - self._mouse_press_position).manhattanLength() > 4
+            and (event.pos() - self._mouse_press_position).manhattanLength()
+            > self.CLICK_SLOP_PX
         ):
             self._mouse_dragged = True
         if (
@@ -995,6 +1018,32 @@ class EvidenceImageView(QGraphicsView):
             self._select_marker_position(event.pos())
             event.accept()
             return
+        # Counting mode: a mostly-horizontal left drag scrubs the recording.
+        # Movement below SCRUB_START_PX stays a click, so one person is still one
+        # click; once the drag starts it never also counts on release.  Counting
+        # wins over the identity-line mode just as it does for a plain click;
+        # Shift + left still moves the line, and the middle button still pans.
+        if (
+            self._count_mode
+            and self.has_frame
+            and self._mouse_press_position is not None
+            and event.buttons() & Qt.LeftButton
+        ):
+            horizontal_delta = event.pos().x() - self._mouse_press_position.x()
+            if self._video_scrubbing or (
+                abs(horizontal_delta) > self.SCRUB_START_PX
+                and abs(horizontal_delta)
+                >= abs(event.pos().y() - self._mouse_press_position.y())
+            ):
+                if not self._video_scrubbing:
+                    self._video_scrubbing = True
+                    self.viewport().setCursor(Qt.SizeHorCursor)
+                    self.scrub_started.emit()
+                # The pane coalesces these pixel deltas on an 80 ms timer and
+                # snaps them to whole frames before asking the decoder to seek.
+                self.scrub_delta_requested.emit(horizontal_delta)
+                event.accept()
+                return
         if (
             self._mouse_dragged
             and self._mouse_press_position is not None
@@ -1009,7 +1058,9 @@ class EvidenceImageView(QGraphicsView):
             self._pan_dragging = False
             self._pan_last_position = None
             self.viewport().setCursor(
-                Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
+                Qt.CrossCursor
+                if (self._marker_mode or self._count_mode)
+                else Qt.ArrowCursor
             )
             event.accept()
             return
@@ -1021,7 +1072,8 @@ class EvidenceImageView(QGraphicsView):
             marker_dragging = self._marker_dragging
             was_click = (
                 not self._mouse_dragged
-                and (event.pos() - press_position).manhattanLength() <= 4
+                and (event.pos() - press_position).manhattanLength()
+                <= self.CLICK_SLOP_PX
             )
             self._mouse_press_position = None
             self._mouse_dragged = False
@@ -1029,7 +1081,9 @@ class EvidenceImageView(QGraphicsView):
             video_scrubbing = self._video_scrubbing
             self._video_scrubbing = False
             self.viewport().setCursor(
-                Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
+                Qt.CrossCursor
+                if (self._marker_mode or self._count_mode)
+                else Qt.ArrowCursor
             )
             if marker_dragging:
                 self._select_marker_position(event.pos())

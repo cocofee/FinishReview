@@ -312,7 +312,9 @@ def row_label(item: "ProblemItem") -> str:
     if item.kind == KIND_NEAR_CROSSING:
         return "可能漏读"
     if item.kind == KIND_CHIP_NO_CROSSING:
-        return "有芯片没画面"
+        # A chip a confirmed group count left without a person: the people were
+        # on screen, one chip too many came with them.
+        return "疑似双芯片" if item.evidence.get("count_difference") else "有芯片没画面"
     if item.kind == KIND_MANUAL_REVIEW:
         return "单人"
     return CLASS_TITLES[problem_class(item)]

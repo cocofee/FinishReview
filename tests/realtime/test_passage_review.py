@@ -680,6 +680,174 @@ def test_evidence_view_maps_full_resolution_tile_to_source_coordinates(qapp):
     view.close()
 
 
+def _send_drag(view, start, end, *, button=Qt.LeftButton):
+    """Send one press, one move and one release with the button still held."""
+
+    viewport = view.viewport()
+    for event_type, position, pressed, buttons in (
+        (QEvent.MouseButtonPress, start, button, button),
+        (QEvent.MouseMove, end, Qt.NoButton, button),
+        (QEvent.MouseButtonRelease, end, button, Qt.NoButton),
+    ):
+        QApplication.sendEvent(
+            viewport,
+            QMouseEvent(
+                event_type,
+                QPointF(position),
+                pressed,
+                buttons,
+                Qt.NoModifier,
+            ),
+        )
+
+
+def _count_view(qapp):
+    view = passage_review.EvidenceImageView()
+    view.resize(640, 480)
+    view.show()
+    view.set_frame(QImage(640, 480, QImage.Format_RGB32))
+    view.set_count_mode(True)
+    qapp.processEvents()
+    return view
+
+
+def test_count_click_still_counts_without_starting_a_scrub(qapp):
+    """The counting surface keeps the plain click: one person, no seek."""
+
+    view = _count_view(qapp)
+    counts, started, deltas, finished = [], [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=center)
+        qapp.processEvents()
+
+        assert len(counts) == 1
+        assert started == [] and deltas == [] and finished == []
+    finally:
+        view.close()
+
+
+def test_count_drag_scrubs_frames_and_never_counts(qapp):
+    """A horizontal left drag reports one scrub and no person."""
+
+    view = _count_view(qapp)
+    counts, started, deltas, finished = [], [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(90, 0))
+        qapp.processEvents()
+
+        assert counts == []
+        assert started == [True]
+        assert deltas and deltas[-1] == 90
+        assert finished == [90]
+        assert view._video_scrubbing is False
+        assert view.viewport().cursor().shape() == Qt.CrossCursor
+    finally:
+        view.close()
+
+
+def test_count_click_slop_is_not_a_drag(qapp):
+    """A tiny hand movement still counts one person instead of scrubbing."""
+
+    view = _count_view(qapp)
+    counts, started, finished = [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(3, 0))
+        qapp.processEvents()
+
+        assert len(counts) == 1
+        assert started == [] and finished == []
+    finally:
+        view.close()
+
+
+def test_drag_outside_count_mode_neither_scrubs_nor_counts(qapp):
+    view = passage_review.EvidenceImageView()
+    view.resize(640, 480)
+    view.show()
+    view.set_frame(QImage(640, 480, QImage.Format_RGB32))
+    counts, started, deltas, finished = [], [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(90, 0))
+        qapp.processEvents()
+
+        assert counts == []
+        assert started == [] and deltas == [] and finished == []
+    finally:
+        view.close()
+
+
+def test_identity_line_mode_without_counting_does_not_scrub(qapp):
+    view = passage_review.EvidenceImageView()
+    view.resize(640, 480)
+    view.show()
+    view.set_frame(QImage(640, 480, QImage.Format_RGB32))
+    view.set_marker_mode(True)
+    deltas, started = [], []
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(90, 0))
+        qapp.processEvents()
+
+        assert started == [] and deltas == []
+    finally:
+        view.close()
+
+
+def test_pane_scrub_is_frame_relative_and_coalesced(qapp):
+    """Pixels become whole-frame deltas; only the latest preview is requested."""
+
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE)
+    pane.resize(900, 500)
+    pane.show()
+    qapp.processEvents()
+    pane._worker = _FakePlaybackWorker(Path("camera_01.mkv"))
+    pane._duration_ms = 20_000
+    pane._target_position_ms = 10_000
+    pane._current_position_ms = 10_000
+    pane._fps = 25.0
+    previews, finals, started = [], [], []
+    pane.scrub_preview_requested.connect(previews.append)
+    pane.passage_delta_requested.connect(finals.append)
+    pane.scrub_started.connect(lambda: started.append(True))
+    try:
+        pane._on_video_scrub_started()
+        pane._on_video_scrub_delta(6)
+        pane._on_video_scrub_delta(12)
+        assert previews == []  # Still coalesced in the 80 ms timer.
+        pane._flush_scrub_preview()
+        width = max(1, pane.video_view.viewport().width())
+        frame_ms = pane.frame_duration_ms()
+        expected = int(round(12 * 6_000 / width / frame_ms)) * frame_ms
+        assert previews == [expected]
+        pane._on_video_scrub_finished(12)
+        assert finals == [expected]
+        assert started == [True]
+    finally:
+        pane.close()
+
+
+
 def test_empty_preview_keeps_time_filmstrip_visible(qapp, tmp_path):
     dialog = PassageReviewDialog(
         PassageEventStore(tmp_path / "passages.jsonl"),

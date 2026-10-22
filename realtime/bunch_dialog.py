@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
 
 from .bunch_review import (BunchContext, BunchReviewStore, align_counts, detected_crossings,
                            is_excluded, load_context, add_viewed, uncovered_intervals, review_candidates,
-                           group_member_batch, review_completion_issue)
+                           group_member_batch, review_completion_issue, view_reach)
 from .bunch_timeline import BunchTimeline, group_strip, pixmap_of
 from .chip_history import format_chip_time
 from .line_sampling import load_strip, line_config_digest
@@ -500,7 +500,8 @@ class BunchReviewDialog(QDialog):
         if number != self.request_number or self.closing:
             return
         self.frame, self.busy = frame, False
-        self.viewed_ranges = add_viewed(self.viewed_ranges, frame.recorder_ms, self.context.start_ms, self.context.end_ms)
+        self.viewed_ranges = add_viewed(self.viewed_ranges, frame.recorder_ms, self.context.start_ms, self.context.end_ms,
+                                        view_reach(self.context.item))
         if self.selected_candidate:
             candidate = next((c for c in self.candidates if c["id"] == self.selected_candidate), None)
             if candidate and candidate["start_ms"]-100 <= frame.recorder_ms <= candidate["end_ms"]+100:

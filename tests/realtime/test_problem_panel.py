@@ -462,7 +462,10 @@ def test_crossing_order_survives_backtracking_editing_and_undo(qapp, tmp_path):
     assert panel.count_table.currentRow() == 1  # 新点的是第三条原记录、第二行过线
     assert [mark["recorder_ms"] for mark in panel.current_marks()] == [T + 300, T + 100, T + 100]
 
+    jumps = []
+    panel.jump_requested.connect(jumps.append)
     panel.count_table.setCurrentCell(0, 0)
+    assert jumps == []  # 换人不动画面：整团逐帧看，跳到某人的帧就认不出谁是谁。
     panel.bib_input.setText("057")
     panel.assign_button.click()
     assert panel.current_marks()[1]["bib"] == "057"
@@ -495,8 +498,11 @@ def test_the_chip_time_column_uses_each_events_official_time(qapp, tmp_path):
     assert [panel.count_table.item(row, 3).text() for row in range(2)] == [
         format_chip_time(T + 100), format_chip_time(T + 150)]
     assert [panel.count_table.item(row, 0).text() for row in range(2)] == ["待看", "待看"]
+    jumps = []
+    panel.jump_requested.connect(jumps.append)
     panel.count_table.setCurrentCell(0, 0)
     assert panel.person_box.isHidden()  # 芯片读数不是已确认的画面选手。
+    assert jumps == []
     panel.close()
 
 

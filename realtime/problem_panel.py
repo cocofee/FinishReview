@@ -119,7 +119,9 @@ def _missed_entry(item: ProblemItem, batch, bunch_parent) -> bool:
 PENDING_REASON = "路人 / 遮挡 / 看不清，先放着"
 
 # 判读集团时画面上面那条刻度的一句话图例：四种颜色各是什么，一眼就分得清。
-TIMELINE_HELP = "整团过线图 · 按时间从左到右过线 · 点刻度回看"
+TIMELINE_HELP = "整团过线图 · 点刻度跳转；大画面里按住左键拖动回看，N / Shift+N 跳到下一处 / 上一处检测到的过线；都不会自动计数"
+# 画面落到的帧和检测时刻最多差半帧（20 帧/秒时 25 毫秒）；在这以内算同一处。
+DETECTION_SLACK_MS = 30
 
 # The one token a row of the queue carries when its class does not already name it.
 SHORT_NOTES = {
@@ -307,6 +309,8 @@ class ProblemListPanel(QFrame):
         self._timeline_signature = None
         self._band_cache: dict = {}
         self._band_token = None
+        # 上一次 N 跳到的检测过线：画面还没回帧就再按一次，也要接着往下跳。
+        self._detection_stop = None
         layout.addWidget(self.timeline)
         splitter = self.splitter = QSplitter(Qt.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -359,7 +363,8 @@ class ProblemListPanel(QFrame):
         images.addWidget(self.filmstrip, 1)
         detail_layout.addLayout(images)
         # 同一张表按过线先后放画面与芯片；修正操作只跟着选中的人出现。
-        self.big_help = QLabel("按过线先后看 · 点人计数 · 看完整团后回车确认", detail)
+        self.big_help = QLabel("大画面里按住左键左右拖动回看 · N 跳到下一处检测到的过线 · 点压线的人计数 · "
+                               "看完整团后回车确认", detail)
         self.big_help.setWordWrap(True)
         self.big_help.setStyleSheet("color:#667085; font-size:9pt;")
         self.big_help.hide()
@@ -842,6 +847,20 @@ class ProblemListPanel(QFrame):
             self.bunch_store = BunchReviewStore(self.problem_dir)
         except (OSError, ValueError) as error:
             self.hint.setText(f"集团核对记录读取失败：{error}")
+        self._sync_differences()
+
+    def _sync_differences(self) -> None:
+        """A confirmed group's differences are rows of their own, each at its own
+        time: the person more than there are chips, the chip nobody stood for."""
+
+        self.items = [item for item in self.items if not item.evidence.get("count_difference")]
+        if self.bunch_store is None or self.workspace_dir is None:
+            return
+        for group in [item for item in self.items if item.kind in (KIND_BUNCH, KIND_OBSTRUCTION) and not item.grouped]:
+            try:
+                self.items += self.bunch_store.differences(group, self.workspace_dir)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                self.hint.setText(f"集团差异读取失败：{error}")
 
     def _upstream_closed(self, item: ProblemItem) -> bool:
         """Every chip record of the item was voided or deleted upstream since."""
@@ -1099,7 +1118,8 @@ class ProblemListPanel(QFrame):
             self._shown_id = identity
             self._group_context, self._group_context_id = None, None
             self._editing_mark = -1
-            bib, reason = self._drafts.get(identity, ("", ""))
+            # A number already read inside the group comes along to its own row.
+            bib, reason = self._drafts.get(identity, (item.evidence.get("read_bib", "") if item else "", ""))
             self.bib_input.blockSignals(True)
             self.reason_input.blockSignals(True)
             self.bib_input.setText(bib)
@@ -1237,6 +1257,7 @@ class ProblemListPanel(QFrame):
                 return
             self._marks[item.item_id] = marks
             self.save_drafts()
+            self._sync_differences()
             self._render()
             self.hint.setText("已重新打开本团，原点数保留；可直接修改。")
             return
@@ -1311,6 +1332,8 @@ class ProblemListPanel(QFrame):
             # The frames step from here too, so the operator never has to give the
             # keyboard away by clicking the picture first.
             self.frame_step_requested.emit(-1 if key == Qt.Key_Left else 1)
+            return True
+        if key == Qt.Key_N and self._jump_detection(-1 if event.modifiers() & Qt.ShiftModifier else 1):
             return True
         if key == Qt.Key_Backspace:
             self.undo_mark()
@@ -1439,9 +1462,10 @@ class ProblemListPanel(QFrame):
             return
         if str(frame.get("segment_id")) not in {s.segment.segment_id for s in context.segments}:
             return
-        from .bunch_review import add_viewed
+        from .bunch_review import add_viewed, view_reach
         state = self._view_state(context)
-        state["ranges"] = add_viewed(state["ranges"], recorder_ms, context.start_ms, context.end_ms)
+        state["ranges"] = add_viewed(state["ranges"], recorder_ms, context.start_ms, context.end_ms,
+                                     view_reach(context.item))
         self.timeline.current = int(recorder_ms)
         self._draft_timer.start()
         self._sync_sidebar()
@@ -1529,12 +1553,12 @@ class ProblemListPanel(QFrame):
         if not present:
             self.hint.setText("本团没有已生成的过线图缓存；仍可逐帧点数。灰色区域不代表无人过线。")
 
-    def _seek_group_time(self, recorder_ms: int) -> None:
+    def _seek_group_time(self, recorder_ms: int) -> bool:
         """点到刻度上哪一刻，画面就跳到那一刻的原帧。"""
 
         context = self._inline_context()
         if context is None:
-            return
+            return False
         for piece in context.segments:
             if piece.start_ms <= recorder_ms <= piece.end_ms:
                 self.jump_requested.emit({
@@ -1542,8 +1566,52 @@ class ProblemListPanel(QFrame):
                     "video_path": str(piece.path), "position_ms": int(recorder_ms - piece.start_ms),
                     "frame_index": None,
                 })
-                self.hint.setText("已跳到刻度上那一刻；点压线的人计数，左键拖动看细节。")
-                return
+                self.hint.setText("已跳到刻度上那一刻；在大画面按住左键拖动回看，单击压线的人计数。")
+                return True
+        return False
+
+    def _jump_detection(self, direction: int) -> bool:
+        """N / Shift+N：跳到本团下一处 / 上一处检测到的过线。
+
+        检测到的过线只是停靠点，不是人数：一团 12 人检测出 9 次，漏掉的 3 人
+        还是靠逐帧看、在画面上点出来。这里只挪画面，一个人也不加。
+        """
+
+        context = self._inline_context()
+        if context is None:
+            return False
+        stops = []
+        for moment in sorted(int(entry["recorder_ms"]) for entry in context.detected):
+            if not stops or moment - stops[-1] > DETECTION_SLACK_MS:   # 同一帧上的两人是同一处
+                stops.append(moment)
+        if not stops:
+            self.hint.setText("本团没有检测到的过线；按住画面左右拖动逐帧看，点压线的人计数。")
+            return True
+        # 画面落到的帧和检测时刻差半帧以内；刚跳过来、画面还没回帧或没挪开，
+        # 就从这一处接着数，免得连按 N 停在同一处。
+        reference = self.timeline.current
+        last = self._detection_stop
+        if last is not None and last[0] == context.signature and (
+                reference == last[2] or reference is None
+                or abs(reference - last[1]) <= DETECTION_SLACK_MS * 5):
+            reference = last[1]
+        if reference is None:
+            reference = context.start_ms - DETECTION_SLACK_MS - 1 if direction > 0 else context.end_ms + DETECTION_SLACK_MS + 1
+        ahead = ([stop for stop in stops if stop > reference + DETECTION_SLACK_MS] if direction > 0
+                 else [stop for stop in stops if stop < reference - DETECTION_SLACK_MS])
+        if not ahead:
+            self.hint.setText(f"已是本团{'最后' if direction > 0 else '第一'}一处检测到的过线（共 {len(stops)} 处）；"
+                              "检测会漏人，仍请把整团看完。")
+            return True
+        target = ahead[0] if direction > 0 else ahead[-1]
+        before = self.timeline.current
+        if not self._seek_group_time(target):
+            self.hint.setText("这一处检测过线不在录像里（录像缺口）；请拖动画面看其余时段。")
+            return True
+        self._detection_stop = (context.signature, target, before)
+        self.hint.setText(f"检测到的过线 第 {stops.index(target) + 1} / {len(stops)} 处 · 只跳画面不计数；"
+                          "看到压线的人请单击计数，检测会漏人。")
+        return True
 
     def _sidebar_chips(self, item) -> list:
         return [(chip.bib, chip.chip_ms) for chip in self._crossing_chips(item)]
@@ -1601,7 +1669,9 @@ class ProblemListPanel(QFrame):
             context.start_ms, context.end_ms, self._view_state(context)["ranges"], tolerance=100))
         if unseen:
             return text + f" · 整团还有 {unseen / 1000:.1f} 秒没看"
-        return text + (" · 已看完整团，回车确认" if counted else " · 已看完整团")
+        if not counted:
+            return text + " · 已看完整团"
+        return text + " · 已看完整团，回车确认" + ("；人数差异另列待处理" if counted != len(chips) else "")
 
     def _fill_count_table(self, marks) -> None:
         """过线顺序、过线时间、认出号码与芯片时间在同一行里。"""
@@ -1691,25 +1761,19 @@ class ProblemListPanel(QFrame):
                 self.table.item(row, column).setForeground(QColor("#8a8f98"))
 
     def _count_row_changed(self, row: int) -> None:
-        """名单里选了一行，画面就跟到那一刻；这位就是下面的号码和纠正的对象。"""
+        """名单里选了一行，这位就是下面的号码和纠正的对象；画面不动。
+
+        整团是逐帧一起看完、一起判的：跳到某个人的那一帧，操作员就认不出
+        画面上谁是谁了。要看那一刻，点刻度。
+        """
 
         if not 0 <= row < len(self._crossing_rows):
             return
-        entry = self._crossing_rows[row]
-        index = entry["mark_index"]
+        index = self._crossing_rows[row]["mark_index"]
         self._editing_mark = index if index is not None else -1
-        if index is None:
-            self._sync_person_buttons()
-            if self._inline_context() is not None:
-                self._seek_group_time(entry["recorder_ms"])
-            else:
-                self._jump()
-            return
-        mark = self.current_marks()[index]
-        self.bib_input.setText(str(mark.get("bib") or ""))
+        if index is not None:
+            self.bib_input.setText(str(self.current_marks()[index].get("bib") or ""))
         self._sync_person_buttons()
-        if mark.get("frame"):
-            self.jump_requested.emit(dict(mark["frame"]))
 
     def _assign_selected_bib(self) -> None:
         """号码框里的号码，记在名单中选中的那一位身上。"""
@@ -1930,10 +1994,15 @@ class ProblemListPanel(QFrame):
         if completed and self.bunch_store is not None:
             try:
                 doubts = self.bunch_store.open_doubts(context)
-            except (ValueError, OSError):
-                doubts = []
-            if doubts:
-                self.hint.setText(self.hint.text() + f" 组内另有 {len(doubts)} 条疑点，已单独列入待处理。")
+                differences = {row.item_id for row in self.bunch_store.differences(item, self.workspace_dir)}
+            except (ValueError, OSError, KeyError, TypeError):
+                doubts, differences = [], set()
+            counted_out = sum(row in differences for row in doubts)
+            if counted_out:
+                self.hint.setText(self.hint.text() + f" 人数差异 {counted_out} 条（多出的人、没对上人的芯片）"
+                                  "已按时间单独列入待处理。")
+            if len(doubts) > counted_out:
+                self.hint.setText(self.hint.text() + f" 组内另有 {len(doubts) - counted_out} 条疑点，已单独列入待处理。")
         self._render()
         (self.setFocus if self._big_view else self.table.setFocus)()
 

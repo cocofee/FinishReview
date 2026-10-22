@@ -28,6 +28,7 @@ from .problem_items import (
     ACTION_RIDE_BACK,
     ACTION_SAME_CROSSING,
     ACTION_SIDE_BY_SIDE,
+    CATEGORY_VIDEO,
     KIND_CHIP_NO_CROSSING,
     KIND_NEAR_CROSSING,
     KIND_NO_CHIP_CROSSING,
@@ -35,7 +36,9 @@ from .problem_items import (
     STATUS_CLOSED_UPSTREAM,
     STATUS_EXCLUDED,
     STATUS_INFO,
+    STATUS_OPEN,
     ProblemItem,
+    stable_item_id,
 )
 
 
@@ -66,19 +69,35 @@ CHILD_ANSWERS = {
 }
 RESOLVED_STATUSES = (STATUS_CLOSED_UPSTREAM, STATUS_EXCLUDED, STATUS_INFO)
 
+# One parse per version of the problem list: every confirmed group asks for its
+# children on every refresh, and the list of a whole race is large.
+_CHILDREN: dict[tuple, dict[str, list[dict]]] = {}
+
 
 def load_child_items(workspace: Path, group_id: str) -> list[dict]:
     """The group's current children, straight from the problem list.
 
     A draft or a saved record keeps its own signature, so the child list is
     read when a decision needs it: a child added, answered or re-analysed later
-    must never be hidden by an earlier copy of the context.
+    must never be hidden by an earlier copy of the context. The parsed list is
+    reused only while the file is unchanged; callers must not modify it.
     """
 
     path = Path(workspace) / PROBLEM_LIST_NAME
-    payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return [child for child in payload.get("items", [])
-            if child.get("evidence", {}).get("group") == group_id]
+    try:
+        stamp = (str(path), path.stat().st_mtime_ns, path.stat().st_size)
+    except OSError:
+        return []
+    if stamp not in _CHILDREN:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        groups: dict[str, list[dict]] = {}
+        for child in payload.get("items", []):
+            group = child.get("evidence", {}).get("group")
+            if group:
+                groups.setdefault(group, []).append(child)
+        _CHILDREN.clear()
+        _CHILDREN[stamp] = groups
+    return list(_CHILDREN[stamp].get(group_id, ()))
 
 
 # The detection run writes one file per camera; it is the only place that keeps
@@ -251,10 +270,14 @@ def uncovered_intervals(start, end, ranges, tolerance=0):
     return gaps
 
 
-def add_viewed(ranges, timestamp, start, end):
-    """Only decoded frames contribute; seeking across a gap never fills it."""
+def add_viewed(ranges, timestamp, start, end, reach=50):
+    """Only decoded frames contribute; seeking across a gap never fills it.
+
+    A frame covers ``reach`` either side of it: a group is looked at frame by
+    frame, an obstruction period may be swept through quickly (``view_reach``).
+    """
     merged = []
-    for left, right in sorted([*ranges, [max(start, timestamp-50), min(end, timestamp+50)]]):
+    for left, right in sorted([*ranges, [max(start, timestamp-reach), min(end, timestamp+reach)]]):
         if right < left:
             continue
         if merged and left <= merged[-1][1]:
@@ -262,6 +285,17 @@ def add_viewed(ranges, timestamp, start, end):
         else:
             merged.append([left, right])
     return merged
+
+
+def view_reach(item) -> int:
+    """How far either side of one decoded frame counts as seen.
+
+    A group of riders is followed frame by frame (50 ms covers a 20 fps frame).
+    A blocked or crowded period can last minutes; the operator decided it may
+    be swept through quickly and confirmed by hand, so one frame every half
+    second while dragging is enough there.
+    """
+    return 250 if item.kind == "obstruction" else 50
 
 
 def review_candidates(context, marks, result):
@@ -432,6 +466,32 @@ def unresolved_crossing_conflicts(context, marks, result):
     return conflicts
 
 
+def unanswered_differences(context, rows) -> list[ProblemItem]:
+    """The differences of a confirmed count that nobody has answered yet.
+
+    Only the operator's own answer on the row closes one — for a chip, a keep
+    or delete given in the member flow too. The count that produced the row
+    never answers it: the counted person is on that very frame.
+    """
+
+    from .problem_resolutions import ProblemResolutionStore
+
+    store = ProblemResolutionStore(context.workspace / "finish_problems/problem_resolutions.jsonl")
+    member_states = None
+    unanswered = []
+    for row in rows:
+        decision, stale = store.state(row)
+        if decision is not None and not stale and decision.action in CHILD_ANSWERS[row.kind]:
+            continue
+        if row.kind == KIND_CHIP_NO_CROSSING:
+            if member_states is None:
+                member_states = group_member_states(context)
+            if member_states and chip_answered_by_members(row, member_states):
+                continue
+        unanswered.append(row)
+    return unanswered
+
+
 def is_excluded(mark: dict) -> bool:
     """Old drafts are rider counts; an explicit reason records manual exclusion."""
     return bool(mark.get("exclusion_reason", "").strip())
@@ -540,10 +600,11 @@ def align_counts(chips: list[BunchChip], marks: list[dict], fallback_bias_ms: in
 def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) -> str:
     """What the count itself still owes before the group can be confirmed.
 
-    人数相等不等于身份对上：读出来的号码不在本团芯片里，就是漏读、双芯片或备用
-    芯片的迹象，总数相等也要留着待核。没认号的人按时间先后对芯片只作参考，不另设
-    门槛。多出来的人必须有号码、前后都有参考过线者，才补得进 CycleRace。看没看
-    完整团由 ``review_completion_issue`` 判断。
+    Only a count that cannot be read blocks: nobody counted, or one number on
+    two people. A difference between the people and the chips never does —
+    confirming says the whole group was seen, and every difference becomes a row
+    of its own at its own time (``count_differences``). Whether the whole group
+    was seen is ``review_completion_issue``'s question.
     """
 
     active = [mark for mark in marks if not is_excluded(mark)]
@@ -552,19 +613,102 @@ def completion_issue(chips: list[BunchChip], marks: list[dict], result: dict) ->
     bibs = [m.get("bib", "").strip() for m in active if m.get("bib", "").strip()]
     if len(bibs) != len(set(bibs)):
         return "同一号码被填写在多人上，请先核对并修正。"
-    if len(active) == len(chips):
-        # A read number left unpaired has no chip in this group: an identity
-        # difference that equal totals would otherwise hide.
-        unknown = [extra["bib"].strip() for extra in result["extras"] if extra["bib"].strip()]
-        if unknown:
-            return (f"号码 {'、'.join(unknown)} 不在本团芯片里：人数相等也可能有漏读或双芯片，"
-                    "请核对号码；无法确认时保存进度。")
-        return ""
-    if result["missing"]:
-        return "仍有芯片没有对应的计数，请补查原帧；无法确认时保存进度，保留待处理。"
-    if any(not e["bib"] or e["chip_time_ms"] is None for e in result["extras"]):
-        return "多出的人须看清号码，且前后都有参考过线者才能估算补录时间；否则保存进度。"
     return ""
+
+
+def group_exports(extra: dict, counted: int, chip_count: int) -> bool:
+    """A counted person the confirmed group itself hands on as a 补录.
+
+    The number was read and two counted riders bracket the moment, so the chip
+    time is interpolated between theirs. With equal totals nothing is exported:
+    a number outside the group there may as well be a misread or a double chip.
+    """
+
+    return bool(extra["bib"].strip()) and extra["chip_time_ms"] is not None and counted != chip_count
+
+
+def count_differences(item: ProblemItem, camera: int, chips: list[BunchChip], marks: list[dict], result: dict,
+                      *, children=(), model: ClockModel | None = None, version: int = 0) -> list[ProblemItem]:
+    """What a confirmed count left unsettled: one row per person or chip.
+
+    A number read on a person but not among the group's chips, or one person
+    more than there are chips, is a suspected missed read on that person's own
+    frame — unless the group already exports them (``group_exports``). A chip
+    no counted person stands for is a suspected double or spare chip, or a
+    rider overlooked. How many rows there are follows from the totals and the
+    numbers read, never from crossing times alone: a clock offset must not
+    turn an equal count into differences. Which unread person or chip is the
+    surplus is a guess from crossing times, and the row says so. A frame or a
+    chip already carrying a doubt of its own is taken first, so one difference
+    is asked once.
+    """
+
+    def read(index):
+        return marks[index].get("bib", "").strip()
+
+    active = [index for index, mark in enumerate(marks) if not is_excluded(mark)]
+    unread = [index for index in active if not read(index)]
+    by_number = {chip for index, chip in result["pairs"].items() if read(index)}
+    free = [chip for chip in range(len(chips)) if chip not in by_number]
+    bias = result.get("bias_ms", 0)
+    extras = {extra["mark"]: extra for extra in result["extras"]}
+    rows = []
+
+    def gap(index, chip):
+        return abs(marks[index]["recorder_ms"] - bias - chips[chip].recorder_ms)
+
+    lines = [child for child in children if child.kind in (KIND_NO_CHIP_CROSSING, KIND_NEAR_CROSSING)]
+    surplus = max(0, len(unread) - len(free))
+    guessed = sorted((index for index in extras if not read(index)), key=lambda index: (
+        not any(counted_person_on_child_frame(child, [marks[index]]) for child in lines),
+        -min((gap(index, chip) for chip in free), default=0), marks[index]["recorder_ms"]))
+    for index in [index for index in extras if read(index)] + guessed[:surplus]:
+        extra, mark = extras[index], marks[index]
+        if group_exports(extra, len(active), len(chips)):
+            continue
+        frame = dict(mark.get("frame") or {})
+        evidence = {"group": item.item_id, "camera_index": camera, "recorder_ms": int(mark["recorder_ms"]),
+                    "position": [mark.get("x"), mark.get("y")], "count_difference": "extra",
+                    "read_bib": read(index)}
+        if frame:
+            evidence["frame"] = frame
+        chip_time = extra["chip_time_ms"]
+        if chip_time is not None:
+            evidence["time_source"] = (f"集团内前后过线芯片之间插值（前后参考相隔 {extra['bracket_ms']} ms）"
+                                       if extra.get("bracket_ms") is not None else "集团内前后过线芯片之间插值")
+        elif model is not None:
+            chip_time = int(model.to_chip(mark["recorder_ms"], frame.get("session_id", "")))
+        detail = (f"{read(index)} 号不在本团芯片里：疑似漏读，也可能号码看错或一人两个芯片；核对后认号补录"
+                  if read(index) else
+                  "本团点出的人比芯片多，这一位没有对应芯片：疑似漏读（未认号，按过线时间推测是这一位）；"
+                  "认得出号码就补录，看不清就保留待证据")
+        rows.append(ProblemItem(
+            stable_item_id(KIND_NO_CHIP_CROSSING, "count", item.item_id, mark["recorder_ms"], mark.get("x"), mark.get("y")),
+            KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, detail, chip_time_ms=chip_time, status=STATUS_OPEN,
+            priority=25, evidence=evidence, calibration_version=version))
+
+    doubted = {event_id for child in children if child.kind in (KIND_CHIP_NO_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING)
+               for event_id in child.event_ids}
+    missing = set(result["missing"])
+    shortfall = max(0, len(free) - len(unread))
+    candidates = sorted(free, key=lambda chip: (
+        chips[chip].event_id not in doubted, chip not in missing,
+        -min((gap(index, chip) for index in unread), default=0), chips[chip].chip_ms))
+    for chip in candidates[:shortfall]:
+        reading = chips[chip]
+        if reading.event_id in doubted:
+            continue
+        rows.append(ProblemItem(
+            stable_item_id(KIND_CHIP_NO_CROSSING, "count", item.item_id, reading.event_id),
+            KIND_CHIP_NO_CROSSING, CATEGORY_VIDEO,
+            f"芯片 {reading.bib} 没有对应到本团点出的人"
+            + ("（未认号，按过线时间推测是这一条）" if unread else "")
+            + "：疑似一人两个芯片或备用芯片，也可能漏看了一人",
+            chip_time_ms=reading.chip_ms, bibs=(reading.bib,), event_ids=(reading.event_id,),
+            status=STATUS_OPEN, priority=25, calibration_version=version,
+            evidence={"group": item.item_id, "camera_index": camera, "expected_recorder_ms": reading.recorder_ms,
+                      "count_difference": "missing"}))
+    return sorted(rows, key=lambda row: row.evidence.get("recorder_ms", row.evidence.get("expected_recorder_ms")))
 
 
 def review_completion_issue(context: BunchContext, marks: list[dict], result: dict,
@@ -574,9 +718,10 @@ def review_completion_issue(context: BunchContext, marks: list[dict], result: di
 
     Confirming says "本集团已完整查看并完成人数对照": the recording has no gap,
     every moment from before the first to after the last crosser was on screen,
-    the count owes nothing, and the operator said so. Equal totals never close a
-    group by themselves. The doubts folded into the group are not answered by
-    the confirmation; they stay open on their own (see ``open_doubts``).
+    the count can be read, and the operator said so. Equal totals never close a
+    group by themselves, and unequal ones never keep it open: the doubts folded
+    into the group and the differences the count leaves are not answered by the
+    confirmation; they stay open on rows of their own (see ``open_doubts``).
     """
 
     if context.gaps:
@@ -616,6 +761,8 @@ class BunchReviewStore:
         self.latest = {}
         # (item_id, camera) -> (record, decision stamp, open doubt ids)
         self._doubts = {}
+        # item_id -> (record, problem list stamp, difference rows)
+        self._differences = {}
         if self.path.is_file():
             lines = self.path.read_bytes().splitlines(keepends=True)
             for number, line in enumerate(lines):
@@ -661,8 +808,9 @@ class BunchReviewStore:
         Confirming a group settles its count, not its children: a double chip, a
         chip nobody was seen with, or a crossing without a chip stays a question
         until the operator answers it — on the counted person's own frame or
-        number, or on its own row. Children and answers are read from disk and
-        re-read whenever one of those files changes.
+        number, or on its own row. So does every difference the count itself
+        left (``count_differences``). Children and answers are read from disk
+        and re-read whenever one of those files changes.
         """
 
         record = self.get(context)
@@ -674,7 +822,40 @@ class BunchReviewStore:
         if cached is None or cached[0] is not record or cached[1] != stamp:
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
             doubts = [child.item_id for child in unresolved_crossing_conflicts(context, record["marks"], result)]
+            doubts += [row.item_id for row in unanswered_differences(
+                context, self.differences(context.item, context.workspace))]
             cached = self._doubts[key] = (record, stamp, doubts)
+        return list(cached[2])
+
+    def differences(self, item: ProblemItem, workspace: Path) -> list[ProblemItem]:
+        """The rows the group's confirmed count leaves (``count_differences``).
+
+        None while the group is open, or when its confirmation belongs to another
+        version of the item or of the rule. Worked out from the saved record
+        alone, so listing them never opens a recording.
+        """
+
+        record = self.latest_for(item)
+        if (not record or not record.get("completed")
+                or record.get("completion_policy_version") != COMPLETION_POLICY_VERSION
+                or record.get("item_snapshot") != item.to_payload()):
+            return []
+        path = Path(workspace) / PROBLEM_LIST_NAME
+        try:
+            stamp = (path.stat().st_mtime_ns, path.stat().st_size)
+        except OSError:
+            stamp = None
+        cached = self._differences.get(item.item_id)
+        if cached is None or cached[0] is not record or cached[1] != stamp:
+            chips = [BunchChip(**chip) for chip in record.get("chips", [])]
+            result = align_counts(chips, record["marks"], record.get("fallback_bias_ms", 0))
+            children = [ProblemItem.from_payload(value) for value in load_child_items(workspace, item.item_id)]
+            camera = int(record["camera"])
+            version = int(record.get("calibration_version") or item.calibration_version)
+            model = ClockModelStore(Path(workspace) / CLOCK_MODEL_FILENAME).get(camera, version)
+            rows = count_differences(item, camera, chips, record["marks"], result,
+                                     children=children, model=model, version=version)
+            cached = self._differences[item.item_id] = (record, stamp, rows)
         return list(cached[2])
 
     def latest_for(self, item: ProblemItem) -> dict | None:
@@ -730,9 +911,10 @@ class BunchReviewStore:
             # Recompute from the saved evidence so stale cached extras cannot
             # reintroduce an excluded person or an incomplete group's suggestions.
             result = align_counts(context.chips, record["marks"], record.get("fallback_bias_ms", 0))
-            if rider_count(record["marks"]) == len(context.chips):
-                continue  # 数量相等的集团只完成点数，不把暂未对上的时间参考导出成漏读。
+            counted = rider_count(record["marks"])
             for extra in result["extras"]:
+                if not group_exports(extra, counted, len(context.chips)):
+                    continue  # a row of its own (count_differences), answered there
                 mark = record["marks"][extra["mark"]]
                 # Every missed rider keeps its own frame, time and bracketing
                 # reference; two riders never share one card or one time.
