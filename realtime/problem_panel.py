@@ -193,6 +193,9 @@ class ProblemListPanel(QFrame):
         # the positions; the moments inside them align the count with the chips.
         self._marks: dict[str, list] = {}
         self._viewed: dict[str, dict] = {}
+        # The arrival table's own working state (which picture counts which wave,
+        # what of the recording was looked at); saved with the other drafts.
+        self._arrival_drafts: dict[str, dict] = {}
         # Confirmed group -> the doubts it still holds; filled by state().
         self._open_doubts: dict[str, frozenset] = {}
         self._group_context = None
@@ -542,7 +545,8 @@ class ProblemListPanel(QFrame):
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps({"drafts": self._drafts, "held": self._held,
                                              "marks": self._marks, "viewed": self._viewed,
-                                             "items": self._operator_items}, ensure_ascii=False),
+                                             "items": self._operator_items,
+                                             "arrivals": self._arrival_drafts}, ensure_ascii=False),
                                  encoding="utf-8")
             temporary.replace(path)
         except OSError as error:
@@ -605,6 +609,7 @@ class ProblemListPanel(QFrame):
         self._browsing = False
         self._next_analysis = 0.0
         self._drafts, self._held, self._marks, self._operator_items, self._viewed = {}, {}, {}, {}, {}
+        self._arrival_drafts = {}
         self._open_doubts = {}
         self._group_context, self._group_context_id = None, None
         self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
@@ -617,6 +622,7 @@ class ProblemListPanel(QFrame):
             self._marks = state.get("marks", {})
             self._viewed = state.get("viewed", {})
             self._operator_items = state.get("items", {})
+            self._arrival_drafts = state.get("arrivals", {})
         except (OSError, ValueError):
             pass
         self.refresh()
@@ -644,6 +650,7 @@ class ProblemListPanel(QFrame):
         self._finalizing_live = False
         self._drafts, self._held = {}, {}
         self._marks, self._viewed, self._operator_items = {}, {}, {}
+        self._arrival_drafts = {}
         self._open_doubts = {}
         self._group_context, self._group_context_id = None, None
         self._editing_mark = -1

@@ -603,7 +603,7 @@ def test_group_count_picture_drag_scrubs_active_pane_without_counting(qapp, tmp_
         assert saved["frame"]["segment_id"] == segment.segment_id
         assert not panel.current_marks()
         assert "marker_x_normalized" not in saved["frame"]
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_3)
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)
         assert not any(row.decision for row in panel._arrival_rows)
         assert panel._selected_arrival().bib == "321"
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
@@ -685,7 +685,7 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert pane.video_view._history_markers[0][2] == "21"
         panel.bicycle_button.click()
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_3)
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)
         assert not any(row.decision for row in panel._arrival_rows)
         assert panel._selected_arrival().bib == "21"
         assert panel._category() is None
@@ -695,8 +695,8 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#b42318"
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
-        # Several circles count several vehicles on this same picture. Re-click
-        # a circle to assign the next chip without adding a duplicate vehicle.
+        # 22 and 23 arrive within 2 s of 21: one wave, counted on this same picture,
+        # each circle labelled in chip order. Re-clicking a circle adds no duplicate.
         for bib in ("22", "23"):
             window.passage_store.append(_event(event_id="click-" + bib, bib=bib,
                                                passage_timestamp_ms=start + 2000 + int(bib)))
@@ -709,15 +709,17 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert panel.current_item().item_id == candidate_id
         window._problem_count_clicked(.7, .62, pane)
         assert len(panel.current_marks()) == 3
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
-        panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "23"))
-        window._problem_count_clicked(.8, .62, pane)
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        assert "本波还没看完" in panel.hint.text()
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+        for position in range(1400, 2701, 200):
+            pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), position, position // 40)
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 3
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_3)
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 2
-        assert panel._selected_arrival().bib == "23"
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)  # takes back the whole wave confirm
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+        assert "已撤销本波确认（2 人）" in panel.hint.text()
     finally:
         window.close()
 

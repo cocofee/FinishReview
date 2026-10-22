@@ -2847,19 +2847,14 @@ class FinishReviewWindow(PassageReviewSurface):
 
         panel = self.problem_panel
         row = panel._selected_arrival()
-        if row is not None and (row.decision is not None or row.stale):
-            panel.hint.setText("该记录已确认或证据已变化，请先撤销或重新打开原帧。")
+        item, refusal = panel.picture_candidate(frame)
+        if refusal:
+            panel.hint.setText(refusal)
             return
         frame = dict(frame, marker_x_normalized=float(x_normalized),
                      marker_y_normalized=float(y_normalized))
         selected_key = row.key if row is not None and row.event is not None else None
-        item = panel.current_item()
-        original = item.evidence.get("frame", {}) if item else {}
-        reuse = bool(item and item.kind == "manual_review" and not item.evidence.get("superseded")
-                     and not item.evidence.get("configuration_stale")
-                     and original.get("camera_index") == frame["camera_index"]
-                     and original.get("recorder_ms") is not None
-                     and abs(original["recorder_ms"] - frame["recorder_ms"]) <= 10000)
+        reuse = item is not None
         self._pause_arrival_confirmation()
         try:
             location = self._persist_filmstrip_location(pane.location)
@@ -2871,6 +2866,7 @@ class FinishReviewWindow(PassageReviewSurface):
                     frame, reason="人工点选自行车与终点线位置，待确认芯片",
                     recorder_ms=frame["recorder_ms"], thumbnail=pane.video_view._pixmap_item.pixmap(),
                 )
+                panel.adopt_picture_candidate(item, selected_key)
         except (OSError, ValueError, RuntimeError) as error:
             panel.hint.setText(f"标记未保存：{error}")
             return
@@ -2902,8 +2898,9 @@ class FinishReviewWindow(PassageReviewSurface):
         self._problem_count_mode_changed(True)
         self._problem_marks_changed(())
         panel.hint.setText(
-            f"已标记 {row.bib} 的压线位置；按 1 保存过线。"
-            if selected_key else "已圈出自行车压线位置；请选择左侧对应芯片记录，再按 1 保存。"
+            panel.picture_mark_hint()
+            or (f"已标记 {row.bib} 的压线位置；按 1 保存过线。"
+                if selected_key else "已圈出自行车压线位置；请选择左侧对应芯片记录，再按 1 保存。")
         )
 
     def _problem_marks_changed(self, _marks) -> None:
@@ -2936,13 +2933,23 @@ class FinishReviewWindow(PassageReviewSurface):
         marks = self.problem_panel.current_marks()
         labels = mark_order_labels(marks)
         dot = bool(getattr(self.problem_panel, "quick_review", False))
-        return tuple((float(marks[index]["x"]), float(marks[index]["y"]),
-                      (self.problem_panel.picture_mark_label(marks[index]) if dot else
-                       labels[index] + (f" {marks[index]['bib']}" if marks[index].get("bib") else ""))
-                      + (f" 已排除：{marks[index]['exclusion_reason']}" if is_excluded(marks[index]) else ""),
-                      True, False, dot)
-                     for index in ordered_mark_indices(marks)
-                     if mark_on_frame(marks[index], frame, frame["recorder_ms"]))
+        # A person beyond the wave's chips, or without a chip, is drawn in red.
+        warning = getattr(self.problem_panel, "picture_mark_warning", lambda _mark: False)
+        overlays = []
+        for index in ordered_mark_indices(marks):
+            mark = marks[index]
+            if not mark_on_frame(mark, frame, frame["recorder_ms"]):
+                continue
+            if dot:
+                label = self.problem_panel.picture_mark_label(mark)
+                reason = mark.get("exclusion_reason", "").strip() if is_excluded(mark) else ""
+                label += f" 已排除：{reason}" if reason and reason != label else ""
+            else:
+                label = (labels[index] + (f" {mark['bib']}" if mark.get("bib") else "")
+                         + (f" 已排除：{mark['exclusion_reason']}" if is_excluded(mark) else ""))
+            alert = bool(warning(mark))
+            overlays.append((float(mark["x"]), float(mark["y"]), label, not alert, alert, dot))
+        return tuple(overlays)
 
     def _problem_browse_started(self):
         if getattr(self, "_problem_workbench_active", False):

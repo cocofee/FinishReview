@@ -774,6 +774,23 @@ def test_count_click_slop_is_not_a_drag(qapp):
         view.close()
 
 
+def test_count_vertical_drag_neither_scrubs_nor_counts(qapp):
+    """A press that wanders off the spot is no click, in whatever direction."""
+
+    view = _count_view(qapp)
+    counts, started = [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(2, 30))
+        qapp.processEvents()
+
+        assert counts == [] and started == []
+    finally:
+        view.close()
+
+
 def test_drag_outside_count_mode_neither_scrubs_nor_counts(qapp):
     view = passage_review.EvidenceImageView()
     view.resize(640, 480)
