@@ -27,6 +27,7 @@ from .problem_items import (
     STATUS_WAITING, ProblemItem, stable_item_id,
 )
 from .problem_panel import ProblemListPanel
+from .race_strip import RaceStripPanel
 
 
 # Chips closer together than this are one wave, and the operator counts the
@@ -156,33 +157,37 @@ class QuickReviewPanel(ProblemListPanel):
         self.quick_undo_button.clicked.connect(self._undo_arrival)
         more = QPushButton("更多", self.quick_toolbar)
         menu = QMenu(more)
-        menu.addAction("暂放当前记录", lambda: self._classify("held"))
         menu.addAction("分析录像", self._toggle_analysis)
         menu.addAction("导出过线记录", self.export_arrivals)
-        menu.addAction("导出交接清单", self.export)
-        menu.addAction("复杂异常处理", self._open_legacy)
         menu.addSeparator()
         menu.addAction("清空试验数据", self.clear_data_requested.emit)
         more.setMenu(menu)
         bar.addWidget(more)
         self.layout().insertWidget(0, self.quick_toolbar)
-        guidance = QHBoxLayout()
-        self.finish_line_button = QPushButton("终点线 / 模型", self)
+        # One row: count and status on the left, then line setup and the judging keys.
+        self.finish_line_button = QPushButton("终点线 / 模型", self.quick_toolbar)
         self.finish_line_button.setToolTip(
             "绘制本机位终点线，选择本机 YOLOX ONNX 模型并试运行；只分析已封存录像"
         )
         self.finish_line_button.clicked.connect(self._configure_sampling)
-        guidance.addWidget(self.finish_line_button)
-        self.finish_line_status = QLabel("终点线未设置：请先在实际画面上画线", self)
-        guidance.addWidget(self.finish_line_status)
-        self.confirmation_status = QLabel("", self)
-        guidance.addWidget(self.confirmation_status, 1)
-        self.layout().insertLayout(1, guidance)
+        self.finish_line_status = QLabel("终点线未设置：请先在实际画面上画线", self.quick_toolbar)
+        self.confirmation_status = QLabel("", self.quick_toolbar)
+        self.confirmation_status.setStyleSheet("color:#374151;")
+        bar.insertWidget(1, self.confirmation_status, 1)
+        bar.insertWidget(2, self.finish_line_status)
+        bar.insertWidget(3, self.finish_line_button)
+        bar.setStretchFactor(self.quick_title, 0)
+        self.race_strip = RaceStripPanel(self)
+        self.race_strip.seek_requested.connect(self._seek_race_strip)
+        self.layout().insertWidget(1, self.race_strip)
         self._quick_ready = True
         QApplication.instance().installEventFilter(self)
         self._render()
 
     def eventFilter(self, watched, event):
+        if (self._quick_ready and watched is self.race_strip.view and event.type() == QEvent.KeyPress
+                and self.isVisible() and self.race_strip.view.navigate_key(event)):
+            return True
         if (self._quick_ready and event.type() == QEvent.KeyPress and self.isVisible()
                 and isinstance(watched, QWidget) and watched.window() is self.window()
                 and not isinstance(watched, (QLineEdit, QAbstractSpinBox, QComboBox, QTextEdit, QPlainTextEdit))
@@ -194,6 +199,8 @@ class QuickReviewPanel(ProblemListPanel):
         self._frame_provider = provider
 
     def set_workspace(self, workspace_dir):
+        if self._quick_ready:
+            self.race_strip.load(workspace_dir)
         if Path(workspace_dir) != self.workspace_dir:
             self._active_item = None
             self._selected_key = None
@@ -449,6 +456,8 @@ class QuickReviewPanel(ProblemListPanel):
             self.hint.setText(f"到达记录读取失败：{error}")
             return
         self._arrival_rows = rows
+        self.race_strip.set_chips([(int(row.event.timeline_timestamp_ms), row.bib, row.decision is not None)
+                                   for row in rows if row.event is not None and row.event.is_active])
         self._index_waves()
         self._simultaneous = Counter(row.time_ms for row in rows if row.decision)
         self.rows = [row.item for row in rows]
@@ -548,12 +557,20 @@ class QuickReviewPanel(ProblemListPanel):
     def _sync_timeline(self):
         if not self._quick_ready:
             return super()._sync_timeline()
-        previous = self._big_view
-        self._big_view = True
-        try:
-            super()._sync_timeline()
-        finally:
-            self._big_view = previous
+        # The whole-race picture replaces the short group ruler here.  Keep
+        # its current moment for N / Shift+N, without loading a second image.
+        self.timeline.hide()
+        self.timeline_help.hide()
+
+    def _seek_race_strip(self, frame):
+        if frame is None:
+            self.hint.setText("这一刻没有可用的过线图原录像；灰色空档不代表无人过线。")
+            return
+        # Browsing the whole race is not confirmation of the row still
+        # selected on the left; neither its identity nor its marks change.
+        self.jump_requested.emit(dict(frame, reference_only=True))
+        self.race_strip.view.setFocus(Qt.MouseFocusReason)
+        self.hint.setText("已跳到这一刻（只看，不确认）")
 
     def select_item(self, item_id):
         self._last_saved_key = None
@@ -737,32 +754,30 @@ class QuickReviewPanel(ProblemListPanel):
         self.confirm_arrival_button.setEnabled(not reason)
         self.confirm_arrival_button.setToolTip(reason or "保存所选运动员与当前显示的压线原帧；不会修改正式芯片时间")
         count = sum(not mark.get("exclusion_reason") for mark in self.current_marks())
-        status = ((reason or "已就绪：按 1 保存，3 排除，退格撤销")
-                  + (f" · 已圈 {count} 辆" if count else ""))
+        status = ((reason or "1 保存 · 3 排除 · ⌫ 撤销")
+                  + (f" · 已圈 {count}" if count else ""))
         plan = self._wave_plan()
         self.no_chip_button.setVisible(bool(plan and plan.marks))
         wave = plan.chips if plan is not None else self._row_wave(row)
         if plan is not None and plan.marks:
             status = self._wave_status(plan)
         elif wave is not None and len(wave) > 1 and any(chip.decision is None for chip in wave):
-            status = (f"本波 {len(wave)} 个芯片（{wave[0].bib} → {wave[-1].bib}）：拖动画面看完整波，"
-                      "每人点一下，号码按芯片顺序自动标出")
+            status = f"本波 {wave[0].bib}→{wave[-1].bib}（{len(wave)} 个芯片）：逐个点人"
         self.confirmation_status.setText(status)
 
     def _wave_status(self, plan):
         chips, people = len(plan.chips), plan.people
-        status = f"本波 {chips} 个芯片 · 已点 {people} 人"
+        status = f"芯片 {chips} · 已点 {people}"
         if people > chips:
-            status += f" · 多 {people - chips} 人：找出没芯片的人按 4"
+            status += f" · 多 {people - chips} 人（按 4）"
         elif people < chips:
             status += f" · 少 {chips - people} 人"
-        else:
-            status += " · 人数相同"
+
         unseen = self._unseen(plan)
         if unseen:
             status += f" · 还有 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看"
         elif plan.open_people:
-            status += " · 回车确认本波"
+            status += " · 回车确认"
         return status
 
     def _unseen(self, plan):
@@ -778,10 +793,12 @@ class QuickReviewPanel(ProblemListPanel):
     def record_viewed_frame(self, frame, recorder_ms):
         """Remember, in chip time, what of the recording the operator has looked at."""
         super().record_viewed_frame(frame, recorder_ms)
+        self.timeline.current = int(recorder_ms)
         crossing = recorder_crossing_time(recorder_ms, frame, self.workspace_dir)
         if crossing is None or self.workspace_dir is None:
             return
         stamp = crossing.value_ms
+        self.race_strip.set_cursor(stamp, frame.get("camera_index") or 1)
         camera = str(int(frame.get("camera_index") or 1))
         seen = self._arrival_drafts.setdefault("seen", {})
         seen[camera] = add_viewed(seen.get(camera, []), stamp, stamp - WAVE_VIEW_REACH_MS,
@@ -838,14 +855,13 @@ class QuickReviewPanel(ProblemListPanel):
         if len(plan.chips) == 1 and plan.people == 1 and label:
             return f"已标记 {label} 的压线位置；按 1 保存过线。"
         if index in plan.extra:
-            head = f"这一位是「{label}」：本波芯片已用完，找出没芯片的人点中按 4"
+            head = f"多出的人：没芯片的按 4"
         else:
             head = f"这一位标为 {label}" if label else "已点这一位"
-        return (f"{head}；本波 {len(plan.chips)} 个芯片，已点 {plan.people} 人。"
-                "看完整波后回车确认，点错右键取消。")
+        return f"{head}；回车确认，右键取消。"
 
     def set_finish_line_status(self, configured):
-        self.finish_line_status.setText("绿色实线：实际终点线" if configured else "终点线未设置：请先在实际画面上画线")
+        self.finish_line_status.setText("" if configured else "终点线未设置：请先在实际画面上画线")
         self.finish_line_status.setStyleSheet("color:#17675b;" if configured else "color:#9a5b12;")
 
     def _configure_sampling(self):
@@ -1298,7 +1314,7 @@ class QuickReviewPanel(ProblemListPanel):
 
     def _queue_key(self, event):
         if event.isAutoRepeat():
-            return event.key() in (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_Backspace)
+            return event.key() in (Qt.Key_1, Qt.Key_3, Qt.Key_4, Qt.Key_Backspace)
         if event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_Z:
             self._undo_arrival()
             return True
@@ -1311,15 +1327,17 @@ class QuickReviewPanel(ProblemListPanel):
         if event.key() == Qt.Key_Escape and self._big_view:
             self.toggle_big_view()
             return True
+        if event.key() in (Qt.Key_Left, Qt.Key_Right):
+            step = 5 if event.modifiers() & Qt.ShiftModifier else 1
+            self.frame_step_requested.emit(-step if event.key() == Qt.Key_Left else step)
+            return True
         # 3 excludes, as the operator reaches for it; 2 keeps working for anyone
         # used to the older layout.  4 marks a counted person 无芯片.  Undo is
         # only Backspace / Ctrl+Z.
-        actions = {Qt.Key_1: self._confirm_bicycle, Qt.Key_2: self._exclude, Qt.Key_3: self._exclude,
+        actions = {Qt.Key_1: self._confirm_bicycle, Qt.Key_3: self._exclude,
                    Qt.Key_4: self._mark_no_chip, Qt.Key_Backspace: self._undo_arrival,
                    Qt.Key_Return: self._confirm_selected_arrival, Qt.Key_Enter: self._confirm_selected_arrival,
-                   Qt.Key_Up: lambda: self._step(-1), Qt.Key_Down: lambda: self._step(1),
-                   Qt.Key_Left: lambda: self.frame_step_requested.emit(-1),
-                   Qt.Key_Right: lambda: self.frame_step_requested.emit(1)}
+                   Qt.Key_Up: lambda: self._step(-1), Qt.Key_Down: lambda: self._step(1)}
         if event.key() in actions:
             actions[event.key()]()
             return True

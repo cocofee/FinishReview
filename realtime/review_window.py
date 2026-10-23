@@ -2584,9 +2584,15 @@ class FinishReviewWindow(PassageReviewSurface):
         rail.navigation_started.connect(self._problem_browse_started)
         rail.follow_button.toggled.connect(lambda enabled: self._problem_browse_started() if enabled else None)
         self.pipeline_label = QLabel("录像未启动 · 封存到 等待首段 ｜ 分析到 等待录像 / 校时 ｜ 积压 0 秒", self)
-        self.pipeline_label.setWordWrap(True)
-        self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
-        self.layout().insertWidget(1, self.pipeline_label)
+        toolbar = getattr(self.problem_panel, "quick_toolbar", None)
+        if toolbar is not None:
+            # Same row as the record count and judging keys: no separate band.
+            self.pipeline_label.setStyleSheet("color:#17675b;")
+            toolbar.layout().insertWidget(0, self.pipeline_label)
+        else:
+            self.pipeline_label.setWordWrap(True)
+            self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
+            self.layout().insertWidget(1, self.pipeline_label)
         self.problem_panel.set_workspace(self.output_dir)
 
     def _problem_selection_changed(self, item):

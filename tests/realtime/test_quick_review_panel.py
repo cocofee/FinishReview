@@ -207,9 +207,8 @@ def test_exclude_and_hold_are_manual_and_do_not_delete_chip_events(panel):
     QTest.keyClick(panel, Qt.Key_Backspace)
     assert not panel._arrival_store.active(SCOPE)
     assert "已撤销排除" in panel.hint.text()
-    QTest.keyClick(panel, Qt.Key_2)  # The older key still excludes.
-    assert panel._arrival_store.active(SCOPE)[-1]["action"] == "not_rider"
-    QTest.keyClick(panel, Qt.Key_Backspace)
+    QTest.keyClick(panel, Qt.Key_2)  # 2 does nothing; 3 is the one exclude key.
+    assert not panel._arrival_store.active(SCOPE)
     panel._classify("held")
     assert panel._arrival_store.active(SCOPE)[-1]["action"] == "held"
 
@@ -534,7 +533,7 @@ def test_counting_a_wave_labels_people_in_chip_order_and_flags_the_one_without_a
         count_on_picture(wave_panel, x, offset)
     assert labels(wave_panel) == ["61", "20", "76", "多 1"]
     assert [wave_panel.picture_mark_warning(mark) for mark in wave_panel.current_marks()] == [False] * 3 + [True]
-    assert "本波 3 个芯片 · 已点 4 人 · 多 1 人" in wave_panel.confirmation_status.text()
+    assert "芯片 3 · 已点 4 · 多 1 人" in wave_panel.confirmation_status.text()
     # The wave's picture is not a row of its own: the table stays the chips in arrival order.
     assert [entry.bib for entry in wave_panel._arrival_rows] == ["61", "20", "76", "5"]
 
