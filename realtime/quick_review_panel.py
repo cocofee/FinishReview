@@ -1378,10 +1378,8 @@ class QuickReviewPanel(ProblemListPanel):
             return True
         if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
             return False
-        # F must work from any workbench child; Esc symmetrically restores the rail.
-        if event.key() == Qt.Key_F:
-            self.toggle_big_view()
-            return True
+        # The picture is already as large as the workbench allows: F does nothing.
+        # Esc still leaves an enlarged view, however it was entered.
         if event.key() == Qt.Key_Escape and self._big_view:
             self.toggle_big_view()
             return True
@@ -1410,7 +1408,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._sync_arrival_confirmation()
         self.count_mode_changed.emit(self._big_view)
         if self._big_view:
-            self.hint.setText("选择芯片，停在压线原帧按 1 保存；多人可点圈数车。3 排除，退格撤销。F / Esc 返回。")
+            self.hint.setText("选择芯片，停在压线原帧按 1 保存；多人可点圈数车。3 排除，退格撤销。Esc 返回。")
             self.setFocus()
         else:
             self.hint.setText("已返回胶卷视图；单人直接按 1 保存，多人可点圈数车。3 排除，退格撤销。")

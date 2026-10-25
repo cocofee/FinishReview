@@ -123,7 +123,9 @@ def test_unclassified_chip_click_requests_playback_but_classified_picture_is_pre
 def test_f_enlarges_evidence_and_escape_restores_arrival_table(panel):
     changes = QSignalSpy(panel.big_view_changed)
     panel.table.setFocus()
-    QTest.keyClick(panel.table, Qt.Key_F)
+    QTest.keyClick(panel.table, Qt.Key_F)  # F no longer enlarges anything
+    assert not panel.big_view and not changes
+    panel.toggle_big_view()
     assert panel.big_view
     assert not panel.table.isHidden()
     assert not panel.quick_toolbar.isHidden()

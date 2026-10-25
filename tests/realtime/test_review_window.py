@@ -410,6 +410,9 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         qapp.processEvents()
         QTest.keyClick(view.viewport(), Qt.Key_F)
         qapp.processEvents()
+        assert not window.problem_panel.big_view  # F enlarges nothing in the workbench
+        window.problem_panel.toggle_big_view()
+        qapp.processEvents()
         assert window.problem_panel.big_view
         assert not window.preview_panel.isVisibleTo(window)
         QTest.keyClick(view.viewport(), Qt.Key_Escape)
@@ -1097,6 +1100,9 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         qapp.processEvents()
         QTest.keyClick(rail.canvas.viewport(), Qt.Key_F)
         qapp.processEvents()
+        assert not panel.big_view
+        panel.toggle_big_view()
+        qapp.processEvents()
         assert panel.big_view
         assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isHidden()
         assert not window.preview_panel.isVisibleTo(window)
@@ -1104,14 +1110,11 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         panel.toggle_big_view()
         qapp.processEvents()
 
-        # A top-bar button leaves the key unhandled too; the window takes it.
         window.recheck_button.setFocus()
         qapp.processEvents()
         QTest.keyClick(window.recheck_button, Qt.Key_F)
         qapp.processEvents()
-        assert panel.big_view
-        panel.toggle_big_view()
-        qapp.processEvents()
+        assert not panel.big_view
 
         # A field that takes typing keeps the letter: the bib is typed, not enlarged.
         panel.bib_input.setText("")

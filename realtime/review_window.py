@@ -2445,6 +2445,9 @@ class FinishReviewWindow(PassageReviewSurface):
         # otherwise swallow the press for its own judging window (operator: "F does
         # not work"), and the press has to land wherever the hands are.
         self.video_filmstrip.full_race.set_enlarge_key_enabled(not expanded)
+        # In the workbench the picture already fills the room; F enlarges nothing.
+        for pane in self.evidence_panes:
+            pane._maximize_shortcut.setEnabled(not expanded)
         self.setMinimumHeight(700 if expanded else 760)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
@@ -2719,22 +2722,10 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_problem_finish_lines()
 
     def keyPressEvent(self, event) -> None:
-        """F enlarges the picture from whatever corner of the workbench holds the keys.
-
-        The queue and the panes answer F themselves.  A button in the top bar or in
-        the time rail leaves it unhandled, and a press that disappears there reads to
-        the operator as "F does not work" - so the window picks it up.  A field that
-        takes typing keeps the letter, as it must.
-        """
+        """The judging keys work from whatever corner of the workbench holds the keys."""
 
         if (getattr(self, "_problem_workbench_active", False)
                 and self.problem_panel._queue_key(event)):
-            event.accept()
-            return
-        if (event.key() == Qt.Key_F
-                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
-                and getattr(self, "_problem_workbench_active", False)):
-            self.problem_panel.toggle_big_view()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -3193,7 +3184,11 @@ class FinishReviewWindow(PassageReviewSurface):
         workbench = getattr(self, "_problem_workbench_active", False)
         self.video_filmstrip.setVisible(bool(visible) or not workbench)
         self.crossing_cards.setVisible(workbench)
-
+        # Without the recording rail the bottom holds two buttons only: give the
+        # picture the height instead of leaving an empty band.
+        compact = workbench and not visible
+        self.preview_panel.setMinimumHeight(0 if compact else 190 if workbench else 420)
+        self.preview_panel.setMaximumHeight(self.crossing_cards.sizeHint().height() + 16 if compact else 16777215)
     def _refresh_crossing_cards(self):
         if not hasattr(self, "crossing_cards"):
             return
