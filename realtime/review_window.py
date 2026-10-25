@@ -2328,14 +2328,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_list_button.setObjectName("finishProblemListButton")
         self.problem_list_button.setFixedHeight(32)
         self.problem_list_button.setCheckable(True)
-        self.problem_list_button.setToolTip("只处理有问题的：自动通过、待处理和无法核实")
         self.problem_list_button.clicked.connect(self._open_problem_list)
+        # The workbench is the only view now: its table already lists every chip,
+        # with search, groups and delete; the old records page has no entry.
+        self.problem_list_button.hide()
         top_layout.addWidget(self.problem_list_button)
-        self.passages_button = QPushButton("通过记录", panel)
-        self.passages_button.setCheckable(True)
-        self.passages_button.setFixedHeight(32)
-        self.passages_button.clicked.connect(self._open_passages)
-        top_layout.addWidget(self.passages_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2346,7 +2343,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.problem_list_button.setStyleSheet(tool_button_style)
-        self.passages_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.setMinimumWidth(88)
@@ -2450,7 +2446,6 @@ class FinishReviewWindow(PassageReviewSurface):
         # not work"), and the press has to land wherever the hands are.
         self.video_filmstrip.full_race.set_enlarge_key_enabled(not expanded)
         self.setMinimumHeight(700 if expanded else 760)
-        self.passages_button.setChecked(not expanded)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
         self.filter_bar.setVisible(not expanded)
@@ -2544,7 +2539,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
-        self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
+        self.problem_panel.delete_requested.connect(self._delete_problem_record)
         self.problem_panel.summary_changed.connect(lambda _text: self._refresh_crossing_cards())
         self._normal_crossing_cards = {}
         self._opened_normal_crossing = ""
@@ -3243,6 +3238,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_problem_list()
         if expanded:
             self._return_to_problem()
+
+    def _delete_problem_record(self, event_id: str) -> None:
+        event = self.passage_store.get(event_id)
+        if event is not None:
+            self._delete_record(event)
+            self.problem_panel.refresh()
 
     def _open_passages(self):
         self.problem_list_button.setChecked(False)

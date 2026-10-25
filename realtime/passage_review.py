@@ -6282,7 +6282,9 @@ class PassageReviewSurface(QDialog):
         row = self.table.currentRow()
         if not 0 <= row < len(self._visible_events):
             return
-        event = self._visible_events[row]
+        self._delete_record(self._visible_events[row])
+
+    def _delete_record(self, event: PassageEvent) -> None:
         store = self.passage_store
         identity = " ".join(value for value in (event.bib, event.athlete_name) if value)
         reason, accepted = QInputDialog.getText(

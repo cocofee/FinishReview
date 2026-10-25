@@ -392,7 +392,7 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
-        assert window.problem_panel.table.columnCount() == 4
+        assert window.problem_panel.table.columnCount() == 5  # the group column hides with one group
         assert window.problem_panel._browsing
         window._return_to_problem()
         assert not window.problem_panel._browsing
@@ -2473,6 +2473,34 @@ def test_deleting_passage_immediately_updates_review_export(qapp, tmp_path, monk
     monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("备用芯片", True))
     window.delete_record_button.click()
     assert window.table.rowCount() == 0
+    with summary.open(encoding="utf-8-sig", newline="") as handle:
+        assert len(list(csv.reader(handle))) == 1
+    window.close()
+
+
+def test_arrival_table_deletes_a_chip_and_the_old_records_page_has_no_entry(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path / "events")
+    assert window.problem_list_button.isHidden() and not hasattr(window, "passages_button")
+    metadata = RaceMetadata(
+        race_id="race-delete", stage_id="stage-1", revision=1,
+        emitted_at_ms=1, race_name="删除测试", stage_name="终点",
+    )
+    assert window._activate_cyclerace_workspace(metadata)
+    window.passage_store.append(_event(race_id="race-delete", event_id="spare"))
+    window.refresh()
+    window._export_review_summary()
+    panel = window.problem_panel
+    panel.refresh()
+    assert [entry.event.event_id for entry in panel._arrival_rows if entry.event] == ["spare"]
+    from PyQt5.QtWidgets import QInputDialog
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("", False))
+    panel._arrival_clicked(0)
+    panel._request_delete()  # cancelled: nothing happens
+    assert window.passage_store.get("spare") in window.passage_store.events()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("备用芯片", True))
+    panel._request_delete()
+    assert not [entry for entry in panel._arrival_rows if entry.event]
+    summary = window.output_dir / REVIEW_SUMMARY_FILENAME
     with summary.open(encoding="utf-8-sig", newline="") as handle:
         assert len(list(csv.reader(handle))) == 1
     window.close()

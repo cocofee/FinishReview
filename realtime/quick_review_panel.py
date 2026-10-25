@@ -12,7 +12,7 @@ import uuid
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QApplication, QAbstractSpinBox, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QAbstractSpinBox, QComboBox, QHBoxLayout, QLabel, QLineEdit,
     QMenu, QPlainTextEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -83,6 +83,8 @@ class QuickReviewPanel(ProblemListPanel):
     candidate_preparing = pyqtSignal()
     sampling_configured = pyqtSignal()
     sampling_preparing = pyqtSignal()
+    # A chip record the operator wants gone (spare chip, misread); the window asks why.
+    delete_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         self._quick_ready = False
@@ -113,16 +115,30 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
         self.table.cellDoubleClicked.connect(lambda index, _column: self._open_row(index))
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "组别"])
         self.table.horizontalHeaderItem(2).setToolTip(
             "校时后的芯片域时间；悬浮单元格可看录像原时刻"
         )
-        for column, width in enumerate((42, 66, 137)):
+        for column, width in enumerate((42, 66, 137, 72)):
             self.table.setColumnWidth(column, width)
+        # The group column only appears when the race has more than one group.
+        self.table.setColumnHidden(4, True)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
         self.table.setToolTip("点击选择芯片记录，双击回看；单人直接按 1 保存，多人可点圈数车")
+        # Search sits on top of the table: a bib or a name, Enter jumps to the row.
+        column = self.table_column = QWidget(self.splitter)
+        column_layout = QVBoxLayout(column)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(3)
+        self.search = QLineEdit(column)
+        self.search.setPlaceholderText("搜号码 / 姓名，回车跳到")
+        self.search.setClearButtonEnabled(True)
+        self.search.returnPressed.connect(self._find)
+        column_layout.addWidget(self.search)
+        self.splitter.insertWidget(0, column)
+        column_layout.addWidget(self.table)
         self.quick_toolbar = QWidget(self)
         bar = QHBoxLayout(self.quick_toolbar)
         bar.setContentsMargins(2, 3, 2, 3)
@@ -159,6 +175,7 @@ class QuickReviewPanel(ProblemListPanel):
         menu = QMenu(more)
         menu.addAction("分析录像", self._toggle_analysis)
         menu.addAction("导出过线记录", self.export_arrivals)
+        menu.addAction("删除选中的芯片记录…", self._request_delete)
         menu.addSeparator()
         menu.addAction("清空试验数据", self.clear_data_requested.emit)
         more.setMenu(menu)
@@ -439,6 +456,39 @@ class QuickReviewPanel(ProblemListPanel):
             return "疑似漏读"
         return "已排除" if category and category["action"] == "not_rider" else "待定"
 
+    @staticmethod
+    def _row_group(row):
+        event = row.event
+        if event is None:
+            return ""
+        return (getattr(event, "group_name", "") or "").strip() or str(getattr(event, "group_id", "") or "")
+
+    def _find(self):
+        """Jump to the next row whose bib is the text, or whose bib or name holds it."""
+        text = self.search.text().strip()
+        if not text:
+            return
+        rows = self._arrival_rows
+        exact = [i for i, row in enumerate(rows) if row.bib == text]
+        found = exact or [i for i, row in enumerate(rows)
+                          if text in row.bib or text in (getattr(row.event, "athlete_name", "") or "")]
+        if not found:
+            self.hint.setText(f"没有找到 {text}")
+            return
+        current = self.table.currentRow()
+        index = next((i for i in found if i > current), found[0])
+        self._arrival_clicked(index)
+        self.table.scrollToItem(self.table.item(index, 0))
+        # Back on the table, so 1 / 3 / Backspace work at once.
+        self.table.setFocus()
+
+    def _request_delete(self):
+        row = next((row for row in self._arrival_rows if row.key == self._selected_key), None)
+        if row is None or row.event is None:
+            self.hint.setText("先在左表选中要删除的芯片记录")
+            return
+        self.delete_requested.emit(row.event.event_id)
+
     def _row_category(self, row):
         if row.decision:
             return "运动员"
@@ -461,13 +511,21 @@ class QuickReviewPanel(ProblemListPanel):
         self._index_waves()
         self._simultaneous = Counter(row.time_ms for row in rows if row.decision)
         self.rows = [row.item for row in rows]
+        groups = [self._row_group(row) for row in rows]
         signature = (self._arrival_scope, self._selected_key,
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
-                            candidate_binding(row.item), self._wave_of.get(row.key)) for row in rows))
+                            candidate_binding(row.item), self._wave_of.get(row.key), group)
+                           for row, group in zip(rows, groups)))
         if signature == self._quick_render_signature:
             self._sync_arrival_confirmation()
             return
         self._quick_render_signature = signature
+        several_groups = len({group for group in groups if group}) > 1
+        self.table.setColumnHidden(4, not several_groups)
+        # Room for a name like 男子山地精英组 beside the state.
+        self.table.setMinimumWidth(450 if several_groups else 340)
+        for widget in (self.table, self.table_column):
+            widget.setMaximumWidth(540 if several_groups else 440)
         self.table.blockSignals(True)
         scroll = self.table.verticalScrollBar().value()
         self.table.setRowCount(len(rows))
@@ -482,7 +540,7 @@ class QuickReviewPanel(ProblemListPanel):
                 chip_number += 1
                 if category != "非运动员":
                     number = str(chip_number)
-            for column, text in enumerate((number, row.bib or "—", time, state)):
+            for column, text in enumerate((number, row.bib or "—", time, state, groups[index])):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
@@ -1331,9 +1389,7 @@ class QuickReviewPanel(ProblemListPanel):
             step = 5 if event.modifiers() & Qt.ShiftModifier else 1
             self.frame_step_requested.emit(-step if event.key() == Qt.Key_Left else step)
             return True
-        # 3 excludes, as the operator reaches for it; 2 keeps working for anyone
-        # used to the older layout.  4 marks a counted person 无芯片.  Undo is
-        # only Backspace / Ctrl+Z.
+        # 3 excludes; 4 marks a counted person 无芯片.  Undo is only Backspace / Ctrl+Z.
         actions = {Qt.Key_1: self._confirm_bicycle, Qt.Key_3: self._exclude,
                    Qt.Key_4: self._mark_no_chip, Qt.Key_Backspace: self._undo_arrival,
                    Qt.Key_Return: self._confirm_selected_arrival, Qt.Key_Enter: self._confirm_selected_arrival,
@@ -1378,20 +1434,3 @@ class QuickReviewPanel(ProblemListPanel):
                                  row.decision["calibration_version"]])
         self.hint.setText(f"已导出：{path}")
         return path
-
-    def _open_legacy(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("复杂异常处理")
-        dialog.resize(1100, 750)
-        layout = QVBoxLayout(dialog)
-        panel = ProblemListPanel(dialog)
-        panel.set_events_provider(self._events_provider)
-        panel.set_workspace(self.workspace_dir)
-        panel.set_scope(*self._scope)
-        panel.jump_requested.connect(self.jump_requested.emit)
-        layout.addWidget(panel)
-        dialog.exec_()
-        panel.stop_analysis()
-        panel.stop_chip_checks()
-        panel.save_drafts()
-        self.refresh()

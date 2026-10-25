@@ -42,8 +42,9 @@ def row(panel, bib):
 
 
 def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
-    assert panel.table.columnCount() == 4
+    assert panel.table.columnCount() == 5
     assert [panel.table.horizontalHeaderItem(i).text() for i in range(4)] == ["顺序", "号码", "时间", "状态"]
+    assert panel.table.isColumnHidden(4)  # one group: no group column
     assert all("参考" not in panel.table.item(row_index, 2).text() for row_index in range(panel.table.rowCount()))
     for index, entry in enumerate(panel._arrival_rows):
         assert panel.table.item(index, 1).text() == entry.bib
@@ -68,6 +69,42 @@ def test_finish_line_has_one_visible_entry(panel):
         for action in button.menu().actions()
     ]
     assert "终点线 / 模型" not in menu_texts
+
+
+def test_search_jumps_to_the_bib_and_leaves_the_judging_keys_on_the_table(panel, qapp):
+    panel.show()
+    qapp.processEvents()
+    panel._arrival_clicked(row(panel, "321"))
+    panel.search.setFocus()
+    QTest.keyClicks(panel.search, "258")
+    assert not panel._arrival_store.active(SCOPE)  # typed digits are not judging keys
+    QTest.keyClick(panel.search, Qt.Key_Return)
+    assert panel._selected_key == panel._arrival_rows[row(panel, "258")].key
+    assert QApplication.focusWidget() is panel.table
+    panel.search.setText("999")
+    panel._find()
+    assert "没有找到 999" in panel.hint.text()
+    assert panel._selected_key == panel._arrival_rows[row(panel, "258")].key
+
+
+def test_group_column_appears_only_when_the_race_has_several_groups(panel):
+    assert panel.table.isColumnHidden(4)
+    panel.events = [replace(panel.events[0], group_name="男子精英"),
+                    replace(panel.events[1], group_id="h", group_name="女子组")]
+    panel.refresh()
+    assert not panel.table.isColumnHidden(4)
+    assert panel.table.item(row(panel, "258"), 4).text() == "女子组"
+    assert panel.table.minimumWidth() >= 450
+
+
+def test_delete_asks_the_window_for_the_selected_chip_only(panel):
+    deletes = QSignalSpy(panel.delete_requested)
+    panel._selected_key = None
+    panel._request_delete()
+    assert not deletes and "先在左表选中" in panel.hint.text()
+    panel._arrival_clicked(row(panel, "258"))
+    panel._request_delete()
+    assert [entry[0] for entry in deletes] == ["two"]
 
 
 def test_unclassified_chip_click_requests_playback_but_classified_picture_is_preserved(panel):
