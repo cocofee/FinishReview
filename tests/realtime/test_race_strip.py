@@ -1,11 +1,12 @@
 from dataclasses import replace
 
+import numpy as np
 import pytest
 from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
-from realtime.race_strip import RaceStripPanel, RaceStripView, StripPiece
+from realtime.race_strip import RaceStripPanel, RaceStripView, StripPiece, first_crossing
 from tests.realtime.test_quick_review_panel import panel, qapp
 
 
@@ -152,3 +153,28 @@ def test_frequent_workbench_refresh_does_not_restart_the_strip_scan(qapp, tmp_pa
     for _ in range(10):
         strip.load(tmp_path, background=False)
     assert len(reads) == 1 and strip._token == token
+
+
+class _Strips:
+    """A cache holding made-up strips: still road, then riders."""
+
+    def __init__(self, times, image):
+        self.strip = times, image
+
+    def get(self, _piece):
+        return self.strip
+
+
+def test_first_crossing_is_where_the_wheel_meets_the_line_not_the_chip_time(tmp_path):
+    times = T + np.arange(0, 6000, 40, dtype=np.float64)
+    rng = np.random.default_rng(1)
+    image = (100 + rng.integers(-2, 3, (100, times.size, 3))).astype(np.uint8)
+    touch = int(np.searchsorted(times, T + 3480))
+    image[:8, touch] = 125                       # the front wheel, barely on the line
+    image[:40, touch + 1:touch + 4] = 30         # the rider
+    image[50:90, touch + 6:touch + 9] = 30       # the next rider, close behind
+    strips = _Strips(times, image)
+    chip = T + 3700                              # read 220 ms late
+    assert first_crossing([piece(tmp_path)], strips, chip) == times[touch]
+    still = _Strips(times, np.full((100, times.size, 3), 100, np.uint8))
+    assert first_crossing([piece(tmp_path)], still, chip) is None

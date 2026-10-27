@@ -271,6 +271,14 @@ def _safe_event_folder_name(value: str, fallback: str) -> str:
 
 def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
     root = Path(root).expanduser().resolve()
+    try:
+        own = RaceMetadataStore(root / "cyclerace_race_metadata.json").current()
+    except (OSError, RuntimeError, ValueError):
+        own = None
+    if own is not None and own.race_id == metadata.race_id:
+        # An older layout keeps the race in the root itself: its recordings are
+        # there, so coming back to it must not open an empty folder beside them.
+        return root
     folder_name = _safe_event_folder_name(metadata.race_name, metadata.race_id)
     race_suffix = _safe_event_folder_name(metadata.race_id, "race")
     candidates = [root / folder_name, root / f"{folder_name}_{race_suffix}"]
@@ -2597,9 +2605,15 @@ class FinishReviewWindow(PassageReviewSurface):
         self._opened_normal_crossing = ""
         if hasattr(self, "group_start_button"):
             group = item is not None and item.kind in ("bunch_check", "obstruction")
-            self.group_start_button.setVisible(group)
+            selected = getattr(self.problem_panel, "_selected_arrival", lambda: None)()
+            wave = getattr(self.problem_panel, "_row_wave", lambda _row: None)(selected)
+            self.group_start_button.setVisible(group or len(wave or ()) > 1)
         if getattr(self, "_problem_workbench_active", False):
-            if not getattr(self, "_creating_manual_crossing", False):
+            if getattr(self.problem_panel, "holds_picture", False):
+                # The panel places (or keeps) the picture for this row itself.
+                self._opened_normal_crossing = ""
+                self.video_filmstrip.full_race.follow_button.setChecked(False)
+            elif not getattr(self, "_creating_manual_crossing", False):
                 self._return_to_problem()
             self._refresh_crossing_cards()
             self._problem_count_mode_changed(True)
@@ -3105,6 +3119,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._problem_count_mode_changed(True)
 
     def _open_group_start(self):
+        if getattr(self.problem_panel, "open_wave_start", lambda: False)():
+            return
         context = self.problem_panel._inline_context()
         if context is None:
             return

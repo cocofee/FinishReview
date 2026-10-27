@@ -27,13 +27,14 @@ from .problem_items import (
     STATUS_WAITING, ProblemItem, stable_item_id,
 )
 from .problem_panel import ProblemListPanel
-from .race_strip import RaceStripPanel
+from .race_strip import RaceStripPanel, first_crossing, frame_at
 
 
 # Chips closer together than this are one wave, and the operator counts the
 # people of a wave against its chips.  On real races (古浪, 定边, 可克达拉)
 # the gaps cluster below 2 s and above 3 s, so the cut falls in the quiet.
 WAVE_GAP_MS = 2000
+KEEP = "keep"  # landing: the picture already shows this row's wave; leave it
 # A wave is looked at from a little before its first chip to a little after its
 # last: a rider without a chip may lead it or close it.
 WAVE_VIEW_MARGIN_MS = 500
@@ -106,6 +107,11 @@ class QuickReviewPanel(ProblemListPanel):
         self._quick_render_signature = None
         self._simultaneous = Counter()
         self._frame_provider = lambda: None
+        self._shown_ms = None
+        self._landing_pending = None
+        # True while a row is opened whose picture the panel itself places (or
+        # keeps): the window must not reopen the item's stored frame over it.
+        self.holds_picture = False
         super().__init__(parent)
         self.header.hide()
         self.detail_scroll.hide()
@@ -114,7 +120,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.currentCellChanged.disconnect()
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
-        self.table.cellDoubleClicked.connect(lambda index, _column: self._open_row(index))
+        self.table.cellDoubleClicked.connect(self._arrival_clicked)
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "组别"])
         self.table.horizontalHeaderItem(2).setToolTip(
@@ -196,6 +202,7 @@ class QuickReviewPanel(ProblemListPanel):
         bar.setStretchFactor(self.quick_title, 0)
         self.race_strip = RaceStripPanel(self)
         self.race_strip.seek_requested.connect(self._seek_race_strip)
+        self.race_strip.ready.connect(self._strip_ready)
         self.layout().insertWidget(1, self.race_strip)
         self._quick_ready = True
         QApplication.instance().installEventFilter(self)
@@ -599,7 +606,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.bicycle_button.setEnabled(self.current_item() is not None)
         self._sync_arrival_confirmation()
 
-    def _open_row(self, index):
+    def _open_row(self, index, keep=True):
         if not 0 <= index < len(self._arrival_rows):
             return
         row = self._arrival_rows[index]
@@ -608,9 +615,63 @@ class QuickReviewPanel(ProblemListPanel):
         self._shown_id = row.item.item_id
         self.table.setCurrentCell(index, 0)
         self._sync_timeline()
-        self.current_changed.emit(row.item)
+        self._present(row.item, self._landing(row, keep))
         self._sync_arrival_confirmation()
         self.marks_changed.emit(tuple(self.current_marks()))
+
+    def _landing(self, row, keep=True):
+        """Where the picture goes when this row is opened; the one rule for every way in.
+
+        A decided row: the frame it was decided on.  A chip row: its wave's first
+        rider meeting the line as the strip sees it (the chip time alone lands on
+        the wrong rider of a bunch), unless the picture already shows this wave:
+        switching riders inside a wave never moves it.  KEEP means stay; None
+        means the row's own stored frame or chip reference.
+        """
+        self._landing_pending = None
+        if row.decision and row.decision.get("frame"):
+            return dict(row.decision["frame"])
+        stamps = [int(chip.event.timeline_timestamp_ms) for chip in self._row_wave(row) or ()
+                  if chip.event is not None and chip.event.is_active]
+        if not stamps or not self._quick_ready:
+            return None
+        if not self.race_strip.view.pieces:
+            self._landing_pending = row.key  # the strip is still loading: land when it is read
+            return None
+        first, last = min(stamps), max(stamps)
+        if keep and self._shown_ms is not None and first - WAVE_GAP_MS / 2 <= self._shown_ms <= last + WAVE_GAP_MS / 2:
+            return KEEP
+        pieces, cache = self.race_strip.view.pieces, self.race_strip.view.cache
+        moment = first_crossing(pieces, cache, first)
+        frame = frame_at(pieces, first if moment is None else moment)
+        return dict(frame, reference_only=True) if frame is not None else None
+
+    def _strip_ready(self):
+        """The strip was still being read when the row was opened (at start): land it now."""
+        key, self._landing_pending = self._landing_pending, None
+        row = self._selected_arrival()
+        if key is not None and row is not None and row.key == key:
+            landing = self._landing(row, keep=False)
+            if isinstance(landing, dict):
+                self.jump_requested.emit(landing)
+
+    def _present(self, item, landing):
+        self.holds_picture = landing is not None
+        try:
+            self.current_changed.emit(item)
+        finally:
+            self.holds_picture = False
+        if isinstance(landing, dict):
+            self.jump_requested.emit(landing)
+
+    def open_wave_start(self):
+        """回到团首: the selected row's wave, from its first rider at the line."""
+        row = self._selected_arrival()
+        landing = self._landing(row, keep=False) if row is not None and not row.decision else None
+        if isinstance(landing, dict):
+            self.jump_requested.emit(landing)
+            return True
+        return False
 
     def _sync_timeline(self):
         if not self._quick_ready:
@@ -631,10 +692,9 @@ class QuickReviewPanel(ProblemListPanel):
         self.hint.setText("已跳到这一刻（只看，不确认）")
 
     def select_item(self, item_id):
-        self._last_saved_key = None
         index = next((i for i, row in enumerate(self._arrival_rows) if row.item.item_id == item_id), None)
         if index is not None:
-            self._open_row(index)
+            self._arrival_clicked(index)
 
     def _arrival_clicked(self, index, _column=0):
         if not 0 <= index < len(self._arrival_rows):
@@ -643,41 +703,40 @@ class QuickReviewPanel(ProblemListPanel):
         row = self._arrival_rows[index]
         if row.decision:
             self._open_row(index)
-            self.jump_requested.emit(dict(row.decision["frame"]))
             return
         candidate = self._wave_candidate(self._row_wave(row))
         if candidate is not None:
-            # A wave is judged as a whole: picking another of its riders keeps
-            # the picture where it is; coming from elsewhere opens the wave's own.
+            # A wave is judged as a whole on its one picture.
             self._selected_key = row.key
             self.table.setCurrentCell(index, 0)
+            landing = self._landing(row)
             if self._active_item is None or self._active_item.item_id != candidate.item_id:
                 self._active_item = candidate
                 self._shown_id = candidate.item_id
-                self.current_changed.emit(candidate)
+                self._present(candidate, landing)
+            elif isinstance(landing, dict):
+                self.jump_requested.emit(landing)
             self._sync_arrival_confirmation()
             self.marks_changed.emit(tuple(self.current_marks()))
             return
-        current = self.current_item()
-        if current is not None and current.item_id in self._candidate_wave:
-            # Leaving a wave that is being counted for a row outside it.
-            self._open_row(index)
-            return
         # Preserve a deliberately classified picture while assigning identities,
-        # but do not strand a newly received chip on an unrelated/empty picture.
-        category = self._category()
-        frame = self._frame_provider()
+        # but not once everyone on it has a row: the next chip is someone else.
         item = self.current_item()
-        circle = bool(item and item.evidence.get("frame", {}).get("marker_x_normalized") is not None)
-        if not ((circle or category and category.get("action") == "bicycle") and frame
-                and frame.get("frame_index", -1) >= 0):
-            self._open_row(index)
-            return
-        self._selected_key = row.key
-        self.table.setCurrentCell(index, 0)
-        self._sync_arrival_confirmation()
-        self.marks_changed.emit(tuple(self.current_marks()))
-        self.hint.setText("已选中运动员；停在压线原帧按 1 保存，多人可点圈数车。")
+        people = max(1, sum(not is_excluded(mark) for mark in self.current_marks()))
+        if (item is not None and item.item_id not in self._candidate_wave
+                and len(self._decided.get(item.item_id, ())) < people):
+            category = self._category()
+            frame = self._frame_provider()
+            circle = item.evidence.get("frame", {}).get("marker_x_normalized") is not None
+            if ((circle or category and category.get("action") == "bicycle") and frame
+                    and frame.get("frame_index", -1) >= 0):
+                self._selected_key = row.key
+                self.table.setCurrentCell(index, 0)
+                self._sync_arrival_confirmation()
+                self.marks_changed.emit(tuple(self.current_marks()))
+                self.hint.setText("已选中运动员；停在压线原帧按 1 保存，多人可点圈数车。")
+                return
+        self._open_row(index)
 
     def _selected_arrival(self):
         index = self.table.currentRow()
@@ -856,6 +915,7 @@ class QuickReviewPanel(ProblemListPanel):
         if crossing is None or self.workspace_dir is None:
             return
         stamp = crossing.value_ms
+        self._shown_ms = stamp
         self.race_strip.set_cursor(stamp, frame.get("camera_index") or 1)
         camera = str(int(frame.get("camera_index") or 1))
         seen = self._arrival_drafts.setdefault("seen", {})
@@ -1132,7 +1192,9 @@ class QuickReviewPanel(ProblemListPanel):
                           if self._arrival_rows[i].item.evidence.get("wave_parent") != item.item_id),
                          None) if positions else None
         if following is not None:
-            self._open_row(following)
+            # On to the next wave from its start, even if the end of this one
+            # was looked at so far that it is nearly there.
+            self._open_row(following, keep=False)
         self._last_saved_key = f"wave:{wave}:{item.item_id}"
         parts = [f"本波 {len(plan.chips)} 个芯片、{plan.people} 人：已确认 {confirmed} 人"]
         if split:
@@ -1364,9 +1426,11 @@ class QuickReviewPanel(ProblemListPanel):
                           else "这一行没有可撤销的判定。")
 
     def _step(self, delta):
+        # One step per picture, from the selected row (not the open picture,
+        # which may be a wave's counting picture without a row of its own).
         items = list(dict.fromkeys(row.item.item_id for row in self._arrival_rows))
-        current = self.current_item()
-        index = items.index(current.item_id) if current is not None and current.item_id in items else -1
+        selected = self._selected_arrival()
+        index = items.index(selected.item.item_id) if selected is not None else -1
         if 0 <= index + delta < len(items):
             self.select_item(items[index + delta])
 

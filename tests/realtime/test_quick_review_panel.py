@@ -387,10 +387,13 @@ def test_circle_uses_selected_bib_then_keeps_saved_bib_when_selection_changes(pa
     assert panel.picture_mark_label(mark) == "258"
     panel._confirm_bicycle()
     assert panel._selected_arrival().decision
-    panel._arrival_clicked(row(panel, "321"))
-    assert panel.picture_mark_label(mark) == "258"
     panel.refresh()
     assert panel.picture_mark_label(mark) == "258"
+    # Everyone on the picture has a row now: the next chip opens its own.
+    panel._arrival_clicked(row(panel, "321"))
+    assert panel.current_item().item_id != manual.item_id
+    panel._arrival_clicked(row(panel, "258"))
+    assert panel.current_item().item_id == manual.item_id and panel.picture_mark_label(mark) == "258"
 
 
 def test_undo_on_another_picture_takes_back_only_that_picture(panel):
@@ -662,6 +665,105 @@ def test_switching_riders_inside_a_wave_keeps_the_picture_and_leaving_it_opens_t
     wave_panel._arrival_clicked(row(wave_panel, "20"))  # coming back opens the wave's own picture
     assert wave_panel.current_item().item_id == picture
     assert labels(wave_panel) == ["61"]
+
+
+def strip_piece(tmp_path):
+    from realtime.race_strip import StripPiece
+    video = tmp_path / "camera_01_archive_0000.avi"
+    video.touch()
+    return StripPiece(tmp_path / "strip.npz", 1, "archive", video, T0 - 60_000, T0 + 60_000, True, 0)
+
+
+@pytest.fixture
+def strip_landing(wave_panel, monkeypatch, tmp_path):
+    """The strip sees each wave's first rider 107 ms before its first chip; jumps are shown at once."""
+
+    from realtime import quick_review_panel as module
+    wave_panel.race_strip.view.set_pieces([strip_piece(tmp_path)])
+    asked = []
+    monkeypatch.setattr(module, "first_crossing", lambda pieces, cache, chip_ms: asked.append(chip_ms) or chip_ms - 107)
+    monkeypatch.setattr(module, "frame_at", lambda pieces, chip_ms: {"camera_index": 1, "position_ms": chip_ms})
+    jumps = []
+
+    def show(frame):
+        jumps.append(frame)
+        moment = frame.get("recorder_ms", frame["position_ms"])
+        wave_panel.record_viewed_frame(dict(FRAME, recorder_ms=moment), moment)
+
+    wave_panel.jump_requested.connect(show)
+    return asked, jumps
+
+
+def test_every_way_into_a_row_lands_on_its_wave_s_first_rider_not_the_chip_time(wave_panel, strip_landing):
+    """古浪 267、7、167、76：芯片时间换算落在别人身上；过线图上第一处变化才是这一波第一个人。"""
+
+    asked, jumps = strip_landing
+    first, lone = T0, T0 + 10_000
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
+    assert jumps[-1] == {"camera_index": 1, "position_ms": lone - 107, "reference_only": True}
+    wave_panel._arrival_clicked(row(wave_panel, "76"))  # any rider of the wave: it starts at its first
+    assert asked[-1] == first and jumps[-1]["position_ms"] == first - 107
+    for enter in (lambda index: wave_panel.table.cellDoubleClicked.emit(index, 0),
+                  lambda index: wave_panel.select_item(wave_panel._arrival_rows[index].item.item_id)):
+        wave_panel._arrival_clicked(row(wave_panel, "5"))
+        enter(row(wave_panel, "20"))
+        assert jumps[-1]["position_ms"] == first - 107
+    wave_panel._arrival_clicked(row(wave_panel, "76"))
+    QTest.keyClick(wave_panel.table, Qt.Key_Down)
+    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == lone - 107
+    QTest.keyClick(wave_panel.table, Qt.Key_Up)
+    assert wave_panel._selected_arrival().bib == "76" and jumps[-1]["position_ms"] == first - 107
+
+
+def test_inside_the_shown_wave_the_picture_stays_and_the_window_does_not_reopen_it(wave_panel, strip_landing):
+    _asked, jumps = strip_landing
+    held = []
+    wave_panel.current_changed.connect(lambda _item: held.append(wave_panel.holds_picture))
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    assert held == [True]  # the panel placed the picture; the window must not reopen the item
+    look_through(wave_panel, 300, 700)
+    count = len(jumps)
+    wave_panel._arrival_clicked(row(wave_panel, "76"))
+    wave_panel._arrival_clicked(row(wave_panel, "20"))
+    assert len(jumps) == count and all(held)
+    count_on_picture(wave_panel, .2, 100)
+    wave_panel._arrival_clicked(row(wave_panel, "76"))  # on the wave's own picture too
+    assert len(jumps) == count
+    assert wave_panel.open_wave_start()  # 回到团首: the first rider, from anywhere in the wave
+    assert jumps[-1]["position_ms"] == T0 - 107
+
+
+def test_after_a_wave_and_a_decided_row_the_next_click_still_lands(wave_panel, strip_landing, monkeypatch):
+    from realtime import quick_review_panel as module
+    _asked, jumps = strip_landing
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    for x, offset in ((.2, 100), (.4, 500), (.6, 1000)):
+        count_on_picture(wave_panel, x, offset)
+    look_through(wave_panel, -600, 1500)
+    QTest.keyClick(wave_panel, Qt.Key_Return)
+    # Confirming goes on to the next wave at its first rider.
+    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == T0 + 10_000 - 107
+    wave_panel._arrival_clicked(row(wave_panel, "20"))  # a decided row: the frame it was decided on
+    assert jumps[-1]["recorder_ms"] == T0 + 500 and not jumps[-1].get("reference_only")
+    monkeypatch.setattr(module, "first_crossing", lambda pieces, cache, chip_ms: None)
+    wave_panel._arrival_clicked(row(wave_panel, "5"))  # the strip cannot tell: the chip time
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 10_000, "reference_only": True}
+
+
+def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monkeypatch, tmp_path):
+    """启动时过线图还在后台读：先按芯片时间打开，读完再落到这一波第一个人。"""
+
+    from realtime import quick_review_panel as module
+    monkeypatch.setattr(module, "first_crossing", lambda pieces, cache, chip_ms: chip_ms - 43)
+    monkeypatch.setattr(module, "frame_at", lambda pieces, chip_ms: {"camera_index": 1, "position_ms": chip_ms})
+    jumps = QSignalSpy(wave_panel.jump_requested)
+    wave_panel._arrival_clicked(row(wave_panel, "76"))
+    assert not jumps  # nothing to land on yet: the window opens the chip time meanwhile
+    strip = wave_panel.race_strip
+    strip._apply((strip._token, ([strip_piece(tmp_path)], {})))
+    assert [jump[0]["position_ms"] for jump in jumps] == [T0 - 43]
+    strip._apply((strip._token, ([strip_piece(tmp_path)], {})))  # a later rescan does not move it again
+    assert len(jumps) == 1
 
 
 def test_three_on_a_wave_picture_excludes_the_person_not_the_picture(wave_panel):

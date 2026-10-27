@@ -1988,6 +1988,17 @@ def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
     assert event_dir == (root / "城市赛_race-new").resolve()
 
 
+def test_a_race_kept_in_the_root_itself_is_its_own_workspace(qapp, tmp_path):
+    """古浪测试副本：CycleRace 切到别的赛事再切回来，录像仍在根目录，不另建空文件夹。"""
+    root = tmp_path / "gulang"
+    metadata = RaceMetadata(race_id="race-gulang", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                            race_name="古浪站", stage_name="终点")
+    RaceMetadataStore(root / "cyclerace_race_metadata.json").store(metadata)
+    assert review_window_module._event_workspace_dir(root, metadata) == root.resolve()
+    other = replace(metadata, race_id="race-other", race_name="特奥")
+    assert review_window_module._event_workspace_dir(root, other) == (root / "特奥").resolve()
+
+
 def test_switching_cyclerace_event_exports_previous_review_summary(qapp, tmp_path):
     root = tmp_path / "events"
     window = _window(root)

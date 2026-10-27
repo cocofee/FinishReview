@@ -33,6 +33,7 @@ CACHE_BYTES = 96 * 1024 * 1024
 CLICK_SLOP_PX = 4                   # a press that moves further drags the picture instead
 EXTENT_MARGIN_MS = 30_000
 RESCAN_MS = 10_000
+FIGURE_LEVEL = 15                   # colour change on the line that is someone there, not light or noise
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,68 @@ def frame_at(pieces, chip_ms):
                     "position_ms": max(0, min(piece.end_ms - piece.start_ms - 1,
                                               piece.recorder_of(chip_ms) - piece.start_ms)),
                     "frame_index": None}
+    return None
+
+
+def first_crossing(pieces, cache, chip_ms):
+    """Where on the chip clock the first rider of a wave really meets the line.
+
+    A chip is read up to a few hundred milliseconds off its rider's crossing,
+    more than the gap between riders in a bunch.  A wave is preceded by at
+    least two quiet seconds, so its first rider is the first figure to arrive
+    on the line.  A rider crosses it square on: many places along it change
+    within a frame or two.  Someone walking along the line, a drifting shadow or
+    staff shifting their feet change a place or two at a time, or stay there;
+    the crowd at the end of the line never settles.  None of those is a rider.
+    The front wheel is thin, so one frame back is taken when the places the
+    rider fills were already stirring.  None when the strip cannot tell.
+    """
+
+    low, high = chip_ms - 3000, chip_ms + 2500
+    for archive in (True, False):
+        parts = sorted((piece for piece in pieces if piece.aligned and piece.archive == archive
+                        and piece.chip_end > low and piece.chip_start < high), key=lambda piece: piece.chip_start)
+        try:
+            loaded = [cache.get(piece) for piece in parts]
+        except (OSError, ValueError, KeyError, BadZipFile, EOFError):
+            continue
+        if not loaded:
+            continue
+        times = np.concatenate([part[0] for part in loaded])
+        image = np.concatenate([part[1] for part in loaded], axis=1)
+        order = np.argsort(times, kind="stable")
+        times, image = times[order], image[:, order]
+        inside = (times >= low) & (times <= high)
+        times, image = times[inside], image[:, inside]
+        quiet = times < chip_ms - 1100
+        if quiet.sum() < 10:
+            continue
+        background = np.median(image[:, quiet].astype(np.int16), axis=1)
+        change = np.abs(image.astype(np.int16) - background[:, None, :]).max(axis=2)
+        calm = (change[:, quiet] > FIGURE_LEVEL).mean(axis=1) <= 0.25
+        if calm.sum() < 20:
+            continue
+        changed = (change > FIGURE_LEVEL) & calm[:, None]
+        stirred = np.zeros_like(changed)
+        for back in range(1, 5):
+            stirred[:, back:] |= changed[:, :-back]
+        fresh = changed & ~stirred
+        count = fresh.sum(axis=0)
+        arriving = count + np.append(count[1:], 0) + np.append(count[2:], [0, 0])
+        for index in np.flatnonzero((times >= chip_ms - 1000) & (times <= chip_ms + 800)):
+            if count[index] < 2 or arriving[index] < 6:
+                continue
+            rows = fresh[:, index:index + 3].any(axis=1)
+            rows = (np.convolve(rows, np.ones(7), "same") > 0) & calm
+            if times[index] < chip_ms - 250:
+                # Well before the chip and staying on: not someone riding over the line.
+                later = (times >= times[index]) & (times < times[index] + 1500)
+                if changed[rows][:, later].any(axis=0).mean() >= 0.8:
+                    continue
+            noise = np.percentile(change[rows][:, quiet], 90, axis=1)
+            if index > 0 and (change[rows, index - 1] - noise > 12).sum() >= 2:
+                index -= 1
+            return float(times[index])
     return None
 
 
@@ -491,6 +554,7 @@ class RaceStripPanel(QWidget):
     """
 
     seek_requested = pyqtSignal(object)         # jump request, or None where nothing was recorded
+    ready = pyqtSignal()                        # the race's pieces are readable now
     _loaded = pyqtSignal(object)
 
     SCROLL_UNIT_MS = 100
@@ -568,6 +632,8 @@ class RaceStripPanel(QWidget):
         else:
             message = ""
         self.view.set_pieces(pieces, message)
+        if pieces:
+            self.ready.emit()
 
     def _source_stamp(self):
         if self.workspace is None:
