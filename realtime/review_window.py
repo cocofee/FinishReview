@@ -271,6 +271,14 @@ def _safe_event_folder_name(value: str, fallback: str) -> str:
 
 def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
     root = Path(root).expanduser().resolve()
+    try:
+        own = RaceMetadataStore(root / "cyclerace_race_metadata.json").current()
+    except (OSError, RuntimeError, ValueError):
+        own = None
+    if own is not None and own.race_id == metadata.race_id:
+        # An older layout keeps the race in the root itself: its recordings are
+        # there, so coming back to it must not open an empty folder beside them.
+        return root
     folder_name = _safe_event_folder_name(metadata.race_name, metadata.race_id)
     race_suffix = _safe_event_folder_name(metadata.race_id, "race")
     candidates = [root / folder_name, root / f"{folder_name}_{race_suffix}"]
@@ -1579,7 +1587,8 @@ class FinishReviewWindow(PassageReviewSurface):
                     save_workspace_mode(self.workspace_root, self.output_dir, "live")
                     applied = True
                 else:
-                    target = self.workspace_root / datetime.now(BEIJING_TIMEZONE).strftime("现场录像_%Y%m%d_%H%M%S_%f")
+                    # Chinese kept out of strftime: Python 3.10 on an English Windows cannot encode it.
+                    target = self.workspace_root / ("现场录像_" + datetime.now(BEIJING_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f"))
                     applied = self._apply_settings(
                         self._current_settings(output_dir=target), persist_settings=False,
                         update_workspace_root=False, preserve_cyclerace_receiver=True,
@@ -2328,14 +2337,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_list_button.setObjectName("finishProblemListButton")
         self.problem_list_button.setFixedHeight(32)
         self.problem_list_button.setCheckable(True)
-        self.problem_list_button.setToolTip("只处理有问题的：自动通过、待处理和无法核实")
         self.problem_list_button.clicked.connect(self._open_problem_list)
+        # The workbench is the only view now: its table already lists every chip,
+        # with search, groups and delete; the old records page has no entry.
+        self.problem_list_button.hide()
         top_layout.addWidget(self.problem_list_button)
-        self.passages_button = QPushButton("通过记录", panel)
-        self.passages_button.setCheckable(True)
-        self.passages_button.setFixedHeight(32)
-        self.passages_button.clicked.connect(self._open_passages)
-        top_layout.addWidget(self.passages_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2346,7 +2352,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.problem_list_button.setStyleSheet(tool_button_style)
-        self.passages_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.setMinimumWidth(88)
@@ -2449,8 +2454,10 @@ class FinishReviewWindow(PassageReviewSurface):
         # otherwise swallow the press for its own judging window (operator: "F does
         # not work"), and the press has to land wherever the hands are.
         self.video_filmstrip.full_race.set_enlarge_key_enabled(not expanded)
+        # In the workbench the picture already fills the room; F enlarges nothing.
+        for pane in self.evidence_panes:
+            pane._maximize_shortcut.setEnabled(not expanded)
         self.setMinimumHeight(700 if expanded else 760)
-        self.passages_button.setChecked(not expanded)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
         self.filter_bar.setVisible(not expanded)
@@ -2544,7 +2551,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
-        self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
+        self.problem_panel.delete_requested.connect(self._delete_problem_record)
         self.problem_panel.summary_changed.connect(lambda _text: self._refresh_crossing_cards())
         self._normal_crossing_cards = {}
         self._opened_normal_crossing = ""
@@ -2584,26 +2591,40 @@ class FinishReviewWindow(PassageReviewSurface):
         rail.navigation_started.connect(self._problem_browse_started)
         rail.follow_button.toggled.connect(lambda enabled: self._problem_browse_started() if enabled else None)
         self.pipeline_label = QLabel("录像未启动 · 封存到 等待首段 ｜ 分析到 等待录像 / 校时 ｜ 积压 0 秒", self)
-        self.pipeline_label.setWordWrap(True)
-        self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
-        self.layout().insertWidget(1, self.pipeline_label)
+        toolbar = getattr(self.problem_panel, "quick_toolbar", None)
+        if toolbar is not None:
+            # Same row as the record count and judging keys: no separate band.
+            self.pipeline_label.setStyleSheet("color:#17675b;")
+            toolbar.layout().insertWidget(0, self.pipeline_label)
+        else:
+            self.pipeline_label.setWordWrap(True)
+            self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
+            self.layout().insertWidget(1, self.pipeline_label)
         self.problem_panel.set_workspace(self.output_dir)
 
     def _problem_selection_changed(self, item):
         self._opened_normal_crossing = ""
         if hasattr(self, "group_start_button"):
             group = item is not None and item.kind in ("bunch_check", "obstruction")
-            self.group_start_button.setVisible(group)
+            selected = getattr(self.problem_panel, "_selected_arrival", lambda: None)()
+            wave = getattr(self.problem_panel, "_row_wave", lambda _row: None)(selected)
+            self.group_start_button.setVisible(group or len(wave or ()) > 1)
         if getattr(self, "_problem_workbench_active", False):
-            if not getattr(self, "_creating_manual_crossing", False):
+            if getattr(self.problem_panel, "holds_picture", False):
+                # The panel places (or keeps) the picture for this row itself.
+                self._opened_normal_crossing = ""
+                self.video_filmstrip.full_race.follow_button.setChecked(False)
+            elif not getattr(self, "_creating_manual_crossing", False):
                 self._return_to_problem()
             self._refresh_crossing_cards()
             self._problem_count_mode_changed(True)
 
         # 表里点到的是一条自动对应的记录：那是在复查这条过线，点画面不算新建待处理。
         # 放在 _return_to_problem 之后，因为回看问题本身会清掉这个标记。
+        # 到达记录表不同：点到人就算数，自动对应的单人也一样。
         from .problem_items import KIND_AUTO_PASSED
-        if item is not None and item.kind == KIND_AUTO_PASSED:
+        if (item is not None and item.kind == KIND_AUTO_PASSED
+                and not getattr(self.problem_panel, "quick_review", False)):
             self._opened_normal_crossing = item.item_id
 
     def _pause_arrival_confirmation(self):
@@ -2718,22 +2739,10 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_problem_finish_lines()
 
     def keyPressEvent(self, event) -> None:
-        """F enlarges the picture from whatever corner of the workbench holds the keys.
-
-        The queue and the panes answer F themselves.  A button in the top bar or in
-        the time rail leaves it unhandled, and a press that disappears there reads to
-        the operator as "F does not work" - so the window picks it up.  A field that
-        takes typing keeps the letter, as it must.
-        """
+        """The judging keys work from whatever corner of the workbench holds the keys."""
 
         if (getattr(self, "_problem_workbench_active", False)
                 and self.problem_panel._queue_key(event)):
-            event.accept()
-            return
-        if (event.key() == Qt.Key_F
-                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
-                and getattr(self, "_problem_workbench_active", False)):
-            self.problem_panel.toggle_big_view()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -2799,7 +2808,7 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = self._frame_for_problem_count(pane)
         if frame is None:
             return
-        if getattr(self.problem_panel, "quick_review", False) and not self._opened_normal_crossing:
+        if getattr(self.problem_panel, "quick_review", False):
             self._quick_review_mark_arrival(frame, x_normalized, y_normalized, pane)
             return
         item = self.problem_panel.current_item()
@@ -2876,7 +2885,10 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         self._creating_manual_crossing = True
         try:
-            panel.select_item(item.item_id)
+            if item.item_id in panel._candidate_wave:
+                panel.open_picture(item)  # the click's own wave; the frame stays where it is
+            else:
+                panel.select_item(item.item_id)
         finally:
             self._creating_manual_crossing = False
         from .bunch_review import mark_on_frame
@@ -2888,7 +2900,10 @@ class FinishReviewWindow(PassageReviewSurface):
         else:
             panel._editing_mark = existing
         index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
-        if index is not None:
+        if panel._wave_plan() is not None:
+            # On a wave's picture the row of whoever was clicked is selected.
+            panel.show_counted(panel._editing_mark)
+        elif index is not None:
             panel._selected_key = selected_key
             panel._active_item = item
             panel.table.setCurrentCell(index, 0)
@@ -2928,6 +2943,8 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = self._frame_for_problem_count(pane)
         if frame is None:
             return ()
+        if hasattr(self.problem_panel, "picture_overlays"):
+            return tuple(self.problem_panel.picture_overlays(frame))
         from .bunch_review import is_excluded, mark_on_frame
         from .crossing_order import mark_order_labels, ordered_mark_indices
         marks = self.problem_panel.current_marks()
@@ -3113,6 +3130,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._problem_count_mode_changed(True)
 
     def _open_group_start(self):
+        if getattr(self.problem_panel, "open_wave_start", lambda: False)():
+            return
         context = self.problem_panel._inline_context()
         if context is None:
             return
@@ -3192,7 +3211,11 @@ class FinishReviewWindow(PassageReviewSurface):
         workbench = getattr(self, "_problem_workbench_active", False)
         self.video_filmstrip.setVisible(bool(visible) or not workbench)
         self.crossing_cards.setVisible(workbench)
-
+        # Without the recording rail the bottom holds two buttons only: give the
+        # picture the height instead of leaving an empty band.
+        compact = workbench and not visible
+        self.preview_panel.setMinimumHeight(0 if compact else 190 if workbench else 420)
+        self.preview_panel.setMaximumHeight(self.crossing_cards.sizeHint().height() + 16 if compact else 16777215)
     def _refresh_crossing_cards(self):
         if not hasattr(self, "crossing_cards"):
             return
@@ -3237,6 +3260,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_problem_list()
         if expanded:
             self._return_to_problem()
+
+    def _delete_problem_record(self, event_id: str) -> None:
+        event = self.passage_store.get(event_id)
+        if event is not None:
+            self._delete_record(event)
+            self.problem_panel.refresh()
 
     def _open_passages(self):
         self.problem_list_button.setChecked(False)

@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 import realtime.launch_dialog as launch_dialog_module
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -392,7 +392,7 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
-        assert window.problem_panel.table.columnCount() == 4
+        assert window.problem_panel.table.columnCount() == 5  # the group column hides with one group
         assert window.problem_panel._browsing
         window._return_to_problem()
         assert not window.problem_panel._browsing
@@ -409,6 +409,9 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         view.setFocus()
         qapp.processEvents()
         QTest.keyClick(view.viewport(), Qt.Key_F)
+        qapp.processEvents()
+        assert not window.problem_panel.big_view  # F enlarges nothing in the workbench
+        window.problem_panel.toggle_big_view()
         qapp.processEvents()
         assert window.problem_panel.big_view
         assert not window.preview_panel.isVisibleTo(window)
@@ -655,71 +658,70 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert panel._selected_key == "event:click-321"
         assert panel.current_item().evidence["frame"]["marker_x_normalized"] == pytest.approx(0.55)
         assert panel.current_item().evidence["frame"]["marker_y_normalized"] == pytest.approx(0.62)
-        assert panel._category() is None
-        assert not any(row.decision for row in panel._arrival_rows)
+        # The click on the rider is the save: no 1 needed.
+        assert panel._category()["action"] == "bicycle"
+        saved = next(row.decision for row in panel._arrival_rows if row.bib == "21")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.55)
+        assert saved["frame"]["marker_y_normalized"] == pytest.approx(0.62)
         overlays = window._problem_count_overlays(pane)
         assert len(overlays) == 1
         assert overlays[0][0] == pytest.approx(0.55)
         assert overlays[0][1] == pytest.approx(0.62)
         assert overlays[0][2] == "21"
-        assert overlays[0][5] is True
+        assert overlays[0][5] is True and overlays[0][6] is False
         assert pane.video_view._history_markers[0][2] == "21"
 
         assert panel.confirm_arrival_button.isHidden()
         if save_action == "key":
-            QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+            QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # out of habit: harmless
         else:
             panel.bicycle_button.click()
-        saved = next(row.decision for row in panel._arrival_rows if row.bib == "21")
-        assert saved["frame"]["frame_index"] == 50
-        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.55)
-        assert saved["frame"]["marker_y_normalized"] == pytest.approx(0.62)
+        assert "不用按 1" in panel.hint.text()
+        assert panel._selected_arrival().bib == "21"
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         target_row = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
         assert panel.table.item(target_row, 3).text() == "已确认"
         assert panel.table.item(target_row, 3).foreground().color().name() == "#126044"
-        assert window._problem_count_overlays(pane)[0][2] == "21"
         panel.refresh()
         panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21"))
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         assert pane.video_view._history_markers[0][2] == "21"
-        panel.bicycle_button.click()
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)
         assert not any(row.decision for row in panel._arrival_rows)
         assert panel._selected_arrival().bib == "21"
-        assert panel._category() is None
+        assert not panel.current_marks()
         assert pane._worker is worker
         assert pane._current_frame_index == 50
         assert panel.table.item(panel.table.currentRow(), 3).text() == "待定"
         assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#b42318"
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        window._problem_count_clicked(0.55, 0.62, pane)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         # 22 and 23 arrive within 2 s of 21: one wave, counted on this same picture,
-        # each circle labelled in chip order. Re-clicking a circle adds no duplicate.
+        # each circle labelled in chip order and saved at once. Re-clicking a circle adds no duplicate.
         for bib in ("22", "23"):
             window.passage_store.append(_event(event_id="click-" + bib, bib=bib,
                                                passage_timestamp_ms=start + 2000 + int(bib)))
         panel.refresh()
         panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "22"))
         candidate_id = panel.current_item().item_id
+        jumps = QSignalSpy(panel.jump_requested)
         window._problem_count_clicked(.7, .62, pane)
         window._problem_count_clicked(.8, .62, pane)
+        # 古浪 261：点第 5 个人时画面不能被拉回已保存的 69 那一帧。
+        assert len(jumps) == 0
         assert len(panel.current_marks()) == 3
         assert panel.current_item().item_id == candidate_id
+        assert panel._selected_arrival().bib == "23"  # the one just clicked, on the left
         window._problem_count_clicked(.7, .62, pane)
         assert len(panel.current_marks()) == 3
+        assert panel._selected_arrival().bib == "22"  # a click on a counted ring picks them out
+        assert len(jumps) == 0
         assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
-        assert "本波还没看完" in panel.hint.text()
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
-        for position in range(1400, 2701, 200):
-            pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), position, position // 40)
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 3
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)  # takes back the whole wave confirm
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
-        assert "已撤销本波确认（2 人）" in panel.hint.text()
+        window._problem_count_cancelled(.7, .62, pane)  # right click: 22 is taken back, 23 moves up
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22"]
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 2
     finally:
         window.close()
 
@@ -852,7 +854,7 @@ def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path)
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 3000, 75)
         assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["待选号码"]
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
-        assert not window._problem_count_overlays(pane)
+        assert all(overlay[6] for overlay in window._problem_count_overlays(pane))  # faded, a frame later
 
         panel._exclude_mark(1, "工作人员")
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
@@ -863,8 +865,8 @@ def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path)
         window.close()
 
 
-def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_path):
-    """正常单人只留一行过线记录：翻出来是复查原帧，永远不会变成待处理。"""
+def test_a_normal_single_is_one_row_and_a_click_on_the_rider_confirms_it(qapp, tmp_path):
+    """正常单人只留一行过线记录；古浪 60 号：点到人就算数，自动对应的单人也一样。"""
 
     import json
     from PyQt5.QtGui import QImage
@@ -887,6 +889,7 @@ def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_pa
                      position_ms=2000, frame_index=50)
         passed = {"bib": "057", "event_id": "e-057", "chip_time_ms": start + 1900, "active_now": True,
                   "recorder_ms": start + 2000, "source": "auto", "frame": frame}
+        window.passage_store.append(_event(event_id="e-057", bib="057", passage_timestamp_ms=start + 1900))
         path = tmp_path / "finish_problems/problem_list.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"items": [], "summary": {"auto_passed": 1}, "auto_passed": [passed]}),
@@ -900,18 +903,17 @@ def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_pa
         assert len(auto) == 1
         qapp.processEvents()
 
-        # 点开这一行就是打开那条过线的原帧，并且说明这是复查。
+        # 点开这一行就打开那条过线的原帧；点中人就保存，不用再按 1。
+        assert window.problem_panel._selected_arrival().bib == "057"
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         qapp.processEvents()
-        assert window._opened_normal_crossing == auto[0].item_id
-        assert "057" in window.problem_panel.hint.text()
-
-        # 点画面是复查，不是计数：什么新问题都不会冒出来。
+        assert not window._opened_normal_crossing
         window._problem_count_clicked(0.5, 0.5, pane)
-        assert "已自动对应" in window.problem_panel.hint.text()
-        assert not window.problem_panel.current_marks()
-        assert [item.item_id for item in window.problem_panel.rows] == [auto[0].item_id]
+        saved = next(row.decision for row in window.problem_panel._arrival_rows if row.bib == "057")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.5)
+        assert "057 已保存过线" in window.problem_panel.hint.text()
     finally:
         window.close()
 
@@ -1097,6 +1099,9 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         qapp.processEvents()
         QTest.keyClick(rail.canvas.viewport(), Qt.Key_F)
         qapp.processEvents()
+        assert not panel.big_view
+        panel.toggle_big_view()
+        qapp.processEvents()
         assert panel.big_view
         assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isHidden()
         assert not window.preview_panel.isVisibleTo(window)
@@ -1104,14 +1109,11 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         panel.toggle_big_view()
         qapp.processEvents()
 
-        # A top-bar button leaves the key unhandled too; the window takes it.
         window.recheck_button.setFocus()
         qapp.processEvents()
         QTest.keyClick(window.recheck_button, Qt.Key_F)
         qapp.processEvents()
-        assert panel.big_view
-        panel.toggle_big_view()
-        qapp.processEvents()
+        assert not panel.big_view
 
         # A field that takes typing keeps the letter: the bib is typed, not enlarged.
         panel.bib_input.setText("")
@@ -1985,6 +1987,17 @@ def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
     assert event_dir == (root / "城市赛_race-new").resolve()
 
 
+def test_a_race_kept_in_the_root_itself_is_its_own_workspace(qapp, tmp_path):
+    """古浪测试副本：CycleRace 切到别的赛事再切回来，录像仍在根目录，不另建空文件夹。"""
+    root = tmp_path / "gulang"
+    metadata = RaceMetadata(race_id="race-gulang", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                            race_name="古浪站", stage_name="终点")
+    RaceMetadataStore(root / "cyclerace_race_metadata.json").store(metadata)
+    assert review_window_module._event_workspace_dir(root, metadata) == root.resolve()
+    other = replace(metadata, race_id="race-other", race_name="特奥")
+    assert review_window_module._event_workspace_dir(root, other) == (root / "特奥").resolve()
+
+
 def test_switching_cyclerace_event_exports_previous_review_summary(qapp, tmp_path):
     root = tmp_path / "events"
     window = _window(root)
@@ -2473,6 +2486,34 @@ def test_deleting_passage_immediately_updates_review_export(qapp, tmp_path, monk
     monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("备用芯片", True))
     window.delete_record_button.click()
     assert window.table.rowCount() == 0
+    with summary.open(encoding="utf-8-sig", newline="") as handle:
+        assert len(list(csv.reader(handle))) == 1
+    window.close()
+
+
+def test_arrival_table_deletes_a_chip_and_the_old_records_page_has_no_entry(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path / "events")
+    assert window.problem_list_button.isHidden() and not hasattr(window, "passages_button")
+    metadata = RaceMetadata(
+        race_id="race-delete", stage_id="stage-1", revision=1,
+        emitted_at_ms=1, race_name="删除测试", stage_name="终点",
+    )
+    assert window._activate_cyclerace_workspace(metadata)
+    window.passage_store.append(_event(race_id="race-delete", event_id="spare"))
+    window.refresh()
+    window._export_review_summary()
+    panel = window.problem_panel
+    panel.refresh()
+    assert [entry.event.event_id for entry in panel._arrival_rows if entry.event] == ["spare"]
+    from PyQt5.QtWidgets import QInputDialog
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("", False))
+    panel._arrival_clicked(0)
+    panel._request_delete()  # cancelled: nothing happens
+    assert window.passage_store.get("spare") in window.passage_store.events()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("备用芯片", True))
+    panel._request_delete()
+    assert not [entry for entry in panel._arrival_rows if entry.event]
+    summary = window.output_dir / REVIEW_SUMMARY_FILENAME
     with summary.open(encoding="utf-8-sig", newline="") as handle:
         assert len(list(csv.reader(handle))) == 1
     window.close()
