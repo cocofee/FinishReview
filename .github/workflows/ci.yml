@@ -14,6 +14,7 @@ jobs:
         python-version: ["3.10", "3.12"]
     env:
       QT_QPA_PLATFORM: offscreen
+      PYTHONIOENCODING: utf-8  # Chinese messages on the runner's English console
 
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +43,7 @@ jobs:
     needs: test
     env:
       QT_QPA_PLATFORM: offscreen
+      PYTHONIOENCODING: utf-8  # Chinese messages on the runner's English console
 
     steps:
       - uses: actions/checkout@v4

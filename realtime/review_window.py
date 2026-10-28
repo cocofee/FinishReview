@@ -1587,7 +1587,8 @@ class FinishReviewWindow(PassageReviewSurface):
                     save_workspace_mode(self.workspace_root, self.output_dir, "live")
                     applied = True
                 else:
-                    target = self.workspace_root / datetime.now(BEIJING_TIMEZONE).strftime("现场录像_%Y%m%d_%H%M%S_%f")
+                    # Chinese kept out of strftime: Python 3.10 on an English Windows cannot encode it.
+                    target = self.workspace_root / ("现场录像_" + datetime.now(BEIJING_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f"))
                     applied = self._apply_settings(
                         self._current_settings(output_dir=target), persist_settings=False,
                         update_workspace_root=False, preserve_cyclerace_receiver=True,

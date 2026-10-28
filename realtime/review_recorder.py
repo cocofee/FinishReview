@@ -116,7 +116,8 @@ def parse_directshow_source(source: object) -> DirectShowReviewSource | None:
     if parsed.scheme.lower() != _DIRECTSHOW_SCHEME or not parsed.netloc or parsed.path:
         return None
     try:
-        query = parse_qs(parsed.query, strict_parsing=True)
+        # Python 3.10 rejects an empty query under strict parsing.
+        query = parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
     except ValueError:
         return None
     if set(query) - {"video_size", "framerate"}:
