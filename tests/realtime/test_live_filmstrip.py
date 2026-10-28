@@ -166,10 +166,14 @@ def test_live_boundary_step_keeps_exact_neighbor_and_does_not_bridge_gaps(
     pane._fps = 25
     pane.frame_duration_ms = lambda: 40
     window._camera_one_pane = lambda: pane
-    window.video_filmstrip = SimpleNamespace(full_race=SimpleNamespace(index=RaceRecordingIndex(sources)))
+    # Read from the recording index itself, never from the strip's background copy.
+    window._recording_sources_for_step = lambda _pane: sources
+    window._recording_session_key = PassageReviewSurface._recording_session_key
+    window._step_into_neighbour_recording = (
+        lambda *args: PassageReviewSurface._step_into_neighbour_recording(window, *args))
     opened = []
 
-    def seek(location, position, frame):
+    def seek(location, position, frame, camera_index=1):
         saved = ring.retain_filmstrip_segment(location.segment, store)
         opened.append((saved, position, frame))
         return True
@@ -187,6 +191,64 @@ def test_live_boundary_step_keeps_exact_neighbor_and_does_not_bridge_gaps(
         assert saved.media_started_at_ms + actual_position == (
             pane.location.segment.media_started_at_ms + pane._current_position_ms + direction * 40
         )
+
+
+@pytest.mark.parametrize(("direction", "start", "archive_on_disk", "expected"), [
+    (1, "240", True, ("archive_0001", 4548)),  # 20.504 s: the very next moment, none skipped
+    (-1, "241", True, ("archive_0001", 4547)),  # 20.464 s: 240's last frame, seen in the archive
+    (1, "240", False, ("241", 0)),  # without the archive the next live file goes on
+])
+def test_step_off_a_two_second_file_goes_on_without_the_strip_or_a_chip_record(
+    tmp_path, direction, start, archive_on_disk, expected,
+):
+    """古浪 548：2 秒的 TS 播到最后一帧，按右方向键要接着看到 261。
+
+    The whole-race strip's index may be empty (rebuilt in the background) and
+    the arrival workbench selects no chip record; neither may stop the step.
+    """
+    from realtime.recording_catalog import FilmstripSource
+    from realtime.video_timeline import PassageVideoLocation, RecordingSegment
+
+    session, other = "camera_01_20261018_112915_434937", "camera_01_20261018_112643_389019"
+    buffer, videos = tmp_path / "review_buffer" / "camera_01", tmp_path / "videos"
+    buffer.mkdir(parents=True)
+    videos.mkdir()
+    files = {
+        "240": (buffer / f"{session}_review_0000000000000240.ts", 0, 1999, 1),
+        "241": (buffer / f"{session}_review_0000000000000241.ts", 1999, 1999, 1),
+        # The same session's archive began 179.924 s earlier, off the TS frame grid.
+        "archive_0001": (videos / f"{session}_archive_0001.mkv", -179924, 299880, 0),
+        # Another session's archive covers the moment too: never preferred.
+        "other": (videos / f"{other}_archive_0002.mkv", -31978, 299880, 0),
+    }
+    sources, locations = [], {}
+    for name, (path, offset, duration, priority) in files.items():
+        if name != "archive_0001" or archive_on_disk:
+            path.write_bytes(b"video")
+        segment = RecordingSegment(name, "camera_01_review", 1, str(path), BASE + offset,
+                                   BASE + offset + duration, duration, BASE + offset)
+        locations[name] = PassageVideoLocation(segment, path, 0, 0, 0, 0, "located")
+        sources.append(FilmstripSource(locations[name], BASE + offset, BASE + offset + duration, True, priority))
+    pane = SimpleNamespace(
+        camera_index=1, location=locations[start], _worker=object(), _fps=25, _frame_count=50, _duration_ms=2000,
+        _current_frame_index=49 if direction > 0 else 0, _current_position_ms=1960 if direction > 0 else 0,
+        frame_duration_ms=lambda: 40,
+    )
+    opened = []
+    window = SimpleNamespace(
+        _selected_event_id="", passage_store=SimpleNamespace(get=lambda _: None),
+        _camera_one_pane=lambda: pane, _recording_sources_for_step=lambda _pane: sources,
+        _recording_session_key=PassageReviewSurface._recording_session_key,
+        _seek_retained_camera_frame=lambda location, position, frame, camera_index=1: opened.append(
+            (location.segment.segment_id, position, frame)) or True,
+    )
+    window._step_into_neighbour_recording = (
+        lambda *args: PassageReviewSurface._step_into_neighbour_recording(window, *args))
+    assert PassageReviewSurface._step_across_recording_boundary(window, pane, direction)
+    name, frame = expected
+    assert opened == [(name, frame * 40, frame)]
+    shown = BASE + files[start][1] + pane._current_position_ms
+    assert abs(BASE + files[name][1] + frame * 40 - (shown + direction * 40)) < 20  # the neighbouring frame
 
 
 def test_hls_origin_and_session_calibration_survive_archive_handover(tmp_path):

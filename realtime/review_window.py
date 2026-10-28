@@ -2620,8 +2620,10 @@ class FinishReviewWindow(PassageReviewSurface):
 
         # 表里点到的是一条自动对应的记录：那是在复查这条过线，点画面不算新建待处理。
         # 放在 _return_to_problem 之后，因为回看问题本身会清掉这个标记。
+        # 到达记录表不同：点到人就算数，自动对应的单人也一样。
         from .problem_items import KIND_AUTO_PASSED
-        if item is not None and item.kind == KIND_AUTO_PASSED:
+        if (item is not None and item.kind == KIND_AUTO_PASSED
+                and not getattr(self.problem_panel, "quick_review", False)):
             self._opened_normal_crossing = item.item_id
 
     def _pause_arrival_confirmation(self):
@@ -2805,7 +2807,7 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = self._frame_for_problem_count(pane)
         if frame is None:
             return
-        if getattr(self.problem_panel, "quick_review", False) and not self._opened_normal_crossing:
+        if getattr(self.problem_panel, "quick_review", False):
             self._quick_review_mark_arrival(frame, x_normalized, y_normalized, pane)
             return
         item = self.problem_panel.current_item()
@@ -2882,7 +2884,10 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         self._creating_manual_crossing = True
         try:
-            panel.select_item(item.item_id)
+            if item.item_id in panel._candidate_wave:
+                panel.open_picture(item)  # the click's own wave; the frame stays where it is
+            else:
+                panel.select_item(item.item_id)
         finally:
             self._creating_manual_crossing = False
         from .bunch_review import mark_on_frame
@@ -2894,7 +2899,10 @@ class FinishReviewWindow(PassageReviewSurface):
         else:
             panel._editing_mark = existing
         index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
-        if index is not None:
+        if panel._wave_plan() is not None:
+            # On a wave's picture the row of whoever was clicked is selected.
+            panel.show_counted(panel._editing_mark)
+        elif index is not None:
             panel._selected_key = selected_key
             panel._active_item = item
             panel.table.setCurrentCell(index, 0)
@@ -2934,6 +2942,8 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = self._frame_for_problem_count(pane)
         if frame is None:
             return ()
+        if hasattr(self.problem_panel, "picture_overlays"):
+            return tuple(self.problem_panel.picture_overlays(frame))
         from .bunch_review import is_excluded, mark_on_frame
         from .crossing_order import mark_order_labels, ordered_mark_indices
         marks = self.problem_panel.current_marks()

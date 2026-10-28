@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 import realtime.launch_dialog as launch_dialog_module
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -658,71 +658,70 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert panel._selected_key == "event:click-321"
         assert panel.current_item().evidence["frame"]["marker_x_normalized"] == pytest.approx(0.55)
         assert panel.current_item().evidence["frame"]["marker_y_normalized"] == pytest.approx(0.62)
-        assert panel._category() is None
-        assert not any(row.decision for row in panel._arrival_rows)
+        # The click on the rider is the save: no 1 needed.
+        assert panel._category()["action"] == "bicycle"
+        saved = next(row.decision for row in panel._arrival_rows if row.bib == "21")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.55)
+        assert saved["frame"]["marker_y_normalized"] == pytest.approx(0.62)
         overlays = window._problem_count_overlays(pane)
         assert len(overlays) == 1
         assert overlays[0][0] == pytest.approx(0.55)
         assert overlays[0][1] == pytest.approx(0.62)
         assert overlays[0][2] == "21"
-        assert overlays[0][5] is True
+        assert overlays[0][5] is True and overlays[0][6] is False
         assert pane.video_view._history_markers[0][2] == "21"
 
         assert panel.confirm_arrival_button.isHidden()
         if save_action == "key":
-            QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+            QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # out of habit: harmless
         else:
             panel.bicycle_button.click()
-        saved = next(row.decision for row in panel._arrival_rows if row.bib == "21")
-        assert saved["frame"]["frame_index"] == 50
-        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.55)
-        assert saved["frame"]["marker_y_normalized"] == pytest.approx(0.62)
+        assert "不用按 1" in panel.hint.text()
+        assert panel._selected_arrival().bib == "21"
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         target_row = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
         assert panel.table.item(target_row, 3).text() == "已确认"
         assert panel.table.item(target_row, 3).foreground().color().name() == "#126044"
-        assert window._problem_count_overlays(pane)[0][2] == "21"
         panel.refresh()
         panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21"))
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         assert pane.video_view._history_markers[0][2] == "21"
-        panel.bicycle_button.click()
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)
         assert not any(row.decision for row in panel._arrival_rows)
         assert panel._selected_arrival().bib == "21"
-        assert panel._category() is None
+        assert not panel.current_marks()
         assert pane._worker is worker
         assert pane._current_frame_index == 50
         assert panel.table.item(panel.table.currentRow(), 3).text() == "待定"
         assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#b42318"
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        window._problem_count_clicked(0.55, 0.62, pane)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         # 22 and 23 arrive within 2 s of 21: one wave, counted on this same picture,
-        # each circle labelled in chip order. Re-clicking a circle adds no duplicate.
+        # each circle labelled in chip order and saved at once. Re-clicking a circle adds no duplicate.
         for bib in ("22", "23"):
             window.passage_store.append(_event(event_id="click-" + bib, bib=bib,
                                                passage_timestamp_ms=start + 2000 + int(bib)))
         panel.refresh()
         panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "22"))
         candidate_id = panel.current_item().item_id
+        jumps = QSignalSpy(panel.jump_requested)
         window._problem_count_clicked(.7, .62, pane)
         window._problem_count_clicked(.8, .62, pane)
+        # 古浪 261：点第 5 个人时画面不能被拉回已保存的 69 那一帧。
+        assert len(jumps) == 0
         assert len(panel.current_marks()) == 3
         assert panel.current_item().item_id == candidate_id
+        assert panel._selected_arrival().bib == "23"  # the one just clicked, on the left
         window._problem_count_clicked(.7, .62, pane)
         assert len(panel.current_marks()) == 3
+        assert panel._selected_arrival().bib == "22"  # a click on a counted ring picks them out
+        assert len(jumps) == 0
         assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
-        assert "本波还没看完" in panel.hint.text()
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
-        for position in range(1400, 2701, 200):
-            pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), position, position // 40)
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 3
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)  # takes back the whole wave confirm
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
-        assert "已撤销本波确认（2 人）" in panel.hint.text()
+        window._problem_count_cancelled(.7, .62, pane)  # right click: 22 is taken back, 23 moves up
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22"]
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 2
     finally:
         window.close()
 
@@ -855,7 +854,7 @@ def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path)
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 3000, 75)
         assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["待选号码"]
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
-        assert not window._problem_count_overlays(pane)
+        assert all(overlay[6] for overlay in window._problem_count_overlays(pane))  # faded, a frame later
 
         panel._exclude_mark(1, "工作人员")
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
@@ -866,8 +865,8 @@ def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path)
         window.close()
 
 
-def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_path):
-    """正常单人只留一行过线记录：翻出来是复查原帧，永远不会变成待处理。"""
+def test_a_normal_single_is_one_row_and_a_click_on_the_rider_confirms_it(qapp, tmp_path):
+    """正常单人只留一行过线记录；古浪 60 号：点到人就算数，自动对应的单人也一样。"""
 
     import json
     from PyQt5.QtGui import QImage
@@ -890,6 +889,7 @@ def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_pa
                      position_ms=2000, frame_index=50)
         passed = {"bib": "057", "event_id": "e-057", "chip_time_ms": start + 1900, "active_now": True,
                   "recorder_ms": start + 2000, "source": "auto", "frame": frame}
+        window.passage_store.append(_event(event_id="e-057", bib="057", passage_timestamp_ms=start + 1900))
         path = tmp_path / "finish_problems/problem_list.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"items": [], "summary": {"auto_passed": 1}, "auto_passed": [passed]}),
@@ -903,18 +903,17 @@ def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_pa
         assert len(auto) == 1
         qapp.processEvents()
 
-        # 点开这一行就是打开那条过线的原帧，并且说明这是复查。
+        # 点开这一行就打开那条过线的原帧；点中人就保存，不用再按 1。
+        assert window.problem_panel._selected_arrival().bib == "057"
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         qapp.processEvents()
-        assert window._opened_normal_crossing == auto[0].item_id
-        assert "057" in window.problem_panel.hint.text()
-
-        # 点画面是复查，不是计数：什么新问题都不会冒出来。
+        assert not window._opened_normal_crossing
         window._problem_count_clicked(0.5, 0.5, pane)
-        assert "已自动对应" in window.problem_panel.hint.text()
-        assert not window.problem_panel.current_marks()
-        assert [item.item_id for item in window.problem_panel.rows] == [auto[0].item_id]
+        saved = next(row.decision for row in window.problem_panel._arrival_rows if row.bib == "057")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.5)
+        assert "057 已保存过线" in window.problem_panel.hint.text()
     finally:
         window.close()
 

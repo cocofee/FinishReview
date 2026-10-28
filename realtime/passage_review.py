@@ -496,7 +496,7 @@ class EvidenceImageView(QGraphicsView):
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
-            tuple[float, float, str, bool, bool, bool], ...
+            tuple[float, float, str, bool, bool, bool, bool], ...
         ] = ()
         self._show_marker_label = True
         self._show_identity_badge = True
@@ -920,6 +920,7 @@ class EvidenceImageView(QGraphicsView):
                 bool(confirmed),
                 bool(simple),
                 bool(marker[5]) if len(marker) > 5 else False,
+                bool(marker[6]) if len(marker) > 6 else False,
             )
             for marker in markers
             for x_normalized, y_normalized, label, confirmed, simple in [marker[:5]]
@@ -1184,40 +1185,55 @@ class EvidenceImageView(QGraphicsView):
                 for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
                     painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
                                      QPointF(b[0] * self._source_width, b[1] * self._source_height))
-        for index, (x_normalized, y_normalized, label, confirmed, simple, dot) in enumerate(
+        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost) in enumerate(
             self._history_markers
         ):
             x = x_normalized * self._source_width
             y = y_normalized * self._source_height
             color = QColor("#1bbf83" if confirmed else "#c0372b")
+            if ghost:
+                # Counted on a nearby frame: faded where they were, so they are not clicked twice.
+                color.setAlpha(150)
             pen = QPen(color, 2)
             pen.setCosmetic(True)
-            if not confirmed and not simple:
+            if (not confirmed and not simple) or ghost:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
+            radius = (16.0 if ghost else 22.0) / scale
             if dot:
+                # A large hollow ring with a dark rim reads on any kit, and leaves the rider visible.
                 painter.setBrush(Qt.NoBrush)
-                painter.drawEllipse(QPointF(x, y), 11.0 / scale, 11.0 / scale)
+                if not ghost:
+                    rim = QPen(QColor(0, 0, 0, 170), 6)
+                    rim.setCosmetic(True)
+                    painter.setPen(rim)
+                    painter.drawEllipse(QPointF(x, y), radius, radius)
+                    pen.setWidth(3)
+                    painter.setPen(pen)
+                painter.drawEllipse(QPointF(x, y), radius, radius)
             else:
                 painter.drawLine(int(x), 0, int(x), self._source_height)
-            if not self._show_marker_label:
+            if not self._show_marker_label or ghost:
                 continue
             margin = 6.0 / scale
-            tag_width = max(52.0, 18.0 + len(label) * 18.0) / scale
+            size = 18.0
+            tag_width = max(52.0, 18.0 + len(label) * size) / scale
             tag_height = 30.0 / scale
-            tag_x = x + margin
+            # Beside the ring, not on the rider.
+            offset = radius + margin if dot else margin
+            tag_x = x + offset
             if tag_x + tag_width > self._source_width - margin:
-                tag_x = x - tag_width - margin
+                tag_x = x - tag_width - offset
             tag_x = max(margin, min(tag_x, self._source_width - tag_width - margin))
-            tag_y = y + margin if dot else margin + index * (tag_height + margin)
-            tag_y = min(tag_y, max(margin, self._source_height - tag_height - margin))
+            tag_y = y - tag_height / 2.0 if dot else margin + index * (tag_height + margin)
+            tag_y = max(margin, min(tag_y, max(margin, self._source_height - tag_height - margin)))
             tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(tag_rect, 2.0 / scale, 2.0 / scale)
             painter.setPen(QColor("#07120e" if confirmed else "#231703"))
             font = QFont(self.font())
-            font.setPixelSize(max(1, int(round(18.0 / scale))))
+            font.setPixelSize(max(1, int(round(size / scale))))
             font.setBold(True)
             painter.setFont(font)
             painter.drawText(tag_rect, Qt.AlignCenter, label)
@@ -3667,7 +3683,7 @@ class PassageReviewSurface(QDialog):
         )
         pane.step_boundary_reached.connect(
             lambda direction, current=pane: self._step_across_recording_boundary(
-                current, direction
+                current, direction, at_edge=True
             )
         )
         pane.play_requested.connect(lambda current=pane: self._toggle_pane(current))
@@ -8927,8 +8943,12 @@ class PassageReviewSurface(QDialog):
         self,
         pane: PassageEvidencePane,
         frame_delta: int,
+        at_edge: bool = False,
     ) -> bool:
-        """Continue single-frame navigation into an adjacent recording file."""
+        """Continue single-frame navigation into an adjacent recording file.
+
+        AT_EDGE: the decoder itself found no further frame in this file.
+        """
 
         location = pane.location
         worker = getattr(pane, "_worker", None)
@@ -8946,36 +8966,15 @@ class PassageReviewSurface(QDialog):
         ) or (
             duration_ms > 0 and position_ms >= duration_ms - frame_ms
         )
-        if direction < 0 and not at_first_frame:
+        if not at_edge and direction < 0 and not at_first_frame:
             return False
-        if direction > 0 and not at_last_frame:
+        if not at_edge and direction > 0 and not at_last_frame:
             return False
 
         current = location.segment
-        if pane is self._camera_one_pane():
-            origin = int(current.media_started_at_ms or current.started_at_ms)
-            edge = origin + int(current.media_duration_ms or duration_ms)
-            index = self.video_filmstrip.full_race.index
-            span = index.span_at(edge if direction > 0 else origin - 1)
-            live_boundary = location.video_path.suffix.lower() == ".ts" or (
-                span is not None and span.source is not None
-                and span.source.location.video_path.suffix.lower() == ".ts"
-            )
-            if live_boundary:
-                # Cross closed live files and the archive/live seam without
-                # requiring the next TS to have been opened and saved already.
-                if span is None or span.source is None or not span.source.available:
-                    return False
-                if direction < 0 and span.end_ms < origin:
-                    return False
-                timestamp = edge if direction > 0 else origin - frame_ms
-                target = span.source.location
-                position = max(0, timestamp - span.source.start_ms)
-                fps = float(getattr(pane, "_fps", 0) or 1000 / frame_ms)
-                return self._seek_retained_camera_frame(target, position, round(position * fps / 1000))
         event = self.passage_store.get(self._selected_event_id)
-        if event is None:
-            return False
+        if pane is self._camera_one_pane() or event is None:
+            return self._step_into_neighbour_recording(pane, direction, frame_ms, duration_ms)
         current_session_key = self._recording_session_key(location)
         segments = sorted(
             (
@@ -9065,6 +9064,61 @@ class PassageReviewSurface(QDialog):
         )
         self._update_shared_time_label()
         return True
+
+    def _step_into_neighbour_recording(
+        self, pane: PassageEvidencePane, direction: int, frame_ms: int, duration_ms: int,
+    ) -> bool:
+        """Open the frame right after (or before) the one shown, in the file that continues it.
+
+        The neighbour is looked up in the recording index itself, not in the
+        whole-race strip's copy of it (rebuilt in the background, so it can be
+        empty while a recorder reconnects) and not through the selected chip
+        record (the arrival workbench has none): stepping must not stop at the
+        end of a two-second file (古浪 548 → 261).  The same recording session
+        is preferred, then the long archive over its live copies.  A gap in
+        the recording, however short, is never bridged.
+        """
+
+        location = pane.location
+        current = location.segment
+        origin = int(current.media_started_at_ms if current.media_started_at_ms is not None
+                     else current.started_at_ms)
+        edge = origin + int(current.media_duration_ms or duration_ms)
+        boundary = edge if direction > 0 else origin - 1
+        shown = origin + int(getattr(pane, "_current_position_ms", 0))
+        session = self._recording_session_key(location)
+        neighbours = sorted(
+            (source for source in self._recording_sources_for_step(pane)
+             if source.start_ms <= boundary < source.end_ms
+             and source.location.segment.segment_id != current.segment_id
+             and Path(source.location.video_path) != Path(location.video_path)),
+            key=lambda source: (self._recording_session_key(source.location) != session,
+                                source.priority, source.start_ms - source.end_ms),
+        )
+        for source in neighbours:
+            if not Path(source.location.video_path).is_file():
+                continue
+            if direction > 0:  # the first frame after the one shown
+                frame = (shown + frame_ms // 2 - source.start_ms) // frame_ms + 1
+            else:  # the last frame before it
+                frame = -((source.start_ms - shown + frame_ms // 2) // frame_ms) - 1
+            last = max(0, -(-(source.end_ms - source.start_ms) // frame_ms) - 1)
+            frame = max(0, min(int(frame), last))
+            return self._seek_retained_camera_frame(
+                source.location, frame * frame_ms, frame, int(getattr(pane, "camera_index", 1) or 1),
+            )
+        return False
+
+    def _recording_sources_for_step(self, pane: PassageEvidencePane):
+        """This camera's recordings, closed files and the live tail, read afresh."""
+
+        sources, _pending = recording_sources(
+            self.timeline_store, int(getattr(pane, "camera_index", 1) or 1), self._filmstrip_race_id(),
+            live_locations=self._live_locations_for_filmstrip(pane),
+            # Only the file actually opened is checked, not every file of the race.
+            path_available=lambda _path, _live: True,
+        )
+        return sources
 
     def _navigate_video_candidate(
         self,
