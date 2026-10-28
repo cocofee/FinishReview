@@ -94,10 +94,19 @@ def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: boo
 
     from realtime.problem_analysis import config_from_workspace, run_offline_analysis
 
-    def report(stage: str, done: int, total: int) -> None:
+    def emit(payload: dict) -> None:
         # Frozen Windows executables may ignore PYTHONIOENCODING. ASCII JSON
         # keeps the pipe protocol independent of the system code page.
-        print(_json.dumps({"stage": stage, "done": done, "total": total}, ensure_ascii=True), flush=True)
+        try:
+            print(_json.dumps(payload, ensure_ascii=True, default=str), flush=True)
+        except OSError:
+            # The console that started this run is gone (closed or ended from
+            # the task manager): nobody reads the result, so stop quietly
+            # instead of leaving an "Unhandled exception" box on the screen.
+            raise SystemExit(1) from None
+
+    def report(stage: str, done: int, total: int) -> None:
+        emit({"stage": stage, "done": done, "total": total})
 
     config = config_from_workspace(event_dir)
     if live or finish_live:
@@ -106,10 +115,9 @@ def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: boo
         config.evidence_delay_ms = 0
     summary = run_offline_analysis(config, progress=report)
     if summary.get("skipped"):
-        print(_json.dumps({"stage": "skipped", "message": summary["skipped"]}, ensure_ascii=True), flush=True)
+        emit({"stage": "skipped", "message": summary["skipped"]})
         return 1
-    print(_json.dumps({"stage": "done", "summary": summary.get("summary", {})}, ensure_ascii=True, default=str),
-          flush=True)
+    emit({"stage": "done", "summary": summary.get("summary", {})})
     return 0
 
 

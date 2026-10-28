@@ -1875,7 +1875,8 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     receiver.deliver_metadata(metadata)
     qapp.processEvents()
 
-    event_dir = root / "2026 城市公路自行车赛"
+    today = datetime.now(review_window_module.BEIJING_TIMEZONE).date().isoformat()
+    event_dir = root / f"{today} 2026 城市公路自行车赛"
     assert window.workspace_root == root.resolve()
     assert window.output_dir == event_dir.resolve()
     assert window.metadata_store.current() == metadata
@@ -1982,9 +1983,29 @@ def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
         stage_name="终点",
     )
 
-    event_dir = review_window_module._event_workspace_dir(root, metadata)
+    day = date(2026, 10, 28)
 
-    assert event_dir == (root / "城市赛_race-new").resolve()
+    assert review_window_module._event_workspace_dir(root, metadata, today=day) == (root / "2026-10-28 城市赛").resolve()
+    (root / "2026-10-28 城市赛" / "videos").mkdir(parents=True)
+    assert review_window_module._event_workspace_dir(root, metadata, today=day) == (
+        root / "2026-10-28 城市赛_race-new").resolve()
+
+
+def test_a_saved_race_is_found_under_its_old_or_dated_folder_on_any_day(qapp, tmp_path):
+    """10-28 起新赛事建“日期 赛事名”文件夹；之前建的、或前一天建的赛事，回来仍进原文件夹。"""
+    root = tmp_path / "events"
+    old = RaceMetadata(race_id="race-old", stage_id="stage-1", revision=1, emitted_at_ms=1, race_name="城市赛")
+    RaceMetadataStore(root / "城市赛_race-old" / "cyclerace_race_metadata.json").store(old)
+    dated = replace(old, race_id="race-dated")
+    RaceMetadataStore(root / "2026-10-28 城市赛" / "cyclerace_race_metadata.json").store(dated)
+
+    later = date(2026, 10, 30)
+    assert review_window_module._event_workspace_dir(root, old, today=later) == (root / "城市赛_race-old").resolve()
+    assert review_window_module._event_workspace_dir(root, dated, today=later) == (
+        root / "2026-10-28 城市赛").resolve()
+    fresh = replace(old, race_id="race-fresh")
+    assert review_window_module._event_workspace_dir(root, fresh, today=later) == (
+        root / "2026-10-30 城市赛").resolve()
 
 
 def test_a_race_kept_in_the_root_itself_is_its_own_workspace(qapp, tmp_path):
@@ -1995,7 +2016,8 @@ def test_a_race_kept_in_the_root_itself_is_its_own_workspace(qapp, tmp_path):
     RaceMetadataStore(root / "cyclerace_race_metadata.json").store(metadata)
     assert review_window_module._event_workspace_dir(root, metadata) == root.resolve()
     other = replace(metadata, race_id="race-other", race_name="特奥")
-    assert review_window_module._event_workspace_dir(root, other) == (root / "特奥").resolve()
+    assert review_window_module._event_workspace_dir(root, other, today=date(2026, 10, 28)) == (
+        root / "2026-10-28 特奥").resolve()
 
 
 def test_switching_cyclerace_event_exports_previous_review_summary(qapp, tmp_path):
@@ -2633,6 +2655,33 @@ def test_live_formal_metadata_starts_recording_before_first_passage(
     assert window.recorder is not None and window.recorder.is_running
     assert len(_FakeRecorder.instances) == 1
     assert window.passage_store.events() == ()
+    window.close()
+
+
+def test_another_race_never_cuts_the_running_recording_over(qapp, tmp_path):
+    """10-28: CycleRace test races switched the live console every 3-4 s, restarting the recording."""
+    window = _window(tmp_path)
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[-1]
+    receiver.deliver_metadata(RaceMetadata(
+        race_id="race-formal", stage_id="stage-1", revision=1, emitted_at_ms=1,
+        race_name="正式赛事", stage_name="终点", groups=(RaceGroupMetadata("men-open", "男子公开组"),)))
+    qapp.processEvents()
+    recorder = window.recorder
+    folder = window.output_dir
+    assert recorder is not None and recorder.is_running
+
+    for index in range(3):
+        receiver.deliver_metadata(RaceMetadata(
+            race_id=f"legacy-db-{index}-race-1", stage_id="stage-1", revision=1, emitted_at_ms=2,
+            race_name="接力测试赛", stage_name="接力赛段", groups=(RaceGroupMetadata("1", "公开组"),)))
+        qapp.processEvents()
+
+    assert window.recorder is recorder and recorder.is_running and not recorder.stopped
+    assert window.output_dir == folder
+    assert window.metadata_store.current().race_id == "race-formal"
+    assert "接力测试赛" in window._workspace_notice and "未切换" in window._workspace_notice
+    assert not [path for path in tmp_path.rglob("cyclerace_race_metadata.json") if "接力测试赛" in str(path)]
     window.close()
 
 

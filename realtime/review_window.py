@@ -269,7 +269,27 @@ def _safe_event_folder_name(value: str, fallback: str) -> str:
     return name[:80].rstrip(" .") or "赛事"
 
 
-def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
+def _saved_race_id(folder: Path) -> str | None:
+    """The race a saved folder holds, from its metadata, else from its review scope."""
+    try:
+        existing = RaceMetadataStore(folder / "cyclerace_race_metadata.json").current()
+    except (OSError, RuntimeError, ValueError):
+        existing = None
+    if existing is not None:
+        return existing.race_id
+    scope_path = folder / "review_event_scope.json"
+    if scope_path.is_file():
+        import json
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if isinstance(scope, dict):
+            return scope.get("race_id")
+    return None
+
+
+def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | None = None) -> Path:
     root = Path(root).expanduser().resolve()
     try:
         own = RaceMetadataStore(root / "cyclerace_race_metadata.json").current()
@@ -281,27 +301,26 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
         return root
     folder_name = _safe_event_folder_name(metadata.race_name, metadata.race_id)
     race_suffix = _safe_event_folder_name(metadata.race_id, "race")
-    candidates = [root / folder_name, root / f"{folder_name}_{race_suffix}"]
-    candidates.extend(root / f"{folder_name}_{race_suffix}_{index}" for index in range(2, 100))
+    # A race already saved stays where it is, under its bare name (folders
+    # made before 10-28) or its dated one.
+    dated = re.compile(r"\d{4}-\d{2}-\d{2} " + re.escape(folder_name) + r"(_.*)?")
+    try:
+        saved = sorted(path for path in root.iterdir() if path.is_dir() and (
+            path.name == folder_name or path.name.startswith(f"{folder_name}_") or dated.fullmatch(path.name)))
+    except OSError:
+        saved = []
+    for candidate in saved:
+        if _saved_race_id(candidate) == metadata.race_id:
+            return candidate
+    # A new race is filed under the day it first arrived, not CycleRace's stage
+    # date, which can be wrong (特奥 ran 10-28 with a stage dated 09-20).
+    day = (today or datetime.now(BEIJING_TIMEZONE).date()).isoformat()
+    base = f"{day} {folder_name}"
+    candidates = [root / base, root / f"{base}_{race_suffix}"]
+    candidates.extend(root / f"{base}_{race_suffix}_{index}" for index in range(2, 100))
     for candidate in candidates:
-        metadata_path = candidate / "cyclerace_race_metadata.json"
         if not candidate.exists():
             return candidate
-        try:
-            existing = RaceMetadataStore(metadata_path).current()
-        except (OSError, RuntimeError, ValueError):
-            existing = None
-        if existing is not None and existing.race_id == metadata.race_id:
-            return candidate
-        scope_path = candidate / "review_event_scope.json"
-        if existing is None and scope_path.is_file():
-            import json
-            try:
-                scope = json.loads(scope_path.read_text(encoding="utf-8"))
-                if isinstance(scope, dict) and scope.get("race_id") == metadata.race_id:
-                    return candidate
-            except (OSError, ValueError):
-                pass
         try:
             is_empty = not any(candidate.iterdir())
         except OSError:
@@ -598,6 +617,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._workspace_mode = "live"
         self._archive_background_passage_count = 0
         self._live_metadata_scope = None
+        self._held_race_ids: set[str] = set()
         # The base review surface starts timers while the production window is
         # still being assembled. Initialise health-check state before that
         # happens so an early clock tick cannot observe half-built state.
@@ -4401,7 +4421,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 and (
                     active_metadata is None
                     or (active_metadata.race_id != event.race_id
-                        and self._live_metadata_scope == (event.race_id, event.stage_id))
+                        and self._live_metadata_scope == (event.race_id, event.stage_id)
+                        and not self._other_race_while_recording(event.race_id, event.race_name))
                 )
             ):
                 self._activate_cyclerace_workspace(inbox_metadata)
@@ -4502,8 +4523,29 @@ class FinishReviewWindow(PassageReviewSurface):
         self._observe_runtime_metric("passage_batch_apply", started, item_count=len(changed))
         self._update_runtime_status()
 
+    def _other_race_while_recording(self, race_id: str, race_name: str = "") -> bool:
+        """A recording is never cut over to another race by itself; the operator decides.
+
+        10-28: CycleRace's test races (接力测试赛, 78 of them) reached the live
+        console and switched it every 3-4 s for 35 minutes, restarting the
+        finish recording each time and leaving 120 folders behind.
+        """
+        current = self.metadata_store.current() if self.metadata_store is not None else None
+        if current is None or current.race_id == race_id or not self._recording_any_active():
+            return False
+        self._workspace_notice = (f"收到其他赛事：{race_name or race_id}。正在录像，未切换；"
+                                  "要切换请先停止录像，再在“设置”中打开该赛事。")
+        if race_id not in self._held_race_ids:
+            self._held_race_ids.add(race_id)
+            logger.info("Live recording kept on %s; other race %s not switched to", current.race_id, race_id)
+        self._update_runtime_status()
+        return True
+
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
         if self._defer_capture_callback(self._on_metadata_received, metadata):
+            return
+        if self._workspace_mode != "archive" and self._other_race_while_recording(metadata.race_id,
+                                                                                 metadata.race_name):
             return
         self._live_metadata_scope = (metadata.race_id, metadata.stage_id)
         if self._workspace_mode == "archive":
