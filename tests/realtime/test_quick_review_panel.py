@@ -6,9 +6,12 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication, QLabel
 
-from realtime.problem_items import CATEGORY_VIDEO, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem
+from realtime.problem_items import (
+    CATEGORY_VIDEO, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
+)
 from realtime.quick_review_panel import QuickReviewPanel
 from realtime.chip_history import format_chip_time
+from realtime.arrival_review import candidate_binding
 from tests.realtime.test_arrival_review import event, FRAME, SCOPE
 
 
@@ -860,3 +863,85 @@ def test_three_on_a_wave_picture_excludes_the_person_not_the_picture(wave_panel)
     QTest.keyClick(wave_panel, Qt.Key_3)
     assert labels(wave_panel) == ["61", "非运动员"]
     assert saved(wave_panel) == {"61": 100}
+
+
+# 古浪 10-28: one rider's passage came out as 7 rows of "—" within 1.1 s.
+PIECES = (20_000, 20_300, 20_900, 21_200, 40_000)
+
+
+@pytest.fixture
+def fragment_panel(qapp, tmp_path):
+    """Chips 61 and 5; video pieces with no chip at 20.0 / 20.3 / 20.9 / 21.2 s and 40 s."""
+    directory = tmp_path / "finish_problems"
+    directory.mkdir()
+    items = [ProblemItem(f"piece-{offset}", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "",
+                         chip_time_ms=T0 + offset,
+                         evidence={"frame": dict(FRAME, recorder_ms=T0 + offset, position_ms=250 + offset,
+                                                 frame_index=5 + offset // 50),
+                                   "recorder_ms": T0 + offset}).to_payload()
+             for offset in PIECES]
+    (directory / "problem_list.json").write_text(json.dumps({"race_id": SCOPE[0], "stage_id": SCOPE[1],
+                                                            "items": items}), encoding="utf-8")
+    widget = QuickReviewPanel()
+    widget.events = [event("61", "a", T0), event("5", "d", T0 + 60_000)]
+    widget.frame = dict(FRAME, recorder_ms=T0 + 20_000, position_ms=20_250, frame_index=405)
+    widget.set_events_provider(lambda: widget.events)
+    widget.set_frame_provider(lambda: widget.frame)
+    widget.set_workspace(tmp_path)
+    widget.set_scope(*SCOPE)
+    return widget
+
+
+def video_rows(panel):
+    return [(entry.time_ms - T0, [piece.time_ms - T0 for piece in entry.fragments])
+            for entry in panel._arrival_rows if entry.event is None]
+
+
+def test_pieces_of_one_passage_within_a_second_are_one_row_never_chained(fragment_panel):
+    # 21.2 s is 0.3 s after 20.9 s but 1.2 s after the first piece: a row of its own.
+    assert video_rows(fragment_panel) == [(20_000, [20_300, 20_900]), (21_200, []), (40_000, [])]
+    assert [entry.bib for entry in fragment_panel._arrival_rows] == ["61", "", "", "", "5"]
+    index = next(i for i, entry in enumerate(fragment_panel._arrival_rows) if entry.fragments)
+    assert fragment_panel.table.item(index, 3).text() == "待定·3段"
+    assert "拆成 3 段" in fragment_panel.table.item(index, 3).toolTip()
+
+
+def test_a_folded_row_is_excluded_only_after_it_is_all_seen_and_comes_back_whole(fragment_panel):
+    panel = fragment_panel
+    index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
+    panel._arrival_clicked(index)
+    assert "还差" in panel.confirmation_status.text()
+    QTest.keyClick(panel, Qt.Key_3)
+    assert "没看" in panel.hint.text()
+    assert not panel._arrival_store.active(SCOPE)  # nothing ruled on a span nobody saw
+
+    look_through(panel, 19_500, 21_400)
+    assert "已看完" in panel.confirmation_status.text()
+    panel._arrival_clicked(index)
+    QTest.keyClick(panel, Qt.Key_3)
+    ruled = {entry["key"]: entry["action"] for entry in panel._arrival_store.active(SCOPE)}
+    assert ruled == {f"candidate:piece-{offset}": "not_rider" for offset in (20_000, 20_300, 20_900)}
+    assert video_rows(panel) == [(20_000, [20_300, 20_900]), (21_200, []), (40_000, [])]
+    excluded = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
+    assert panel.table.item(excluded, 3).text() == "已排除·3段"
+
+    panel._arrival_clicked(excluded)
+    QTest.keyClick(panel, Qt.Key_Backspace)
+    assert not panel._arrival_store.active(SCOPE)
+
+
+def test_a_piece_judged_on_its_own_stays_a_row_of_its_own(fragment_panel):
+    panel = fragment_panel
+    piece = next(item for item in panel.items if item.item_id == "piece-20300")
+    panel._arrival_store.save(SCOPE, "candidate:piece-20300", candidate_binding(piece), "not_rider",
+                              candidate_id="piece-20300", frame=dict(FRAME))
+    panel._quick_render_signature = None
+    panel._render()
+    assert video_rows(panel) == [(20_000, [20_900]), (20_300, []), (21_200, []), (40_000, [])]
+
+
+def test_opening_a_folded_piece_opens_its_row(fragment_panel):
+    panel = fragment_panel
+    panel.select_item("piece-20900")
+    selected = panel._selected_arrival()
+    assert selected.time_ms - T0 == 20_000 and len(selected.fragments) == 2

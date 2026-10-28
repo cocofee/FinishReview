@@ -23,7 +23,7 @@ from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, u
 from .chip_history import format_chip_time
 from .crossing_time import item_crossing_time, recorder_crossing_time, workspace_clocks
 from .problem_items import (
-    CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, STATUS_EXCLUDED,
+    CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING, STATUS_EXCLUDED,
     STATUS_WAITING, ProblemItem, stable_item_id,
 )
 from .problem_panel import ProblemListPanel
@@ -41,6 +41,10 @@ WAVE_VIEW_MARGIN_MS = 500
 # A wave is swept by dragging the picture; a rider stays in view about a second
 # either side of the line, so one decoded frame covers 250 ms either side.
 WAVE_VIEW_REACH_MS = 250
+# One passage the detector broke into pieces (古浪, 10-28: 7 pieces in 1.1 s)
+# is one row: pieces without a chip within a second of the first, never
+# chained on from a later piece, so two riders a few seconds apart stay apart.
+FRAGMENT_REACH_MS = 1000
 # A chip of a confirmed wave that nobody on the picture was counted for
 # (older confirmations only; a wave now shows 少 N until someone is counted).
 WAVE_NO_PERSON = "wave_no_person"
@@ -64,6 +68,7 @@ class ArrivalRow:
     stale: bool = False
     note: str = ""
     mark: dict | None = None  # a 多出 row: someone counted beyond the wave's chips
+    fragments: tuple = ()  # later pieces of the same passage shown on this row (rows of their own before)
 
 
 @dataclass
@@ -378,6 +383,7 @@ class QuickReviewPanel(ProblemListPanel):
         counting = set(self._wave_candidates().values())
         rows = [row for row in rows if row.event is not None
                 or self._candidate_shown(row.item, assigned, counting)]
+        rows = self._fold_fragments(rows, assigned)
         # Official chip order remains stable when a corrected video time is saved.
         chips = sorted((row for row in rows if row.event is not None), key=lambda row: (
             row.event.sequence, int(row.event.timeline_timestamp_ms), row.key))
@@ -391,6 +397,39 @@ class QuickReviewPanel(ProblemListPanel):
                 merged.append(others.pop(0))
             merged.append(chip)
         return merged + others
+
+    def _fold_fragments(self, rows, assigned):
+        """Pieces of one passage without a chip, within a second of the first, share its row.
+
+        Display only: every piece keeps its own record, and a ruling on the row
+        is saved on each.  Only untouched pieces of a no-chip crossing fold, and
+        only with pieces in the same state, so nothing judged or counted hides.
+        """
+        def foldable(row):
+            item = row.item
+            return (row.event is None and row.mark is None and row.decision is None and row.time_ms is not None
+                    and item.kind == KIND_NO_CHIP_CROSSING and not item.evidence.get("wave_parent")
+                    and not self._marks.get(item.item_id) and not assigned[item.item_id])
+        folded, leads = set(), {}
+        for row in sorted((row for row in rows if foldable(row)), key=lambda row: (row.time_ms, row.key)):
+            state = (self._row_state(row), (self._category(row.item) or {}).get("action"),
+                     int((row.item.evidence.get("frame") or {}).get("camera_index") or 1))
+            lead = leads.get(state)
+            if lead is not None and row.time_ms - lead.time_ms <= FRAGMENT_REACH_MS:
+                lead.fragments += (row,)
+                folded.add(row.key)
+            else:
+                leads[state] = row
+        return [row for row in rows if row.key not in folded]
+
+    def _fragment_unseen(self, row):
+        """What of a folded row, from its first piece − 0.5 s to its last + 0.5 s, nobody has looked at."""
+        if row is None or not row.fragments:
+            return []
+        camera = str(int((row.item.evidence.get("frame") or {}).get("camera_index") or 1))
+        seen = self._arrival_drafts.get("seen", {}).get(camera, [])
+        return uncovered_intervals(row.time_ms - WAVE_VIEW_MARGIN_MS,
+                                   row.fragments[-1].time_ms + WAVE_VIEW_MARGIN_MS, seen, tolerance=100)
 
     def _candidate_shown(self, item, assigned, counting):
         """A picture is a row while it shows someone who is not yet a chip's crossing.
@@ -572,7 +611,8 @@ class QuickReviewPanel(ProblemListPanel):
         counted = {index: plan.matches for index, plan in plans.items() if plan.marks or plan.split}
         signature = (self._arrival_scope, self._selected_key, tuple(sorted(counted.items())),
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
-                            candidate_binding(row.item), self._wave_of.get(row.key), group)
+                            candidate_binding(row.item), self._wave_of.get(row.key), group,
+                            tuple(piece.key for piece in row.fragments))
                            for row, group in zip(rows, groups)))
         if signature == self._quick_render_signature:
             self._sync_arrival_confirmation()
@@ -598,7 +638,8 @@ class QuickReviewPanel(ProblemListPanel):
                 chip_number += 1
                 if category != "非运动员":
                     number = str(chip_number)
-            for column, text in enumerate((number, row.bib or "—", time, state, groups[index])):
+            shown_state = f"{state}·{len(row.fragments) + 1}段" if row.fragments else state
+            for column, text in enumerate((number, row.bib or "—", time, shown_state, groups[index])):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
@@ -616,6 +657,11 @@ class QuickReviewPanel(ProblemListPanel):
                            "点击回看对应时段；已确认有自行车时单击只选择运动员，双击回看；不会自动确认过线")
                 if row.mark is not None:
                     tooltip = "比芯片多点出的人：点这一行回到点他的那一帧；没芯片按 4，不是运动员按 3，点错右键取消"
+                if row.fragments:
+                    tooltip = (f"同一次过线被拆成 {len(row.fragments) + 1} 段画面，合成这一行"
+                               f"（{(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒）\n"
+                               "看完首段前 0.5 秒到末段后 0.5 秒，画面上看到几个人就点几个；3 排除整行，退格撤回整行\n"
+                               + tooltip)
                 wave = self._row_wave(row) if row.key in self._wave_of else None
                 if column == 0 and wave is not None and len(wave) > 1:
                     # Neighbouring waves alternate shades, so where one ends shows.
@@ -635,9 +681,10 @@ class QuickReviewPanel(ProblemListPanel):
                                f"录像原时刻：{format_chip_time(row.recorder_ms)}\n" + tooltip)
                 cell.setToolTip(tooltip)
                 self.table.setItem(index, column, cell)
-            if row.key == self._selected_key:
+            if row.key == self._selected_key or any(piece.key == self._selected_key for piece in row.fragments):
                 selected = index
         if selected >= 0:
+            self._selected_key = rows[selected].key
             self.table.setCurrentCell(selected, 0)
         elif rows:
             self.table.setCurrentCell(0, 0)
@@ -651,6 +698,10 @@ class QuickReviewPanel(ProblemListPanel):
             self._open_row(0)
         elif self._active_item is not None:
             fresh = next((row.item for row in rows if row.item.item_id == self._active_item.item_id), None)
+            if fresh is None:
+                # A piece just folded into the row of its passage: the row stays open, on this piece.
+                fresh = next((piece.item for row in rows for piece in row.fragments
+                              if piece.item.item_id == self._active_item.item_id), None)
             if fresh is None and self._active_item.item_id in self._candidate_wave:
                 # A wave's counting picture has no row of its own; it stays open.
                 fresh = next((item for item in self.items if item.item_id == self._active_item.item_id), None)
@@ -771,6 +822,9 @@ class QuickReviewPanel(ProblemListPanel):
         counting = item_id in self._candidate_wave
         index = next((i for i, row in enumerate(self._arrival_rows)
                       if row.item.item_id == item_id and not (counting and (row.decision or row.mark))), None)
+        if index is None:  # a piece of a folded passage opens its row
+            index = next((i for i, row in enumerate(self._arrival_rows)
+                          if any(piece.item.item_id == item_id for piece in row.fragments)), None)
         if index is not None:
             self._arrival_clicked(index)
 
@@ -972,6 +1026,12 @@ class QuickReviewPanel(ProblemListPanel):
         color = ""
         if plan is not None and (plan.marks or plan.split):
             status, color = self._wave_status(plan)
+        elif row is not None and row.fragments and wave is None:
+            unseen = self._fragment_unseen(row)
+            status = (f"{len(row.fragments) + 1} 段 · {(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒"
+                      + (f" · 还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看" if unseen
+                         else " · 已看完") + " · 看到几个人就点几个，3 排除整行")
+            color = "#9a5b12" if unseen else "#126044"
         elif wave is not None and len(wave) > 1 and any(chip.decision is None for chip in wave):
             status = f"本波 {wave[0].bib}→{wave[-1].bib}（{len(wave)} 个芯片）：点一个人存一个"
         self.confirmation_status.setText(status)
@@ -1022,7 +1082,8 @@ class QuickReviewPanel(ProblemListPanel):
         seen[camera] = add_viewed(seen.get(camera, []), stamp, stamp - WAVE_VIEW_REACH_MS,
                                   stamp + WAVE_VIEW_REACH_MS, WAVE_VIEW_REACH_MS)
         self._draft_timer.start()
-        if self._wave_plan() is not None:
+        selected = self._selected_arrival()
+        if self._wave_plan() is not None or (selected is not None and selected.fragments):
             self._sync_arrival_confirmation()  # "还有 x 秒没看" counts down on this very frame
 
     def picture_candidate(self, frame):
@@ -1258,15 +1319,31 @@ class QuickReviewPanel(ProblemListPanel):
                                          for row in self._arrival_rows):
             self.hint.setText("本处已有选手确认，请先撤销误确认。")
             return
+        row = self._selected_arrival()
+        members = [row.item, *(piece.item for piece in row.fragments)] if row is not None and row.fragments else []
+        pieces = [member for member in members if member.item_id != item.item_id] if any(
+            member.item_id == item.item_id for member in members) else []
+        unseen = self._fragment_unseen(row) if pieces else []
+        if unseen and action != "held":
+            # A folded row is ruled on as a whole, so all of it is looked at first.
+            self.hint.setText(f"这一行 {len(pieces) + 1} 段画面还差 "
+                              f"{sum(right - left for left, right in unseen) / 1000:.1f} 秒没看；"
+                              "看完首段前 0.5 秒到末段后 0.5 秒再判。")
+            return
+        operation = getattr(self, "_shortcut_operation", None) or (uuid.uuid4().hex if pieces else None)
         try:
             frame = dict(frame or {})
             frame.setdefault("calibration_version", item.calibration_version)
-            self._arrival_store.save(self._arrival_scope, "candidate:" + item.item_id,
-                                     candidate_binding(item), action, candidate_id=item.item_id,
-                                     frame=frame,
-                                     analysis_signature=item.evidence.get("analysis_signature", ""),
-                                     operation_id=getattr(self, "_shortcut_operation", None),
-                                     calibration_version=item.calibration_version)
+            # One ruling for the row is saved on every piece of it, under one
+            # operation, so Backspace takes the whole row back.
+            for target in (item, *pieces):
+                self._arrival_store.save(self._arrival_scope, "candidate:" + target.item_id,
+                                         candidate_binding(target), action, candidate_id=target.item_id,
+                                         frame=frame,
+                                         analysis_signature=target.evidence.get("analysis_signature", ""),
+                                         operation_id=operation,
+                                         calibration_version=target.calibration_version,
+                                         **({"fragment_of": item.item_id} if target is not item else {}))
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"审核未保存：{error}")
             return
