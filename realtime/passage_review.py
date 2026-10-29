@@ -9168,6 +9168,8 @@ class PassageReviewSurface(QDialog):
             if piece is None:
                 return location
             piece_location, piece_ms = piece
+            if piece_location.segment.media_started_at_ms is None:
+                return location  # a piece not timed yet has no picture to match
             # A picture tried once is not decoded again: unsure (a still scene) or not found.
             tried = self.__dict__.setdefault("_archive_tries", {})
             attempt = (segment.segment_id, str(piece_location.video_path), int(piece_ms))

@@ -71,9 +71,12 @@ RECORD_BIB = "record_bib"
 # it is the same passage (古浪 6 号 was a late import), not a miss.
 BIB_CHIP_REACH_MS = 5000
 # A detected crossing this close to someone counted on a wave's picture, on the
-# same camera, is that person: not a row of its own (古浪 10-28: one rider showed
-# as a 疑似漏读 row and a 待定 card at 11:28:57.101).
+# same camera, is most likely that person (古浪 10-28: one rider showed as a
+# 疑似漏读 row and a 待定 card at 11:28:57.101).  It stays a row, shown as
+# 已点附近: it may be someone else nobody counted (review 10-29, 疑点保留).
 COUNTED_REACH_MS = 500
+NEAR_COUNTED_TEXT = ("已点附近：这一刻 0.5 秒内已点过人，多半就是那个人。看一眼：是同一个人按 1 排除；"
+                     "是没点到的人就在画面上补点，或按 3 补录号码。")
 # People counted up to about three frames before the frame shown are drawn as a
 # faded ring, so a rider still on the line is not counted a second time.  Only
 # earlier ones and only this close: further off the rider has moved on and the
@@ -178,6 +181,7 @@ class QuickReviewPanel(ProblemListPanel):
         # line before it (None: nobody), read off the strip once (earlier_arrival).
         self._earlier = {}
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
+        self._near_counted_items = frozenset()  # item ids of crossings within COUNTED_REACH_MS of someone counted
         self._strip_end = (None, 0.0)  # (pieces, the strip's last chip-clock moment)
         self._earlier_timer = QTimer(self)
         self._earlier_timer.setSingleShot(True)
@@ -447,8 +451,9 @@ class QuickReviewPanel(ProblemListPanel):
         assigned = Counter(row.decision["candidate_id"] for row in rows if row.decision)
         counting = set(self._wave_candidates().values())
         moments = self._counted_moments(counting)
-        rows = [row for row in rows if row.event is not None
-                or self._candidate_shown(row.item, assigned, counting, moments)]
+        rows = [row for row in rows if row.event is not None or self._candidate_shown(row.item, assigned, counting)]
+        self._near_counted_items = frozenset(row.item.item_id for row in rows
+                                       if row.event is None and self._near_counted_moment(row.item, assigned, moments))
         rows = self._without_repeats(rows)
         rows = self._fold_fragments(rows, assigned)
         # Arrival order is chip time.  Not the order the records came in: a chip
@@ -582,28 +587,33 @@ class QuickReviewPanel(ProblemListPanel):
         elif read == EARLIER_BATCH:
             self._earlier_timer.start()
 
-    def _candidate_shown(self, item, assigned, counting, moments=None):
+    def _candidate_shown(self, item, assigned, counting):
         """A picture is a row while it shows someone who is not yet a chip's crossing.
 
         The picture a wave is counted on is never a row of its own: its people
         are the wave's chip rows, and whoever is left over is split onto a row of
         their own when the wave is confirmed.  A split-off person is a row while
-        they stand on it; undoing the wave takes them back into it.  A detected
-        crossing nobody ruled on, at the moment someone was counted on a wave's
-        picture, is that person.
+        they stand on it; undoing the wave takes them back into it.
         """
         if item.item_id in counting:
             return False
         marks = self._marks.get(item.item_id, ())
         if item.evidence.get("wave_parent"):
             return assigned[item.item_id] < rider_count(marks)
-        if moments and not marks and not assigned[item.item_id] and self._category(item) is None:
-            frame = item.evidence.get("frame") or {}
-            stamp = item.evidence.get("recorder_ms", frame.get("recorder_ms"))
-            near = moments.get(int(frame.get("camera_index") or 1), ())
-            if stamp is not None and any(abs(int(stamp) - moment) <= COUNTED_REACH_MS for moment in near):
-                return False
         return assigned[item.item_id] < max(1, len(marks))
+
+    def _near_counted_moment(self, item, assigned, moments):
+        """A detected crossing nobody ruled on, at the moment someone was counted on a wave's picture.
+
+        Most likely that person, maybe someone nobody counted: a row, 已点附近
+        (COUNTED_REACH_MS).
+        """
+        if not moments or self._marks.get(item.item_id) or assigned[item.item_id] or self._category(item) is not None:
+            return False
+        frame = item.evidence.get("frame") or {}
+        stamp = item.evidence.get("recorder_ms", frame.get("recorder_ms"))
+        near = moments.get(int(frame.get("camera_index") or 1), ())
+        return stamp is not None and any(abs(int(stamp) - moment) <= COUNTED_REACH_MS for moment in near)
 
     def _counted_moments(self, counting):
         """Camera -> recorder moments of everyone counted on a wave's picture, those without a chip too."""
@@ -795,7 +805,7 @@ class QuickReviewPanel(ProblemListPanel):
                    for index, plan in plans.items() if plan.marks or plan.split}
         busy = self._earlier_shown = frozenset(key for key, arrival in self._earlier.items() if arrival is not None)
         signature = (self._arrival_scope, self._selected_key, tuple(sorted(counted.items())), self._attention_only,
-                     busy,
+                     busy, self._near_counted_items,
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
                             candidate_binding(row.item), self._wave_of.get(row.key), group, row.carrier,
                             tuple(piece.key for piece in row.fragments))
@@ -838,6 +848,9 @@ class QuickReviewPanel(ProblemListPanel):
             arrival = self._earlier_arrival(row, read=False)
             if arrival is not None:
                 shown_state = "可能多人"
+            near_counted = state == "待定" and row.item.item_id in self._near_counted_items
+            if near_counted:
+                shown_state = "已点附近"
             if state == "多余芯片":
                 shown_state = f"{row.carrier}号带的" if row.carrier else "双芯片"
             for column, text in enumerate((number, row.bib or "—", time, shown_state, groups[index])):
@@ -875,6 +888,8 @@ class QuickReviewPanel(ProblemListPanel):
                 if arrival is not None:
                     tooltip = (f"可能多人：过线前 {(row.time_ms - arrival) / 1000:.1f} 秒线上还有人到，"
                                "看到几个人就点几个\n" + tooltip)
+                if near_counted:
+                    tooltip = NEAR_COUNTED_TEXT + "\n" + tooltip
                 if row.fragments:
                     tooltip = (f"同一次过线被拆成 {len(row.fragments) + 1} 段画面，合成这一行"
                                f"（{(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒）\n"
@@ -1149,6 +1164,8 @@ class QuickReviewPanel(ProblemListPanel):
         if arrival is not None:
             text = (f"可能多人：过线前 {(row.time_ms - arrival) / 1000:.1f} 秒线上还有人到，"
                     "已从那时放起；看到几个人就点几个。")
+        if self._row_state(row) == "待定" and row.item.item_id in self._near_counted_items:
+            text = NEAR_COUNTED_TEXT
         if text:
             self.hint.setText(text)
 

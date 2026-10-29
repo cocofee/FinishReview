@@ -1277,13 +1277,21 @@ def test_a_person_flagged_without_a_chip_cannot_be_counted_again(wave_panel):
     assert saved(wave_panel) == {}
 
 
-def test_a_detected_crossing_at_a_counted_moment_is_not_a_second_row(wave_panel):
+def test_a_detected_crossing_at_a_counted_moment_stays_a_row_shown_as_near_someone_counted(wave_panel):
+    """Review 10-29: hidden, it might be someone nobody counted; it is shown, 已点附近 (疑点保留)."""
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     count_on_picture(wave_panel, .2, 100)
     detected = wave_panel.add_manual_problem(dict(FRAME, frame_index=9, recorder_ms=T0 + 300), recorder_ms=T0 + 300)
     far = wave_panel.add_manual_problem(dict(FRAME, frame_index=60, recorder_ms=T0 + 3000), recorder_ms=T0 + 3000)
-    shown = {entry.item.item_id for entry in wave_panel._arrival_rows}
-    assert detected.item_id not in shown and far.item_id in shown
+    rows = {entry.item.item_id: index for index, entry in enumerate(wave_panel._arrival_rows)}
+    assert detected.item_id in rows and far.item_id in rows
+    assert wave_panel.table.item(rows[detected.item_id], 3).text() == "已点附近"
+    assert wave_panel.table.item(rows[far.item_id], 3).text() == "待定"
+    assert "多半就是那个人" in wave_panel.table.item(rows[detected.item_id], 3).toolTip()
+    assert "待定" in wave_panel.attention_button.toolTip()  # still to look at
+    wave_panel._arrival_clicked(rows[detected.item_id])
+    assert "按 1 排除" in wave_panel.hint.text()
+    assert menu_labels(wave_panel, rows[detected.item_id])[:2] == ["补录号码…", "不是运动员"]
 
 
 def counted_short(wave_panel):

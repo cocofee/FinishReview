@@ -5,6 +5,7 @@ import os
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -138,6 +139,20 @@ def wire_archive_clock(window):
     window._is_archive = PassageReviewSurface._is_archive
     window._archive_on_piece_clock = lambda: False
     window._aligned_archive = lambda *args: PassageReviewSurface._aligned_archive(window, *args)
+
+
+def test_an_archive_is_not_aligned_on_a_piece_not_timed_yet(monkeypatch):
+    """Review 10-29: stepping out of a piece without a media start crashed the step (int(None))."""
+    def matched(*args, **kwargs):
+        raise AssertionError("no picture to match on a piece without a start")
+
+    monkeypatch.setattr("realtime.archive_alignment.archive_shift_ms", matched)
+    window = SimpleNamespace(_archive_on_piece_clock=lambda: True, _is_archive=PassageReviewSurface._is_archive)
+    archive = SimpleNamespace(video_path=Path("cam_archive_0001.mkv"),
+                              segment=SimpleNamespace(segment_id="a", media_started_at_ms=BASE))
+    piece = SimpleNamespace(video_path=Path("cam_review_0001.ts"),
+                            segment=SimpleNamespace(segment_id="p", media_started_at_ms=None))
+    assert PassageReviewSurface._aligned_archive(window, archive, BASE + 500, (piece, BASE + 500)) is archive
 
 
 @pytest.mark.parametrize(("direction", "frame_index", "gap_ms", "archive", "expected"), [
