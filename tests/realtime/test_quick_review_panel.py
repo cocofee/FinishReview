@@ -877,35 +877,35 @@ def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monk
     assert len(jumps) == 1
 
 
-def test_a_crossing_without_a_chip_opens_two_seconds_before_it(wave_panel, strip_landing):
-    """15:50 现代五项：一次过线 4 个人，落在那一刻只看到 2 个，前两人早 1.7 秒；从前 2 秒开始看。"""
+def test_a_crossing_without_a_chip_opens_half_a_second_before_it(wave_panel, strip_landing):
+    """现代五项 10-29：从前 2 秒看起人还在远处，太远；和一波芯片一样从前 0.5 秒看起。"""
     _asked, jumps = strip_landing
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 18_000, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_500, "reference_only": True}
 
 
-def test_without_an_aligned_strip_a_crossing_opens_two_seconds_back_from_its_own_frame(wave_panel):
-    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 2 秒开始看（可能在上一段录像里）。"""
+def test_without_an_aligned_strip_a_crossing_opens_half_a_second_back_from_its_own_frame(wave_panel):
+    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.5 秒开始看（可能在上一段录像里）。"""
     jumps = []
     wave_panel.jump_requested.connect(jumps.append)
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=40, position_ms=2000, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 0,
+    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1500,
                          "frame_index": None, "reference_only": True}
-    wave_panel.add_manual_problem(dict(FRAME, frame_index=20, position_ms=1000, recorder_ms=T0 + 30_000),
+    wave_panel.add_manual_problem(dict(FRAME, frame_index=4, position_ms=200, recorder_ms=T0 + 30_000),
                                   recorder_ms=T0 + 30_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.time_ms == T0 + 30_000))
-    assert jumps[-1]["position_ms"] == -1000  # before the file: the window opens what holds it
+    assert jumps[-1]["position_ms"] == -300  # before the file: the window opens what holds it
 
 
 def test_a_crossing_where_someone_came_on_earlier_is_marked_maybe_several(wave_panel, strip_landing, monkeypatch):
-    """15:50 现代五项：前两人早 1.9 秒到线，落在那一刻只看到后两人；标“可能多人”，从更早看起，只是提示。"""
+    """15:50 现代五项：前两人早 1.9 秒到线，落在那一刻只看到后两人；标“可能多人”，从前两人到线时看起，只是提示。"""
     from realtime import quick_review_panel as module
     _asked, jumps = strip_landing
     asked = []
@@ -921,8 +921,8 @@ def test_a_crossing_where_someone_came_on_earlier_is_marked_maybe_several(wave_p
     index = next(i for i, entry in enumerate(wave_panel._arrival_rows) if entry.item.item_id == busy.item_id)
     assert wave_panel._row_state(wave_panel._arrival_rows[index]) == "待定"  # a hint, nothing decided
     wave_panel._arrival_clicked(index)
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 17_600, "reference_only": True}
-    assert "过线前 1.9 秒线上还有人到，已从前 2.4 秒放起" in wave_panel.hint.text()
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 18_100, "reference_only": True}
+    assert "过线前 1.9 秒线上还有人到，已从那时放起" in wave_panel.hint.text()
     assert wave_panel.confirmation_status.text().startswith("可能多人 · ")
     # Read once per crossing; the other crossings are someone else's, not this one's people.
     assert [at for at, _others in asked].count(T0 + 20_000) == 1
@@ -1190,13 +1190,17 @@ def test_keys_on_a_crossing_without_a_chip(fragment_panel):
     assert panel._row_state(entered) == "补录" and entered.bib == "88"
     QTest.keyClick(panel, Qt.Key_4)  # the bib goes, the row stays 疑似漏读
     assert panel._row_state(panel._arrival_rows[lone]) == "疑似漏读"
-    provider, panel._frame_provider = panel._frame_provider, lambda: {}  # the recording does not open
-    QTest.keyClick(panel, Qt.Key_1)
-    assert panel._row_state(panel._arrival_rows[lone]) == "疑似漏读"  # nothing half done
-    assert "有效录像画面" in panel.hint.text()
-    panel._frame_provider = provider
+    # 10-29 现场：画面不在这一行自己那一帧（提前看起、换到完整录像）时按 1，
+    # 每按一次就新建一条“人工发现”并排除它，选中的行不动。按键只处理选中的行。
+    preparing = QSignalSpy(panel.candidate_preparing)
+    own = panel._arrival_rows[lone].item.evidence["frame"]
+    provider, panel._frame_provider = panel._frame_provider, lambda: {}  # the picture is not this row's
     QTest.keyClick(panel, Qt.Key_1)
     assert panel._row_state(panel._arrival_rows[lone]) == "已排除"
+    assert not preparing  # nothing on screen made into a 人工发现 row
+    ruling = next(entry for entry in panel._arrival_store.active(SCOPE) if entry["action"] == "not_rider")
+    assert (ruling["frame"]["segment_id"], ruling["frame"]["position_ms"]) == (own["segment_id"], own["position_ms"])
+    panel._frame_provider = provider
     excluded = sum(entry["action"] == "not_rider" for entry in panel._arrival_store.active(SCOPE))
     folded = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
     panel._arrival_clicked(folded)

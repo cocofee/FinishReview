@@ -39,10 +39,6 @@ KEEP = "keep"  # landing: the picture already shows this row's wave; leave it
 # A wave is looked at from a little before its first chip to a little after its
 # last: a rider without a chip may lead it or close it.
 WAVE_VIEW_MARGIN_MS = 500
-# A crossing without a chip is looked at from 2 s before it: one row may be
-# several people (15:50, 10-29: the row's moment showed the last 2 of 4, the
-# first two crossed 1.7 s earlier).
-PASSAGE_LEAD_MS = 2000
 # Crossings without a chip read for 可能多人 per pass, so the table never waits on the strip.
 EARLIER_BATCH = 8
 # A wave is swept by dragging the picture; a rider stays in view about a second
@@ -517,7 +513,7 @@ class QuickReviewPanel(ProblemListPanel):
         return [row for row in rows if row.key not in folded]
 
     def _fragment_unseen(self, row, whole=False):
-        """What of a row, from its first piece − 2 s to its last + 0.5 s, nobody has looked at.
+        """What of a row, from where it is looked at from to its last piece + 0.5 s, nobody has looked at.
 
         Only a folded row has to be seen whole before it is ruled on, or any row
         of a Shift+3 run (WHOLE).
@@ -531,16 +527,17 @@ class QuickReviewPanel(ProblemListPanel):
                                    seen, tolerance=100)
 
     def _passage_lead(self, row):
-        """How long before a crossing without a chip it is looked at from (PASSAGE_LEAD_MS).
+        """How long before a crossing it is looked at from: half a second, as a wave.
 
-        可能多人: from half a second before the other one came onto the line.
+        可能多人: from the moment the other one came onto the line (15:50,
+        10-29: the first two of 4 came on 1.9 s before the row's moment).  2 s
+        before every crossing, and half a second more on 可能多人, was too far
+        back: the rider was still far off.
         """
-        if row is None or row.event is not None:
-            return WAVE_VIEW_MARGIN_MS
-        arrival = self._earlier_arrival(row, read=False)
+        arrival = self._earlier_arrival(row, read=False) if row is not None and row.event is None else None
         if arrival is None:
-            return PASSAGE_LEAD_MS
-        return max(PASSAGE_LEAD_MS, -(-(int(row.time_ms - arrival) + WAVE_VIEW_MARGIN_MS) // 100) * 100)
+            return WAVE_VIEW_MARGIN_MS
+        return max(WAVE_VIEW_MARGIN_MS, -(-int(row.time_ms - arrival) // 100) * 100)
 
     def _earlier_arrival(self, row, read=True):
         """When someone else came onto the line up to 2 s before this crossing without a chip (可能多人).
@@ -996,11 +993,11 @@ class QuickReviewPanel(ProblemListPanel):
         return dict(frame, reference_only=True) if frame is not None else None
 
     def _passage_start(self, row):
-        """2 s before a crossing without a chip, on its own camera; None: its own frame.
+        """Where a crossing without a chip is looked at from (_passage_lead), on its own camera.
 
         Without a strip aligned to the chips (a race without chips: 现代五项
-        10-29) it is 2 s back from the row's own frame, maybe before its file
-        starts: the window opens the archive or the piece that holds it.
+        10-29) it is that far back from the row's own frame, maybe before its
+        file starts: the window opens the archive or the piece that holds it.
         """
         if (not self._quick_ready or row.event is not None or row.time_ms is None
                 or self._row_state(row) != "待定"):
@@ -1151,7 +1148,7 @@ class QuickReviewPanel(ProblemListPanel):
         arrival = self._earlier_arrival(row, read=False)
         if arrival is not None:
             text = (f"可能多人：过线前 {(row.time_ms - arrival) / 1000:.1f} 秒线上还有人到，"
-                    f"已从前 {self._passage_lead(row) / 1000:.1f} 秒放起；看到几个人就点几个。")
+                    "已从那时放起；看到几个人就点几个。")
         if text:
             self.hint.setText(text)
 
@@ -1302,7 +1299,8 @@ class QuickReviewPanel(ProblemListPanel):
         row = self._arrival_rows[index]
         if self.current_item() is None or self.current_item().item_id != row.item.item_id:
             self._open_row(index)
-        self._classify("not_rider")
+            row = self._row_by_key(key) or row
+        self._classify("not_rider", row)
 
     def _miss_not_rider(self, key):
         """不是运动员 on a 疑似漏读 row: out of the wave's count, or the picture excluded."""
@@ -1312,9 +1310,7 @@ class QuickReviewPanel(ProblemListPanel):
         if row.item.evidence.get("wave_parent"):
             self._return_to_wave(row, exclude=True)
             return
-        if self.current_item() is None or self.current_item().item_id != row.item.item_id:
-            self._open_row(self._arrival_rows.index(row))
-        if not self._frame_usable(self._frame_provider()):
+        if not self._frame_usable(self._row_frame(row)):
             self.hint.setText("请先打开当前候选的有效录像画面。")  # still 疑似漏读: nothing taken back
             return
         self._take_back_no_chip(row)
@@ -1491,8 +1487,8 @@ class QuickReviewPanel(ProblemListPanel):
             status, color = self._wave_status(plan)
         elif row is not None and wave is None and self._row_state(row) == "待定" and row.time_ms is not None:
             # A crossing without a chip may be several people: it is looked at
-            # from 2 s before to half a second after (15:50, 10-29: 4 people on
-            # one row, the first frame showed 2).
+            # from half a second before (可能多人: from when the first came on) to
+            # half a second after (15:50, 10-29: 4 people on one row).
             unseen = self._fragment_unseen(row, whole=True)
             span = (f"{len(row.fragments) + 1} 段 · {(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒 · "
                     if row.fragments else "")
@@ -1831,16 +1827,37 @@ class QuickReviewPanel(ProblemListPanel):
     @staticmethod
     def _frame_usable(frame):
         """A frame of a recording a ruling can be saved on and reopened from."""
-        return bool(frame and frame.get("frame_index", -1) >= 0 and frame.get("position_ms", -1) >= 0
+        index = frame.get("frame_index") if frame else None
+        return bool(frame and index is not None and index >= 0 and frame.get("position_ms", -1) >= 0
                     and frame.get("segment_id") and frame.get("video_path"))
 
-    def _classify(self, action):
-        if action != "held":
-            self.candidate_preparing.emit()
-        if not self._usable():
-            return
-        item = self._candidate_item()
+    def _row_frame(self, row):
+        """The frame a ruling on ROW is saved on: the one shown if it is this row's, else the row's own.
+
+        This row's: from where it is looked at from (a second at least) to a
+        second after its last piece.
+        """
         frame = self._frame_provider()
+        last = (row.fragments[-1] if row.fragments else row).time_ms
+        if (not self._frame_usable(frame) or self._shown_ms is None or row.time_ms is None
+                or not row.time_ms - max(1000, self._passage_lead(row)) <= self._shown_ms <= last + 1000):
+            frame = row.item.evidence.get("frame")
+        return frame
+
+    def _classify(self, action, row=None):
+        """Rule on the candidate on screen; with ROW (1, its right click), on that row of the table.
+
+        On screen, a frame browsed to becomes a candidate of its own first (the
+        window's candidate_preparing: Enter on a moment dragged to).  A row is
+        ruled on as it is, wherever the picture is: 10-29 a row opened before
+        its own frame made a new 人工发现 row of every 1 pressed on it.
+        """
+        if action != "held" and row is None:
+            self.candidate_preparing.emit()
+        item = row.item if row is not None else self._candidate_item()
+        if not self._usable(item):
+            return
+        frame = self._row_frame(row) if row is not None else self._frame_provider()
         # A classification belongs to the candidate currently on screen.  Do not
         # let a stale/partial provider result create an audit entry that cannot be
         # reopened later (``held`` is the sole action that may be frame-less).
@@ -1851,7 +1868,7 @@ class QuickReviewPanel(ProblemListPanel):
                                          for row in self._arrival_rows):
             self.hint.setText("本处已有选手确认，请先撤销误确认。")
             return
-        row = self._selected_arrival()
+        row = row if row is not None else self._selected_arrival()
         members = [row.item, *(piece.item for piece in row.fragments)] if row is not None and row.fragments else []
         pieces = [member for member in members if member.item_id != item.item_id] if any(
             member.item_id == item.item_id for member in members) else []
@@ -2048,15 +2065,10 @@ class QuickReviewPanel(ProblemListPanel):
 
     def _exclude_seen(self, row, operation):
         """Exclude a row seen whole, on the frame shown if it is this row's, else the row's own."""
-        frame = self._frame_provider()
-        last = (row.fragments[-1] if row.fragments else row).time_ms
-        if self._shown_ms is None or not row.time_ms - 1000 <= self._shown_ms <= last + 1000:
-            frame = row.item.evidence.get("frame")
-        if (not frame or (frame.get("frame_index") if frame.get("frame_index") is not None else -1) < 0
-                or frame.get("position_ms", -1) < 0 or not frame.get("segment_id") or not frame.get("video_path")):
+        frame = self._row_frame(row)
+        if not self._frame_usable(frame):
             self.hint.setText("请先打开当前候选的有效录像画面。")
             return False
-        self.candidate_preparing.emit()
         if not self._save_ruling(row.item, [piece.item for piece in row.fragments], "not_rider", frame, operation):
             return False
         self._render()
@@ -2503,14 +2515,8 @@ class QuickReviewPanel(ProblemListPanel):
 
     def _candidate_no_chip(self, row):
         """A picture without a chip of its own shows a rider: a 疑似漏读 row, kept for the operator."""
-        frame = self._frame_provider()
-        last = (row.fragments[-1] if row.fragments else row).time_ms
         # The frame shown only if it is this row's: a right click may come from anywhere.
-        if (not frame or frame.get("frame_index", -1) is None or frame.get("frame_index", -1) < 0
-                or not (frame.get("segment_id") and frame.get("video_path"))
-                or self._shown_ms is None or row.time_ms is None
-                or not row.time_ms - 1000 <= self._shown_ms <= last + 1000):
-            frame = row.item.evidence.get("frame")
+        frame = self._row_frame(row)
         members = [row.item, *(piece.item for piece in row.fragments)]
         try:
             for member in members:
@@ -2521,7 +2527,6 @@ class QuickReviewPanel(ProblemListPanel):
         except (OSError, RuntimeError, ValueError) as error:
             self.hint.setText(f"审核未保存：{error}")
             return
-        self.candidate_preparing.emit()
         if not self._save_ruling(row.item, members[1:], "bicycle", frame, uuid.uuid4().hex, no_chip=True):
             return
         self._render()
