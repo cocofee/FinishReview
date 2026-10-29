@@ -133,6 +133,13 @@ def test_cleanup_before_click_refuses_to_publish_wrong_media(tmp_path):
     assert store.segments() == ()
 
 
+def wire_archive_clock(window):
+    """Outside the arrival workbench an archive keeps its own clock (see _aligned_archive)."""
+    window._is_archive = PassageReviewSurface._is_archive
+    window._archive_on_piece_clock = lambda: False
+    window._aligned_archive = lambda *args: PassageReviewSurface._aligned_archive(window, *args)
+
+
 @pytest.mark.parametrize(("direction", "frame_index", "gap_ms", "archive", "expected"), [
     (1, 49, 0, False, (2, 0, 0)),
     (-1, 0, 0, False, (0, 1960, 49)),
@@ -171,6 +178,7 @@ def test_live_boundary_step_keeps_exact_neighbor_and_does_not_bridge_gaps(
     window._recording_session_key = PassageReviewSurface._recording_session_key
     window._step_into_neighbour_recording = (
         lambda *args: PassageReviewSurface._step_into_neighbour_recording(window, *args))
+    wire_archive_clock(window)
     opened = []
 
     def seek(location, position, frame, camera_index=1):
@@ -244,6 +252,7 @@ def test_step_off_a_two_second_file_goes_on_without_the_strip_or_a_chip_record(
     )
     window._step_into_neighbour_recording = (
         lambda *args: PassageReviewSurface._step_into_neighbour_recording(window, *args))
+    wire_archive_clock(window)
     assert PassageReviewSurface._step_across_recording_boundary(window, pane, direction)
     name, frame = expected
     assert opened == [(name, frame * 40, frame)]

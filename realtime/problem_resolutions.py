@@ -393,9 +393,11 @@ def export_lists(
     # Rows the arrival list settled (a person without a chip, a second chip).
     manual.extend(manual_extra)
     deletions.extend(deletions_extra)
+    # 携带人号码: whose second chip it is (the arrival list's 双芯片); blank elsewhere.
+    deletions = [tuple(row) + ("",) * (12 - len(row)) for row in deletions]
     tables = (
         (EXPORT_MANUAL_ENTRIES, ("号码", "芯片域时间", "证据帧", "机位", "校时版本", "说明", "时间来源"), manual),
-        (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因", "事件ID", "记录修订", "批次ID", "证据帧", "校时版本", "证据快照JSON"), deletions),
+        (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因", "事件ID", "记录修订", "批次ID", "证据帧", "校时版本", "证据快照JSON", "携带人号码"), deletions),
         (EXPORT_CHANGES, ("原号码", "建议号码或圈数", "通过时间", "CycleRace 记录编号", "问题类型", "原因"), changes),
     )
     counts = {}

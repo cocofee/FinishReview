@@ -478,8 +478,10 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         window.passage_store.append(target_event)
         window.problem_panel.refresh()
         for _ in range(5):
-            QTest.keyClick(view.viewport(), Qt.Key_1)
+            QTest.keyClick(view.viewport(), Qt.Key_5)  # 5 is no key any more
         assert not any(row.decision for row in window.problem_panel._arrival_rows)
+        assert "这个键不用了" in window.problem_panel.hint.text()
+        window.problem_panel._classify("bicycle")  # what the old 1 (运动员) did; the button is hidden
         target_row = next(i for i, row in enumerate(window.problem_panel._arrival_rows) if row.bib == "321")
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
         cell = window.problem_panel.table.item(target_row, 2)
@@ -573,7 +575,7 @@ def test_group_count_picture_drag_scrubs_active_pane_without_counting(qapp, tmp_
         window.close()
 
 
-
+def test_a_lone_chip_row_is_saved_by_a_click_on_its_picture_and_never_by_a_number(qapp, tmp_path):
     from PyQt5.QtGui import QImage
     window = _window(tmp_path, workbench=True)
     try:
@@ -595,28 +597,26 @@ def test_group_count_picture_drag_scrubs_active_pane_without_counting(qapp, tmp_
                                        video_path=str(video), position_ms=2000, frame_index=50))
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
-        assert "1" in panel.confirmation_status.text()
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
+        assert "按 1" not in panel.confirmation_status.text()
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # 不是运动员 needs the person clicked first
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert "321 号还没点人" in panel.hint.text()
+        window._problem_count_clicked(0.5, 0.5, pane)
+        qapp.processEvents()
         assert panel._selected_arrival().bib == "321"
-        assert panel.current_item().item_id.startswith("manual:")
         assert not panel.big_view
         assert pane._current_frame_index == 50
         saved = next(row.decision for row in panel._arrival_rows if row.bib == "321")
         assert saved["frame"]["frame_index"] == 50
         assert saved["frame"]["segment_id"] == segment.segment_id
-        assert not panel.current_marks()
-        assert "marker_x_normalized" not in saved["frame"]
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)
         assert not any(row.decision for row in panel._arrival_rows)
         assert panel._selected_arrival().bib == "321"
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)
-        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
     finally:
         window.close()
 
 
-@pytest.mark.parametrize("save_action", ["key", "button"])
-def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path, save_action):
+def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path):
     from PyQt5.QtGui import QImage
 
     window = _window(tmp_path, workbench=True)
@@ -673,11 +673,8 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert pane.video_view._history_markers[0][2] == "21"
 
         assert panel.confirm_arrival_button.isHidden()
-        if save_action == "key":
-            QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # out of habit: harmless
-        else:
-            panel.bicycle_button.click()
-        assert "不用按 1" in panel.hint.text()
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_5)  # out of habit: harmless
+        assert "这个键不用了" in panel.hint.text()
         assert panel._selected_arrival().bib == "21"
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         target_row = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
@@ -5671,3 +5668,51 @@ def test_video_anomaly_can_quickly_focus_roster_bib_without_creating_passage(
     assert window.selected_identity_value.text() == "321"
     assert window.passage_store.events() == ()
     window.close()
+
+
+def test_a_row_opens_in_its_sealed_archive_on_the_same_picture(qapp, tmp_path):
+    """10-29「2 秒割裂」：归档后打开完整录像，按同一画面对齐，圈仍落在同一个人上。"""
+    import cv2
+    import numpy as np
+    from realtime.video_timeline import PassageVideoLocation
+
+    def write(path, indexes):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 20, (160, 120))
+        for index in indexes:
+            image = np.zeros((120, 160, 3), np.uint8)
+            cv2.rectangle(image, (index * 3 % 150, 40), (index * 3 % 150 + 10, 80), (255, 255, 255), -1)
+            writer.write(image)
+        writer.release()
+        return path
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        start = 1_789_600_000_000
+        stem = "camera_01_20261029_153844_113960"
+        archive = write(tmp_path / "videos" / f"{stem}_archive_0002.avi", range(300))
+        piece = write(tmp_path / "review_buffer" / "camera_01" / f"{stem}_review_0000000000000007.avi",
+                      range(100, 150))
+        add = window.timeline_store.add_completed_segment
+        add(source_id="camera_01_review", camera_index=1, video_path=archive, media_started_at_ms=start,
+            media_duration_ms=15_000, clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="race-1")
+        # The archive's clock runs 150 ms late: the piece's picture 0 is archive frame 100.
+        piece_segment = add(source_id="camera_01_review", camera_index=1, video_path=piece,
+                            media_started_at_ms=start + 5000 - 150, media_duration_ms=2500,
+                            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+                            end_reason="retained_problem_segment", race_id="race-1")
+        location = PassageVideoLocation(piece_segment, piece, 500, 500, 0, 0, "located")
+        window._problem_workbench_active = True
+        opened, position, index = window._problem_frame_source(location, 500, 10)
+        assert "archive" in Path(opened.video_path).stem
+        assert opened.segment.media_started_at_ms == start - 150  # on the pieces' clock
+        assert (position, index) == (5500, None)  # archive frame 110: the piece's frame 10
+        # 2 s before the piece starts is still in the archive, on the same clock.
+        assert window._problem_frame_source(location, -2000, None)[1] == 3000
+        window._problem_workbench_active = False  # elsewhere archives keep their own clock
+        window.__dict__.pop("_archive_shifts", None)
+        opened, position, _index = window._problem_frame_source(location, 500, 10)
+        assert opened is location and position == 500
+    finally:
+        window.close()

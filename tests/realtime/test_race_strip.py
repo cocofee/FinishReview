@@ -6,7 +6,7 @@ from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
-from realtime.race_strip import RaceStripPanel, RaceStripView, StripPiece, first_crossing
+from realtime.race_strip import RaceStripPanel, RaceStripView, StripPiece, earlier_arrival, first_crossing
 from tests.realtime.test_quick_review_panel import panel, qapp
 
 
@@ -178,3 +178,25 @@ def test_first_crossing_is_where_the_wheel_meets_the_line_not_the_chip_time(tmp_
     assert first_crossing([piece(tmp_path)], strips, chip) == times[touch]
     still = _Strips(times, np.full((100, times.size, 3), 100, np.uint8))
     assert first_crossing([piece(tmp_path)], still, chip) is None
+
+
+def test_someone_on_the_line_before_a_crossing_without_a_chip_is_found(tmp_path):
+    """15:50 现代五项：一行 4 个人，前两人早 1.9 秒过线、已走开；一直在线上走的人不算。"""
+    times = T + np.arange(0, 6000, 40, dtype=np.float64)
+    rng = np.random.default_rng(2)
+    image = (100 + rng.integers(-2, 3, (100, times.size, 3))).astype(np.uint8)
+    at = T + 5000
+
+    def body(picture, rows, start, end):
+        picture[rows, int(np.searchsorted(times, start)):int(np.searchsorted(times, end))] = 30
+
+    body(image, slice(60, 90), at - 100, at + 300)        # the row's own crossing
+    earlier = image.copy()
+    body(earlier, slice(10, 40), at - 1900, at - 1600)    # two came on earlier and are gone
+    arrival = times[np.searchsorted(times, at - 1900)]
+    assert earlier_arrival([piece(tmp_path)], _Strips(times, earlier), at) == arrival
+    assert earlier_arrival([piece(tmp_path)], _Strips(times, earlier), at, others=[at - 1800]) is None
+    assert earlier_arrival([piece(tmp_path)], _Strips(times, image), at) is None
+    walking = image.copy()
+    body(walking, slice(10, 40), at - 1900, at + 300)     # someone walking along the line all along
+    assert earlier_arrival([piece(tmp_path)], _Strips(times, walking), at) is None

@@ -2934,8 +2934,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._problem_marks_changed(())
         panel.hint.setText(
             panel.picture_mark_hint()
-            or (f"已标记 {row.bib} 的压线位置；按 1 保存过线。"
-                if selected_key else "已圈出自行车压线位置；请选择左侧对应芯片记录，再按 1 保存。")
+            or (f"已标记 {row.bib} 的压线位置。"
+                if selected_key else "已圈出压线位置；请在左边选对应的芯片记录。")
         )
 
     def _problem_marks_changed(self, _marks) -> None:
@@ -3326,12 +3326,14 @@ class FinishReviewWindow(PassageReviewSurface):
             return False
         position = int(frame.get("position_ms", 0))
         index = None if frame.get("frame_index") is None else int(frame["frame_index"])
+        camera = int(frame.get("camera_index", 1) or 1)
         location = PassageVideoLocation(segment, path, position, position, 0,
                                         segment.timing_error_ms, "located")
+        location, position, index = self._problem_frame_source(location, position, index)
         self._set_sync_playing(False, seek_final=False)
-        if segment.media_started_at_ms is not None:
-            self.video_filmstrip.full_race.browse_to(segment.media_started_at_ms + position)
-        opened = self._seek_retained_camera_frame(location, position, index, int(frame.get("camera_index", 1) or 1))
+        if location.segment.media_started_at_ms is not None:
+            self.video_filmstrip.full_race.browse_to(location.segment.media_started_at_ms + position)
+        opened = self._seek_retained_camera_frame(location, position, index, camera)
         if opened:
             # The pane is on the problem's own frame now, so the panel is not
             # browsing elsewhere and may be decided on: F would otherwise leave the
@@ -3343,7 +3345,7 @@ class FinishReviewWindow(PassageReviewSurface):
             if reference:
                 date_note = "；芯片日期与接收日期不同，按接收日期查找，正式时间未改" if frame.get("date_aligned") else ""
                 self.problem_panel.hint.setText(
-                    f"参考录像 · {target}：尚未校时/匹配，不代表已确认过线{date_note}。请逐帧找压线帧，再按 1 人工确认。"
+                    f"参考录像 · {target}：尚未校时/匹配，不代表已确认过线{date_note}。请逐帧找到压线帧，左键点人。"
                 )
             else:
                 self.problem_panel.hint.setText(f"已定位原录像{target}，请逐帧核对后处理。")
@@ -3351,6 +3353,51 @@ class FinishReviewWindow(PassageReviewSurface):
         self._problem_count_mode_changed(True)
         self._problem_marks_changed(None)
         return opened
+
+    def _archive_on_piece_clock(self) -> bool:
+        return bool(getattr(self, "_problem_workbench_active", False))
+
+    def _problem_frame_source(self, location, position, index):
+        """Where a row's frame is shown: (location, position, frame index).
+
+        A two-second buffer piece plays two seconds and stops, and a lead-in
+        before it (2 s for a crossing without a chip) falls in the piece
+        before (10-29: "2 秒割裂").  Once the five-minute archive of that moment
+        is sealed the frame opens there, on the very picture and on the pieces'
+        clock (see archive_alignment), so the rings saved on pieces stay on
+        their people; an archive whose picture is not found is not used.
+        Before that, a moment ahead of the piece opens in the piece holding it.
+        """
+
+        from .race_filmstrip import recording_sources
+
+        segment = location.segment
+        if segment.media_started_at_ms is None:
+            return location, max(0, position), index
+        moment = int(segment.media_started_at_ms) + int(position)
+        if self._is_archive(location):
+            return self._aligned_archive(location, moment), position, index
+        session = self._recording_session_key(location)
+        sources, _pending = recording_sources(
+            self.timeline_store, int(segment.camera_index), self._filmstrip_race_id(),
+            path_available=lambda _path, _live: True)  # only the files used are checked
+        holding = [source for source in sources
+                   if source.start_ms <= moment < source.end_ms
+                   and self._recording_session_key(source.location) == session
+                   and Path(source.location.video_path).is_file()]
+        archive = next((source.location for source in holding if self._is_archive(source.location)), None)
+        if archive is not None:
+            duration = max(1, int(segment.media_duration_ms or 1))
+            shown = int(segment.media_started_at_ms) + min(max(0, int(position)), duration - 1)
+            aligned = self._aligned_archive(archive, moment, (location, shown))
+            if aligned is not archive:
+                return aligned, max(0, moment - int(aligned.segment.media_started_at_ms)), None
+        if position >= 0:
+            return location, position, index
+        piece = next((source for source in holding if source.priority == 1), None)
+        if piece is not None:
+            return piece.location, moment - piece.start_ms, None
+        return location, 0, index
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label
