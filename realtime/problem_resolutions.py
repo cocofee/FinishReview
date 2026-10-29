@@ -309,7 +309,7 @@ def export_lists(
     items: Sequence[ProblemItem],
     store: ProblemResolutionStore,
     output_dir: str | Path,
-    *, events=(),
+    *, events=(), manual_extra=(), deletions_extra=(),
 ) -> dict[str, int]:
     """Write 补录 / 建议删除 / 建议改号改圈 CSV lists for CycleRace."""
 
@@ -390,6 +390,9 @@ def export_lists(
                               json.dumps(decision["binding"], ensure_ascii=False)))
             exported.add(key)
     manual.extend(bunches.manual_entries(items, store.journal_path.parent.parent))
+    # Rows the arrival list settled (a person without a chip, a second chip).
+    manual.extend(manual_extra)
+    deletions.extend(deletions_extra)
     tables = (
         (EXPORT_MANUAL_ENTRIES, ("号码", "芯片域时间", "证据帧", "机位", "校时版本", "说明", "时间来源"), manual),
         (EXPORT_DELETIONS, ("号码", "通过时间", "CycleRace 记录编号", "问题类型", "原因", "事件ID", "记录修订", "批次ID", "证据帧", "校时版本", "证据快照JSON"), deletions),

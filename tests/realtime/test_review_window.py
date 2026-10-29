@@ -681,7 +681,7 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert panel._selected_arrival().bib == "21"
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         target_row = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
-        assert panel.table.item(target_row, 3).text() == "已确认"
+        assert panel.table.item(target_row, 3).text() == "已点"  # a click counts someone; it is not a confirmed identity
         assert panel.table.item(target_row, 3).foreground().color().name() == "#126044"
         panel.refresh()
         panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21"))
@@ -913,7 +913,7 @@ def test_a_normal_single_is_one_row_and_a_click_on_the_rider_confirms_it(qapp, t
         saved = next(row.decision for row in window.problem_panel._arrival_rows if row.bib == "057")
         assert saved["frame"]["frame_index"] == 50
         assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.5)
-        assert "057 已保存过线" in window.problem_panel.hint.text()
+        assert "记为 057 号" in window.problem_panel.hint.text()
     finally:
         window.close()
 

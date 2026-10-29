@@ -2,7 +2,7 @@ import json
 from dataclasses import replace
 
 import pytest
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication, QLabel
 
@@ -340,6 +340,7 @@ def test_non_rider_category_is_explicit_and_preserved_after_refresh(panel):
 
 
 def test_numbers_follow_chip_order_even_when_video_times_cross_and_candidates_are_added(panel):
+    """Chip time, not the order records came in (古浪 6 号 was imported last but crossed mid-wave)."""
     panel.events[0] = replace(panel.events[0], sequence=2)
     panel.events[1] = replace(panel.events[1], sequence=1)
     panel.refresh()
@@ -351,13 +352,13 @@ def test_numbers_follow_chip_order_even_when_video_times_cross_and_candidates_ar
         return [(entry.bib, panel.table.item(i, 0).text())
                 for i, entry in enumerate(panel._arrival_rows) if entry.event is not None]
 
-    assert chip_order() == [("258", "1"), ("321", "2")]
+    assert chip_order() == [("321", "1"), ("258", "2")]
     panel.select_item(manual.item_id)
     panel._classify("bicycle")
     panel._arrival_clicked(row(panel, "321"))
     panel.frame = dict(FRAME, recorder_ms=FRAME["recorder_ms"] - 3000)
     panel.confirm_arrival_button.click()
-    assert chip_order() == [("258", "1"), ("321", "2")]
+    assert chip_order() == [("321", "1"), ("258", "2")]
 
 
 def test_a_crossing_without_a_chip_sits_at_its_own_time_between_the_chips(panel):
@@ -508,8 +509,10 @@ def test_live_calibration_shows_judgment_time_and_keeps_recorder_time_in_tooltip
     index = row(panel, "321")
     entry = panel._arrival_rows[index]
     assert entry.time_ms == FRAME["recorder_ms"] - 2138
-    assert panel.table.item(index, 2).text() == format_chip_time(FRAME["recorder_ms"] - 2138)
+    # The column reads in chip order; the judged moment is in the tooltip.
+    assert panel.table.item(index, 2).text() == format_chip_time(entry.event.timeline_timestamp_ms)
     tooltip = panel.table.item(index, 2).toolTip()
+    assert f"判读时间（校时后）：{format_chip_time(FRAME['recorder_ms'] - 2138)}" in tooltip
     assert "录像原时刻" in tooltip
     assert format_chip_time(FRAME["recorder_ms"]) in tooltip
 
@@ -631,14 +634,15 @@ def test_counting_a_wave_labels_people_in_chip_order_and_flags_the_one_without_a
     assert wave_panel._arrival_rows[3].time_ms == T0 + 1000
 
     wave_panel.frame = dict(FRAME, frame_index=19, position_ms=950, recorder_ms=T0 + 700)
-    wave_panel._editing_mark = 2
+    wave_panel._arrival_clicked(row(wave_panel, "76"))  # the third person, picked on the left
     QTest.keyClick(wave_panel, Qt.Key_4)
     # The person without a chip moves onto a 疑似漏读 row at their own time; 76 shifts to the next one.
     assert labels(wave_panel) == ["61", "20", "76"]
     assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
     rows = wave_panel._arrival_rows
     assert [entry.bib or "—" for entry in rows] == ["61", "20", "—", "76", "5"]
-    assert [wave_panel.table.item(i, 3).text() for i in range(4)] == ["已确认", "已确认", "疑似漏读", "已确认"]
+    # A click only counts someone: 已点, never 已确认 (10-29).
+    assert [wave_panel.table.item(i, 3).text() for i in range(4)] == ["已点", "已点", "疑似漏读", "已点"]
     assert rows[2].time_ms == T0 + 700
     assert "无芯片 1" in wave_panel.confirmation_status.text()
     assert "已核" in wave_panel.confirmation_status.text() or "秒没看" in wave_panel.confirmation_status.text()
@@ -685,7 +689,7 @@ def test_a_chip_nobody_was_counted_for_shows_short_and_is_saved_when_found(wave_
     wave_panel._arrival_clicked(row(wave_panel, "76"))
     count_on_picture(wave_panel, .7, 950)
     assert labels(wave_panel)[-1] == "76"
-    assert wave_panel.table.item(row(wave_panel, "76"), 3).text() == "已确认"
+    assert wave_panel.table.item(row(wave_panel, "76"), 3).text() == "已点"
 
 
 def test_a_person_counted_on_a_nearby_frame_is_drawn_faded_and_can_be_cancelled_there(wave_panel):
@@ -739,7 +743,7 @@ def test_backspace_takes_back_the_person_just_clicked_and_a_restart_keeps_the_re
     restored.set_workspace(tmp_path)
     restored.set_scope(*SCOPE)
     assert saved(restored) == {"61": 100, "20": 500}
-    assert [restored.table.item(i, 3).text() for i in range(3)] == ["已确认", "已确认", "待定"]
+    assert [restored.table.item(i, 3).text() for i in range(3)] == ["已点", "已点", "待定"]
 
 
 def test_switching_riders_inside_a_wave_keeps_the_picture_and_leaving_it_opens_the_next(wave_panel):
@@ -911,9 +915,11 @@ def test_a_folded_row_is_excluded_only_after_it_is_all_seen_and_comes_back_whole
     index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
     panel._arrival_clicked(index)
     assert "还差" in panel.confirmation_status.text()
-    QTest.keyClick(panel, Qt.Key_3)
-    assert "没看" in panel.hint.text()
+    QTest.keyClick(panel, Qt.Key_3)  # plays the rest first (nothing plays here)
+    assert "正在补看" in panel.hint.text()
     assert not panel._arrival_store.active(SCOPE)  # nothing ruled on a span nobody saw
+    QTest.keyClick(panel, Qt.Key_3)  # a second key stops it
+    assert panel._auto_review is None
 
     look_through(panel, 19_500, 21_400)
     assert "已看完" in panel.confirmation_status.text()
@@ -945,3 +951,324 @@ def test_opening_a_folded_piece_opens_its_row(fragment_panel):
     panel.select_item("piece-20900")
     selected = panel._selected_arrival()
     assert selected.time_ms - T0 == 20_000 and len(selected.fragments) == 2
+
+
+class _Player:
+    """Shows a frame, in chip time, wherever the panel jumps or steps to (40 ms a frame)."""
+
+    def __init__(self, panel, at_ms=None):
+        self.panel, self.at = panel, at_ms
+        panel._review_frame = lambda chip_ms, _row: {"chip_ms": chip_ms}
+        panel.jump_requested.connect(self.jump)
+        panel.frame_step_requested.connect(self.step)
+
+    def show(self):
+        at = self.at
+        QTimer.singleShot(1, lambda: self.panel.record_viewed_frame(dict(FRAME, recorder_ms=at), at))
+
+    def jump(self, frame):
+        if "chip_ms" in frame:
+            self.at = frame["chip_ms"]
+            self.show()
+
+    def step(self, frames):
+        self.at += 40 * frames
+        self.show()
+
+
+def _until_done(panel, timeout_ms=5000):
+    for _ in range(timeout_ms // 10):
+        if panel._auto_review is None:
+            return
+        QTest.qWait(10)
+    raise AssertionError("auto review never finished")
+
+
+def test_3_on_a_folded_row_plays_the_rest_then_excludes_it_whole(fragment_panel):
+    """10-28: a 3 refused for “还差 0.8 秒没看” looked like a dead key."""
+    panel = fragment_panel
+    player = _Player(panel)  # noqa: F841 - its slots are held weakly
+    index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
+    panel._arrival_clicked(index)
+    QTest.keyClick(panel, Qt.Key_3)
+    assert "正在补看" in panel.hint.text()
+    assert not panel._arrival_store.active(SCOPE)  # nothing ruled before it is seen
+    _until_done(panel)
+    ruled = {entry["key"]: entry["action"] for entry in panel._arrival_store.active(SCOPE)}
+    assert ruled == {f"candidate:piece-{offset}": "not_rider" for offset in (20_000, 20_300, 20_900)}
+    assert not panel._fragment_unseen(next(entry for entry in panel._arrival_rows if entry.fragments), whole=True)
+
+    QTest.keyClick(panel, Qt.Key_Backspace)
+    assert not panel._arrival_store.active(SCOPE)
+
+
+def test_any_key_stops_the_play_and_nothing_is_excluded(fragment_panel):
+    panel = fragment_panel
+    player = _Player(panel)  # noqa: F841 - its slots are held weakly
+    index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
+    panel._arrival_clicked(index)
+    QTest.keyClick(panel, Qt.Key_3)
+    QTest.keyClick(panel, Qt.Key_3)
+    assert panel._auto_review is None and "未排除" in panel.hint.text()
+    QTest.qWait(300)
+    assert not panel._arrival_store.active(SCOPE)
+
+
+def test_the_play_stops_when_no_frame_comes(fragment_panel):
+    panel = fragment_panel
+    panel._review_frame = lambda chip_ms, _row: {"chip_ms": chip_ms}  # a jump nobody answers
+    panel._review_timer.setInterval(100)
+    index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
+    panel._arrival_clicked(index)
+    QTest.keyClick(panel, Qt.Key_3)
+    _until_done(panel)
+    assert "没有画面" in panel.hint.text()
+    assert not panel._arrival_store.active(SCOPE)
+
+
+def test_shift_3_excludes_the_pictures_after_it_up_to_a_long_gap_and_undoes_at_once(fragment_panel):
+    """Someone walking about at the line: 20 s (3 pieces) and 21.2 s go; 40 s is 18.8 s on and stays."""
+    panel = fragment_panel
+    player = _Player(panel)  # noqa: F841 - its slots are held weakly
+    index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
+    panel._arrival_clicked(index)
+    QTest.keyClick(panel, Qt.Key_3, Qt.ShiftModifier)
+    _until_done(panel)
+    ruled = {entry["key"] for entry in panel._arrival_store.active(SCOPE)}
+    assert ruled == {f"candidate:piece-{offset}" for offset in (20_000, 20_300, 20_900, 21_200)}
+    assert "已排除 2 行" in panel.hint.text()
+
+    QTest.keyClick(panel, Qt.Key_Backspace)
+    assert not panel._arrival_store.active(SCOPE)
+
+
+def test_4_with_nobody_clicked_only_says_what_to_do_and_a_click_always_just_counts(wave_panel):
+    """10-29：左键只有一个意思（点人）；没有“先按 4 再点”的模式。"""
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    QTest.keyClick(wave_panel, Qt.Key_4)
+    assert "先在画面上点中这个人" in wave_panel.hint.text()
+    assert not wave_panel._arrival_store.active(SCOPE)
+    count_on_picture(wave_panel, .2, 100)
+    assert saved(wave_panel) == {"61": 100}
+    assert "已点" in wave_panel.hint.text() and "没芯片就按 4" in wave_panel.hint.text()
+
+
+def test_4_flags_the_person_just_clicked_and_4_again_gives_their_bib_back(wave_panel):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 100)
+    count_on_picture(wave_panel, .4, 500)
+    assert saved(wave_panel) == {"61": 100, "20": 500}
+    QTest.keyClick(wave_panel, Qt.Key_Right)  # another key does not change who 4 is for
+    QTest.keyClick(wave_panel, Qt.Key_4)  # the second person has no chip
+    assert saved(wave_panel) == {"61": 100}
+    selected = wave_panel._selected_arrival()
+    assert selected.event is None and wave_panel._row_state(selected) == "疑似漏读"
+    assert "再按 4 取消" in wave_panel.hint.text()
+    QTest.keyClick(wave_panel, Qt.Key_4)  # changed mind: they are 20 after all
+    assert saved(wave_panel) == {"61": 100, "20": 500}
+    assert all(entry.event is not None for entry in wave_panel._arrival_rows)
+    assert wave_panel._selected_arrival().bib == "20"
+    QTest.keyClick(wave_panel, Qt.Key_4)
+    QTest.keyClick(wave_panel, Qt.Key_Backspace)  # Backspace takes the 4 back too
+    assert saved(wave_panel) == {"61": 100, "20": 500}
+
+
+def test_4_only_acts_on_someone_on_the_frame_shown(wave_panel):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 100)
+    wave_panel.frame = dict(FRAME, frame_index=40, position_ms=2000, recorder_ms=T0 + 1750)
+    QTest.keyClick(wave_panel, Qt.Key_4)
+    assert saved(wave_panel) == {"61": 100}
+    assert "先在画面上点中这个人" in wave_panel.hint.text()
+
+
+def test_4_on_a_picture_without_a_chip_lists_it_as_a_suspected_miss(fragment_panel):
+    panel = fragment_panel
+    index = next(i for i, entry in enumerate(panel._arrival_rows) if entry.fragments)
+    panel._arrival_clicked(index)
+    QTest.keyClick(panel, Qt.Key_4)
+    ruled = {entry["key"]: (entry["action"], entry.get("no_chip")) for entry in panel._arrival_store.active(SCOPE)}
+    assert ruled == {f"candidate:piece-{offset}": ("bicycle", True) for offset in (20_000, 20_300, 20_900)}
+    folded = next(entry for entry in panel._arrival_rows if entry.fragments)
+    assert panel._row_state(folded) == "疑似漏读"
+
+    QTest.keyClick(panel, Qt.Key_Backspace)
+    assert not panel._arrival_store.active(SCOPE)
+
+
+def test_a_chip_imported_late_takes_its_place_in_the_wave_by_chip_time(wave_panel):
+    """古浪 6 号：芯片后补进来，排在整波最后，他的那一下给了后面的号码。"""
+    wave_panel.events.append(event("6", "e", T0 + 600))
+    wave_panel.refresh()
+    assert [entry.bib for entry in wave_panel._arrival_rows] == ["61", "20", "6", "76", "5"]
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    for x, offset in ((.2, 100), (.4, 500), (.5, 650), (.6, 1000)):
+        count_on_picture(wave_panel, x, offset)
+    assert saved(wave_panel) == {"61": 100, "20": 500, "6": 650, "76": 1000}
+
+
+def test_a_person_flagged_without_a_chip_cannot_be_counted_again(wave_panel):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    frame = count_on_picture(wave_panel, .2, 100)
+    QTest.keyClick(wave_panel, Qt.Key_4)
+    wave_panel.add_mark(.205, .5, frame["recorder_ms"], frame)
+    assert "已点过" in wave_panel.hint.text()
+    assert saved(wave_panel) == {}
+
+
+def test_a_detected_crossing_at_a_counted_moment_is_not_a_second_row(wave_panel):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 100)
+    detected = wave_panel.add_manual_problem(dict(FRAME, frame_index=9, recorder_ms=T0 + 300), recorder_ms=T0 + 300)
+    far = wave_panel.add_manual_problem(dict(FRAME, frame_index=60, recorder_ms=T0 + 3000), recorder_ms=T0 + 3000)
+    shown = {entry.item.item_id for entry in wave_panel._arrival_rows}
+    assert detected.item_id not in shown and far.item_id in shown
+
+
+def counted_short(wave_panel):
+    """61, 20, 76 within 0.9 s; only two people crossed, looked through from start to end."""
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 100)
+    count_on_picture(wave_panel, .4, 500)
+    look_through(wave_panel, -600, 1500)
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+
+
+def test_a_chip_left_without_anyone_after_the_whole_wave_is_a_suspected_double_chip(wave_panel):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 100)
+    count_on_picture(wave_panel, .4, 500)
+    assert wave_panel.table.item(row(wave_panel, "76"), 3).text() == "待定"  # not all seen yet
+    look_through(wave_panel, -600, 1500)
+    assert wave_panel.table.item(row(wave_panel, "76"), 3).text() == "疑似双芯片"
+
+
+def test_5_marks_a_second_chip_and_the_person_moves_on_to_the_next_chip(wave_panel, tmp_path):
+    counted_short(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "20"))  # the second rider wore 20 and 76: 20 is the extra one
+    QTest.keyClick(wave_panel, Qt.Key_5)
+    assert wave_panel.table.item(row(wave_panel, "20"), 3).text() == "多余芯片"
+    assert saved(wave_panel) == {"61": 100, "76": 500}
+    status = wave_panel._wave_status(wave_panel._wave_plan(wave_panel._counted_plan(
+        wave_panel._arrival_rows[row(wave_panel, "61")]).item))[0]
+    assert "多余芯片 1" in status and "已核" in status
+    restored = QuickReviewPanel()
+    restored.set_events_provider(lambda: wave_panel.events)
+    restored.set_workspace(tmp_path)
+    restored.set_scope(*SCOPE)
+    assert restored.table.item(row(restored, "20"), 3).text() == "多余芯片"
+
+    wave_panel._arrival_clicked(row(wave_panel, "20"))
+    QTest.keyClick(wave_panel, Qt.Key_Backspace)  # or 5 again
+    assert saved(wave_panel) == {"61": 100, "20": 500}
+    assert wave_panel.table.item(row(wave_panel, "76"), 3).text() == "疑似双芯片"
+
+
+def test_5_waits_for_the_wave_to_be_counted_and_seen(wave_panel):
+    wave_panel._arrival_clicked(row(wave_panel, "76"))
+    QTest.keyClick(wave_panel, Qt.Key_5)
+    assert not wave_panel._arrival_store.active(SCOPE)
+    count_on_picture(wave_panel, .2, 100)
+    wave_panel._arrival_clicked(row(wave_panel, "76"))
+    QTest.keyClick(wave_panel, Qt.Key_5)
+    assert "没看完" in wave_panel.hint.text()
+    assert wave_panel.table.item(row(wave_panel, "76"), 3).text() == "待定"
+
+
+def no_chip_row(wave_panel):
+    """A fourth person on the wave without a chip, opened on their own row."""
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    for x, offset in ((.2, 100), (.4, 500), (.6, 700), (.8, 1000)):
+        count_on_picture(wave_panel, x, offset)
+    QTest.keyClick(wave_panel, Qt.Key_4)  # the last one clicked has no chip
+    index = next(i for i, entry in enumerate(wave_panel._arrival_rows) if entry.event is None)
+    wave_panel._arrival_clicked(index)
+    assert wave_panel._wave_plan() is None
+    return index
+
+
+def test_enter_on_a_suspected_miss_takes_the_bib_read_off_the_frame(wave_panel):
+    index = no_chip_row(wave_panel)
+    wave_panel._ask_bib = lambda current: "88"
+    QTest.keyClick(wave_panel, Qt.Key_Return)
+    entry = wave_panel._arrival_rows[index]
+    assert entry.bib == "88" and wave_panel.table.item(index, 3).text() == "补录"
+    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 700}  # chips untouched
+    QTest.keyClick(wave_panel, Qt.Key_Backspace)
+    assert wave_panel._row_state(wave_panel._arrival_rows[index]) == "疑似漏读"
+
+
+def test_a_bib_with_a_chip_close_by_or_already_entered_is_refused(wave_panel):
+    index = no_chip_row(wave_panel)
+    wave_panel._ask_bib = lambda current: "76"
+    QTest.keyClick(wave_panel, Qt.Key_Return)
+    assert "有芯片，不是漏读" in wave_panel.hint.text()
+    assert wave_panel._row_state(wave_panel._arrival_rows[index]) == "疑似漏读"
+
+    wave_panel._ask_bib = lambda current: "88"
+    QTest.keyClick(wave_panel, Qt.Key_Return)
+    other = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
+                                          recorder_ms=T0 + 20_000)
+    position = next(i for i, entry in enumerate(wave_panel._arrival_rows) if entry.item.item_id == other.item_id)
+    wave_panel._arrival_clicked(position)
+    QTest.keyClick(wave_panel, Qt.Key_4)  # a picture without a chip: 疑似漏读
+    QTest.keyClick(wave_panel, Qt.Key_Return)
+    assert "补录过" in wave_panel.hint.text()
+
+
+def test_only_what_is_left_to_handle_is_shown_on_request(wave_panel):
+    counted_short(wave_panel)
+    no_chip = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
+                                            recorder_ms=T0 + 20_000)
+    position = next(i for i, entry in enumerate(wave_panel._arrival_rows) if entry.item.item_id == no_chip.item_id)
+    wave_panel._arrival_clicked(position)
+    QTest.keyClick(wave_panel, Qt.Key_4)
+    assert wave_panel.attention_button.text() == "只看要处理的 2"
+    wave_panel.attention_button.setChecked(True)
+    shown = [wave_panel._row_state(entry) for i, entry in enumerate(wave_panel._arrival_rows)
+             if not wave_panel.table.isRowHidden(i)]
+    assert shown == ["疑似双芯片", "疑似漏读"]
+    assert not wave_panel.table.isRowHidden(wave_panel.table.currentRow())
+    wave_panel._arrival_clicked(row(wave_panel, "76"))
+    wave_panel._step(1)
+    assert wave_panel._row_state(wave_panel._selected_arrival()) == "疑似漏读"
+    wave_panel.attention_button.setChecked(False)
+    assert not any(wave_panel.table.isRowHidden(i) for i in range(wave_panel.table.rowCount()))
+
+
+def test_export_lists_the_bibs_entered_and_the_second_chips(wave_panel, tmp_path):
+    import csv
+    from realtime.problem_resolutions import EXPORT_DELETIONS, EXPORT_MANUAL_ENTRIES
+    counted_short(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "76"))
+    QTest.keyClick(wave_panel, Qt.Key_5)
+    lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
+                                         recorder_ms=T0 + 20_000)
+    position = next(i for i, entry in enumerate(wave_panel._arrival_rows) if entry.item.item_id == lone.item_id)
+    wave_panel._arrival_clicked(position)
+    QTest.keyClick(wave_panel, Qt.Key_4)
+    wave_panel._ask_bib = lambda current: "88"
+    QTest.keyClick(wave_panel, Qt.Key_Return)
+    assert wave_panel.export() is not None
+    exports = tmp_path / "finish_problems" / "exports"
+
+    def read(name):
+        with (exports / name).open(encoding="utf-8-sig") as handle:
+            return list(csv.reader(handle))[1:]
+
+    assert [entry[0] for entry in read(EXPORT_MANUAL_ENTRIES)] == ["88"]
+    assert [(entry[0], entry[5]) for entry in read(EXPORT_DELETIONS)] == [("76", "c")]
+    assert "已导出" in wave_panel.hint.text()
+
+
+def test_one_person_flagged_twice_by_an_older_build_is_one_row(wave_panel):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    frame = count_on_picture(wave_panel, .2, 100)
+    QTest.keyClick(wave_panel, Qt.Key_4)
+    parent = wave_panel._wave_candidate(wave_panel._waves[0])
+    # What an older build allowed: the same rider clicked again and flagged again.
+    wave_panel._split_wave_people(parent, [dict(x=.21, y=.51, recorder_ms=frame["recorder_ms"], frame=frame)],
+                                  "older")
+    assert sum(entry.event is None for entry in wave_panel._arrival_rows) == 1
+    assert wave_panel._wave_plan(parent).split == 1
