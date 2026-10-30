@@ -57,9 +57,9 @@ def menu(panel, label, index=None):
 
 
 def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
-    assert panel.table.columnCount() == 5
+    assert panel.table.columnCount() == 6
     assert [panel.table.horizontalHeaderItem(i).text() for i in range(4)] == ["顺序", "号码", "时间", "状态"]
-    assert panel.table.isColumnHidden(4)  # one group: no group column
+    assert panel.table.isColumnHidden(4) and panel.table.isColumnHidden(5)  # one group, no laps: neither column
     assert all("参考" not in panel.table.item(row_index, 2).text() for row_index in range(panel.table.rowCount()))
     for index, entry in enumerate(panel._arrival_rows):
         assert panel.table.item(index, 1).text() == entry.bib
@@ -877,31 +877,31 @@ def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monk
     assert len(jumps) == 1
 
 
-def test_a_crossing_without_a_chip_opens_half_a_second_before_it(wave_panel, strip_landing):
-    """现代五项 10-29：从前 2 秒看起人还在远处，太远；和一波芯片一样从前 0.5 秒看起。"""
+def test_a_crossing_without_a_chip_opens_a_quarter_second_before_it(wave_panel, strip_landing):
+    """现代五项：从前 2 秒（10-29）、0.5 秒（10-30）看起人都还在远处；从前 0.25 秒看起。"""
     _asked, jumps = strip_landing
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_500, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_750, "reference_only": True}
 
 
-def test_without_an_aligned_strip_a_crossing_opens_half_a_second_back_from_its_own_frame(wave_panel):
-    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.5 秒开始看（可能在上一段录像里）。"""
+def test_without_an_aligned_strip_a_crossing_opens_a_quarter_second_back_from_its_own_frame(wave_panel):
+    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.25 秒开始看（可能在上一段录像里）。"""
     jumps = []
     wave_panel.jump_requested.connect(jumps.append)
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=40, position_ms=2000, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1500,
+    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1750,
                          "frame_index": None, "reference_only": True}
     wave_panel.add_manual_problem(dict(FRAME, frame_index=4, position_ms=200, recorder_ms=T0 + 30_000),
                                   recorder_ms=T0 + 30_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.time_ms == T0 + 30_000))
-    assert jumps[-1]["position_ms"] == -300  # before the file: the window opens what holds it
+    assert jumps[-1]["position_ms"] == -50  # before the file: the window opens what holds it
 
 
 def test_a_crossing_where_someone_came_on_earlier_is_marked_maybe_several(wave_panel, strip_landing, monkeypatch):
@@ -1455,3 +1455,55 @@ def test_one_person_flagged_twice_by_an_older_build_is_one_row(wave_panel):
                                   "older")
     assert sum(entry.event is None for entry in wave_panel._arrival_rows) == 1
     assert wave_panel._wave_plan(parent).split == 1
+
+
+def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel):
+    """Multi-lap review: a rider's laps before the last are not rows (only the last lap is judged)."""
+    from dataclasses import replace as _replace
+    wave_panel.events = [
+        _replace(event("16", "lap1", T0), lap=1, group_target_laps=3),
+        _replace(event("16", "lap2", T0 + 60_000), lap=2, group_target_laps=3),
+        _replace(event("16", "lap3", T0 + 120_000), lap=3, group_target_laps=3),
+        event("5", "d", T0 + 200_000),  # a group without laps: listed as before
+    ]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    bibs = [wave_panel.table.item(index, 1).text() for index in range(wave_panel.table.rowCount())]
+    assert bibs.count("16") == 1
+    assert "中间圈 2 条不列" in wave_panel.quick_title.text()
+
+
+def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(wave_panel):
+    """16 passes on lap 2 of 3 inside the bunch finishing: the wave is the finishers' chips only."""
+    from dataclasses import replace as _replace
+    wave_panel.events = [
+        _replace(event("61", "a", T0), lap=3, group_target_laps=3),
+        _replace(event("16", "x", T0 + 300), lap=2, group_target_laps=3),
+        _replace(event("20", "b", T0 + 600), lap=3, group_target_laps=3),
+    ]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    waves = [[row.bib for row in wave] for wave in wave_panel._waves]
+    assert waves == [["61", "20"]]
+
+
+def test_laps_show_as_k_of_n_and_a_rider_short_of_laps_is_only_a_hint_once_someone_finished(wave_panel):
+    from dataclasses import replace as _replace
+    laps = lambda bib, identity, stamp, lap: _replace(event(bib, identity, stamp), lap=lap, group_target_laps=3)
+    wave_panel.events = [laps("61", "a1", T0, 1), laps("16", "b1", T0 + 100, 1),
+                         laps("61", "a2", T0 + 60_000, 2), laps("16", "b2", T0 + 60_100, 2)]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    assert "圈数不足" not in wave_panel.quick_title.text()  # nobody has finished: every rider is still racing
+    wave_panel.events.append(laps("61", "a3", T0 + 120_000, 3))
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    assert not wave_panel.table.isColumnHidden(5)
+    row = next(i for i in range(wave_panel.table.rowCount()) if wave_panel.table.item(i, 1).text() == "61")
+    assert wave_panel.table.item(row, 5).text() == "3/3"
+    assert "圈数不足 1 人" in wave_panel.quick_title.text()
+    assert "16 号" in wave_panel.quick_title.toolTip()
+
+
+def test_the_lap_column_stays_hidden_without_target_laps(wave_panel):
+    assert wave_panel.table.isColumnHidden(5)

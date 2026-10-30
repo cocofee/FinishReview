@@ -926,3 +926,15 @@ def test_stop_keeps_thread_reference_after_join_timeout(tmp_path):
 
     assert receiver.is_running is False
     assert thread.join_calls == 2
+
+
+def test_group_target_laps_is_optional_and_kept_when_sent():
+    """Lap 1 of a 3-lap group is intermediate; a record without the field stays as before (0)."""
+    sent = PassageEvent.from_payload(passage_payload(lap=1, group_target_laps=3))
+    assert sent.group_target_laps == 3
+    assert sent.to_payload()["group_target_laps"] == 3
+    old = PassageEvent.from_payload(passage_payload())
+    assert old.group_target_laps == 0
+    assert "group_target_laps" not in old.to_payload()
+    with pytest.raises(passage_receiver_module.PassageEventError):
+        PassageEvent.from_payload(passage_payload(group_target_laps=-1))

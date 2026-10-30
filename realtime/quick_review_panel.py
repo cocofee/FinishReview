@@ -22,6 +22,7 @@ from .arrival_review import (
 from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, uncovered_intervals
 from .chip_history import format_chip_time
 from .crossing_time import item_crossing_time, recorder_crossing_time, workspace_clocks
+from .lap_wave import INTERMEDIATE, Passage, lap_role, short_riders
 from .problem_items import (
     CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING, STATUS_EXCLUDED,
     STATUS_WAITING, ProblemItem, stable_item_id,
@@ -39,6 +40,11 @@ KEEP = "keep"  # landing: the picture already shows this row's wave; leave it
 # A wave is looked at from a little before its first chip to a little after its
 # last: a rider without a chip may lead it or close it.
 WAVE_VIEW_MARGIN_MS = 500
+# A crossing without a chip is looked at from this much before it to this much
+# after its last piece.  Half a second each side was too much (10-30: the
+# runners were still metres off at the start, and with many crossings the
+# extra second each added up).
+PASSAGE_VIEW_MARGIN_MS = 250
 # Crossings without a chip read for 可能多人 per pass, so the table never waits on the strip.
 EARLIER_BATCH = 8
 # A wave is swept by dragging the picture; a rider stays in view about a second
@@ -180,6 +186,8 @@ class QuickReviewPanel(ProblemListPanel):
         # 可能多人: crossing (item id, moment) -> when someone else came onto the
         # line before it (None: nobody), read off the strip once (earlier_arrival).
         self._earlier = {}
+        self._intermediate_laps = 0  # chip reads of laps before the last, not listed
+        self._short_bibs = ()  # riders whose last read is short of the target, once the group has a finisher
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
         self._near_counted_items = frozenset()  # item ids of crossings within COUNTED_REACH_MS of someone counted
         self._strip_end = (None, 0.0)  # (pieces, the strip's last chip-clock moment)
@@ -195,8 +203,8 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
         self.table.cellDoubleClicked.connect(self._arrival_clicked)
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "组别"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "组别", "圈数"])
         self.table.horizontalHeaderItem(2).setToolTip(
             "校时后的芯片域时间；悬浮单元格可看录像原时刻"
         )
@@ -204,6 +212,9 @@ class QuickReviewPanel(ProblemListPanel):
             self.table.setColumnWidth(column, width)
         # The group column only appears when the race has more than one group.
         self.table.setColumnHidden(4, True)
+        # The lap column only appears when CycleRace sends a group's target laps (多圈).
+        self.table.setColumnWidth(5, 46)
+        self.table.setColumnHidden(5, True)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
         self.table.setToolTip("点一行看这一刻；选中后按 1 不是运动员、2 双芯片、3 补录号码、4 撤销（右键同样）")
@@ -344,11 +355,37 @@ class QuickReviewPanel(ProblemListPanel):
             self._arrival_store.refresh()
 
     def _events(self):
+        """This race's chip reads, without the laps before a rider's last (多圈赛只判最后一圈).
+
+        A lap is known as intermediate only when CycleRace sends the group's
+        target laps; without it every read is listed, as before.
+        """
         events = tuple(self._events_provider())
         scopes = {(event.race_id, event.stage_id) for event in events}
         self._arrival_scope = self._scope if self._scope[0] else next(iter(scopes)) if len(scopes) == 1 else self._scope
-        return {event.event_id: event for event in events
-                if (event.race_id, event.stage_id) == self._arrival_scope}
+        scoped = [event for event in events if (event.race_id, event.stage_id) == self._arrival_scope]
+        listed = [event for event in scoped
+                  if lap_role(event.lap, getattr(event, "group_target_laps", 0)) != INTERMEDIATE]
+        self._intermediate_laps = len(scoped) - len(listed)
+        self._short_bibs = self._short_of_laps(scoped)
+        return {event.event_id: event for event in listed}
+
+    @staticmethod
+    def _short_of_laps(events):
+        """Bibs whose last read is short of the group's target laps, in groups someone has finished.
+
+        Before anyone finishes, every rider is short: nothing is said then.  A
+        hint only (圈数异常只提示): the rider may not have finished, or a lap
+        may have gone unread.
+        """
+        active = [event for event in events if event.is_active and getattr(event, "group_target_laps", 0) > 1]
+        finished = {event.group_id for event in active if event.lap >= event.group_target_laps}
+        passages = [Passage(event.event_id, event.athlete_id or event.bib, int(event.timeline_timestamp_ms),
+                            event.lap, event.group_target_laps)
+                    for event in active if event.group_id in finished]
+        short = short_riders(passages)
+        bibs = {event.athlete_id or event.bib: event.bib for event in active}
+        return tuple(sorted((bibs[rider] or rider for rider in short), key=lambda bib: (len(bib), bib)))
 
     def _category(self, item=None):
         item = item or self._candidate_item()
@@ -518,7 +555,7 @@ class QuickReviewPanel(ProblemListPanel):
         return [row for row in rows if row.key not in folded]
 
     def _fragment_unseen(self, row, whole=False):
-        """What of a row, from where it is looked at from to its last piece + 0.5 s, nobody has looked at.
+        """What of a row, from where it is looked at from to its last piece + 0.25 s, nobody has looked at.
 
         Only a folded row has to be seen whole before it is ruled on, or any row
         of a Shift+3 run (WHOLE).
@@ -528,21 +565,23 @@ class QuickReviewPanel(ProblemListPanel):
         camera = str(int((row.item.evidence.get("frame") or {}).get("camera_index") or 1))
         seen = self._arrival_drafts.get("seen", {}).get(camera, [])
         last = (row.fragments[-1] if row.fragments else row).time_ms
-        return uncovered_intervals(row.time_ms - self._passage_lead(row), last + WAVE_VIEW_MARGIN_MS,
+        return uncovered_intervals(row.time_ms - self._passage_lead(row), last + PASSAGE_VIEW_MARGIN_MS,
                                    seen, tolerance=100)
 
     def _passage_lead(self, row):
-        """How long before a crossing it is looked at from: half a second, as a wave.
+        """How long before a crossing it is looked at from: a quarter second without a chip, half with one.
 
         可能多人: from the moment the other one came onto the line (15:50,
         10-29: the first two of 4 came on 1.9 s before the row's moment).  2 s
         before every crossing, and half a second more on 可能多人, was too far
         back: the rider was still far off.
         """
-        arrival = self._earlier_arrival(row, read=False) if row is not None and row.event is None else None
-        if arrival is None:
+        if row is None or row.event is not None:
             return WAVE_VIEW_MARGIN_MS
-        return max(WAVE_VIEW_MARGIN_MS, -(-int(row.time_ms - arrival) // 100) * 100)
+        arrival = self._earlier_arrival(row, read=False)
+        if arrival is None:
+            return PASSAGE_VIEW_MARGIN_MS
+        return max(PASSAGE_VIEW_MARGIN_MS, -(-int(row.time_ms - arrival) // 100) * 100)
 
     def _earlier_arrival(self, row, read=True):
         """When someone else came onto the line up to 2 s before this crossing without a chip (可能多人).
@@ -823,6 +862,8 @@ class QuickReviewPanel(ProblemListPanel):
                 carried.setdefault(row.carrier, []).append(row.bib)
         several_groups = len({group for group in groups if group}) > 1
         self.table.setColumnHidden(4, not several_groups)
+        self.table.setColumnHidden(5, not any(row.event is not None and getattr(row.event, "group_target_laps", 0) > 1
+                                              for row in rows))
         # Room for a name like 男子山地精英组 beside the state.
         self.table.setMinimumWidth(450 if several_groups else 340)
         for widget in (self.table, self.table_column):
@@ -853,7 +894,9 @@ class QuickReviewPanel(ProblemListPanel):
                 shown_state = "已点附近"
             if state == "多余芯片":
                 shown_state = f"{row.carrier}号带的" if row.carrier else "双芯片"
-            for column, text in enumerate((number, row.bib or "—", time, shown_state, groups[index])):
+            target = getattr(row.event, "group_target_laps", 0) if row.event is not None else 0
+            laps = f"{row.event.lap}/{target}" if target > 1 else ""
+            for column, text in enumerate((number, row.bib or "—", time, shown_state, groups[index], laps)):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
@@ -893,7 +936,8 @@ class QuickReviewPanel(ProblemListPanel):
                 if row.fragments:
                     tooltip = (f"同一次过线被拆成 {len(row.fragments) + 1} 段画面，合成这一行"
                                f"（{(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒）\n"
-                               f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 0.5 秒，画面上看到几个人就点几个；"
+                               f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 "
+                               f"{PASSAGE_VIEW_MARGIN_MS / 1000:g} 秒，画面上看到几个人就点几个；"
                                "按 1（不是运动员）自动补看没看的部分再排除整行，4 或退格撤回整行\n"
                                + tooltip)
                 wave = self._row_wave(row) if row.key in self._wave_of else None
@@ -932,7 +976,12 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.verticalScrollBar().setValue(scroll)
         self.table.blockSignals(False)
         confirmed = sum(row.decision is not None for row in rows)
-        self.quick_title.setText(f"到达记录 {len(rows)} 条 · 已对上 {confirmed} 个芯片")
+        self.quick_title.setText(f"到达记录 {len(rows)} 条 · 已对上 {confirmed} 个芯片"
+                                 + (f" · 中间圈 {self._intermediate_laps} 条不列" if self._intermediate_laps else "")
+                                 + (f" · 圈数不足 {len(self._short_bibs)} 人" if self._short_bibs else ""))
+        self.quick_title.setToolTip(
+            "圈数不足（只提示，不判定；可能未完赛或漏读一圈）：" + "、".join(self._short_bibs) + " 号"
+            if self._short_bibs else "")
         self.summary.setText(self.quick_title.text())
         self.summary_changed.emit(self.quick_title.text())
         if self._active_item is None and rows:
@@ -1504,8 +1553,8 @@ class QuickReviewPanel(ProblemListPanel):
             status, color = self._wave_status(plan)
         elif row is not None and wave is None and self._row_state(row) == "待定" and row.time_ms is not None:
             # A crossing without a chip may be several people: it is looked at
-            # from half a second before (可能多人: from when the first came on) to
-            # half a second after (15:50, 10-29: 4 people on one row).
+            # from a quarter second before (可能多人: from when the first came on)
+            # to a quarter second after (15:50, 10-29: 4 people on one row).
             unseen = self._fragment_unseen(row, whole=True)
             span = (f"{len(row.fragments) + 1} 段 · {(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒 · "
                     if row.fragments else "")
@@ -1899,7 +1948,8 @@ class QuickReviewPanel(ProblemListPanel):
             # A folded row is ruled on as a whole, so all of it is looked at first.
             self.hint.setText(f"这一行 {len(pieces) + 1} 段画面还差 "
                               f"{sum(right - left for left, right in unseen) / 1000:.1f} 秒没看；"
-                              f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 0.5 秒再判。")
+                              f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 "
+                              f"{PASSAGE_VIEW_MARGIN_MS / 1000:g} 秒再判。")
             return
         operation = getattr(self, "_shortcut_operation", None) or (uuid.uuid4().hex if pieces else None)
         if not self._save_ruling(item, pieces, action, frame, operation):
