@@ -392,7 +392,8 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
-        assert window.problem_panel.table.columnCount() == 5  # the group column hides with one group
+        assert window.problem_panel.table.columnCount() == 6  # group and lap columns hide with one group, no laps
+        assert window.problem_panel.table.isColumnHidden(5)
         assert window.problem_panel._browsing
         window._return_to_problem()
         assert not window.problem_panel._browsing

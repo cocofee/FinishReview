@@ -57,9 +57,9 @@ def menu(panel, label, index=None):
 
 
 def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
-    assert panel.table.columnCount() == 5
+    assert panel.table.columnCount() == 6
     assert [panel.table.horizontalHeaderItem(i).text() for i in range(4)] == ["顺序", "号码", "时间", "状态"]
-    assert panel.table.isColumnHidden(4)  # one group: no group column
+    assert panel.table.isColumnHidden(4) and panel.table.isColumnHidden(5)  # one group, no laps: neither column
     assert all("参考" not in panel.table.item(row_index, 2).text() for row_index in range(panel.table.rowCount()))
     for index, entry in enumerate(panel._arrival_rows):
         assert panel.table.item(index, 1).text() == entry.bib
@@ -1471,3 +1471,39 @@ def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel
     bibs = [wave_panel.table.item(index, 1).text() for index in range(wave_panel.table.rowCount())]
     assert bibs.count("16") == 1
     assert "中间圈 2 条不列" in wave_panel.quick_title.text()
+
+
+def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(wave_panel):
+    """16 passes on lap 2 of 3 inside the bunch finishing: the wave is the finishers' chips only."""
+    from dataclasses import replace as _replace
+    wave_panel.events = [
+        _replace(event("61", "a", T0), lap=3, group_target_laps=3),
+        _replace(event("16", "x", T0 + 300), lap=2, group_target_laps=3),
+        _replace(event("20", "b", T0 + 600), lap=3, group_target_laps=3),
+    ]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    waves = [[row.bib for row in wave] for wave in wave_panel._waves]
+    assert waves == [["61", "20"]]
+
+
+def test_laps_show_as_k_of_n_and_a_rider_short_of_laps_is_only_a_hint_once_someone_finished(wave_panel):
+    from dataclasses import replace as _replace
+    laps = lambda bib, identity, stamp, lap: _replace(event(bib, identity, stamp), lap=lap, group_target_laps=3)
+    wave_panel.events = [laps("61", "a1", T0, 1), laps("16", "b1", T0 + 100, 1),
+                         laps("61", "a2", T0 + 60_000, 2), laps("16", "b2", T0 + 60_100, 2)]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    assert "圈数不足" not in wave_panel.quick_title.text()  # nobody has finished: every rider is still racing
+    wave_panel.events.append(laps("61", "a3", T0 + 120_000, 3))
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    assert not wave_panel.table.isColumnHidden(5)
+    row = next(i for i in range(wave_panel.table.rowCount()) if wave_panel.table.item(i, 1).text() == "61")
+    assert wave_panel.table.item(row, 5).text() == "3/3"
+    assert "圈数不足 1 人" in wave_panel.quick_title.text()
+    assert "16 号" in wave_panel.quick_title.toolTip()
+
+
+def test_the_lap_column_stays_hidden_without_target_laps(wave_panel):
+    assert wave_panel.table.isColumnHidden(5)

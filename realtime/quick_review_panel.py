@@ -22,7 +22,7 @@ from .arrival_review import (
 from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, uncovered_intervals
 from .chip_history import format_chip_time
 from .crossing_time import item_crossing_time, recorder_crossing_time, workspace_clocks
-from .lap_wave import INTERMEDIATE, lap_role
+from .lap_wave import INTERMEDIATE, Passage, lap_role, short_riders
 from .problem_items import (
     CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING, STATUS_EXCLUDED,
     STATUS_WAITING, ProblemItem, stable_item_id,
@@ -182,6 +182,7 @@ class QuickReviewPanel(ProblemListPanel):
         # line before it (None: nobody), read off the strip once (earlier_arrival).
         self._earlier = {}
         self._intermediate_laps = 0  # chip reads of laps before the last, not listed
+        self._short_bibs = ()  # riders whose last read is short of the target, once the group has a finisher
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
         self._near_counted_items = frozenset()  # item ids of crossings within COUNTED_REACH_MS of someone counted
         self._strip_end = (None, 0.0)  # (pieces, the strip's last chip-clock moment)
@@ -197,8 +198,8 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.cellDoubleClicked.disconnect()
         self.table.cellClicked.connect(self._arrival_clicked)
         self.table.cellDoubleClicked.connect(self._arrival_clicked)
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "组别"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "组别", "圈数"])
         self.table.horizontalHeaderItem(2).setToolTip(
             "校时后的芯片域时间；悬浮单元格可看录像原时刻"
         )
@@ -206,6 +207,9 @@ class QuickReviewPanel(ProblemListPanel):
             self.table.setColumnWidth(column, width)
         # The group column only appears when the race has more than one group.
         self.table.setColumnHidden(4, True)
+        # The lap column only appears when CycleRace sends a group's target laps (多圈).
+        self.table.setColumnWidth(5, 46)
+        self.table.setColumnHidden(5, True)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
         self.table.setToolTip("点一行看这一刻；选中后按 1 不是运动员、2 双芯片、3 补录号码、4 撤销（右键同样）")
@@ -358,7 +362,25 @@ class QuickReviewPanel(ProblemListPanel):
         listed = [event for event in scoped
                   if lap_role(event.lap, getattr(event, "group_target_laps", 0)) != INTERMEDIATE]
         self._intermediate_laps = len(scoped) - len(listed)
+        self._short_bibs = self._short_of_laps(scoped)
         return {event.event_id: event for event in listed}
+
+    @staticmethod
+    def _short_of_laps(events):
+        """Bibs whose last read is short of the group's target laps, in groups someone has finished.
+
+        Before anyone finishes, every rider is short: nothing is said then.  A
+        hint only (圈数异常只提示): the rider may not have finished, or a lap
+        may have gone unread.
+        """
+        active = [event for event in events if event.is_active and getattr(event, "group_target_laps", 0) > 1]
+        finished = {event.group_id for event in active if event.lap >= event.group_target_laps}
+        passages = [Passage(event.event_id, event.athlete_id or event.bib, int(event.timeline_timestamp_ms),
+                            event.lap, event.group_target_laps)
+                    for event in active if event.group_id in finished]
+        short = short_riders(passages)
+        bibs = {event.athlete_id or event.bib: event.bib for event in active}
+        return tuple(sorted((bibs[rider] or rider for rider in short), key=lambda bib: (len(bib), bib)))
 
     def _category(self, item=None):
         item = item or self._candidate_item()
@@ -833,6 +855,8 @@ class QuickReviewPanel(ProblemListPanel):
                 carried.setdefault(row.carrier, []).append(row.bib)
         several_groups = len({group for group in groups if group}) > 1
         self.table.setColumnHidden(4, not several_groups)
+        self.table.setColumnHidden(5, not any(row.event is not None and getattr(row.event, "group_target_laps", 0) > 1
+                                              for row in rows))
         # Room for a name like 男子山地精英组 beside the state.
         self.table.setMinimumWidth(450 if several_groups else 340)
         for widget in (self.table, self.table_column):
@@ -863,7 +887,9 @@ class QuickReviewPanel(ProblemListPanel):
                 shown_state = "已点附近"
             if state == "多余芯片":
                 shown_state = f"{row.carrier}号带的" if row.carrier else "双芯片"
-            for column, text in enumerate((number, row.bib or "—", time, shown_state, groups[index])):
+            target = getattr(row.event, "group_target_laps", 0) if row.event is not None else 0
+            laps = f"{row.event.lap}/{target}" if target > 1 else ""
+            for column, text in enumerate((number, row.bib or "—", time, shown_state, groups[index], laps)):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
                 cell.setData(Qt.UserRole, row.key)
@@ -943,7 +969,11 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.blockSignals(False)
         confirmed = sum(row.decision is not None for row in rows)
         self.quick_title.setText(f"到达记录 {len(rows)} 条 · 已对上 {confirmed} 个芯片"
-                                 + (f" · 中间圈 {self._intermediate_laps} 条不列" if self._intermediate_laps else ""))
+                                 + (f" · 中间圈 {self._intermediate_laps} 条不列" if self._intermediate_laps else "")
+                                 + (f" · 圈数不足 {len(self._short_bibs)} 人" if self._short_bibs else ""))
+        self.quick_title.setToolTip(
+            "圈数不足（只提示，不判定；可能未完赛或漏读一圈）：" + "、".join(self._short_bibs) + " 号"
+            if self._short_bibs else "")
         self.summary.setText(self.quick_title.text())
         self.summary_changed.emit(self.quick_title.text())
         if self._active_item is None and rows:
