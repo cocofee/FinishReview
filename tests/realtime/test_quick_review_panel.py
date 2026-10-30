@@ -1520,6 +1520,17 @@ def test_the_lap_column_stays_hidden_without_target_laps(wave_panel):
     assert wave_panel.table.isColumnHidden(5)
 
 
+def test_the_crossing_of_an_intermediate_lap_is_not_listed_with_its_bib(panel):
+    """10-30 relay: a crossing bound to a lap-1 chip showed as a 待定 row of its own once the chip was hidden."""
+    from dataclasses import replace as _replace
+    three_laps(panel)
+    panel.events = [_replace(panel.events[0], lap=1), _replace(panel.events[1], lap=3)]
+    panel._quick_render_signature = None
+    panel._render()
+    assert [entry.bib for entry in panel._arrival_rows] == ["258"]
+    assert "中间圈 1 条不列" in panel.quick_title.text()
+
+
 def test_target_laps_of_another_race_are_not_used(wave_panel):
     """The metadata of another race (or none: CycleRace before it) leaves every read listed."""
     from dataclasses import replace as _replace

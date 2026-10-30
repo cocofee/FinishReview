@@ -189,6 +189,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._metadata_provider = lambda: None  # CycleRace's race metadata: the groups' target laps
         self._target_laps = {}  # group id -> target laps of this race (CycleRace's metadata), when sent
         self._intermediate_laps = 0  # chip reads of laps before the last, not listed
+        self._intermediate_ids = frozenset()  # their event ids: a crossing bound to one is not listed either
         self._short_bibs = ()  # riders whose last read is short of the target, once the group has a finisher
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
         self._near_counted_items = frozenset()  # item ids of crossings within COUNTED_REACH_MS of someone counted
@@ -376,6 +377,7 @@ class QuickReviewPanel(ProblemListPanel):
         listed = [event for event in scoped
                   if lap_role(event.lap, self._target_laps.get(event.group_id, 0)) != INTERMEDIATE]
         self._intermediate_laps = len(scoped) - len(listed)
+        self._intermediate_ids = frozenset(event.event_id for event in scoped) - {event.event_id for event in listed}
         self._short_bibs = self._short_of_laps(scoped)
         return {event.event_id: event for event in listed}
 
@@ -434,7 +436,9 @@ class QuickReviewPanel(ProblemListPanel):
                                        recorder_ms=raw_recorder_ms,
                                        reference=crossing is None or crossing.source in ("expected", "chip")))
             for event_id, bib in pairs:
-                if not event_id or event_id in represented:
+                # The crossing of an intermediate lap goes with its chip read: not
+                # a row of its own (10-30 relay: 27 of them showed as 待定).
+                if not event_id or event_id in represented or event_id in self._intermediate_ids:
                     continue
                 represented.add(event_id)
                 event = events.get(event_id)
