@@ -36,15 +36,15 @@ from .race_strip import RaceStripPanel, earlier_arrival, first_crossing, frame_a
 # the gaps cluster below 2 s and above 3 s, so the cut falls in the quiet.
 WAVE_GAP_MS = 2000
 KEEP = "keep"  # landing: the picture already shows this row's wave; leave it
-# A wave is looked at from a little before its first chip to a little after its
-# last: a rider without a chip may lead it or close it (and gets a row of its
-# own when its crossing is seen).  Half a second each side was too much (10-30).
-WAVE_VIEW_MARGIN_MS = 150
+# A wave is looked at from its first chip to its last, no more: a rider without
+# a chip gets a row of its own when its crossing is seen.  Half a second each
+# side was too much (10-30: in a relay the ones waiting to take over stand in
+# front of the line, and with many riders the extra added up).
+WAVE_VIEW_MARGIN_MS = 0
 # A crossing without a chip is looked at from this much before it to this much
-# after its last piece.  Half a second each side was too much (10-30: the
-# runners were still metres off at the start, and with many crossings the
-# extra second each added up).
-PASSAGE_VIEW_MARGIN_MS = 250
+# after its last piece: just enough that the picture does not stutter between
+# one piece of video and the next (10-30).
+PASSAGE_VIEW_MARGIN_MS = 150
 # Crossings without a chip read for 可能多人 per pass, so the table never waits on the strip.
 EARLIER_BATCH = 8
 # A wave is swept by dragging the picture; a rider stays in view about a second
@@ -524,7 +524,7 @@ class QuickReviewPanel(ProblemListPanel):
         return [row for row in rows if row.key not in folded]
 
     def _fragment_unseen(self, row, whole=False):
-        """What of a row, from where it is looked at from to its last piece + 0.25 s, nobody has looked at.
+        """What of a row, from where it is looked at from to its last piece + 0.15 s, nobody has looked at.
 
         Only a folded row has to be seen whole before it is ruled on, or any row
         of a Shift+3 run (WHOLE).
@@ -538,7 +538,7 @@ class QuickReviewPanel(ProblemListPanel):
                                    seen, tolerance=100)
 
     def _passage_lead(self, row):
-        """How long before a crossing it is looked at from: a quarter second without a chip, half with one.
+        """How long before a crossing it is looked at from: 0.15 s without a chip, none with one.
 
         可能多人: from the moment the other one came onto the line (15:50,
         10-29: the first two of 4 came on 1.9 s before the row's moment).  2 s
@@ -551,6 +551,10 @@ class QuickReviewPanel(ProblemListPanel):
         if arrival is None:
             return PASSAGE_VIEW_MARGIN_MS
         return max(PASSAGE_VIEW_MARGIN_MS, -(-int(row.time_ms - arrival) // 100) * 100)
+
+    def _lead_text(self, row):
+        lead = self._passage_lead(row)
+        return f"从过线前 {lead / 1000:g} 秒看起" if lead else "从过线那一刻看起"
 
     def _earlier_arrival(self, row, read=True):
         """When someone else came onto the line up to 2 s before this crossing without a chip (可能多人).
@@ -879,7 +883,7 @@ class QuickReviewPanel(ProblemListPanel):
                     cell.setBackground(QColor(background))
                     cell.setTextAlignment(Qt.AlignCenter)
                 tooltip = ("点击回看保存原帧" if row.decision else
-                           f"点击回看这一刻（从过线前 {self._passage_lead(row) / 1000:g} 秒看起）；"
+                           f"点击回看这一刻（{self._lead_text(row)}）；"
                            "选中按 1/2/3/4 或右键处理这一行")
                 if row.mark is not None:
                     tooltip = "比芯片多点出的人：点这一行回到点他的那一帧；按 3 补录号码或 1 不是运动员，点错在画面上右键去掉"
@@ -1584,8 +1588,11 @@ class QuickReviewPanel(ProblemListPanel):
         stamps = [int(row.event.timeline_timestamp_ms) for row in plan.chips]
         camera = str(int((plan.item.evidence.get("frame") or {}).get("camera_index") or 1))
         seen = self._arrival_drafts.get("seen", {}).get(camera, [])
-        return uncovered_intervals(min(stamps) - WAVE_VIEW_MARGIN_MS, max(stamps) + WAVE_VIEW_MARGIN_MS,
-                                   seen, tolerance=100)
+        start, end = min(stamps) - WAVE_VIEW_MARGIN_MS, max(stamps) + WAVE_VIEW_MARGIN_MS
+        if start == end:  # a lone chip and no margin: its own moment has to have been shown
+            shown = any(left - 100 <= start <= right + 100 for left, right in seen)
+            return [] if shown else [[start, start + 100]]
+        return uncovered_intervals(start, end, seen, tolerance=100)
 
     def record_viewed_frame(self, frame, recorder_ms):
         """Remember, in chip time, what of the recording the operator has looked at."""

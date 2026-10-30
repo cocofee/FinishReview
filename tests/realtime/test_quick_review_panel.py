@@ -1,5 +1,6 @@
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from PyQt5.QtCore import Qt, QTimer
@@ -674,10 +675,22 @@ def test_every_click_saves_and_the_unseen_part_only_shows_never_blocks(wave_pane
         count_on_picture(wave_panel, x, offset)
     assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
     look_through(wave_panel, -200, 400)
-    assert "秒没看" in wave_panel.confirmation_status.text()  # 20 to 76 + 0.15 s is still unseen
+    assert "秒没看" in wave_panel.confirmation_status.text()  # 20 to 76 is still unseen
     look_through(wave_panel, 400, 1400)
     assert "已核" in wave_panel.confirmation_status.text()
     assert wave_panel.table.item(row(wave_panel, "61"), 0).foreground().color().name() == "#126044"
+
+
+def test_a_chip_wave_is_looked_at_without_a_margin_but_a_lone_chip_still_has_its_moment_shown(wave_panel):
+    """现代五项接力 10-30：有芯片的不再前后多看；只有一个芯片时，那一刻本身仍要看过。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
+    entry = wave_panel._arrival_rows[row(wave_panel, "5")]
+    plan = SimpleNamespace(chips=[entry], item=entry.item)
+    assert wave_panel._unseen(plan) == [[T0 + 10_000, T0 + 10_100]]
+    assert "从过线那一刻看起" in wave_panel.table.item(row(wave_panel, "5"), 3).toolTip()
+    look_through(wave_panel, 10_000, 10_000)
+    assert wave_panel._unseen(plan) == []
 
 
 def test_a_click_before_someone_shifts_the_bibs_after_it_and_a_right_click_shifts_them_back(wave_panel):
@@ -806,24 +819,24 @@ def strip_landing(wave_panel, monkeypatch, tmp_path):
 
 def test_every_way_into_a_row_lands_on_its_wave_s_first_rider_not_the_chip_time(wave_panel, strip_landing):
     """古浪 267、7、167、76：芯片时间换算落在别人身上；过线图上第一处变化才是这一波第一个人，
-    再提前 0.15 秒（15:50 现代五项：落在压线那一刻只看到 4 人中的 2 人；10-30：半秒又太早）。"""
+    不再提前（15:50 现代五项：落在压线那一刻只看到 4 人中的 2 人，靠整波看完解决；10-30 接力：线前等接棒的人，提前只会看到他们）。"""
 
     asked, jumps = strip_landing
     first, lone = T0, T0 + 10_000
     wave_panel._arrival_clicked(row(wave_panel, "5"))
-    assert jumps[-1] == {"camera_index": 1, "position_ms": lone - 257, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": lone - 107, "reference_only": True}
     wave_panel._arrival_clicked(row(wave_panel, "76"))  # any rider of the wave: it starts at its first
-    assert asked[-1] == first and jumps[-1]["position_ms"] == first - 257
+    assert asked[-1] == first and jumps[-1]["position_ms"] == first - 107
     for enter in (lambda index: wave_panel.table.cellDoubleClicked.emit(index, 0),
                   lambda index: wave_panel.select_item(wave_panel._arrival_rows[index].item.item_id)):
         wave_panel._arrival_clicked(row(wave_panel, "5"))
         enter(row(wave_panel, "20"))
-        assert jumps[-1]["position_ms"] == first - 257
+        assert jumps[-1]["position_ms"] == first - 107
     wave_panel._arrival_clicked(row(wave_panel, "76"))
     QTest.keyClick(wave_panel.table, Qt.Key_Down)
-    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == lone - 257
+    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == lone - 107
     QTest.keyClick(wave_panel.table, Qt.Key_Up)
-    assert wave_panel._selected_arrival().bib == "76" and jumps[-1]["position_ms"] == first - 257
+    assert wave_panel._selected_arrival().bib == "76" and jumps[-1]["position_ms"] == first - 107
 
 
 def test_inside_the_shown_wave_the_picture_stays_and_the_window_does_not_reopen_it(wave_panel, strip_landing):
@@ -841,7 +854,7 @@ def test_inside_the_shown_wave_the_picture_stays_and_the_window_does_not_reopen_
     wave_panel._arrival_clicked(row(wave_panel, "76"))  # on the wave's own picture too
     assert len(jumps) == count
     assert wave_panel.open_wave_start()  # 回到团首: the first rider, from anywhere in the wave
-    assert jumps[-1]["position_ms"] == T0 - 257
+    assert jumps[-1]["position_ms"] == T0 - 107
 
 
 def test_after_a_wave_and_a_decided_row_the_next_click_still_lands(wave_panel, strip_landing, monkeypatch):
@@ -853,12 +866,12 @@ def test_after_a_wave_and_a_decided_row_the_next_click_still_lands(wave_panel, s
     look_through(wave_panel, -600, 1500)
     QTest.keyClick(wave_panel, Qt.Key_Return)
     # Confirming goes on to the next wave at its first rider.
-    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == T0 + 10_000 - 257
+    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == T0 + 10_000 - 107
     wave_panel._arrival_clicked(row(wave_panel, "20"))  # a decided row: the frame it was decided on
     assert jumps[-1]["recorder_ms"] == T0 + 500 and not jumps[-1].get("reference_only")
     monkeypatch.setattr(module, "first_crossing", lambda pieces, cache, chip_ms: None)
     wave_panel._arrival_clicked(row(wave_panel, "5"))  # the strip cannot tell: the chip time
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 10_000 - 150, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 10_000, "reference_only": True}
 
 
 def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monkeypatch, tmp_path):
@@ -872,36 +885,36 @@ def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monk
     assert not jumps  # nothing to land on yet: the window opens the chip time meanwhile
     strip = wave_panel.race_strip
     strip._apply((strip._token, ([strip_piece(tmp_path)], {})))
-    assert [jump[0]["position_ms"] for jump in jumps] == [T0 - 193]
+    assert [jump[0]["position_ms"] for jump in jumps] == [T0 - 43]
     strip._apply((strip._token, ([strip_piece(tmp_path)], {})))  # a later rescan does not move it again
     assert len(jumps) == 1
 
 
-def test_a_crossing_without_a_chip_opens_a_quarter_second_before_it(wave_panel, strip_landing):
-    """现代五项：从前 2 秒（10-29）、0.5 秒（10-30）看起人都还在远处；从前 0.25 秒看起。"""
+def test_a_crossing_without_a_chip_opens_150_ms_before_it(wave_panel, strip_landing):
+    """现代五项：从前 2 秒（10-29）、0.5 秒（10-30）看起人都还在远处；0.25 秒仍嫌多（人多时太麻烦）；从前 0.15 秒看起，只为不在两段视频之间卡一下。"""
     _asked, jumps = strip_landing
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_750, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_850, "reference_only": True}
 
 
-def test_without_an_aligned_strip_a_crossing_opens_a_quarter_second_back_from_its_own_frame(wave_panel):
-    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.25 秒开始看（可能在上一段录像里）。"""
+def test_without_an_aligned_strip_a_crossing_opens_150_ms_back_from_its_own_frame(wave_panel):
+    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.15 秒开始看（可能在上一段录像里）。"""
     jumps = []
     wave_panel.jump_requested.connect(jumps.append)
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=40, position_ms=2000, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1750,
+    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1850,
                          "frame_index": None, "reference_only": True}
     wave_panel.add_manual_problem(dict(FRAME, frame_index=4, position_ms=200, recorder_ms=T0 + 30_000),
                                   recorder_ms=T0 + 30_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.time_ms == T0 + 30_000))
-    assert jumps[-1]["position_ms"] == -50  # before the file: the window opens what holds it
+    assert jumps[-1]["position_ms"] == 50  # before the file: the window opens what holds it
 
 
 def test_a_crossing_where_someone_came_on_earlier_is_marked_maybe_several(wave_panel, strip_landing, monkeypatch):
