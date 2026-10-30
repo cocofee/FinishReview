@@ -877,31 +877,31 @@ def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monk
     assert len(jumps) == 1
 
 
-def test_a_crossing_without_a_chip_opens_half_a_second_before_it(wave_panel, strip_landing):
-    """现代五项 10-29：从前 2 秒看起人还在远处，太远；和一波芯片一样从前 0.5 秒看起。"""
+def test_a_crossing_without_a_chip_opens_a_quarter_second_before_it(wave_panel, strip_landing):
+    """现代五项：从前 2 秒（10-29）、0.5 秒（10-30）看起人都还在远处；从前 0.25 秒看起。"""
     _asked, jumps = strip_landing
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_500, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_750, "reference_only": True}
 
 
-def test_without_an_aligned_strip_a_crossing_opens_half_a_second_back_from_its_own_frame(wave_panel):
-    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.5 秒开始看（可能在上一段录像里）。"""
+def test_without_an_aligned_strip_a_crossing_opens_a_quarter_second_back_from_its_own_frame(wave_panel):
+    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.25 秒开始看（可能在上一段录像里）。"""
     jumps = []
     wave_panel.jump_requested.connect(jumps.append)
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=40, position_ms=2000, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1500,
+    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1750,
                          "frame_index": None, "reference_only": True}
     wave_panel.add_manual_problem(dict(FRAME, frame_index=4, position_ms=200, recorder_ms=T0 + 30_000),
                                   recorder_ms=T0 + 30_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.time_ms == T0 + 30_000))
-    assert jumps[-1]["position_ms"] == -300  # before the file: the window opens what holds it
+    assert jumps[-1]["position_ms"] == -50  # before the file: the window opens what holds it
 
 
 def test_a_crossing_where_someone_came_on_earlier_is_marked_maybe_several(wave_panel, strip_landing, monkeypatch):

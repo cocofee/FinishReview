@@ -39,6 +39,11 @@ KEEP = "keep"  # landing: the picture already shows this row's wave; leave it
 # A wave is looked at from a little before its first chip to a little after its
 # last: a rider without a chip may lead it or close it.
 WAVE_VIEW_MARGIN_MS = 500
+# A crossing without a chip is looked at from this much before it to this much
+# after its last piece.  Half a second each side was too much (10-30: the
+# runners were still metres off at the start, and with many crossings the
+# extra second each added up).
+PASSAGE_VIEW_MARGIN_MS = 250
 # Crossings without a chip read for 可能多人 per pass, so the table never waits on the strip.
 EARLIER_BATCH = 8
 # A wave is swept by dragging the picture; a rider stays in view about a second
@@ -518,7 +523,7 @@ class QuickReviewPanel(ProblemListPanel):
         return [row for row in rows if row.key not in folded]
 
     def _fragment_unseen(self, row, whole=False):
-        """What of a row, from where it is looked at from to its last piece + 0.5 s, nobody has looked at.
+        """What of a row, from where it is looked at from to its last piece + 0.25 s, nobody has looked at.
 
         Only a folded row has to be seen whole before it is ruled on, or any row
         of a Shift+3 run (WHOLE).
@@ -528,21 +533,23 @@ class QuickReviewPanel(ProblemListPanel):
         camera = str(int((row.item.evidence.get("frame") or {}).get("camera_index") or 1))
         seen = self._arrival_drafts.get("seen", {}).get(camera, [])
         last = (row.fragments[-1] if row.fragments else row).time_ms
-        return uncovered_intervals(row.time_ms - self._passage_lead(row), last + WAVE_VIEW_MARGIN_MS,
+        return uncovered_intervals(row.time_ms - self._passage_lead(row), last + PASSAGE_VIEW_MARGIN_MS,
                                    seen, tolerance=100)
 
     def _passage_lead(self, row):
-        """How long before a crossing it is looked at from: half a second, as a wave.
+        """How long before a crossing it is looked at from: a quarter second without a chip, half with one.
 
         可能多人: from the moment the other one came onto the line (15:50,
         10-29: the first two of 4 came on 1.9 s before the row's moment).  2 s
         before every crossing, and half a second more on 可能多人, was too far
         back: the rider was still far off.
         """
-        arrival = self._earlier_arrival(row, read=False) if row is not None and row.event is None else None
-        if arrival is None:
+        if row is None or row.event is not None:
             return WAVE_VIEW_MARGIN_MS
-        return max(WAVE_VIEW_MARGIN_MS, -(-int(row.time_ms - arrival) // 100) * 100)
+        arrival = self._earlier_arrival(row, read=False)
+        if arrival is None:
+            return PASSAGE_VIEW_MARGIN_MS
+        return max(PASSAGE_VIEW_MARGIN_MS, -(-int(row.time_ms - arrival) // 100) * 100)
 
     def _earlier_arrival(self, row, read=True):
         """When someone else came onto the line up to 2 s before this crossing without a chip (可能多人).
@@ -893,7 +900,8 @@ class QuickReviewPanel(ProblemListPanel):
                 if row.fragments:
                     tooltip = (f"同一次过线被拆成 {len(row.fragments) + 1} 段画面，合成这一行"
                                f"（{(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒）\n"
-                               f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 0.5 秒，画面上看到几个人就点几个；"
+                               f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 "
+                               f"{PASSAGE_VIEW_MARGIN_MS / 1000:g} 秒，画面上看到几个人就点几个；"
                                "按 1（不是运动员）自动补看没看的部分再排除整行，4 或退格撤回整行\n"
                                + tooltip)
                 wave = self._row_wave(row) if row.key in self._wave_of else None
@@ -1504,8 +1512,8 @@ class QuickReviewPanel(ProblemListPanel):
             status, color = self._wave_status(plan)
         elif row is not None and wave is None and self._row_state(row) == "待定" and row.time_ms is not None:
             # A crossing without a chip may be several people: it is looked at
-            # from half a second before (可能多人: from when the first came on) to
-            # half a second after (15:50, 10-29: 4 people on one row).
+            # from a quarter second before (可能多人: from when the first came on)
+            # to a quarter second after (15:50, 10-29: 4 people on one row).
             unseen = self._fragment_unseen(row, whole=True)
             span = (f"{len(row.fragments) + 1} 段 · {(row.fragments[-1].time_ms - row.time_ms) / 1000:.1f} 秒 · "
                     if row.fragments else "")
@@ -1899,7 +1907,8 @@ class QuickReviewPanel(ProblemListPanel):
             # A folded row is ruled on as a whole, so all of it is looked at first.
             self.hint.setText(f"这一行 {len(pieces) + 1} 段画面还差 "
                               f"{sum(right - left for left, right in unseen) / 1000:.1f} 秒没看；"
-                              f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 0.5 秒再判。")
+                              f"看完首段前 {self._passage_lead(row) / 1000:g} 秒到末段后 "
+                              f"{PASSAGE_VIEW_MARGIN_MS / 1000:g} 秒再判。")
             return
         operation = getattr(self, "_shortcut_operation", None) or (uuid.uuid4().hex if pieces else None)
         if not self._save_ruling(item, pieces, action, frame, operation):
