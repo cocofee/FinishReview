@@ -325,6 +325,71 @@ def first_crossing(pieces, cache, chip_ms):
     return None
 
 
+def earlier_arrival(pieces, cache, at_ms, others=()):
+    """When someone else came onto the line up to 2 s before a crossing without a chip; None if nobody did.
+
+    One crossing row may be several people (15:50, 10-29: the row's moment
+    showed the last 2 of 4; the first two came on 1.7 s earlier).  An arrival
+    as in first_crossing, 0.7-2 s before AT_MS, counts when the body it starts
+    is gone again before AT_MS: still on the line then (someone walking along
+    it, 10-29: 5 of 7 such hints) it is the one crossing.  Arrivals near
+    another crossing in OTHERS are that one's.  Any recording of the moment
+    will do, aligned to the chips or not.
+    """
+
+    low, high = at_ms - 4500, at_ms + 1500
+    for archive in (True, False):
+        parts = sorted((piece for piece in pieces if piece.archive == archive
+                        and piece.chip_end > low and piece.chip_start < high), key=lambda piece: piece.chip_start)
+        try:
+            loaded = [cache.get(piece) for piece in parts]
+        except (OSError, ValueError, KeyError, BadZipFile, EOFError):
+            continue
+        if not loaded:
+            continue
+        times = np.concatenate([part[0] for part in loaded])
+        image = np.concatenate([part[1] for part in loaded], axis=1)
+        order = np.argsort(times, kind="stable")
+        times, image = times[order], image[:, order]
+        inside = (times >= low) & (times <= high)
+        times, image = times[inside], image[:, inside]
+        quiet = times < at_ms - 2500
+        if inside.sum() <= 20 or quiet.sum() < 10:
+            continue
+        background = np.median(image[:, quiet].astype(np.int16), axis=1)
+        change = np.abs(image.astype(np.int16) - background[:, None, :]).max(axis=2)
+        calm = (change[:, quiet] > FIGURE_LEVEL).mean(axis=1) <= 0.25
+        if calm.sum() < 20:
+            return None
+        changed = (change > FIGURE_LEVEL) & calm[:, None]
+        stirred = np.zeros_like(changed)
+        for back in range(1, 5):
+            stirred[:, back:] |= changed[:, :-back]
+        fresh = changed & ~stirred
+        count = fresh.sum(axis=0)
+        arriving = count + np.append(count[1:], 0) + np.append(count[2:], [0, 0])
+        # Bodies on the line over time: what touches across a few places and frames is one.
+        _count, bodies = cv2.connectedComponents(
+            cv2.dilate(changed.astype(np.uint8), np.ones((5, 3), np.uint8)), connectivity=8)
+        at = int(np.argmin(np.abs(times - at_ms)))
+        crossing = set(np.unique(bodies[:, max(0, at - 2):at + 3][changed[:, max(0, at - 2):at + 3]])) - {0}
+        for index in np.flatnonzero((times >= at_ms - 2000) & (times <= at_ms - 700)):
+            if count[index] < 2 or arriving[index] < 6:
+                continue
+            if any(abs(times[index] - other) <= 400 for other in others):
+                continue
+            rows = fresh[:, index:index + 3].any(axis=1)
+            rows = (np.convolve(rows, np.ones(7), "same") > 0) & calm
+            later = (times >= times[index]) & (times < times[index] + 1500)
+            if changed[rows][:, later].any(axis=0).mean() >= 0.8:
+                continue  # staying on: not someone passing
+            if set(np.unique(bodies[:, index:index + 3][fresh[:, index:index + 3]])) & crossing:
+                continue
+            return float(times[index])
+        return None
+    return None
+
+
 class RaceStripView(QWidget):
     """The picture itself: the strip, the chips above it, the time below."""
 

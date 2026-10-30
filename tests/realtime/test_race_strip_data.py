@@ -70,7 +70,7 @@ def _segment(root, *, name, start_ms, duration_ms, camera=1, end_reason="stopped
     return segment, video
 
 
-def _chip_read(root, chip_ms, *, race_id="race", stage_id="stage"):
+def _chip_read(root, chip_ms, *, race_id="race", stage_id="stage", received_at_ms=None):
     """One active chip record, enough for the race clock window."""
 
     (root / SCOPE_FILE).write_text(
@@ -87,7 +87,7 @@ def _chip_read(root, chip_ms, *, race_id="race", stage_id="stage"):
         passage_time_ms=int(chip_ms),
         passage_timestamp_ms=int(chip_ms),
         emitted_at_ms=int(chip_ms),
-        received_at_ms=int(chip_ms) + 100,
+        received_at_ms=int(chip_ms) + 100 if received_at_ms is None else int(received_at_ms),
     )
     (root / PASSAGE_JOURNAL).write_text(
         json.dumps(event.to_payload(), ensure_ascii=False) + "\n", encoding="utf-8"
@@ -249,6 +249,28 @@ def test_archive_outranks_its_clip_and_the_clip_fills_outside_it(tmp_path):
     assert hit["position_ms"] == 10_500
     assert Path(hit["video_path"]) == archive_video
     assert frame_at(pieces, T + 30_000) is None
+
+
+def test_a_stage_carrying_the_wrong_date_still_shows_todays_strip(tmp_path):
+    """CycleRace's stage said 09-20 while the race ran 10-28 (real case): the strip was empty."""
+
+    stale = T - 38 * 86_400_000
+    _chip_read(tmp_path, stale + 60_000, received_at_ms=T + 60_100)
+    segment, _video = _segment(tmp_path, name="camera_01_s1_archive_0001.mkv", start_ms=T, duration_ms=300_000)
+    _save_segment(tmp_path, segment)
+
+    pieces, _metas = strip_pieces(tmp_path, 1)
+
+    assert [piece.segment_id for piece in pieces] == [segment.segment_id]
+
+
+def test_a_read_imported_long_after_its_race_does_not_move_the_strip(tmp_path):
+    stale = T - 38 * 86_400_000
+    _chip_read(tmp_path, stale + 60_000, received_at_ms=T + 3_600_000)
+    segment, _video = _segment(tmp_path, name="camera_01_s1_archive_0001.mkv", start_ms=T, duration_ms=300_000)
+    _save_segment(tmp_path, segment)
+
+    assert strip_pieces(tmp_path, 1)[0] == []
 
 
 def test_render_averages_frames_inside_a_pixel_and_holds_or_blanks_the_rest(tmp_path):

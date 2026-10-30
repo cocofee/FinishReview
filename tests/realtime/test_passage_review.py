@@ -3273,6 +3273,63 @@ def test_previous_frame_crosses_into_adjacent_recording_without_changing_rider(
     dialog.close()
 
 
+def test_play_runs_on_into_the_next_recording_and_stops_only_at_a_real_end(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    """现代五项 10-29：每条 2.5 秒的录像播完 ▶ 就停（“2 秒割裂感”）。"""
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = _event(event_id="passage-plays-on", sequence=1, passage_time_ms=19_000, bib="35")
+    passage_store.append(event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = _add_segment(timeline_store, tmp_path / "videos" / "camera_01_archive_0000.mkv",
+                         source_id="camera_01_review", camera_index=1, started_at_ms=10_000, ended_at_ms=20_000)
+    second = _add_segment(timeline_store, tmp_path / "videos" / "camera_01_archive_0001.mkv",
+                          source_id="camera_01_review", camera_index=1, started_at_ms=20_000, ended_at_ms=30_000)
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    assert pane.location.segment.segment_id == first.segment_id
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+
+    # A stop in the middle of the file (a decode failure) does not jump anywhere.
+    pane._worker.frame_ready.emit(frame, 5_000, 125)
+    pane.set_playing(True)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == first.segment_id and not pane.is_playing
+
+    # A pause by the operator is not an end either.
+    pane._worker.frame_ready.emit(frame, 9_960, 249)
+    pane.set_playing(True)
+    pane.set_playing(False)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == first.segment_id
+
+    # Played to the last frame: the next file opens at its start and plays on.
+    pane.set_playing(True)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert dialog._selected_event_id == event.event_id
+    assert pane.location.segment.segment_id == second.segment_id
+    assert pane._worker.video_path == pane.location.video_path
+    assert pane._worker.seek_calls[-1] == 0
+    assert pane.is_playing and pane._worker.speed_calls[-1] == 1.0
+
+    # The last file of the recording: ▶ just stops.
+    pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+    pane._worker.frame_ready.emit(frame, 9_960, 249)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == second.segment_id and not pane.is_playing
+    dialog.close()
+
+
 def test_next_frame_crosses_when_decoder_is_on_last_frame_before_reported_duration(
     qapp,
     tmp_path,

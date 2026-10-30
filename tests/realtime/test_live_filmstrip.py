@@ -5,6 +5,7 @@ import os
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -133,6 +134,27 @@ def test_cleanup_before_click_refuses_to_publish_wrong_media(tmp_path):
     assert store.segments() == ()
 
 
+def wire_archive_clock(window):
+    """Outside the arrival workbench an archive keeps its own clock (see _aligned_archive)."""
+    window._is_archive = PassageReviewSurface._is_archive
+    window._archive_on_piece_clock = lambda: False
+    window._aligned_archive = lambda *args: PassageReviewSurface._aligned_archive(window, *args)
+
+
+def test_an_archive_is_not_aligned_on_a_piece_not_timed_yet(monkeypatch):
+    """Review 10-29: stepping out of a piece without a media start crashed the step (int(None))."""
+    def matched(*args, **kwargs):
+        raise AssertionError("no picture to match on a piece without a start")
+
+    monkeypatch.setattr("realtime.archive_alignment.archive_shift_ms", matched)
+    window = SimpleNamespace(_archive_on_piece_clock=lambda: True, _is_archive=PassageReviewSurface._is_archive)
+    archive = SimpleNamespace(video_path=Path("cam_archive_0001.mkv"),
+                              segment=SimpleNamespace(segment_id="a", media_started_at_ms=BASE))
+    piece = SimpleNamespace(video_path=Path("cam_review_0001.ts"),
+                            segment=SimpleNamespace(segment_id="p", media_started_at_ms=None))
+    assert PassageReviewSurface._aligned_archive(window, archive, BASE + 500, (piece, BASE + 500)) is archive
+
+
 @pytest.mark.parametrize(("direction", "frame_index", "gap_ms", "archive", "expected"), [
     (1, 49, 0, False, (2, 0, 0)),
     (-1, 0, 0, False, (0, 1960, 49)),
@@ -171,6 +193,7 @@ def test_live_boundary_step_keeps_exact_neighbor_and_does_not_bridge_gaps(
     window._recording_session_key = PassageReviewSurface._recording_session_key
     window._step_into_neighbour_recording = (
         lambda *args: PassageReviewSurface._step_into_neighbour_recording(window, *args))
+    wire_archive_clock(window)
     opened = []
 
     def seek(location, position, frame, camera_index=1):
@@ -244,6 +267,7 @@ def test_step_off_a_two_second_file_goes_on_without_the_strip_or_a_chip_record(
     )
     window._step_into_neighbour_recording = (
         lambda *args: PassageReviewSurface._step_into_neighbour_recording(window, *args))
+    wire_archive_clock(window)
     assert PassageReviewSurface._step_across_recording_boundary(window, pane, direction)
     name, frame = expected
     assert opened == [(name, frame * 40, frame)]

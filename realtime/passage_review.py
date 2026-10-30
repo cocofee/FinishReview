@@ -1347,6 +1347,7 @@ class PassageEvidencePane(QFrame):
     open_requested = pyqtSignal(object, object)
     step_requested = pyqtSignal(int)
     step_boundary_reached = pyqtSignal(int)
+    playback_reached_end = pyqtSignal()
     play_requested = pyqtSignal()
     passage_delta_requested = pyqtSignal(int)
     selection_step_requested = pyqtSignal(int)
@@ -2532,9 +2533,13 @@ class PassageEvidencePane(QFrame):
     def _on_playback_finished(self) -> None:
         if self.sender() is not self._worker:
             return
+        was_playing = self._playing
         self._playing = False
         self.play_btn.setText("▶")
         self._schedule_paused_frame_detail()
+        if was_playing:
+            # The surface decides whether the next file carries on (2.5 s pieces, 10-29).
+            self.playback_reached_end.emit()
 
     def _on_step_boundary_reached(self, direction: int) -> None:
         if self.sender() is not self._worker:
@@ -3685,6 +3690,9 @@ class PassageReviewSurface(QDialog):
             lambda direction, current=pane: self._step_across_recording_boundary(
                 current, direction, at_edge=True
             )
+        )
+        pane.playback_reached_end.connect(
+            lambda current=pane: self._continue_playback(current)
         )
         pane.play_requested.connect(lambda current=pane: self._toggle_pane(current))
         pane.detail_requested.connect(self._on_pane_detail_requested)
@@ -8887,6 +8895,20 @@ class PassageReviewSurface(QDialog):
             self._update_shared_from_pane(pane)
         pane.seek_passage_delta(self._shared_delta_ms, linked_playing=True)
 
+    def _continue_playback(self, pane: PassageEvidencePane) -> None:
+        """▶ that ran to the last frame of a file plays on in the file that continues it.
+
+        Rows open 2.5 s review pieces, so ▶ used to stop every 2.5 s (现代五项
+        10-29, “2 秒割裂感”).  Only forward play of one pane at its file's last
+        frame carries on, through the same neighbour lookup as →; a gap in the
+        recording, synchronised play or reverse play just stops as before.
+        """
+
+        if self._sync_playing or pane not in self.evidence_panes:
+            return
+        if self._step_across_recording_boundary(pane, 1):
+            pane.set_playing(True)
+
     def _step_active_pane(self, frame_delta: int) -> None:
         self._step_pane(self._active_playback_pane(), frame_delta)
 
@@ -9098,16 +9120,89 @@ class PassageReviewSurface(QDialog):
         for source in neighbours:
             if not Path(source.location.video_path).is_file():
                 continue
+            target = self._aligned_archive(
+                source.location, shown, None if self._is_archive(location) else (location, shown))
+            start = int(target.segment.media_started_at_ms)
             if direction > 0:  # the first frame after the one shown
-                frame = (shown + frame_ms // 2 - source.start_ms) // frame_ms + 1
+                frame = (shown + frame_ms // 2 - start) // frame_ms + 1
             else:  # the last frame before it
-                frame = -((source.start_ms - shown + frame_ms // 2) // frame_ms) - 1
+                frame = -((start - shown + frame_ms // 2) // frame_ms) - 1
             last = max(0, -(-(source.end_ms - source.start_ms) // frame_ms) - 1)
             frame = max(0, min(int(frame), last))
             return self._seek_retained_camera_frame(
-                source.location, frame * frame_ms, frame, int(getattr(pane, "camera_index", 1) or 1),
+                target, frame * frame_ms, frame, int(getattr(pane, "camera_index", 1) or 1),
             )
         return False
+
+    @staticmethod
+    def _is_archive(location) -> bool:
+        return "archive" in Path(location.video_path).stem.lower()
+
+    def _archive_on_piece_clock(self) -> bool:
+        """Whether archives are shown on their buffer pieces' clock (the arrival workbench, 10-29)."""
+
+        return False
+
+    def _aligned_archive(self, location, moment_ms, piece=None):
+        """An archive's LOCATION with its clock moved onto its buffer pieces' (see archive_alignment).
+
+        PIECE: (location, recorder ms) of a buffer piece showing a picture of
+        this archive; else one at MOMENT_MS is looked up.  The shift found is
+        kept per archive file.  Anything else, or no picture matched, is
+        returned as it is.
+        """
+
+        segment = location.segment
+        if (not self._archive_on_piece_clock() or not self._is_archive(location)
+                or segment.media_started_at_ms is None):
+            return location
+        start = int(segment.media_started_at_ms)
+        shifts = self.__dict__.setdefault("_archive_shifts", {})  # segment id -> (start, shift)
+        shift = shifts.get(segment.segment_id, (start, None))[1]
+        if shift is None:
+            import cv2
+
+            from .archive_alignment import archive_shift_ms
+
+            piece = piece or self._piece_at(location, int(moment_ms))
+            if piece is None:
+                return location
+            piece_location, piece_ms = piece
+            if piece_location.segment.media_started_at_ms is None:
+                return location  # a piece not timed yet has no picture to match
+            # A picture tried once is not decoded again: unsure (a still scene) or not found.
+            tried = self.__dict__.setdefault("_archive_tries", {})
+            attempt = (segment.segment_id, str(piece_location.video_path), int(piece_ms))
+            if attempt not in tried:
+                # The drift grows from file to file: the nearest archive's shift is the first guess.
+                guess = min(shifts.values(), key=lambda known: abs(known[0] - start), default=(start, 0))[1]
+                try:
+                    tried[attempt] = archive_shift_ms(
+                        piece_location.video_path, piece_location.segment.media_started_at_ms, piece_ms,
+                        location.video_path, start, guess_ms=guess)
+                except (cv2.error, OSError, ValueError):
+                    tried[attempt] = (None, False)
+            shift, sure = tried[attempt]
+            if shift is None:
+                return location
+            if sure:
+                shifts[segment.segment_id] = (start, shift)
+        return replace(location, segment=replace(segment, media_started_at_ms=start - int(shift)))
+
+    def _piece_at(self, archive, moment_ms):
+        """(location, recorder ms) of a buffer piece of ARCHIVE's recording showing MOMENT_MS, or None."""
+
+        camera = int(archive.segment.camera_index)
+        session = self._recording_session_key(archive)
+        sources, _pending = recording_sources(
+            self.timeline_store, camera, self._filmstrip_race_id(),
+            path_available=lambda _path, _live: True)  # only the file used is checked
+        piece = next((source for source in sources
+                      if source.priority == 1 and not self._is_archive(source.location)
+                      and source.start_ms <= moment_ms < source.end_ms
+                      and self._recording_session_key(source.location) == session
+                      and Path(source.location.video_path).is_file()), None)
+        return (piece.location, int(moment_ms)) if piece is not None else None
 
     def _recording_sources_for_step(self, pane: PassageEvidencePane):
         """This camera's recordings, closed files and the live tail, read afresh."""
