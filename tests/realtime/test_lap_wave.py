@@ -21,6 +21,11 @@ def test_a_group_that_does_not_run_laps_is_all_final():
     assert lap_role(1, 1) == FINAL
 
 
+def test_a_read_whose_lap_is_not_known_is_listed_not_hidden():
+    assert lap_role(0, 4) == FINAL
+    assert short_riders([Passage("a", "16", 1000, 0, 4)]) == frozenset()
+
+
 def test_a_rider_whose_last_passage_is_short_of_the_target_is_a_hint_not_a_judgement():
     passages = [
         Passage("a1", "16", 1000, 1, 3), Passage("a2", "16", 2000, 2, 3),  # 16 stopped at 2 of 3

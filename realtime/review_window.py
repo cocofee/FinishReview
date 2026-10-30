@@ -2564,6 +2564,9 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.set_events_provider(
             lambda: self.passage_store.events(include_inactive=True)
         )
+        self.problem_panel.set_metadata_provider(
+            lambda: self.metadata_store.current() if getattr(self, "metadata_store", None) is not None else None
+        )
         self.problem_panel.jump_requested.connect(self._open_problem_frame)
         self.problem_panel.current_changed.connect(self._problem_selection_changed)
         self.problem_panel.big_view_changed.connect(self._problem_big_view_changed)

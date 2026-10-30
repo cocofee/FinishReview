@@ -186,6 +186,8 @@ class QuickReviewPanel(ProblemListPanel):
         # 可能多人: crossing (item id, moment) -> when someone else came onto the
         # line before it (None: nobody), read off the strip once (earlier_arrival).
         self._earlier = {}
+        self._metadata_provider = lambda: None  # CycleRace's race metadata: the groups' target laps
+        self._target_laps = {}  # group id -> target laps of this race (CycleRace's metadata), when sent
         self._intermediate_laps = 0  # chip reads of laps before the last, not listed
         self._short_bibs = ()  # riders whose last read is short of the target, once the group has a finisher
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
@@ -306,6 +308,9 @@ class QuickReviewPanel(ProblemListPanel):
     def set_frame_provider(self, provider):
         self._frame_provider = provider
 
+    def set_metadata_provider(self, provider):
+        self._metadata_provider = provider
+
     def set_workspace(self, workspace_dir):
         if self._quick_ready:
             self.race_strip.load(workspace_dir)
@@ -357,31 +362,35 @@ class QuickReviewPanel(ProblemListPanel):
     def _events(self):
         """This race's chip reads, without the laps before a rider's last (多圈赛只判最后一圈).
 
-        A lap is known as intermediate only when CycleRace sends the group's
-        target laps; without it every read is listed, as before.
+        A lap is known as intermediate only when CycleRace's race metadata
+        carries the group's target laps; without them every read is listed, as before.
         """
         events = tuple(self._events_provider())
         scopes = {(event.race_id, event.stage_id) for event in events}
         self._arrival_scope = self._scope if self._scope[0] else next(iter(scopes)) if len(scopes) == 1 else self._scope
         scoped = [event for event in events if (event.race_id, event.stage_id) == self._arrival_scope]
+        metadata = self._metadata_provider()
+        self._target_laps = ({group.group_id: group.target_laps for group in metadata.groups}
+                             if metadata is not None and (metadata.race_id, metadata.stage_id) == self._arrival_scope
+                             else {})
         listed = [event for event in scoped
-                  if lap_role(event.lap, getattr(event, "group_target_laps", 0)) != INTERMEDIATE]
+                  if lap_role(event.lap, self._target_laps.get(event.group_id, 0)) != INTERMEDIATE]
         self._intermediate_laps = len(scoped) - len(listed)
         self._short_bibs = self._short_of_laps(scoped)
         return {event.event_id: event for event in listed}
 
-    @staticmethod
-    def _short_of_laps(events):
+    def _short_of_laps(self, events):
         """Bibs whose last read is short of the group's target laps, in groups someone has finished.
 
         Before anyone finishes, every rider is short: nothing is said then.  A
         hint only (圈数异常只提示): the rider may not have finished, or a lap
         may have gone unread.
         """
-        active = [event for event in events if event.is_active and getattr(event, "group_target_laps", 0) > 1]
-        finished = {event.group_id for event in active if event.lap >= event.group_target_laps}
+        laps = self._target_laps
+        active = [event for event in events if event.is_active and laps.get(event.group_id, 0) > 1]
+        finished = {event.group_id for event in active if event.lap >= laps[event.group_id]}
         passages = [Passage(event.event_id, event.athlete_id or event.bib, int(event.timeline_timestamp_ms),
-                            event.lap, event.group_target_laps)
+                            event.lap, laps[event.group_id])
                     for event in active if event.group_id in finished]
         short = short_riders(passages)
         bibs = {event.athlete_id or event.bib: event.bib for event in active}
@@ -844,7 +853,7 @@ class QuickReviewPanel(ProblemListPanel):
                    for index, plan in plans.items() if plan.marks or plan.split}
         busy = self._earlier_shown = frozenset(key for key, arrival in self._earlier.items() if arrival is not None)
         signature = (self._arrival_scope, self._selected_key, tuple(sorted(counted.items())), self._attention_only,
-                     busy, self._near_counted_items,
+                     busy, self._near_counted_items, tuple(sorted(self._target_laps.items())),
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
                             candidate_binding(row.item), self._wave_of.get(row.key), group, row.carrier,
                             tuple(piece.key for piece in row.fragments))
@@ -862,7 +871,7 @@ class QuickReviewPanel(ProblemListPanel):
                 carried.setdefault(row.carrier, []).append(row.bib)
         several_groups = len({group for group in groups if group}) > 1
         self.table.setColumnHidden(4, not several_groups)
-        self.table.setColumnHidden(5, not any(row.event is not None and getattr(row.event, "group_target_laps", 0) > 1
+        self.table.setColumnHidden(5, not any(row.event is not None and self._target_laps.get(row.event.group_id, 0) > 1
                                               for row in rows))
         # Room for a name like 男子山地精英组 beside the state.
         self.table.setMinimumWidth(450 if several_groups else 340)
@@ -894,7 +903,7 @@ class QuickReviewPanel(ProblemListPanel):
                 shown_state = "已点附近"
             if state == "多余芯片":
                 shown_state = f"{row.carrier}号带的" if row.carrier else "双芯片"
-            target = getattr(row.event, "group_target_laps", 0) if row.event is not None else 0
+            target = self._target_laps.get(row.event.group_id, 0) if row.event is not None else 0
             laps = f"{row.event.lap}/{target}" if target > 1 else ""
             for column, text in enumerate((number, row.bib or "—", time, shown_state, groups[index], laps)):
                 from PyQt5.QtWidgets import QTableWidgetItem

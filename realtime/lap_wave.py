@@ -39,8 +39,11 @@ class WaveMatch:
 
 
 def lap_role(lap: int, target_laps: int) -> str:
-    """FINAL for the last lap (or any lap of a group that does not run laps), INTERMEDIATE before it."""
-    if target_laps <= 1:
+    """FINAL for the last lap (or any lap of a group that does not run laps), INTERMEDIATE before it.
+
+    A lap of 0 is not known (a read without lap counting): listed, as before.
+    """
+    if target_laps <= 1 or lap <= 0:
         return FINAL
     if lap < target_laps:
         return INTERMEDIATE
@@ -53,7 +56,7 @@ def short_riders(passages: list[Passage]) -> frozenset[str]:
     """Riders whose last passage is short of the group's target laps (圈数不足: a hint, never a judgement)."""
     last: dict[str, Passage] = {}
     for passage in passages:
-        if passage.target_laps <= 1:
+        if passage.target_laps <= 1 or passage.lap <= 0:
             continue
         if passage.rider not in last or passage.time_ms > last[passage.rider].time_ms:
             last[passage.rider] = passage

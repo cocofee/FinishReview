@@ -928,13 +928,33 @@ def test_stop_keeps_thread_reference_after_join_timeout(tmp_path):
     assert thread.join_calls == 2
 
 
-def test_group_target_laps_is_optional_and_kept_when_sent():
-    """Lap 1 of a 3-lap group is intermediate; a record without the field stays as before (0)."""
-    sent = PassageEvent.from_payload(passage_payload(lap=1, group_target_laps=3))
-    assert sent.group_target_laps == 3
-    assert sent.to_payload()["group_target_laps"] == 3
-    old = PassageEvent.from_payload(passage_payload())
-    assert old.group_target_laps == 0
-    assert "group_target_laps" not in old.to_payload()
-    with pytest.raises(passage_receiver_module.PassageEventError):
-        PassageEvent.from_payload(passage_payload(group_target_laps=-1))
+def test_a_group_s_target_laps_are_optional_and_kept_when_sent():
+    """CycleRace sends each group's target laps in the race metadata; an older one does not (0)."""
+    from realtime.race_metadata import RaceMetadata, RaceMetadataError
+    laps = metadata_payload(groups=[{"group_id": "1", "name": "男子组", "target_laps": 4}])
+    sent = RaceMetadata.from_payload(laps)
+    assert sent.groups[0].target_laps == 4
+    assert sent.to_payload()["groups"] == [{"group_id": "1", "name": "男子组", "target_laps": 4}]
+    old = RaceMetadata.from_payload(metadata_payload())
+    assert old.groups[0].target_laps == 0
+    assert old.to_payload()["groups"] == [{"group_id": "1", "name": "男子精英组"}]
+    for wrong in (-1, "4", True):
+        with pytest.raises(RaceMetadataError):
+            RaceMetadata.from_payload(metadata_payload(groups=[{"group_id": "1", "name": "男子组",
+                                                                "target_laps": wrong}]))
+
+
+def test_the_same_revision_sent_again_with_target_laps_is_kept_not_refused(tmp_path):
+    """An older console kept CycleRace's snapshot without the laps; after the update the same revision
+    comes again with them: it is kept, not refused (refused, CycleRace would show a sending error)."""
+    from realtime.race_metadata import RaceMetadata, RaceMetadataConflictError, RaceMetadataIngestResult
+    path = tmp_path / "race-metadata.json"
+    RaceMetadataStore(path).store(RaceMetadata.from_payload(metadata_payload()))
+    store = RaceMetadataStore(path)
+    laps = metadata_payload(groups=[{"group_id": "1", "name": "男子精英组", "target_laps": 4}])
+    assert store.store(RaceMetadata.from_payload(laps)) == RaceMetadataIngestResult.ACCEPTED
+    assert RaceMetadataStore(path).current().groups[0].target_laps == 4
+    assert store.store(RaceMetadata.from_payload(laps)) == RaceMetadataIngestResult.DUPLICATE
+    other = metadata_payload(groups=[{"group_id": "1", "name": "女子组", "target_laps": 4}])
+    with pytest.raises(RaceMetadataConflictError):
+        store.store(RaceMetadata.from_payload(other))

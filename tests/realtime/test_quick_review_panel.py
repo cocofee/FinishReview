@@ -1457,14 +1457,23 @@ def test_one_person_flagged_twice_by_an_older_build_is_one_row(wave_panel):
     assert wave_panel._wave_plan(parent).split == 1
 
 
+def three_laps(panel):
+    """CycleRace's race metadata: group g runs 3 laps, group other none."""
+    from realtime.race_metadata import RaceGroupMetadata, RaceMetadata
+    metadata = RaceMetadata(race_id=SCOPE[0], stage_id=SCOPE[1], revision=1, emitted_at_ms=0,
+                            groups=(RaceGroupMetadata("g", "男子组", 3), RaceGroupMetadata("other", "其他组", 1)))
+    panel.set_metadata_provider(lambda: metadata)
+
+
 def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel):
     """Multi-lap review: a rider's laps before the last are not rows (only the last lap is judged)."""
     from dataclasses import replace as _replace
+    three_laps(wave_panel)
     wave_panel.events = [
-        _replace(event("16", "lap1", T0), lap=1, group_target_laps=3),
-        _replace(event("16", "lap2", T0 + 60_000), lap=2, group_target_laps=3),
-        _replace(event("16", "lap3", T0 + 120_000), lap=3, group_target_laps=3),
-        event("5", "d", T0 + 200_000),  # a group without laps: listed as before
+        _replace(event("16", "lap1", T0), lap=1),
+        _replace(event("16", "lap2", T0 + 60_000), lap=2),
+        _replace(event("16", "lap3", T0 + 120_000), lap=3),
+        _replace(event("5", "d", T0 + 200_000), lap=1, group_id="other"),  # a group without laps
     ]
     wave_panel._quick_render_signature = None
     wave_panel._render()
@@ -1476,10 +1485,11 @@ def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel
 def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(wave_panel):
     """16 passes on lap 2 of 3 inside the bunch finishing: the wave is the finishers' chips only."""
     from dataclasses import replace as _replace
+    three_laps(wave_panel)
     wave_panel.events = [
-        _replace(event("61", "a", T0), lap=3, group_target_laps=3),
-        _replace(event("16", "x", T0 + 300), lap=2, group_target_laps=3),
-        _replace(event("20", "b", T0 + 600), lap=3, group_target_laps=3),
+        _replace(event("61", "a", T0), lap=3),
+        _replace(event("16", "x", T0 + 300), lap=2),
+        _replace(event("20", "b", T0 + 600), lap=3),
     ]
     wave_panel._quick_render_signature = None
     wave_panel._render()
@@ -1489,7 +1499,8 @@ def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(
 
 def test_laps_show_as_k_of_n_and_a_rider_short_of_laps_is_only_a_hint_once_someone_finished(wave_panel):
     from dataclasses import replace as _replace
-    laps = lambda bib, identity, stamp, lap: _replace(event(bib, identity, stamp), lap=lap, group_target_laps=3)
+    three_laps(wave_panel)
+    laps = lambda bib, identity, stamp, lap: _replace(event(bib, identity, stamp), lap=lap)
     wave_panel.events = [laps("61", "a1", T0, 1), laps("16", "b1", T0 + 100, 1),
                          laps("61", "a2", T0 + 60_000, 2), laps("16", "b2", T0 + 60_100, 2)]
     wave_panel._quick_render_signature = None
@@ -1507,3 +1518,16 @@ def test_laps_show_as_k_of_n_and_a_rider_short_of_laps_is_only_a_hint_once_someo
 
 def test_the_lap_column_stays_hidden_without_target_laps(wave_panel):
     assert wave_panel.table.isColumnHidden(5)
+
+
+def test_target_laps_of_another_race_are_not_used(wave_panel):
+    """The metadata of another race (or none: CycleRace before it) leaves every read listed."""
+    from dataclasses import replace as _replace
+    from realtime.race_metadata import RaceGroupMetadata, RaceMetadata
+    other = RaceMetadata(race_id="another", stage_id=SCOPE[1], revision=1, emitted_at_ms=0,
+                         groups=(RaceGroupMetadata("g", "男子组", 3),))
+    wave_panel.set_metadata_provider(lambda: other)
+    wave_panel.events = [_replace(event("16", "lap1", T0), lap=1), _replace(event("16", "lap2", T0 + 60_000), lap=2)]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    assert wave_panel.table.rowCount() == 2 and "中间圈" not in wave_panel.quick_title.text()
