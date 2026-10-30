@@ -22,6 +22,7 @@ from .arrival_review import (
 from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, uncovered_intervals
 from .chip_history import format_chip_time
 from .crossing_time import item_crossing_time, recorder_crossing_time, workspace_clocks
+from .lap_wave import INTERMEDIATE, lap_role
 from .problem_items import (
     CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING, STATUS_EXCLUDED,
     STATUS_WAITING, ProblemItem, stable_item_id,
@@ -180,6 +181,7 @@ class QuickReviewPanel(ProblemListPanel):
         # 可能多人: crossing (item id, moment) -> when someone else came onto the
         # line before it (None: nobody), read off the strip once (earlier_arrival).
         self._earlier = {}
+        self._intermediate_laps = 0  # chip reads of laps before the last, not listed
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
         self._near_counted_items = frozenset()  # item ids of crossings within COUNTED_REACH_MS of someone counted
         self._strip_end = (None, 0.0)  # (pieces, the strip's last chip-clock moment)
@@ -344,11 +346,19 @@ class QuickReviewPanel(ProblemListPanel):
             self._arrival_store.refresh()
 
     def _events(self):
+        """This race's chip reads, without the laps before a rider's last (多圈赛只判最后一圈).
+
+        A lap is known as intermediate only when CycleRace sends the group's
+        target laps; without it every read is listed, as before.
+        """
         events = tuple(self._events_provider())
         scopes = {(event.race_id, event.stage_id) for event in events}
         self._arrival_scope = self._scope if self._scope[0] else next(iter(scopes)) if len(scopes) == 1 else self._scope
-        return {event.event_id: event for event in events
-                if (event.race_id, event.stage_id) == self._arrival_scope}
+        scoped = [event for event in events if (event.race_id, event.stage_id) == self._arrival_scope]
+        listed = [event for event in scoped
+                  if lap_role(event.lap, getattr(event, "group_target_laps", 0)) != INTERMEDIATE]
+        self._intermediate_laps = len(scoped) - len(listed)
+        return {event.event_id: event for event in listed}
 
     def _category(self, item=None):
         item = item or self._candidate_item()
@@ -932,7 +942,8 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.verticalScrollBar().setValue(scroll)
         self.table.blockSignals(False)
         confirmed = sum(row.decision is not None for row in rows)
-        self.quick_title.setText(f"到达记录 {len(rows)} 条 · 已对上 {confirmed} 个芯片")
+        self.quick_title.setText(f"到达记录 {len(rows)} 条 · 已对上 {confirmed} 个芯片"
+                                 + (f" · 中间圈 {self._intermediate_laps} 条不列" if self._intermediate_laps else ""))
         self.summary.setText(self.quick_title.text())
         self.summary_changed.emit(self.quick_title.text())
         if self._active_item is None and rows:

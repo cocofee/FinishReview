@@ -195,6 +195,8 @@ class PassageEvent:
     team_name: str = ""
     is_active: bool = True
     received_at_ms: WallClockMs = WallClockMs(0)
+    # The group's target laps; 0: not sent (CycleRace before it) or a group without laps.
+    group_target_laps: int = 0
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -219,6 +221,8 @@ class PassageEvent:
             )
         if self.lap < 0:
             raise PassageEventError("lap must be non-negative")
+        if self.group_target_laps < 0:
+            raise PassageEventError("group_target_laps must be non-negative")
         if not self.source.strip():
             raise PassageEventError("source is required")
         if self.emitted_at_ms < 0:
@@ -267,6 +271,7 @@ class PassageEvent:
             team_name=_string_field(payload, "team_name", default=""),
             is_active=_boolean_field(payload, "is_active", default=True),
             received_at_ms=_integer_field(payload, "received_at_ms", default=0),
+            group_target_laps=_integer_field(payload, "group_target_laps", default=0),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -297,6 +302,8 @@ class PassageEvent:
         }
         if payload["received_at_ms"] > 0:
             result["received_at_ms"] = payload["received_at_ms"]
+        if payload["group_target_laps"] > 0:  # a record without it stays as it was sent
+            result["group_target_laps"] = payload["group_target_laps"]
         return result
 
 

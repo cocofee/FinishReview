@@ -1455,3 +1455,19 @@ def test_one_person_flagged_twice_by_an_older_build_is_one_row(wave_panel):
                                   "older")
     assert sum(entry.event is None for entry in wave_panel._arrival_rows) == 1
     assert wave_panel._wave_plan(parent).split == 1
+
+
+def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel):
+    """Multi-lap review: a rider's laps before the last are not rows (only the last lap is judged)."""
+    from dataclasses import replace as _replace
+    wave_panel.events = [
+        _replace(event("16", "lap1", T0), lap=1, group_target_laps=3),
+        _replace(event("16", "lap2", T0 + 60_000), lap=2, group_target_laps=3),
+        _replace(event("16", "lap3", T0 + 120_000), lap=3, group_target_laps=3),
+        event("5", "d", T0 + 200_000),  # a group without laps: listed as before
+    ]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    bibs = [wave_panel.table.item(index, 1).text() for index in range(wave_panel.table.rowCount())]
+    assert bibs.count("16") == 1
+    assert "中间圈 2 条不列" in wave_panel.quick_title.text()
