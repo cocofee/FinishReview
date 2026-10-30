@@ -496,7 +496,7 @@ class EvidenceImageView(QGraphicsView):
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
-            tuple[float, float, str, bool, bool, bool, bool], ...
+            tuple[float, float, str, bool, bool, bool, bool, bool], ...
         ] = ()
         self._show_marker_label = True
         self._show_identity_badge = True
@@ -921,6 +921,7 @@ class EvidenceImageView(QGraphicsView):
                 bool(simple),
                 bool(marker[5]) if len(marker) > 5 else False,
                 bool(marker[6]) if len(marker) > 6 else False,
+                bool(marker[7]) if len(marker) > 7 else False,
             )
             for marker in markers
             for x_normalized, y_normalized, label, confirmed, simple in [marker[:5]]
@@ -1185,18 +1186,19 @@ class EvidenceImageView(QGraphicsView):
                 for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
                     painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
                                      QPointF(b[0] * self._source_width, b[1] * self._source_height))
-        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost) in enumerate(
+        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost, auto) in enumerate(
             self._history_markers
         ):
             x = x_normalized * self._source_width
             y = y_normalized * self._source_height
-            color = QColor("#1bbf83" if confirmed else "#c0372b")
+            # Grey-blue and dashed: paired by the system (自动对上), nobody has counted them yet.
+            color = QColor("#8fb3d9" if auto else "#1bbf83" if confirmed else "#c0372b")
             if ghost:
                 # Counted on a nearby frame: faded where they were, so they are not clicked twice.
                 color.setAlpha(150)
             pen = QPen(color, 2)
             pen.setCosmetic(True)
-            if (not confirmed and not simple) or ghost:
+            if (not confirmed and not simple) or ghost or auto:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
             radius = (16.0 if ghost else 22.0) / scale
