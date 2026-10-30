@@ -37,8 +37,9 @@ from .race_strip import RaceStripPanel, earlier_arrival, first_crossing, frame_a
 WAVE_GAP_MS = 2000
 KEEP = "keep"  # landing: the picture already shows this row's wave; leave it
 # A wave is looked at from a little before its first chip to a little after its
-# last: a rider without a chip may lead it or close it.
-WAVE_VIEW_MARGIN_MS = 500
+# last: a rider without a chip may lead it or close it (and gets a row of its
+# own when its crossing is seen).  Half a second each side was too much (10-30).
+WAVE_VIEW_MARGIN_MS = 150
 # A crossing without a chip is looked at from this much before it to this much
 # after its last piece.  Half a second each side was too much (10-30: the
 # runners were still metres off at the start, and with many crossings the
