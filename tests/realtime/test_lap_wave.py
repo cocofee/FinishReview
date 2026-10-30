@@ -53,6 +53,7 @@ def test_any_one_failed_condition_leaves_the_whole_wave_to_hand():
         ({"clock_ok": True, "short_rider_count": 1}, "圈数不足"),
         ({"clock_ok": True, "maybe_several": True}, "可能多人"),
         ({"clock_ok": True, "near_counted": True}, "已点附近"),
+        ({"clock_ok": True, "obstructed": True}, "视线被挡"),
     ]
     for flags, text in cases:
         match = match_wave(chips, crossings, **flags)

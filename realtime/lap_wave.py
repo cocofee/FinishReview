@@ -71,6 +71,7 @@ def match_wave(
     short_rider_count: int = 0,
     maybe_several: bool = False,
     near_counted: bool = False,
+    obstructed: bool = False,
     min_gap_ms: int = MIN_GAP_MS,
 ) -> WaveMatch:
     """Pair the final-lap chips of a wave with the people on its picture, in order, or say why not.
@@ -91,6 +92,8 @@ def match_wave(
         reasons.append("有可能多人")
     if near_counted:
         reasons.append("有已点附近的过线")
+    if obstructed:
+        reasons.append("过线时视线被挡")
     ordered = sorted(crossings, key=lambda crossing: crossing[1])
     if any(later[1] - earlier[1] < min_gap_ms for earlier, later in zip(ordered, ordered[1:])):
         reasons.append(f"相邻过线不到 {min_gap_ms} 毫秒，顺序可能对错")

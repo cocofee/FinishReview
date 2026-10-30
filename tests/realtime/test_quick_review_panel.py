@@ -665,7 +665,7 @@ def test_counting_a_wave_labels_people_in_chip_order_and_flags_the_one_without_a
     assert "已核" in wave_panel.confirmation_status.text() or "秒没看" in wave_panel.confirmation_status.text()
     # Still drawn on the wave's picture, in red.
     drawn = wave_panel.picture_overlays(wave_panel.frame)
-    assert any(label == "无芯片" and alert and not ghost for _x, _y, label, _ok, alert, _dot, ghost in drawn)
+    assert any(label == "无芯片" and alert and not ghost for _x, _y, label, _ok, alert, _dot, ghost, _auto in drawn)
 
 
 def test_every_click_saves_and_the_unseen_part_only_shows_never_blocks(wave_panel):
@@ -716,7 +716,7 @@ def test_a_person_counted_on_a_nearby_frame_is_drawn_faded_and_can_be_cancelled_
     count_on_picture(wave_panel, .2, 100)  # frame 7
     later = dict(FRAME, frame_index=10, position_ms=400, recorder_ms=T0 + 250)
     drawn = wave_panel.picture_overlays(later)
-    assert [(label, ghost) for _x, _y, label, _ok, _alert, _dot, ghost in drawn] == [("61", True)]
+    assert [(label, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, _auto in drawn] == [("61", True)]
     # Further on the rider has moved away: no ring left on empty road.
     assert wave_panel.picture_overlays(dict(later, frame_index=11, recorder_ms=T0 + 300)) == []
     assert wave_panel.picture_overlays(dict(later, frame_index=5, recorder_ms=T0)) == []  # not before the click
@@ -1542,3 +1542,72 @@ def test_target_laps_of_another_race_are_not_used(wave_panel):
     wave_panel._quick_render_signature = None
     wave_panel._render()
     assert wave_panel.table.rowCount() == 2 and "中间圈" not in wave_panel.quick_title.text()
+
+
+def auto_people(panel, monkeypatch, offsets, blocked=False):
+    """The analysis saw one person cross at each of these moments (ms after the first chip), all on one camera."""
+    from realtime import quick_review_panel as module
+    from realtime.auto_label import DetectedPerson
+    people = [DetectedPerson(f"1|a.mkv|{n}|{n}", 1, T0 + offset, T0 + offset, .2 + .1 * n, .6, blocked, True,
+                             dict(FRAME, frame_index=5 + offset // 50, position_ms=250 + offset,
+                                  recorder_ms=T0 + offset))
+              for n, offset in enumerate(offsets)]
+    monkeypatch.setattr(module, "people_on_line", lambda *_args: people)
+    panel._quick_render_signature = None
+    panel._render()
+    return people
+
+
+def states(panel):
+    return {entry.bib: panel.table.item(i, 3).text() for i, entry in enumerate(panel._arrival_rows) if entry.bib}
+
+
+def test_a_wave_with_as_many_people_as_chips_is_paired_by_the_system_and_nothing_is_saved(wave_panel, monkeypatch):
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    assert states(wave_panel) == {"61": "自动对上", "20": "自动对上", "76": "自动对上", "5": "待定"}
+    assert not any(entry.decision for entry in wave_panel._arrival_rows)  # a shortcut, not a ruling
+    assert wave_panel.race_strip.view.chips[0][2] == 2  # grey-blue on the full-race strip
+    assert wave_panel._arrival_exports() == ([], [], 0)
+    wave_panel._arrival_clicked(row(wave_panel, "20"))
+    assert "自动对上" in wave_panel.confirmation_status.text()
+    # Drawn on the frame its person was seen on, with the chip's bib, as the system's pairing.
+    drawn = wave_panel.picture_overlays(dict(FRAME, frame_index=15, position_ms=750, recorder_ms=T0 + 500))
+    assert [(label, auto, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, auto in drawn] == [("20", True, False)]
+
+
+def test_a_wave_with_a_different_number_of_people_or_a_blocked_view_is_left_to_hand(wave_panel, monkeypatch):
+    auto_people(wave_panel, monkeypatch, (100, 500))
+    assert set(states(wave_panel).values()) == {"待定"}
+    assert "人数 2 与芯片 3 不一致" in wave_panel.table.item(row(wave_panel, "61"), 3).toolTip()
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000), blocked=True)
+    assert set(states(wave_panel).values()) == {"待定"}
+    assert wave_panel.race_strip.view.chips[0][2] is False
+
+
+def test_enter_counts_the_paired_people_as_if_clicked_once_the_wave_is_looked_through(wave_panel, monkeypatch):
+    people = auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel._enter_key()
+    assert "没看" in wave_panel.hint.text() and not any(entry.decision for entry in wave_panel._arrival_rows)
+    look_through(wave_panel, -500, 1400)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel._enter_key()
+    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
+    assert states(wave_panel)["61"] == "已点"  # counted, never 已确认
+    decision = next(entry.decision for entry in wave_panel._arrival_rows if entry.bib == "20")
+    assert (decision["frame"]["marker_x_normalized"], decision["frame"]["marker_y_normalized"]) == (
+        round(people[1].x, 4), round(people[1].y, 4))
+    assert wave_panel._auto_labels == {}
+    assert wave_panel._arrival_exports() == ([], [], 0)
+
+
+def test_four_takes_the_pairing_back_for_good_and_leaves_the_wave_to_hand(wave_panel, monkeypatch):
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    wave_panel._arrival_clicked(row(wave_panel, "20"))
+    wave_panel._undo_arrival()
+    assert set(states(wave_panel).values()) == {"待定"}
+    assert "已按 4 撤回" in wave_panel.table.item(row(wave_panel, "61"), 3).toolTip()
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    assert wave_panel._auto_labels == {}  # not paired again on the next redraw
+    assert not any(entry.decision for entry in wave_panel._arrival_rows)

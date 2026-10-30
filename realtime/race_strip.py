@@ -33,6 +33,7 @@ CACHE_BYTES = 96 * 1024 * 1024
 CLICK_SLOP_PX = 4                   # a press that moves further drags the picture instead
 EXTENT_MARGIN_MS = 30_000
 RESCAN_MS = 10_000
+AUTO_LABELLED = 2                   # a chip's "done": labelled by the system, not yet looked at (auto_label)
 FIGURE_LEVEL = 15                   # colour change on the line that is someone there, not light or noise
 
 
@@ -535,8 +536,10 @@ class RaceStripView(QWidget):
             if row is not None:
                 baseline = self.LABEL_ROWS[row]
                 if done:
-                    # Confirmed: a solid green badge, readable at a glance.
-                    painter.fillRect(left, baseline - metrics.ascent(), width, metrics.height(), QColor("#16a34a"))
+                    # Confirmed: a solid green badge, readable at a glance; grey-blue
+                    # when only the system has paired it (自动对上, not a confirmation).
+                    painter.fillRect(left, baseline - metrics.ascent(), width, metrics.height(),
+                                     QColor("#5b7a99" if done == AUTO_LABELLED else "#16a34a"))
                     painter.setPen(QColor("#ffffff"))
                     painter.drawText(left + 4, baseline, label)
                 else:
