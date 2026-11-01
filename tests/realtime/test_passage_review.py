@@ -67,6 +67,7 @@ class _FakePlaybackWorker(QObject):
     full_resolution_error = pyqtSignal(str, int)
     playback_finished = pyqtSignal()
     step_boundary_reached = pyqtSignal(int)
+    step_failed = pyqtSignal(str)
     playback_error = pyqtSignal(str)
     finished = pyqtSignal()
     instances = []
@@ -678,6 +679,191 @@ def test_evidence_view_maps_full_resolution_tile_to_source_coordinates(qapp):
     assert view._detail_pixmap_item.pos().x() == 1_000
     assert view._detail_pixmap_item.transform().m11() == pytest.approx(1.0)
     view.close()
+
+
+def _send_drag(view, start, end, *, button=Qt.LeftButton):
+    """Send one press, one move and one release with the button still held."""
+
+    viewport = view.viewport()
+    for event_type, position, pressed, buttons in (
+        (QEvent.MouseButtonPress, start, button, button),
+        (QEvent.MouseMove, end, Qt.NoButton, button),
+        (QEvent.MouseButtonRelease, end, button, Qt.NoButton),
+    ):
+        QApplication.sendEvent(
+            viewport,
+            QMouseEvent(
+                event_type,
+                QPointF(position),
+                pressed,
+                buttons,
+                Qt.NoModifier,
+            ),
+        )
+
+
+def _count_view(qapp):
+    view = passage_review.EvidenceImageView()
+    view.resize(640, 480)
+    view.show()
+    view.set_frame(QImage(640, 480, QImage.Format_RGB32))
+    view.set_count_mode(True)
+    qapp.processEvents()
+    return view
+
+
+def test_count_click_still_counts_without_starting_a_scrub(qapp):
+    """The counting surface keeps the plain click: one person, no seek."""
+
+    view = _count_view(qapp)
+    counts, started, deltas, finished = [], [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=center)
+        qapp.processEvents()
+
+        assert len(counts) == 1
+        assert started == [] and deltas == [] and finished == []
+    finally:
+        view.close()
+
+
+def test_count_drag_scrubs_frames_and_never_counts(qapp):
+    """A horizontal left drag reports one scrub and no person."""
+
+    view = _count_view(qapp)
+    counts, started, deltas, finished = [], [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(90, 0))
+        qapp.processEvents()
+
+        assert counts == []
+        assert started == [True]
+        assert deltas and deltas[-1] == 90
+        assert finished == [90]
+        assert view._video_scrubbing is False
+        assert view.viewport().cursor().shape() == Qt.CrossCursor
+    finally:
+        view.close()
+
+
+def test_count_click_slop_is_not_a_drag(qapp):
+    """A tiny hand movement still counts one person instead of scrubbing."""
+
+    view = _count_view(qapp)
+    counts, started, finished = [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(3, 0))
+        qapp.processEvents()
+
+        assert len(counts) == 1
+        assert started == [] and finished == []
+    finally:
+        view.close()
+
+
+def test_count_vertical_drag_neither_scrubs_nor_counts(qapp):
+    """A press that wanders off the spot is no click, in whatever direction."""
+
+    view = _count_view(qapp)
+    counts, started = [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(2, 30))
+        qapp.processEvents()
+
+        assert counts == [] and started == []
+    finally:
+        view.close()
+
+
+def test_drag_outside_count_mode_neither_scrubs_nor_counts(qapp):
+    view = passage_review.EvidenceImageView()
+    view.resize(640, 480)
+    view.show()
+    view.set_frame(QImage(640, 480, QImage.Format_RGB32))
+    counts, started, deltas, finished = [], [], [], []
+    view.count_mark_selected.connect(lambda x, y: counts.append((x, y)))
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    view.scrub_finished.connect(finished.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(90, 0))
+        qapp.processEvents()
+
+        assert counts == []
+        assert started == [] and deltas == [] and finished == []
+    finally:
+        view.close()
+
+
+def test_identity_line_mode_without_counting_does_not_scrub(qapp):
+    view = passage_review.EvidenceImageView()
+    view.resize(640, 480)
+    view.show()
+    view.set_frame(QImage(640, 480, QImage.Format_RGB32))
+    view.set_marker_mode(True)
+    deltas, started = [], []
+    view.scrub_started.connect(lambda: started.append(True))
+    view.scrub_delta_requested.connect(deltas.append)
+    try:
+        center = view.viewport().rect().center()
+        _send_drag(view, center, center + QPoint(90, 0))
+        qapp.processEvents()
+
+        assert started == [] and deltas == []
+    finally:
+        view.close()
+
+
+def test_pane_scrub_is_frame_relative_and_coalesced(qapp):
+    """Pixels become whole-frame deltas; only the latest preview is requested."""
+
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE)
+    pane.resize(900, 500)
+    pane.show()
+    qapp.processEvents()
+    pane._worker = _FakePlaybackWorker(Path("camera_01.mkv"))
+    pane._duration_ms = 20_000
+    pane._target_position_ms = 10_000
+    pane._current_position_ms = 10_000
+    pane._fps = 25.0
+    previews, finals, started = [], [], []
+    pane.scrub_preview_requested.connect(previews.append)
+    pane.passage_delta_requested.connect(finals.append)
+    pane.scrub_started.connect(lambda: started.append(True))
+    try:
+        pane._on_video_scrub_started()
+        pane._on_video_scrub_delta(6)
+        pane._on_video_scrub_delta(12)
+        assert previews == []  # Still coalesced in the 80 ms timer.
+        pane._flush_scrub_preview()
+        width = max(1, pane.video_view.viewport().width())
+        frame_ms = pane.frame_duration_ms()
+        expected = int(round(12 * 6_000 / width / frame_ms)) * frame_ms
+        assert previews == [expected]
+        pane._on_video_scrub_finished(12)
+        assert finals == [expected]
+        assert started == [True]
+    finally:
+        pane.close()
+
 
 
 def test_empty_preview_keeps_time_filmstrip_visible(qapp, tmp_path):
@@ -3088,6 +3274,63 @@ def test_previous_frame_crosses_into_adjacent_recording_without_changing_rider(
     dialog.close()
 
 
+def test_play_runs_on_into_the_next_recording_and_stops_only_at_a_real_end(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    """现代五项 10-29：每条 2.5 秒的录像播完 ▶ 就停（“2 秒割裂感”）。"""
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = _event(event_id="passage-plays-on", sequence=1, passage_time_ms=19_000, bib="35")
+    passage_store.append(event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = _add_segment(timeline_store, tmp_path / "videos" / "camera_01_archive_0000.mkv",
+                         source_id="camera_01_review", camera_index=1, started_at_ms=10_000, ended_at_ms=20_000)
+    second = _add_segment(timeline_store, tmp_path / "videos" / "camera_01_archive_0001.mkv",
+                          source_id="camera_01_review", camera_index=1, started_at_ms=20_000, ended_at_ms=30_000)
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    assert pane.location.segment.segment_id == first.segment_id
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+
+    # A stop in the middle of the file (a decode failure) does not jump anywhere.
+    pane._worker.frame_ready.emit(frame, 5_000, 125)
+    pane.set_playing(True)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == first.segment_id and not pane.is_playing
+
+    # A pause by the operator is not an end either.
+    pane._worker.frame_ready.emit(frame, 9_960, 249)
+    pane.set_playing(True)
+    pane.set_playing(False)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == first.segment_id
+
+    # Played to the last frame: the next file opens at its start and plays on.
+    pane.set_playing(True)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert dialog._selected_event_id == event.event_id
+    assert pane.location.segment.segment_id == second.segment_id
+    assert pane._worker.video_path == pane.location.video_path
+    assert pane._worker.seek_calls[-1] == 0
+    assert pane.is_playing and pane._worker.speed_calls[-1] == 1.0
+
+    # The last file of the recording: ▶ just stops.
+    pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+    pane._worker.frame_ready.emit(frame, 9_960, 249)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == second.segment_id and not pane.is_playing
+    dialog.close()
+
+
 def test_next_frame_crosses_when_decoder_is_on_last_frame_before_reported_duration(
     qapp,
     tmp_path,
@@ -3936,6 +4179,33 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     assert dialog.group_combo.itemText(1) == "男子公开组"
     assert dialog.group_combo.itemData(1) == "men-open"
     dialog.close()
+
+
+def test_metadata_same_revision_accepts_target_laps_in_either_direction(tmp_path):
+    store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    base = RaceMetadata(race_id="race", stage_id="stage", revision=1, emitted_at_ms=1,
+                        groups=(RaceGroupMetadata("g", "组"),))
+    with_laps = replace(base, groups=(RaceGroupMetadata("g", "组", 4),))
+    assert store.store(with_laps).value == "accepted"
+    assert store.store(base).value == "duplicate"
+    assert store.current().groups[0].target_laps == 4
+    changed_revision = replace(base, revision=2, emitted_at_ms=2)
+    assert store.store(changed_revision).value == "accepted"
+    assert store.current().groups[0].target_laps == 4
+    changed_laps = replace(changed_revision, revision=3, emitted_at_ms=3,
+                           groups=(RaceGroupMetadata("g", "组", 5),))
+    assert store.store(changed_laps).value == "accepted"
+    assert store.current().groups[0].target_laps == 5
+
+
+def test_metadata_null_target_laps_means_unknown(tmp_path):
+    payload = {
+        "schema_version": 1, "message_type": "race_metadata", "race_id": "race", "stage_id": "stage",
+        "revision": 1, "emitted_at_ms": 1,
+        "groups": [{"group_id": "g", "name": "组", "target_laps": None}], "athletes": [],
+    }
+    metadata = RaceMetadata.from_payload(payload)
+    assert metadata.groups[0].target_laps == 0
 
 
 def test_group_filter_popup_fits_long_group_names(qapp, tmp_path):
@@ -6503,3 +6773,251 @@ def test_opt_in_auto_advance_after_first_marked_source(
     assert dialog.table.currentRow() == 1
     assert dialog._selected_event_id == "passage-15"
     dialog.close()
+
+
+@pytest.fixture
+def boundary_review(qapp, tmp_path, fake_playback):
+    dialogs = []
+
+    def create(*, first_name="camera_01_archive_0000.mkv",
+               second_start=20_000, second_name="camera_01_archive_0001.mkv",
+               second_race="race-1", second_camera=1):
+        passages = PassageEventStore(tmp_path / "passages.jsonl")
+        passages.append(_event(event_id="passage-204", bib="204", passage_time_ms=19_000))
+        passages.append(_event(event_id="passage-256", sequence=2, bib="256", passage_time_ms=20_892))
+        timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+        first = _add_segment(
+            timeline, tmp_path / "videos" / first_name,
+            source_id="camera_01_review", camera_index=1,
+            started_at_ms=10_000, ended_at_ms=20_000,
+        )
+        second = _add_segment(
+            timeline, tmp_path / "videos" / second_name,
+            source_id="camera_01_review", camera_index=second_camera,
+            started_at_ms=second_start, ended_at_ms=30_000,
+            race_id=second_race,
+        )
+        dialog = PassageReviewDialog(passages, timeline)
+        dialogs.append(dialog)
+        dialog._select_event("passage-204", locate_target=True)
+        qapp.processEvents()
+        pane = dialog.regular_pane
+        image = QImage(1280, 720, QImage.Format_RGB888)
+        image.fill(0)
+        pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+        pane._worker.frame_ready.emit(image, 9_960, 249)
+        qapp.processEvents()
+        return dialog, timeline.get_segment(first.segment_id), timeline.get_segment(second.segment_id), image
+
+    yield create
+    for dialog in dialogs:
+        dialog.close()
+
+
+
+def test_decoder_eof_crosses_and_confirms_256_in_next_recording(qapp, boundary_review):
+    dialog, first, second, image = boundary_review()
+    pane = dialog.regular_pane
+    dialog._select_event("passage-256", preserve_current_frame=pane)
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == first.segment_id
+    original_worker = pane._worker
+    # The decoder has exhausted real frames although metadata advertises more.
+    original_worker.metadata_ready.emit(12_000, 25.0, 1280, 720, 300)
+    original_worker.step_boundary_reached.emit(1)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-256"
+    assert pane.location.segment.segment_id == second.segment_id
+    assert pane._worker.seek_calls[-1] == 0
+    pane._worker.frame_ready.emit(image, 880, 44)
+    qapp.processEvents()
+    pane._on_marker_position_selected(0.5, 0.5)
+    assert dialog._confirm_pending_marker(pane)
+    association = dialog.association_store.get("passage-256", REGULAR_SOURCE)
+    assert association.segment_id == second.segment_id
+    assert association.position_ms == 880
+    assert association.frame_index == 44
+    assert dialog.passage_store.get("passage-256").timeline_timestamp_ms == 20_892
+
+    # A retired worker must not move the current pane again.
+    current_worker = pane._worker
+    original_worker.step_boundary_reached.emit(1)
+    qapp.processEvents()
+    assert pane._worker is current_worker
+
+
+def test_boundary_seek_uses_aligned_archive_origin(qapp, boundary_review, monkeypatch):
+    dialog, _first, second, _image = boundary_review()
+    pane = dialog.regular_pane
+    opened = []
+
+    def align(location, *_args):
+        assert location.segment.segment_id == second.segment_id
+        return replace(location, segment=replace(location.segment, media_started_at_ms=19_880))
+
+    def seek(location, position_ms, frame_index, camera_index, **kwargs):
+        opened.append((location, position_ms, frame_index, camera_index, kwargs))
+        return True
+
+    monkeypatch.setattr(dialog, "_aligned_archive", align)
+    monkeypatch.setattr(dialog, "_seek_retained_camera_frame", seek)
+    assert dialog._step_into_neighbour_recording(pane, 1, 40, 10_000)
+    location, position, frame_index, camera, options = opened[0]
+    assert location.segment.media_started_at_ms == 19_880
+    assert (position, frame_index, camera) == (120, 3, 1)
+    assert options == {"adjacent_boundary_ms": 80, "adjacent_direction": 1}
+
+
+def test_reported_duration_does_not_override_known_frame_count(qapp, boundary_review):
+    dialog, first, _second, image = boundary_review()
+    pane = dialog.regular_pane
+    worker = pane._worker
+    worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 300)
+    worker.frame_ready.emit(image, 9_960, 249)
+    qapp.processEvents()
+    dialog._step_active_pane(1)
+    qapp.processEvents()
+    assert pane._worker is worker
+    assert pane.location.segment.segment_id == first.segment_id
+    assert worker.step_calls == [1]
+    worker.step_failed.emit("decoder error")
+    qapp.processEvents()
+    assert pane.video_view.has_frame
+    assert pane.quality_label.text() == "decoder error"
+
+
+@pytest.mark.parametrize("case", ["early_eof", "missing", "gap"])
+def test_decoder_boundary_preserves_picture_when_continuation_is_unsafe(
+    qapp, boundary_review, case,
+):
+    dialog, first, second, image = boundary_review(
+        second_start=20_001 if case == "gap" else 20_000,
+    )
+    pane = dialog.regular_pane
+    worker = pane._worker
+    if case == "early_eof":
+        worker.frame_ready.emit(image, 4000, 100)
+        qapp.processEvents()
+    if case == "missing":
+        path = dialog.timeline_store.resolve_video_path(second)
+        assert dialog.timeline_store.video_path_is_playable(path)
+        path.unlink()
+    position = pane._current_position_ms
+    worker.step_boundary_reached.emit(1)
+    qapp.processEvents()
+    assert pane._worker is worker
+    assert pane.location.segment.segment_id == first.segment_id
+    assert pane._current_position_ms == position
+    assert pane.video_view.has_frame
+    assert pane.quality_label.text()
+
+
+@pytest.mark.parametrize("fps,boundary,direction,expected", [
+    (50.0, 460, 1, 24), (25.0, 9500, -1, 237),
+    (30.0, 33, 1, 2), (29.97, 33, 1, 2),
+    (30.0, 33, -1, 0), (25.0, -40, 1, 0),
+])
+def test_seam_seek_waits_for_new_fps_and_excludes_old_frame(
+    qapp, boundary_review, fps, boundary, direction, expected,
+):
+    dialog, _first, _second, _image = boundary_review()
+    pane = dialog.regular_pane
+    worker = pane._worker
+    exact = []
+    worker.seek_frame = exact.append
+    pane._fps = 0
+    pane.seek_adjacent_frame(boundary, direction)
+    assert exact == []
+    worker.metadata_ready.emit(10_000, fps, 1280, 720, round(10 * fps))
+    assert exact == [expected]
+    assert pane.timeline.property("initial_adjacent_frame") is None
+
+
+@pytest.mark.parametrize("inflated_count", [False, True])
+@pytest.mark.parametrize("next_fps,overlap_ms,first_index", [(25, 0, 0), (50, 100, 4)])
+@pytest.mark.parametrize("selected", [True, False])
+def test_real_decoder_crosses_seam_and_saves_256_frame(
+    qapp, tmp_path, monkeypatch, inflated_count, next_fps, overlap_ms, first_index, selected,
+):
+    import cv2
+    import numpy as np
+    from realtime.video_playback import VideoPlaybackWorker
+
+    paths = [tmp_path / f"camera_01_archive_{index:04d}.avi" for index in range(2)]
+    for clip, path in enumerate(paths):
+        fps = next_fps if clip else 25
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (32, 24))
+        assert writer.isOpened()
+        try:
+            for index in range(fps // 5):
+                writer.write(np.full((24, 32, 3), index * 20, dtype=np.uint8))
+        finally:
+            writer.release()
+
+    class Capture:
+        def __init__(self, path):
+            self.capture = cv2.VideoCapture(path)
+            self.inflate = inflated_count and path == str(paths[0])
+
+        def get(self, prop):
+            value = self.capture.get(prop)
+            return value + 20 if self.inflate and prop == cv2.CAP_PROP_FRAME_COUNT else value
+
+        def __getattr__(self, name):
+            return getattr(self.capture, name)
+
+    def make_worker(path, parent=None, **_kwargs):
+        return VideoPlaybackWorker(
+            path, parent, capture_factory=Capture,
+            reverse_prefetch=False, idle_prefetch=False,
+        )
+
+    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", make_worker)
+    passages = PassageEventStore(tmp_path / "passages.jsonl")
+    passages.append(_event(event_id="passage-204", bib="204", passage_time_ms=10_120))
+    passages.append(_event(event_id="passage-256", bib="256", sequence=2, passage_time_ms=10_240))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    segments = [
+        timeline.add_completed_segment(
+            source_id="camera_01_review", camera_index=1, video_path=path,
+            media_started_at_ms=10_000 + index * (200 - overlap_ms), media_duration_ms=200,
+            clock_source="videopipe_system_clock", timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="race-1",
+        )
+        for index, path in enumerate(paths)
+    ]
+    dialog = PassageReviewDialog(passages, timeline)
+    try:
+        pane = dialog.regular_pane
+        first_location = PassageVideoLocation(segments[0], paths[0], 0, 0, 0, 0, "located")
+        assert dialog._seek_retained_camera_frame(first_location, 0, 0)
+        assert _wait_until(lambda: pane._current_frame_index >= 0)
+        assert pane.location.segment.segment_id == segments[0].segment_id
+        pane._worker.seek_frame(4)
+        assert _wait_until(lambda: pane._current_frame_index == 4)
+        dialog._select_event("passage-256", preserve_current_frame=pane)
+        assert dialog._selected_event_id == "passage-256"
+        if not selected:
+            dialog._selected_event_id = ""
+        dialog._step_active_pane(1)
+        assert _wait_until(lambda: (
+            pane.location.segment.segment_id == segments[1].segment_id
+            and pane._current_frame_index == first_index
+        ))
+        assert dialog._selected_event_id == ("passage-256" if selected else "")
+        dialog._step_active_pane(1)
+        assert _wait_until(lambda: pane._current_frame_index == first_index + 1)
+        assert pane._current_position_ms == (first_index + 1) * 1000 // next_fps
+        if not selected:
+            assert dialog.association_store.get("passage-256", REGULAR_SOURCE) is None
+            return
+        pane._on_marker_position_selected(0.5, 0.5)
+        assert dialog._confirm_pending_marker(pane)
+        reopened = PassageEvidenceAssociationStore(dialog.association_store.journal_path)
+        saved = reopened.get("passage-256", REGULAR_SOURCE)
+        assert saved.segment_id == segments[1].segment_id
+        assert saved.frame_index == first_index + 1
+        assert saved.position_ms == (first_index + 1) * 1000 // next_fps
+    finally:
+        dialog.close()

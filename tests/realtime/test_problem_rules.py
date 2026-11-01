@@ -1,7 +1,6 @@
 from dataclasses import replace
 
 import numpy as np
-import pytest
 
 from realtime.analysis_resources import CpuMonitor, ResourceGovernor
 from realtime.bike_check import (
@@ -21,7 +20,6 @@ from realtime.bike_check import (
 )
 from realtime.chip_history import ChipRead
 from realtime.clock_sync import ClockModel
-from realtime.crossing_pairing import pair_crossings
 from realtime.problem_items import (
     KIND_BUNCH,
     KIND_CHIP_NO_CROSSING,
@@ -32,6 +30,7 @@ from realtime.problem_items import (
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
     STATUS_EXCLUDED,
+    row_label,
 )
 from realtime.problem_rules import CrossingRecord, Obstruction, build_video_items
 
@@ -66,41 +65,7 @@ def _rules(**kwargs):
     return build_video_items(**defaults)
 
 
-@pytest.mark.parametrize("delay_ms", [0, 50, 100, 150])
-def test_near_simultaneous_rider_at_another_position_is_never_a_fragment(delay_ms):
-    read = _read("10", T0 + 120_000)
-    first = _crossing(T0 + 121_000, row=150)
-    other = replace(_crossing(first.recorder_ms + delay_ms, row=450), contact=(350.0, 200.0))
-    outcome = _rules(matched=[(first, read, 0.0)], video_only=[other])
-    assert outcome.duplicates == 0 and not outcome.fragments
-    candidate = next(item for item in outcome.items if item.kind == KIND_NEAR_CROSSING)
-    assert candidate.pending
-    assert candidate.evidence["members"][0]["row"] == 450
-    assert candidate.evidence["frame"] == other.frame_payload(MODEL.version)
-
-
-def test_adjacent_frame_at_same_position_is_not_proof_of_same_rider():
-    read = _read("10", T0 + 120_000)
-    first = _crossing(T0 + 121_000)
-    second = _crossing(T0 + 121_050)
-    outcome = _rules(matched=[(first, read, 0)], video_only=[second])
-    assert not outcome.fragments
-    assert any(item.kind == KIND_NEAR_CROSSING and item.pending for item in outcome.items)
-
-
-@pytest.mark.parametrize("residual_ms", [480, 700, 1_400])
-def test_rules_do_not_turn_rejected_dp_pair_into_auto_pass(residual_ms):
-    read = _read("10", T0 + 120_000)
-    crossing = _crossing(T0 + 121_000 + residual_ms)
-    pairing = pair_crossings([crossing], [crossing.recorder_ms], [read], [MODEL.to_recorder(read.chip_ms)])
-    assert not pairing.matched
-    outcome = _rules(matched=pairing.matched, video_only=pairing.video_only, chip_only=pairing.chip_only)
-    assert not outcome.auto_passed and not outcome.late_pair_frames
-    assert any(item.kind == KIND_NEAR_CROSSING and item.pending for item in outcome.items)
-    assert any(item.kind == KIND_CHIP_NO_CROSSING and item.pending for item in outcome.items)
-
-
-def test_wide_pair_and_a_crossing_beside_a_chip_time_stay_candidates():
+def test_late_chip_is_paired_and_a_crossing_beside_a_chip_time_stays_a_candidate():
     late = _read("88", T0 + 60_000)
     paired = _read("10", T0 + 120_000)
     outcome = _rules(
@@ -109,31 +74,30 @@ def test_wide_pair_and_a_crossing_beside_a_chip_time_stay_candidates():
         chip_only=[late],
     )
 
-    assert not outcome.late_pairs and not outcome.late_pair_frames
+    assert outcome.late_pairs == [("88", 480)]
     # Time proximity to a chip is an association, not a verdict: the extra
     # crossing 600 ms after the chip's crossing is a traceable candidate.
     assert outcome.duplicates == 0 and outcome.fragments == []
     near = [item for item in outcome.items if item.kind == KIND_NEAR_CROSSING]
-    assert len(near) == 2 and all(item.pending for item in near)
-    by_bib = {item.evidence["near_read"]["bib"]: item for item in near}
-    assert by_bib["10"].evidence["gap_ms"] == 600
-    assert by_bib["88"].evidence["association_only"]
-    assert any(item.kind == KIND_CHIP_NO_CROSSING and item.bibs == ("88",) for item in outcome.items)
-    assert {item["bib"] for item in outcome.auto_passed} == {"10"}
+    assert len(near) == 1 and near[0].pending and near[0].evidence["gap_ms"] == 600
+    assert near[0].evidence["near_read"]["bib"] == "10"
+    assert {item["bib"] for item in outcome.auto_passed} == {"88", "10"}
     assert all(item["source"] == "auto" for item in outcome.auto_passed)
 
 
-def test_identical_detection_is_deduplicated_with_a_reason_in_the_rider_evidence():
+def test_same_passage_pieces_are_merged_with_a_reason_in_the_rider_evidence():
     paired = _read("10", T0 + 120_000)
     anchor = _crossing(T0 + 121_000)
-    outcome = _rules(matched=[(anchor, paired, 0.0)], video_only=[replace(anchor)])
+    rear_wheel = replace(anchor, recorder_ms=T0 + 121_040, frame_index=anchor.frame_index,
+                         row=300, r0=280, r1=320)
+    outcome = _rules(matched=[(anchor, paired, 0.0)], video_only=[rear_wheel])
 
     assert outcome.duplicates == 1 and len(outcome.fragments) == 1
     fragment = outcome.fragments[0]
-    assert fragment["bib"] == "10" and "重复检测" in fragment["reason"]
+    assert fragment["bib"] == "10" and "同一次过线" in fragment["reason"]
     assert [item.kind for item in outcome.items] == []
     entry = next(item for item in outcome.auto_passed if item["bib"] == "10")
-    assert entry["merged_fragments"][0]["gap_ms"] == 0
+    assert entry["merged_fragments"][0]["gap_ms"] == 40
     assert entry["merged_fragments"][0]["frame"]["frame_index"] == anchor.frame_index
 
 
@@ -174,7 +138,7 @@ def test_a_small_group_with_fewer_chips_than_crossings_gets_its_own_bunch_item()
     matched_read = _read("10", T0 + 120_000)
     outcome = _rules(
         matched=[(_crossing(T0 + 121_000), matched_read, 0.0)],
-        video_only=[_crossing(T0 + 121_600, row=300), _crossing(T0 + 122_300, row=420)],
+        video_only=[_crossing(T0 + 121_400, row=300), _crossing(T0 + 121_800, row=420)],
     )
 
     bunch = [item for item in outcome.items if item.kind == KIND_BUNCH]
@@ -185,18 +149,113 @@ def test_a_small_group_with_fewer_chips_than_crossings_gets_its_own_bunch_item()
     assert "小组人数不能只按芯片判断" in bunch[0].detail
 
 
-def test_equal_counts_do_not_create_a_group_item_and_four_chips_still_do():
+def test_crossings_more_than_1_s_apart_are_not_one_video_group():
+    matched_read = _read("10", T0 + 120_000)
+    outcome = _rules(
+        matched=[(_crossing(T0 + 121_000), matched_read, 0.0)],
+        video_only=[_crossing(T0 + 121_600, row=300), _crossing(T0 + 122_300, row=420)],
+    )
+
+    assert [item for item in outcome.items if item.kind == KIND_BUNCH] == []
+    # Each extra crossing keeps its own question instead.
+    assert sorted(item.kind for item in outcome.items) == [KIND_NEAR_CROSSING, KIND_NO_CHIP_CROSSING]
+
+
+def test_equal_counts_still_get_one_look_row_and_four_chips_are_a_bunch():
     reads = [_read(str(index), T0 + 120_000 + index * 400) for index in range(3)]
     matched = [(_crossing(read.chip_ms + 1_000, row=200 + index * 60), read, 0.0)
                for index, read in enumerate(reads)]
     outcome = _rules(matched=matched)
 
-    assert [item.kind for item in outcome.items if item.kind == KIND_BUNCH] == []
+    # Riders side by side are one change on the line: equal totals still need a look.
+    bunch = [item for item in outcome.items if item.kind == KIND_BUNCH]
+    assert len(bunch) == 1 and bunch[0].pending and row_label(bunch[0]) == "多人"
+    assert (bunch[0].evidence["chip_count"], bunch[0].evidence["video_count"]) == (3, 3)
+    assert "与芯片一样多，仍请看一眼" in bunch[0].detail and "不一致" not in bunch[0].detail
+    assert {item["bib"] for item in outcome.auto_passed} == {"0", "1", "2"}
 
     four = [_read(str(index), T0 + 220_000 + index * 300) for index in range(4)]
     outcome = _rules(matched=[(_crossing(read.chip_ms + 1_000), read, 0.0) for read in four])
     bunch = [item for item in outcome.items if item.kind == KIND_BUNCH]
     assert len(bunch) == 1 and bunch[0].evidence["source"] == "chip" and bunch[0].evidence["chip_count"] == 4
+    assert row_label(bunch[0]) == "集团"
+
+
+def test_groups_are_anchored_on_the_first_chip_and_never_chained():
+    reads = [_read(str(index), T0 + 120_000 + index * 800) for index in range(3)]
+    outcome = _rules(matched=[(_crossing(read.chip_ms + 1_000, row=200 + index * 60), read, 0.0)
+                              for index, read in enumerate(reads)])
+
+    # 0.8 s + 0.8 s is not one group: the third rider is 1.6 s after the first.
+    bunch = [item for item in outcome.items if item.kind == KIND_BUNCH]
+    assert len(bunch) == 1 and bunch[0].bibs == ("0", "1")
+    assert bunch[0].evidence["span_ms"] == 800
+    assert "前后 1 秒内还有别的芯片，视频连着看、分开计数" in bunch[0].detail
+
+
+def test_two_chips_on_one_crossing_in_a_clear_view_is_one_double_chip_row():
+    extra = _read("23", T0 + 120_000)
+    rider = _read("20", T0 + 120_150)
+    outcome = _rules(matched=[(_crossing(T0 + 121_150), rider, 0.0)], chip_only=[extra])
+
+    pending = [item for item in outcome.items if item.pending]
+    assert [item.kind for item in pending] == [KIND_TWO_CHIPS_ONE_CROSSING]
+    assert pending[0].bibs == ("23", "20") and pending[0].evidence["chip_count"] == 2
+    assert outcome.auto_passed == []
+
+
+def test_a_chip_too_far_from_the_one_crossing_is_not_called_a_double_chip():
+    extra = _read("17", T0 + 120_000)
+    rider = _read("636", T0 + 120_700)
+    outcome = _rules(matched=[(_crossing(T0 + 121_700), rider, 0.0)], chip_only=[extra])
+
+    assert not any(item.kind == KIND_TWO_CHIPS_ONE_CROSSING for item in outcome.items)
+    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
+    assert bunch.bibs == ("17", "636") and "画面少 1 次" in bunch.detail
+
+
+def test_two_chips_on_one_crossing_in_a_busy_stretch_is_counted_as_a_group():
+    # Six more riders within 3 s: one crossing for two chips is no proof of a
+    # double chip there, the line may have merged two riders.
+    extra = _read("23", T0 + 120_000)
+    rider = _read("20", T0 + 120_150)
+    others = [_read(str(30 + index), T0 + 121_500 + index * 250) for index in range(6)]
+    matched = [(_crossing(rider.chip_ms + 1_000), rider, 0.0)]
+    matched += [(_crossing(read.chip_ms + 1_000, row=100 + index * 50), read, 0.0) for index, read in enumerate(others)]
+    outcome = _rules(matched=matched, chip_only=[extra])
+
+    assert not any(item.kind == KIND_TWO_CHIPS_ONE_CROSSING for item in outcome.items)
+    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH and "23" in item.bibs)
+    assert bunch.bibs == ("23", "20") and bunch.evidence["video_reliable"] is False
+    assert "画面计数不可信，请整团点数" in bunch.detail and "多芯片" not in bunch.detail
+    child = next(item for item in outcome.items if item.kind == KIND_CHIP_NO_CROSSING)
+    assert child.bibs == ("23",) and child.grouped == bunch.item_id
+    assert "可能是并排被并成一次" in child.detail
+
+
+def test_two_chips_on_one_blocked_crossing_are_counted_as_a_group():
+    extra = _read("23", T0 + 120_000)
+    rider = _read("20", T0 + 120_150)
+    outcome = _rules(matched=[(_crossing(T0 + 121_150, obstruction=True), rider, 0.0)], chip_only=[extra])
+
+    assert not any(item.kind == KIND_TWO_CHIPS_ONE_CROSSING for item in outcome.items)
+    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
+    assert bunch.evidence["video_reliable"] is False and bunch.pending
+
+
+def test_an_unpaired_crossing_between_two_groups_is_counted_once():
+    first = [_read("1", T0 + 120_000), _read("2", T0 + 120_600)]
+    second = [_read("3", T0 + 121_100), _read("4", T0 + 121_700)]
+    matched = [(_crossing(read.chip_ms + 1_000, row=100 + index * 80), read, 0.0)
+               for index, read in enumerate(first + second)]
+    between = _crossing(T0 + 121_800, row=450)  # 200 ms after 2, 300 ms before 3
+    outcome = _rules(matched=matched, video_only=[between])
+
+    bunches = sorted((item for item in outcome.items if item.kind == KIND_BUNCH), key=lambda item: item.chip_time_ms)
+    assert [item.bibs for item in bunches] == [("1", "2"), ("3", "4")]
+    assert [item.evidence["video_count"] for item in bunches] == [3, 2]
+    near = next(item for item in outcome.items if item.kind == KIND_NEAR_CROSSING)
+    assert near.grouped == bunches[0].item_id
 
 
 def test_a_candidate_inside_a_bunch_is_folded_into_the_group():
@@ -207,21 +266,19 @@ def test_a_candidate_inside_a_bunch_is_folded_into_the_group():
     outcome = _rules(matched=matched, video_only=[follower])
 
     near = next(item for item in outcome.items if item.kind == KIND_NEAR_CROSSING)
-    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
-    assert near.grouped == bunch.item_id and not near.pending
-    assert bunch.evidence["members"] == [near.item_id]
+    bunches = [item for item in outcome.items if item.kind == KIND_BUNCH]
+    assert [item.bibs for item in bunches] == [("0", "1", "2"), ("3", "4")]
+    assert near.grouped == bunches[0].item_id and not near.pending
+    assert bunches[0].evidence["members"] == [near.item_id]
+    assert bunches[0].evidence["video_count"] == 4 and "画面多 1 次" in bunches[0].detail
     assert outcome.stats["near_crossings"] == 1
     assert outcome.stats["merged_fragments"] == outcome.stats["duplicates"] == 0
 
 
-def test_isolated_wide_pair_is_only_a_candidate():
+def test_isolated_late_chip_gets_the_wider_window():
     outcome = _rules(video_only=[_crossing(T0 + 62_400)], chip_only=[_read("744", T0 + 60_000)])
 
-    assert not outcome.late_pairs and not outcome.auto_passed and not outcome.late_pair_frames
-    near = next(item for item in outcome.items if item.kind == KIND_NEAR_CROSSING)
-    assert near.pending and near.evidence["gap_ms"] == 1_400
-    assert near.evidence["association_only"]
-    assert any(item.kind == KIND_CHIP_NO_CROSSING for item in outcome.items)
+    assert outcome.late_pairs == [("744", 1_400)]
 
 
 def test_unpaired_crossings_chips_and_repeated_spots():
@@ -266,7 +323,7 @@ def test_manual_entry_closes_crossing_and_model_exclusions_wait_for_operator():
 
 
 def test_bunches_and_obstructions_get_manual_check_items():
-    reads = [_read(str(index), T0 + 10_000 + index * 500) for index in range(5)]
+    reads = [_read(str(index), T0 + 10_000 + index * 200) for index in range(5)]
     matched = [(_crossing(read.chip_ms + 1_000), read, 0.0) for read in reads[:4]]
     outcome = _rules(
         matched=matched, chip_only=[reads[4]],
@@ -367,8 +424,34 @@ def test_line_activity_before_the_first_rider_is_excluded_not_listed():
     assert outcome.stats["before_race"] == 1
 
 
+def test_a_manual_entry_is_included_in_the_bunch_head_count():
+    """A 补录 rider is one of the people the operator must count."""
+
+    reads = [_read(str(index), T0 + 10_000 + index * 250) for index in range(4)]
+    matched = [(_crossing(read.chip_ms + 1_000), read, 0.0) for read in reads]
+    outcome = _rules(
+        matched=matched,
+        manual_entries=[_read("6", T0 + 10_600, manual=True)],
+    )
+
+    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
+    assert bunch.evidence["chip_count"] == 5
+    assert bunch.evidence["manual_bibs"] == ["6"]
+    assert "含补录 6" in bunch.detail and "6" in bunch.bibs
+
+
+def test_a_manual_entry_beside_one_chip_is_a_group_not_a_double_chip():
+    rider = _read("14", T0 + 10_000)
+    outcome = _rules(matched=[(_crossing(rider.chip_ms + 1_000), rider, 0.0)],
+                     manual_entries=[_read("6", T0 + 10_300, manual=True)])
+
+    assert not any(item.kind == KIND_TWO_CHIPS_ONE_CROSSING for item in outcome.items)
+    bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
+    assert bunch.bibs == ("14", "6") and "含补录 6" in bunch.detail
+
+
 def test_items_inside_bunches_and_crowded_periods_are_folded_into_the_group():
-    reads = [_read(str(index), T0 + 10_000 + index * 400) for index in range(5)]
+    reads = [_read(str(index), T0 + 10_000 + index * 200) for index in range(5)]
     matched = [(_crossing(read.chip_ms + 1_000), read, 0.0) for read in reads[:4]]
     walker = _crossing(T0 + 103_000)
     rider = _crossing(T0 + 104_500)
@@ -383,9 +466,9 @@ def test_items_inside_bunches_and_crowded_periods_are_folded_into_the_group():
 
     bunch = next(item for item in outcome.items if item.kind == KIND_BUNCH)
     crowd = next(item for item in outcome.items if item.kind == "obstruction")
-    two = next(item for item in outcome.items if item.kind == KIND_TWO_CHIPS_ONE_CROSSING)
-    assert two.grouped == bunch.item_id and not two.pending
-    assert bunch.evidence["members"] == [two.item_id] and "组内另有 1 条" in bunch.detail
+    child = next(item for item in outcome.items if item.kind == KIND_CHIP_NO_CROSSING)
+    assert child.grouped == bunch.item_id and not child.pending
+    assert bunch.evidence["members"] == [child.item_id] and "组内另有 1 条" in bunch.detail
     folded = [item for item in outcome.items if item.grouped == crowd.item_id]
     assert [item.status for item in folded] == [STATUS_DISPUTED]
     separate = [item for item in outcome.items if item.kind == KIND_NO_CHIP_CROSSING and not item.grouped]

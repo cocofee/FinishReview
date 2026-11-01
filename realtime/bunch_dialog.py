@@ -16,9 +16,9 @@ from PyQt5.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .bunch_review import (BunchContext, BunchReviewStore, align_counts, review_completion_issue, detected_crossings,
+from .bunch_review import (BunchContext, BunchReviewStore, align_counts, detected_crossings,
                            is_excluded, load_context, add_viewed, uncovered_intervals, review_candidates,
-                           group_member_batch)
+                           group_member_batch, review_completion_issue, view_reach)
 from .bunch_timeline import BunchTimeline, group_strip, pixmap_of
 from .chip_history import format_chip_time
 from .line_sampling import load_strip, line_config_digest
@@ -282,7 +282,7 @@ class BunchReviewDialog(QDialog):
         self.next_candidate.clicked.connect(lambda: self.navigate_candidate(1))
         attention.addWidget(self.previous_candidate)
         attention.addWidget(self.next_candidate)
-        self.candidate_label = QLabel("数量一致不能排除漏读与双芯片；须看完整团、逐人认号并处理疑点。")
+        self.candidate_label = QLabel("候选定位不是已找全漏读；本团仍须完整点数。")
         self.candidate_label.setWordWrap(True)
         attention.addWidget(self.candidate_label, 1)
         layout.addLayout(attention)
@@ -500,7 +500,8 @@ class BunchReviewDialog(QDialog):
         if number != self.request_number or self.closing:
             return
         self.frame, self.busy = frame, False
-        self.viewed_ranges = add_viewed(self.viewed_ranges, frame.recorder_ms, self.context.start_ms, self.context.end_ms)
+        self.viewed_ranges = add_viewed(self.viewed_ranges, frame.recorder_ms, self.context.start_ms, self.context.end_ms,
+                                        view_reach(self.context.item))
         if self.selected_candidate:
             candidate = next((c for c in self.candidates if c["id"] == self.selected_candidate), None)
             if candidate and candidate["start_ms"]-100 <= frame.recorder_ms <= candidate["end_ms"]+100:
@@ -710,7 +711,8 @@ class BunchReviewDialog(QDialog):
         self.view.flush_click()
         result = align_counts(self.context.chips, self.marks, self.bias.value())
         if completed:
-            issue = review_completion_issue(self.context, self.marks, result, self.viewed_ranges)
+            issue = review_completion_issue(self.context, self.marks, result, self.viewed_ranges,
+                                            self.fully_viewed.isChecked())
             if issue:
                 self.notice.setText(issue)
                 return False

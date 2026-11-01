@@ -31,6 +31,14 @@ Cache keys include model content, source-file stamps and sampling geometry.
 Stable unverified tracks are cached too, avoiding repeated expensive inference.
 Missing future neighbours and model failures remain retryable.
 
+Verification rule version 2 invalidates earlier verdicts. Association ambiguity
+is checked in both directions, including two tracks competing for one box.
+A stationary complete track cannot turn an unrelated incomplete track into
+`not_crossed`: unresolved targets keep their original evidence for review.
+Shared readers are reopened if a source stamp or decoding thread count changes.
+Model failures remain visible after clock calibration, and an empty candidate
+set reports `no_candidates`, not proof that the model has run successfully.
+
 ## Limits And Acceptance
 
 This is a conservative candidate gate, not front-wheel measurement, a full
@@ -48,3 +56,6 @@ same-side movement, real crossings, stopping/touching the line, reverse motion,
 vehicles and overlapping riders. Hotel footage replay alone is not a race
 readiness or sustained-throughput sign-off. Compare throughput only within
 the same decoded resolution, frame rate, sampling configuration and load.
+
+See `TARGET_CROSSING_MODEL_AUDIT.md` for the retained-footage audit and remaining
+acceptance gaps. Synthetic passing tests are not a model accuracy measurement.

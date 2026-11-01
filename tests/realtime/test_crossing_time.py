@@ -67,6 +67,21 @@ def test_a_missing_pinned_clock_cannot_use_a_newer_fit():
     assert clocks.latest_calls == [1]
 
 
+def test_live_first_rider_calibration_converts_before_auto_model(tmp_path):
+    from realtime.passage_evidence import VideoClockCalibrationStore
+
+    store = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl")
+    store.record(camera_index=1, session_key="camera_01_review|videos|camera_01_20261018_105720_440309",
+                 offset_ms=2138, anchor_event_id="event", anchor_bib="902", calibrated_at_ms=1)
+    frame = {
+        "camera_index": 1,
+        "video_path": r"D:\录像\race\review_buffer\camera_01\camera_01_20261018_105720_440309_review_0000000000000019.ts",
+        "recorder_ms": T + 5000,
+    }
+    value = recorder_crossing_time(T + 5000, frame, workspace=tmp_path)
+    assert value.value_ms == T + 2862 and value.source == "aligned"
+
+
 def test_context_resolves_the_clicked_segment_session_instead_of_group_anchor():
     fit = model(session_offsets=(("second", 400),))
     segment = SimpleNamespace(segment=SimpleNamespace(segment_id="b"), session_id="second")

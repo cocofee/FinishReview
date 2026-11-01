@@ -12,7 +12,8 @@ from PyQt5.QtCore import QPoint, QPointF, Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialogButtonBox
 
-from realtime.analysis_settings import AnalysisSettingsStore, CONFIG_PATH, model_fingerprint, settings_token
+from realtime.analysis_settings import (AnalysisSettingsStore, CONFIG_PATH, inherited_profile, model_fingerprint,
+                                       settings_token)
 from realtime.analysis_workspace import AnalysisWorkspace
 from realtime.bike_check import BikeVerdict, probe_model
 from realtime.line_sampling import read_strip_meta
@@ -127,7 +128,9 @@ def test_polyline_roundtrip_keeps_legacy_and_session_boundaries(sealed):
     config = config_from_workspace(root)
     assert line_for_segment(config, source, segments[0])["points"] == POINTS
     assert line_for_segment(config, source, segments[1])["points"] == shifted
-    assert line_for_segment(config, source, replace(segments[1], session_id="other"))["points"] == POINTS
+    # A later recording session has no profile of its own and inherits the
+    # camera default drawn once for this race.
+    assert line_for_segment(config, source, replace(segments[1], session_id="other"))["points"] == shifted
     other_race = AnalysisWorkspace(root, race_id="other", stage_id="stage")
     assert line_for_segment(config, other_race, segments[1])["points"] == POINTS
     assert profile["revision"] == 1
@@ -135,6 +138,58 @@ def test_polyline_roundtrip_keeps_legacy_and_session_boundaries(sealed):
     assert (root / "long_image_lines.json").read_bytes() == legacy
     save(store, segments[1])
     assert [p["revision"] for p in store.payload["sampling_profiles"]] == [1, 2]
+
+
+def test_saved_line_is_inherited_by_a_new_recording_session(sealed):
+    root, source, segments = sealed
+    shifted = [[.1, .2], [.8, .7]]
+    save(AnalysisSettingsStore(root), segments[1], shifted)
+    config = config_from_workspace(root)
+    assert config.finish_lines[1]["points"] == shifted
+    later = replace(segments[1], session_id="camera_01_20261018_113000_000000")
+    assert line_for_segment(config, source, later)["points"] == shifted
+    next_stage = AnalysisWorkspace(root, race_id="race", stage_id="stage-2")
+    assert line_for_segment(config, next_stage, later)["points"] == shifted
+    # Saving the default must not rewrite recordings that came before it.
+    assert line_for_segment(config, source, segments[0])["points"] == POINTS
+
+
+def test_resaving_the_line_later_does_not_orphan_a_session_in_between(sealed):
+    """古浪 2026-10-18: re-saving the same line at 12:49 left the 11:26 session without one."""
+
+    root, source, segments = sealed
+    store = AnalysisSettingsStore(root)
+    drawn = [[.1, .2], [.8, .7]]
+    save(store, replace(segments[0], session_id="camera_01_20261018_112453_508257"), drawn)
+    between = replace(segments[1], session_id="camera_01_20261018_112643_389019")
+    later = replace(segments[1], session_id="camera_01_20261018_124943_809215",
+                    segment=replace(segments[1].segment, media_started_at_ms=T + 60_000))
+    save(store, later, drawn)
+    config = config_from_workspace(root)
+    assert config.finish_lines[1]["effective_from_ms"] == T + 60_000
+    assert line_for_segment(config, source, between)["points"] == drawn
+    paths = extract_strips(config, (between,), config.finish_lines[1])
+    assert [read_strip_meta(path)["line_config"]["points"] for path in paths] == [drawn]
+
+
+def test_inherited_line_keeps_to_its_race_and_a_pre_race_line_to_a_day():
+    profiles = [dict(camera_index=1, race_id="", session_id="a", effective_from_ms=T, revision=1),
+                dict(camera_index=1, race_id="other", session_id="b", effective_from_ms=T + 1000, revision=2)]
+    assert inherited_profile(profiles, 1, T + 3_600_000, "race")["revision"] == 1
+    assert inherited_profile(profiles, 1, T + 3_600_000, "other")["revision"] == 2
+    assert inherited_profile(profiles, 1, T + 86_400_000, "race") is None
+    assert inherited_profile(profiles, 2, T + 3_600_000, "race") is None
+    assert inherited_profile(profiles, 1, T - 1, "race") is None
+
+
+def test_default_line_is_kept_per_camera(sealed):
+    root, _source, segments = sealed
+    store = AnalysisSettingsStore(root)
+    save(store, segments[1], [[.1, .2], [.8, .7]])
+    camera_two = replace(segments[1], segment=replace(segments[1].segment, camera_index=2), session_id="cam2")
+    save(store, camera_two, [[.3, .3], [.7, .7]])
+    defaults = {item["camera_index"]: item["points"] for item in store.payload["finish_lines"]}
+    assert defaults == {1: [[.1, .2], [.8, .7]], 2: [[.3, .3], [.7, .7]]}
 
 
 def test_atomic_failure_and_conflicting_edit_do_not_change_memory_or_disk(sealed, monkeypatch):
@@ -237,7 +292,7 @@ def test_no_sealed_video_disables_editing(qapp, tmp_path):
     (tmp_path / "review_event_scope.json").write_text('{"race_id":"race", "stage_id":"stage"}')
     dialog = SamplingSettingsDialog(tmp_path)
     assert not dialog.buttons.button(QDialogButtonBox.Save).isEnabled()
-    assert "封存" in dialog.notice.text()
+    assert "开始录像" in dialog.notice.text()
     dialog.reject()
 
 
@@ -441,3 +496,59 @@ def test_detector_loads_model_bytes_for_unicode_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(cv2.dnn, "readNetFromONNX", lambda data: loaded.append(data.tobytes()) or object())
     YoloxDetector(path)
     assert loaded == [b"model data"]
+
+
+def test_configuration_can_use_filmstrip_before_first_crossing(sealed):
+    root, source, segments = sealed
+    timeline = VideoTimelineStore(root / "video_timeline.jsonl")
+    path = root / "camera_02_preview_review_0001.avi"
+    path.write_bytes(segments[0].path.read_bytes())
+    timeline.add_completed_segment(source_id="cam2", camera_index=2, video_path=path,
+                                   media_started_at_ms=T, media_duration_ms=2000,
+                                   clock_source="videopipe_system_clock", timing_error_ms=0,
+                                   end_reason="retained_filmstrip_segment", race_id="race")
+    source = AnalysisWorkspace(root, include_review_segments=True)
+    assert not source.archive_segments(2)
+    assert len(source.archive_segments(2, for_configuration=True)) == 1
+
+
+def test_line_can_be_drawn_before_any_race_event(qapp, tmp_path):
+    """The field order is record first, then draw; no chip receipt is needed."""
+
+    session = "camera_01_20261018_090000_000000"
+    video = tmp_path / "review_buffer" / "camera_01" / f"{session}_review_0000.avi"
+    video.parent.mkdir(parents=True)
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (320, 180))
+    for _ in range(20):
+        writer.write(np.full((180, 320, 3), 80, np.uint8))
+    writer.release()
+    (tmp_path / "videos").mkdir()
+    (tmp_path / "videos" / f"{session}_archive_session.json").write_text(
+        json.dumps({"session_started_at_ms": T - 1500}), encoding="utf-8")
+    VideoTimelineStore(tmp_path / "video_timeline.jsonl").add_completed_segment(
+        source_id="cam", camera_index=1, video_path=video,
+        media_started_at_ms=T, media_duration_ms=2000,
+        clock_source="videopipe_system_clock", timing_error_ms=0,
+        end_reason="retained_filmstrip_segment", race_id="")
+
+    dialog = SamplingSettingsDialog(tmp_path)
+    pump(qapp, lambda: dialog.worker is None)
+    assert len(dialog.segments) == 1
+    assert "尚未收到" in dialog.scope.text()
+    assert dialog.view.width_px == 320
+    dialog.view.points = [[.1, .2], [.8, .7]]
+    dialog._save()
+
+    payload = json.loads((tmp_path / CONFIG_PATH).read_text(encoding="utf-8"))
+    profile = payload["sampling_profiles"][0]
+    assert profile["race_id"] == ""
+    assert profile["session_id"] == session
+    # The line covers the recording from its first frame, not from the moment
+    # the short preview segment happened to be sealed.
+    assert profile["effective_from_ms"] == T - 1500
+
+    workspace = AnalysisWorkspace(tmp_path, race_id="race-new", stage_id="stage",
+                                  include_review_segments=True)
+    segment = workspace.archive_segments(for_configuration=True)[0]
+    config = replace(config_from_workspace(tmp_path), race_id="race-new", stage_id="stage")
+    assert line_for_segment(config, workspace, segment)["points"] == [[.1, .2], [.8, .7]]

@@ -68,3 +68,21 @@ def test_ambiguous_neighbouring_tracks_fail_closed():
     result = check_target_tracks([(0, [box(120)]), (600, [a, replace(a, x=a.x + 1)]),
                                   (1200, [box(80)])], LINE, frame_size=(320, 240))
     assert result.state == "unverified" and result.reason == "ambiguous_tracks"
+
+
+def test_two_tracks_competing_for_one_detection_are_ambiguous():
+    first = box(120)
+    result = check_target_tracks(
+        [(0, [first, replace(first, x=first.x + 1)]),
+         (600, [box(100)]), (1200, [box(80)])], LINE, frame_size=(320, 240),
+    )
+    assert result.state == "unverified" and result.reason == "ambiguous_tracks"
+
+
+def test_stationary_background_does_not_discard_an_incomplete_target():
+    stationary = box(140, x=200)
+    result = check_target_tracks(
+        [(0, [stationary]), (600, [stationary, box(100)]), (1200, [stationary])],
+        LINE, frame_size=(320, 240),
+    )
+    assert result.state == "unverified" and result.reason == "insufficient_track"

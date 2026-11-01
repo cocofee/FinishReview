@@ -8,6 +8,21 @@ import realtime.video_timeline as video_timeline
 from realtime.video_timeline import VideoTimelineStore
 
 
+def test_playability_refresh_detects_cleaned_media_inside_cache_ttl(tmp_path):
+    store = VideoTimelineStore(tmp_path / "timeline.jsonl")
+    video = tmp_path / "segment.ts"
+    video.write_bytes(b"video")
+    playlist = tmp_path / "segment.m3u8"
+    playlist.write_text("#EXTM3U\nsegment.ts\n", encoding="utf-8")
+    assert store.video_path_is_playable(video)
+    assert store.video_path_is_playable(playlist)
+    video.unlink()
+    assert not store.video_path_is_playable(video, refresh=True)
+    assert not store.video_path_is_playable(playlist, refresh=True)
+    assert not store.video_path_is_playable(video)
+    assert not store.video_path_is_playable(playlist)
+
+
 def test_probes_media_duration_from_frame_count_and_fps(tmp_path, monkeypatch):
     video_path = tmp_path / "camera.mkv"
     video_path.write_bytes(b"video")

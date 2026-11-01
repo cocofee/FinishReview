@@ -153,6 +153,34 @@ def test_archive_segments_keep_a_night_race_and_a_folder_without_chips(tmp_path)
     assert len(AnalysisWorkspace(quiet).archive_segments(1)) == 1
 
 
+def test_overlapping_recordings_of_one_camera_cover_each_moment_once(tmp_path):
+    """古浪 2026-10-18: a second instance recorded beside the first for 40 minutes."""
+
+    root = tmp_path / "race"
+    (root / "videos").mkdir(parents=True)
+    t = DAY + 36_000_000
+    _write_events(root, [_event("main", 1, t + 60_000)])
+    first, second, third = (f"camera_01_20260919_{clock}_000000" for clock in ("100000", "100200", "101140"))
+    _archived(root, f"{first}_archive_0000.mkv", t, duration=150_000)
+    _archived(root, f"{first}_archive_0001.mkv", t + 150_000, duration=150_000)
+    _archived(root, f"{first}_archive_0002.mkv", t + 300_000)
+    _archived(root, f"{first}_archive_0003.mkv", t + 600_000, duration=100_000)
+    _archived(root, f"{second}_archive_0000.mkv", t + 120_000)
+    # Back-to-back sessions whose clocks touch are not a second recording.
+    _archived(root, f"{third}_archive_0000.mkv", t + 699_900)
+
+    segments = AnalysisWorkspace(root).archive_segments(1)
+
+    # The later session takes over; the earlier one keeps what nobody else covers.
+    assert [(item.path.name, item.excluded_ranges) for item in segments] == [
+        (f"{first}_archive_0000.mkv", ((t + 120_000, t + 150_000),)),
+        (f"{second}_archive_0000.mkv", ()),
+        (f"{first}_archive_0002.mkv", ((t + 300_000, t + 420_000),)),
+        (f"{first}_archive_0003.mkv", ()),
+        (f"{third}_archive_0000.mkv", ()),
+    ]
+
+
 SESSION = "camera_01_20260919_100000_000000"
 
 

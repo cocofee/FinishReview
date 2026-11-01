@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
+
+
+def recording_session_path(path: Path) -> Path:
+    """Resolve generated HLS evidence windows to their shared recording."""
+    path = Path(path)
+    if path.suffix.lower() == ".m3u8":
+        try:
+            entries = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines()
+                       if line.strip() and not line.startswith("#")]
+            stems = {re.sub(r"_review_\d+$", "", Path(entry).stem) for entry in entries}
+            if len(stems) == 1:
+                stem = next(iter(stems))
+                if re.fullmatch(r"camera_\d+_\d{8}_\d{6}_\d{6}", stem):
+                    return path.with_name(stem + ".ts")
+        except (OSError, UnicodeError):
+            pass
+    return path
 
 
 def configure_qt_plugin_path() -> None:

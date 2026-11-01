@@ -17,9 +17,10 @@ from realtime.passage_receiver import PassageEvent
 DAY = 1_789_747_200_000  # 2026-09-19 00:00 Beijing time
 
 
-def _event(event_id, bib, chip_ms, *, revision=1, active=True, received=None, group="男子青年组", race="race"):
+def _event(event_id, bib, chip_ms, *, revision=1, active=True, received=None, group="男子青年组",
+           race="race", sequence=1):
     return PassageEvent(
-        event_id=event_id, race_id=race, stage_id="stage-1", group_id="1", sequence=1,
+        event_id=event_id, race_id=race, stage_id="stage-1", group_id="1", sequence=sequence,
         bib=bib, chip_id=f"chip-{bib}", passage_time_ms=(chip_ms - DAY) % 86_400_000, lap=0,
         revision=revision, is_active=active, passage_timestamp_ms=chip_ms,
         group_name=group, received_at_ms=received if received is not None else chip_ms - 500,
@@ -72,6 +73,49 @@ def test_late_received_passages_are_manual_entries_and_groups_are_excluded():
     assert reads["901"].excluded == EXCLUDED_SPARE
     assert reads["902"].excluded == EXCLUDED_TEST
     assert calibration_chip_times(reads.values()) == [t + 7_000]
+
+
+def test_late_outbox_flush_keeps_automatic_reads_when_sequence_is_ordered():
+    """All rows arrived at 14:15, but the feed itself kept crossing order."""
+
+    t = DAY + 11 * 3_600_000
+    history = [
+        _event("a", "1", t, sequence=1, received=t + 3 * 3_600_000),
+        _event("b", "2", t + 2_000, sequence=2, received=t + 3 * 3_600_000),
+        _event("c", "3", t + 4_000, sequence=3, received=t + 3 * 3_600_000),
+    ]
+
+    reads = chip_reads(history)
+
+    assert [read.manual_entry for read in reads] == [False, False, False]
+
+
+def test_passage_inserted_out_of_crossing_order_is_a_manual_entry():
+    t = DAY + 11 * 3_600_000
+    history = [
+        _event("a", "1", t, sequence=1),
+        _event("b", "2", t + 90_000, sequence=2),
+        # Entered later with an earlier crossing time: the operator's 补录.
+        _event("missed", "6", t + 1_000, sequence=3, received=t + 600_000),
+    ]
+
+    reads = {read.bib: read for read in chip_reads(history)}
+
+    assert reads["6"].manual_entry
+    assert not reads["1"].manual_entry and not reads["2"].manual_entry
+
+
+def test_receipt_delay_is_the_fallback_when_sequence_carries_no_order():
+    t = DAY + 11 * 3_600_000
+    history = [
+        # Older feeds send the same placeholder sequence for every row.
+        _event("a", "1", t, sequence=1, received=t + 300),
+        _event("b", "2", t + 2_000, sequence=1, received=t + 600_000),
+    ]
+
+    reads = {read.bib: read for read in chip_reads(history)}
+
+    assert reads["2"].manual_entry and not reads["1"].manual_entry
 
 
 def test_local_deletions_mark_reads_inactive_now():

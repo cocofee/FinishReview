@@ -95,6 +95,7 @@ from .workspace_context import (
 from .review_export import export_review_summary
 from .review_clip import PassageReviewBindingStore
 from .receiver_controller import ReceiverController
+from .recording_lock import LOCK_FILENAME, FolderInUseError, RecordingFolderLock
 from .recording_controller import (
     PendingRecordingPassage,
     RecordingSessionController,
@@ -268,31 +269,58 @@ def _safe_event_folder_name(value: str, fallback: str) -> str:
     return name[:80].rstrip(" .") or "赛事"
 
 
-def _event_workspace_dir(root: Path, metadata: RaceMetadata) -> Path:
+def _saved_race_id(folder: Path) -> str | None:
+    """The race a saved folder holds, from its metadata, else from its review scope."""
+    try:
+        existing = RaceMetadataStore(folder / "cyclerace_race_metadata.json").current()
+    except (OSError, RuntimeError, ValueError):
+        existing = None
+    if existing is not None:
+        return existing.race_id
+    scope_path = folder / "review_event_scope.json"
+    if scope_path.is_file():
+        import json
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if isinstance(scope, dict):
+            return scope.get("race_id")
+    return None
+
+
+def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | None = None) -> Path:
     root = Path(root).expanduser().resolve()
+    try:
+        own = RaceMetadataStore(root / "cyclerace_race_metadata.json").current()
+    except (OSError, RuntimeError, ValueError):
+        own = None
+    if own is not None and own.race_id == metadata.race_id:
+        # An older layout keeps the race in the root itself: its recordings are
+        # there, so coming back to it must not open an empty folder beside them.
+        return root
     folder_name = _safe_event_folder_name(metadata.race_name, metadata.race_id)
     race_suffix = _safe_event_folder_name(metadata.race_id, "race")
-    candidates = [root / folder_name, root / f"{folder_name}_{race_suffix}"]
-    candidates.extend(root / f"{folder_name}_{race_suffix}_{index}" for index in range(2, 100))
+    # A race already saved stays where it is, under its bare name (folders
+    # made before 10-28) or its dated one.
+    dated = re.compile(r"\d{4}-\d{2}-\d{2} " + re.escape(folder_name) + r"(_.*)?")
+    try:
+        saved = sorted(path for path in root.iterdir() if path.is_dir() and (
+            path.name == folder_name or path.name.startswith(f"{folder_name}_") or dated.fullmatch(path.name)))
+    except OSError:
+        saved = []
+    for candidate in saved:
+        if _saved_race_id(candidate) == metadata.race_id:
+            return candidate
+    # A new race is filed under the day it first arrived, not CycleRace's stage
+    # date, which can be wrong (特奥 ran 10-28 with a stage dated 09-20).
+    day = (today or datetime.now(BEIJING_TIMEZONE).date()).isoformat()
+    base = f"{day} {folder_name}"
+    candidates = [root / base, root / f"{base}_{race_suffix}"]
+    candidates.extend(root / f"{base}_{race_suffix}_{index}" for index in range(2, 100))
     for candidate in candidates:
-        metadata_path = candidate / "cyclerace_race_metadata.json"
         if not candidate.exists():
             return candidate
-        try:
-            existing = RaceMetadataStore(metadata_path).current()
-        except (OSError, RuntimeError, ValueError):
-            existing = None
-        if existing is not None and existing.race_id == metadata.race_id:
-            return candidate
-        scope_path = candidate / "review_event_scope.json"
-        if existing is None and scope_path.is_file():
-            import json
-            try:
-                scope = json.loads(scope_path.read_text(encoding="utf-8"))
-                if isinstance(scope, dict) and scope.get("race_id") == metadata.race_id:
-                    return candidate
-            except (OSError, ValueError):
-                pass
         try:
             is_empty = not any(candidate.iterdir())
         except OSError:
@@ -584,10 +612,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self._recording_controller = RecordingSessionController(
             recorder_factory=recorder_factory,
         )
+        self._recording_lock = RecordingFolderLock()
         self._settings_saver = settings_saver
         self._workspace_mode = "live"
         self._archive_background_passage_count = 0
         self._live_metadata_scope = None
+        self._held_race_ids: set[str] = set()
         # The base review surface starts timers while the production window is
         # still being assembled. Initialise health-check state before that
         # happens so an early clock tick cannot observe half-built state.
@@ -1577,7 +1607,8 @@ class FinishReviewWindow(PassageReviewSurface):
                     save_workspace_mode(self.workspace_root, self.output_dir, "live")
                     applied = True
                 else:
-                    target = self.workspace_root / datetime.now(BEIJING_TIMEZONE).strftime("现场录像_%Y%m%d_%H%M%S_%f")
+                    # Chinese kept out of strftime: Python 3.10 on an English Windows cannot encode it.
+                    target = self.workspace_root / ("现场录像_" + datetime.now(BEIJING_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f"))
                     applied = self._apply_settings(
                         self._current_settings(output_dir=target), persist_settings=False,
                         update_workspace_root=False, preserve_cyclerace_receiver=True,
@@ -1627,7 +1658,8 @@ class FinishReviewWindow(PassageReviewSurface):
         """
 
         panel = getattr(self, "problem_panel", None)
-        if self._recording_any_active():
+        # A held folder lock means a recorder of ours failed to stop.
+        if self._recording_any_active() or self._recording_lock.held:
             QMessageBox.warning(self, "无法清空数据", "请先停止普通录像，再清空本场测试数据。")
             return
         if self._workspace_mode == "archive":
@@ -1653,16 +1685,44 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         if answer != QMessageBox.Yes:
             return
-        self._invalidate_capture_refresh()
-        self.video_filmstrip.full_race.clear()
-        if panel is not None:
-            panel.reset_data()
-        failures = self._remove_event_data(event_dir, root)
-        for store, label in ((self.passage_store, "通过记录"), (self._receiver_passage_store, "收件箱")):
-            try:
-                store.clear()
-            except Exception as error:  # noqa: BLE001 - report what could not be removed.
-                failures.append(f"{label}：{error}")
+        # The question ran an event loop, and a reading may have started recording.
+        if self._recording_any_active():
+            QMessageBox.warning(self, "无法清空数据", "请先停止普通录像，再清空本场测试数据。")
+            return
+        # Another window recording into this folder would lose its race; holding
+        # the folder also keeps one from starting while the files go.
+        try:
+            self._recording_lock.acquire(self.output_dir)
+        except FolderInUseError as error:
+            QMessageBox.warning(
+                self, "无法清空数据",
+                f"另一个 FinishReview{error.owner}正在向这个赛事文件夹录像，未做任何改动。"
+                "请先在那个窗口停止录像，再清空本场测试数据。",
+            )
+            return
+        try:
+            self._invalidate_capture_refresh()
+            self._clear_selection_details()
+            self._filmstrip_prefetch_timer.stop()
+            self.playback_coordinator.shutdown()
+            for pane in self.all_evidence_panes:
+                pane.shutdown(wait=True)
+            self.video_filmstrip.clear()
+            self.video_filmstrip.full_race.clear()
+            if panel is not None:
+                panel.reset_data()
+            # Retired decoders still own file handles until their reads finish.
+            from .thread_lifecycle import wait_for_retired_threads
+            wait_for_retired_threads(timeout_ms=5000)
+            failures = self._remove_event_data(event_dir, root)
+            for store, label in ((self.passage_store, "通过记录"), (self._receiver_passage_store, "收件箱")):
+                try:
+                    store.clear()
+                except Exception as error:  # noqa: BLE001 - report what could not be removed.
+                    failures.append(f"{label}：{error}")
+        finally:
+            # Hand the folder back before anything below may start recording.
+            self._recording_lock.release()
         applied = self._apply_settings(
             self._current_settings(output_dir=self.output_dir),
             persist_settings=False,
@@ -1707,6 +1767,7 @@ class FinishReviewWindow(PassageReviewSurface):
             "cyclerace_race_metadata.json",
             "review_event_scope.json",
             ".finishreview",
+            LOCK_FILENAME,
         }
         keep_in_problems = ("analysis_config",)
         failures: list[str] = []
@@ -2296,14 +2357,11 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_list_button.setObjectName("finishProblemListButton")
         self.problem_list_button.setFixedHeight(32)
         self.problem_list_button.setCheckable(True)
-        self.problem_list_button.setToolTip("只处理有问题的：自动通过、待处理和无法核实")
         self.problem_list_button.clicked.connect(self._open_problem_list)
+        # The workbench is the only view now: its table already lists every chip,
+        # with search, groups and delete; the old records page has no entry.
+        self.problem_list_button.hide()
         top_layout.addWidget(self.problem_list_button)
-        self.passages_button = QPushButton("通过记录", panel)
-        self.passages_button.setCheckable(True)
-        self.passages_button.setFixedHeight(32)
-        self.passages_button.clicked.connect(self._open_passages)
-        top_layout.addWidget(self.passages_button)
         tool_button_style = (
             "QPushButton { background: #eef3f5; color: #17212b; "
             "border: 1px solid #aab6bf; border-radius: 4px; "
@@ -2314,7 +2372,6 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.problem_list_button.setStyleSheet(tool_button_style)
-        self.passages_button.setStyleSheet(tool_button_style)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.setMinimumWidth(88)
@@ -2417,8 +2474,10 @@ class FinishReviewWindow(PassageReviewSurface):
         # otherwise swallow the press for its own judging window (operator: "F does
         # not work"), and the press has to land wherever the hands are.
         self.video_filmstrip.full_race.set_enlarge_key_enabled(not expanded)
+        # In the workbench the picture already fills the room; F enlarges nothing.
+        for pane in self.evidence_panes:
+            pane._maximize_shortcut.setEnabled(not expanded)
         self.setMinimumHeight(700 if expanded else 760)
-        self.passages_button.setChecked(not expanded)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
         self.filter_bar.setVisible(not expanded)
@@ -2455,6 +2514,8 @@ class FinishReviewWindow(PassageReviewSurface):
     def _toggle_maximized_pane(self, pane):
         # Reopening a paused frame may not decode again. Refresh saved geometry
         # on every F entry as well as on frame changes, including popup judging.
+        # Force the read: two rapid saves can share Windows' coarse mtime.
+        self._review_line_signature = None
         self._refresh_problem_finish_lines()
         super()._toggle_maximized_pane(pane)
 
@@ -2496,11 +2557,15 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         self.problem_panel.confirmation_preparing.connect(self._pause_arrival_confirmation)
         self.problem_panel.candidate_preparing.connect(self._prepare_arrival_candidate)
+        self.problem_panel.sampling_preparing.connect(self._prepare_sampling_frame)
         self.problem_panel.sampling_configured.connect(self._refresh_problem_finish_lines)
         self.results_panel.layout().insertWidget(1, self.problem_panel)
         self.problem_panel.hide()
         self.problem_panel.set_events_provider(
             lambda: self.passage_store.events(include_inactive=True)
+        )
+        self.problem_panel.set_metadata_provider(
+            lambda: self.metadata_store.current() if getattr(self, "metadata_store", None) is not None else None
         )
         self.problem_panel.jump_requested.connect(self._open_problem_frame)
         self.problem_panel.current_changed.connect(self._problem_selection_changed)
@@ -2509,7 +2574,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
-        self.problem_panel.summary_changed.connect(self.problem_list_button.setToolTip)
+        self.problem_panel.delete_requested.connect(self._delete_problem_record)
         self.problem_panel.summary_changed.connect(lambda _text: self._refresh_crossing_cards())
         self._normal_crossing_cards = {}
         self._opened_normal_crossing = ""
@@ -2549,26 +2614,40 @@ class FinishReviewWindow(PassageReviewSurface):
         rail.navigation_started.connect(self._problem_browse_started)
         rail.follow_button.toggled.connect(lambda enabled: self._problem_browse_started() if enabled else None)
         self.pipeline_label = QLabel("录像未启动 · 封存到 等待首段 ｜ 分析到 等待录像 / 校时 ｜ 积压 0 秒", self)
-        self.pipeline_label.setWordWrap(True)
-        self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
-        self.layout().insertWidget(1, self.pipeline_label)
+        toolbar = getattr(self.problem_panel, "quick_toolbar", None)
+        if toolbar is not None:
+            # Same row as the record count and judging keys: no separate band.
+            self.pipeline_label.setStyleSheet("color:#17675b;")
+            toolbar.layout().insertWidget(0, self.pipeline_label)
+        else:
+            self.pipeline_label.setWordWrap(True)
+            self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
+            self.layout().insertWidget(1, self.pipeline_label)
         self.problem_panel.set_workspace(self.output_dir)
 
     def _problem_selection_changed(self, item):
         self._opened_normal_crossing = ""
         if hasattr(self, "group_start_button"):
             group = item is not None and item.kind in ("bunch_check", "obstruction")
-            self.group_start_button.setVisible(group)
+            selected = getattr(self.problem_panel, "_selected_arrival", lambda: None)()
+            wave = getattr(self.problem_panel, "_row_wave", lambda _row: None)(selected)
+            self.group_start_button.setVisible(group or len(wave or ()) > 1)
         if getattr(self, "_problem_workbench_active", False):
-            if not getattr(self, "_creating_manual_crossing", False):
+            if getattr(self.problem_panel, "holds_picture", False):
+                # The panel places (or keeps) the picture for this row itself.
+                self._opened_normal_crossing = ""
+                self.video_filmstrip.full_race.follow_button.setChecked(False)
+            elif not getattr(self, "_creating_manual_crossing", False):
                 self._return_to_problem()
             self._refresh_crossing_cards()
             self._problem_count_mode_changed(True)
 
         # 表里点到的是一条自动对应的记录：那是在复查这条过线，点画面不算新建待处理。
         # 放在 _return_to_problem 之后，因为回看问题本身会清掉这个标记。
+        # 到达记录表不同：点到人就算数，自动对应的单人也一样。
         from .problem_items import KIND_AUTO_PASSED
-        if item is not None and item.kind == KIND_AUTO_PASSED:
+        if (item is not None and item.kind == KIND_AUTO_PASSED
+                and not getattr(self.problem_panel, "quick_review", False)):
             self._opened_normal_crossing = item.item_id
 
     def _pause_arrival_confirmation(self):
@@ -2589,6 +2668,9 @@ class FinishReviewWindow(PassageReviewSurface):
             if item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
                 return
             original = item.evidence.get("frame")
+            from .bunch_review import mark_on_frame
+            if any(mark_on_frame(mark, frame, frame["recorder_ms"]) for mark in panel.current_marks()):
+                return
             if original and self._shows_the_problem_frame(pane, frame["position_ms"], original):
                 return
         selected_key = panel._selected_key
@@ -2604,7 +2686,12 @@ class FinishReviewWindow(PassageReviewSurface):
                 panel.select_item(item.item_id)
                 index = next((i for i, row in enumerate(panel._arrival_rows) if row.key == selected_key), None)
                 if index is not None:
-                    panel._arrival_clicked(index)
+                    # Restore only the identity: clicking would reopen its chip
+                    # reference and discard the raw frame being classified.
+                    panel._selected_key = selected_key
+                    panel._active_item = item
+                    panel.table.setCurrentCell(index, 0)
+                    panel._sync_arrival_confirmation()
         except (OSError, ValueError, RuntimeError) as error:
             panel.hint.setText(f"当前原帧未保存：{error}")
         finally:
@@ -2615,7 +2702,7 @@ class FinishReviewWindow(PassageReviewSurface):
 
         if not hasattr(self, "problem_panel"):
             return
-        from .analysis_settings import CONFIG_PATH, normalized_points
+        from .analysis_settings import CONFIG_PATH, inherited_profile, normalized_points, profile_scope_matches
         from .analysis_workspace import session_id_for_path
 
         paths = [self.output_dir / name for name in ("long_image_lines.json", "finish_lines.json", CONFIG_PATH)]
@@ -2642,11 +2729,16 @@ class FinishReviewWindow(PassageReviewSurface):
                 line = None
                 if frame and pane.source_kind == "regular":
                     session = re.sub(r"_review_\d+$", "", session_id_for_path(pane.location.video_path))
+                    scope_known = bool(scope[0] or scope[1])
                     matches = [p for p in profiles if int(p["camera_index"]) == pane.camera_index
-                               and p["session_id"] == session and (p["race_id"], p.get("stage_id", "")) == scope
+                               and p["session_id"] == session
+                               and (not scope_known or profile_scope_matches(p, *scope))
                                and int(p["effective_from_ms"]) <= frame["recorder_ms"]]
+                    # Like the analysis: a session without its own line shows the one it inherits.
                     line = (max(matches, key=lambda p: (int(p["effective_from_ms"]), int(p["revision"])))
-                            if matches else lines.get(pane.camera_index))
+                            if matches else inherited_profile(
+                                profiles, pane.camera_index, frame["recorder_ms"], scope[0])
+                            or lines.get(pane.camera_index))
                 pane.video_view.set_finish_line(normalized_points(line) if line else ())
             active = self._active_playback_pane()
             self.problem_panel.set_finish_line_status(bool(active.video_view._finish_line_points))
@@ -2670,22 +2762,10 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_problem_finish_lines()
 
     def keyPressEvent(self, event) -> None:
-        """F enlarges the picture from whatever corner of the workbench holds the keys.
-
-        The queue and the panes answer F themselves.  A button in the top bar or in
-        the time rail leaves it unhandled, and a press that disappears there reads to
-        the operator as "F does not work" - so the window picks it up.  A field that
-        takes typing keeps the letter, as it must.
-        """
+        """The judging keys work from whatever corner of the workbench holds the keys."""
 
         if (getattr(self, "_problem_workbench_active", False)
                 and self.problem_panel._queue_key(event)):
-            event.accept()
-            return
-        if (event.key() == Qt.Key_F
-                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
-                and getattr(self, "_problem_workbench_active", False)):
-            self.problem_panel.toggle_big_view()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -2704,8 +2784,11 @@ class FinishReviewWindow(PassageReviewSurface):
         """Every decoded regular-camera picture can record a crossing, large or small."""
 
         active = getattr(self, "_problem_workbench_active", False)
+        quick_review = bool(getattr(self.problem_panel, "quick_review", False))
         for pane in self.evidence_panes:
-            pane.video_view.set_count_mode(active and not getattr(self.problem_panel, "quick_review", False)
+            pane.set_identity_marker_enabled(not (active and quick_review))
+            pane.video_view.set_count_mode(active
+                                           and (not quick_review or pane is self._active_playback_pane())
                                            and pane.source_kind == "regular"
                                            and pane.location is not None and pane._current_frame_index >= 0)
 
@@ -2721,6 +2804,24 @@ class FinishReviewWindow(PassageReviewSurface):
                 "position_ms": pane._current_position_ms,
                 "recorder_ms": int(origin) + int(pane._current_position_ms)}
 
+    def _prepare_sampling_frame(self):
+        for pane in self.evidence_panes:
+            try:
+                locations = self._live_locations_for_filmstrip(pane)
+                location = locations[-1] if locations else pane.location
+                if location is not None:
+                    saved = self._persist_filmstrip_location(location)
+                    if location is pane.location:
+                        pane._location = saved
+            except (OSError, ValueError, RuntimeError) as error:
+                self.problem_panel.hint.setText(f"实时画面暂存失败，终点线仍可手工设置：{error}")
+
+    def _problem_count_cancelled(self, x, y, pane):
+        if (getattr(self, "_problem_workbench_active", False)
+                and getattr(self.problem_panel, "quick_review", False)
+                and pane is self._active_playback_pane()):
+            self.problem_panel.cancel_picture_mark(x, y)
+
     def _problem_count_clicked(self, x_normalized: float, y_normalized: float, pane=None) -> None:
         """A click records the displayed frame; an unreported crossing starts its own item."""
 
@@ -2729,6 +2830,9 @@ class FinishReviewWindow(PassageReviewSurface):
         pane = pane or self._problem_pane()
         frame = self._frame_for_problem_count(pane)
         if frame is None:
+            return
+        if getattr(self.problem_panel, "quick_review", False):
+            self._quick_review_mark_arrival(frame, x_normalized, y_normalized, pane)
             return
         item = self.problem_panel.current_item()
         context = self.problem_panel._inline_context()
@@ -2770,6 +2874,73 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_crossing_cards()
         self.problem_panel.setFocus()
 
+    def _quick_review_mark_arrival(self, frame, x_normalized, y_normalized, pane) -> None:
+        """Use the operator's picture click as the bicycle cue, not a final ruling."""
+
+        panel = self.problem_panel
+        row = panel._selected_arrival()
+        item, refusal = panel.picture_candidate(frame)
+        if refusal:
+            panel.hint.setText(refusal)
+            return
+        frame = dict(frame, marker_x_normalized=float(x_normalized),
+                     marker_y_normalized=float(y_normalized))
+        selected_key = row.key if row is not None and row.event is not None else None
+        reuse = item is not None
+        self._pause_arrival_confirmation()
+        try:
+            location = self._persist_filmstrip_location(pane.location)
+            pane._location = location
+            frame.update(segment_id=location.segment.segment_id, video_path=str(location.video_path))
+            self._creating_manual_crossing = True
+            if not reuse:
+                item = panel.add_manual_problem(
+                    frame, reason="人工点选自行车与终点线位置，待确认芯片",
+                    recorder_ms=frame["recorder_ms"], thumbnail=pane.video_view._pixmap_item.pixmap(),
+                )
+                panel.adopt_picture_candidate(item, selected_key)
+        except (OSError, ValueError, RuntimeError) as error:
+            panel.hint.setText(f"标记未保存：{error}")
+            return
+        finally:
+            self._creating_manual_crossing = False
+        if item is None:
+            return
+        self._creating_manual_crossing = True
+        try:
+            if item.item_id in panel._candidate_wave:
+                panel.open_picture(item)  # the click's own wave; the frame stays where it is
+            else:
+                panel.select_item(item.item_id)
+        finally:
+            self._creating_manual_crossing = False
+        from .bunch_review import mark_on_frame
+        existing = next((i for i, mark in enumerate(panel.current_marks())
+                         if mark_on_frame(mark, frame, frame["recorder_ms"])
+                         and (mark["x"] - x_normalized) ** 2 + (mark["y"] - y_normalized) ** 2 < .02 ** 2), None)
+        if existing is None:
+            panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
+        else:
+            panel._editing_mark = existing
+        index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
+        if panel._wave_plan() is not None:
+            # On a wave's picture the row of whoever was clicked is selected.
+            panel.show_counted(panel._editing_mark)
+        elif index is not None:
+            panel._selected_key = selected_key
+            panel._active_item = item
+            panel.table.setCurrentCell(index, 0)
+            panel._sync_arrival_confirmation()
+        panel._quick_render_signature = None
+        panel._render()
+        self._problem_count_mode_changed(True)
+        self._problem_marks_changed(())
+        panel.hint.setText(
+            panel.picture_mark_hint()
+            or (f"已标记 {row.bib} 的压线位置。"
+                if selected_key else "已圈出压线位置；请在左边选对应的芯片记录。")
+        )
+
     def _problem_marks_changed(self, _marks) -> None:
         """Redraw the counted people on the frame that is being judged."""
 
@@ -2780,6 +2951,9 @@ class FinishReviewWindow(PassageReviewSurface):
     def _continuous_marker_overlays(self, pane):
         """The counted people ride along with the crossing markers of the same frame."""
 
+        if (getattr(self, "_problem_workbench_active", False)
+                and getattr(self.problem_panel, "quick_review", False)):
+            return self._problem_count_overlays(pane)
         overlays = list(super()._continuous_marker_overlays(pane))
         overlays.extend(self._problem_count_overlays(pane))
         return tuple(overlays)
@@ -2792,16 +2966,30 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = self._frame_for_problem_count(pane)
         if frame is None:
             return ()
+        if hasattr(self.problem_panel, "picture_overlays"):
+            return tuple(self.problem_panel.picture_overlays(frame))
         from .bunch_review import is_excluded, mark_on_frame
         from .crossing_order import mark_order_labels, ordered_mark_indices
         marks = self.problem_panel.current_marks()
         labels = mark_order_labels(marks)
-        return tuple((float(marks[index]["x"]), float(marks[index]["y"]),
-                      labels[index] + (f" {marks[index]['bib']}" if marks[index].get("bib") else "")
-                      + (f" 已排除：{marks[index]['exclusion_reason']}" if is_excluded(marks[index]) else ""),
-                      True, False)
-                     for index in ordered_mark_indices(marks)
-                     if mark_on_frame(marks[index], frame, frame["recorder_ms"]))
+        dot = bool(getattr(self.problem_panel, "quick_review", False))
+        # A person beyond the wave's chips, or without a chip, is drawn in red.
+        warning = getattr(self.problem_panel, "picture_mark_warning", lambda _mark: False)
+        overlays = []
+        for index in ordered_mark_indices(marks):
+            mark = marks[index]
+            if not mark_on_frame(mark, frame, frame["recorder_ms"]):
+                continue
+            if dot:
+                label = self.problem_panel.picture_mark_label(mark)
+                reason = mark.get("exclusion_reason", "").strip() if is_excluded(mark) else ""
+                label += f" 已排除：{reason}" if reason and reason != label else ""
+            else:
+                label = (labels[index] + (f" {mark['bib']}" if mark.get("bib") else "")
+                         + (f" 已排除：{mark['exclusion_reason']}" if is_excluded(mark) else ""))
+            alert = bool(warning(mark))
+            overlays.append((float(mark["x"]), float(mark["y"]), label, not alert, alert, dot))
+        return tuple(overlays)
 
     def _problem_browse_started(self):
         if getattr(self, "_problem_workbench_active", False):
@@ -2816,8 +3004,10 @@ class FinishReviewWindow(PassageReviewSurface):
             self._open_problem_frame(dict(item.evidence["frame"]))
         elif item is not None:
             self._set_sync_playing(False, seek_final=False)
+            if self._open_chip_reference(item):
+                return
             for pane in self.evidence_panes:
-                pane.clear_passage("此问题暂无原帧；请查看右侧芯片信息")
+                pane.clear_passage("该芯片时刻暂无可回看录像；请检查录像覆盖或从下方胶卷查找")
             self.problem_panel.set_browsing(False)
         else:
             self.problem_panel.set_browsing(False)
@@ -2830,6 +3020,53 @@ class FinishReviewWindow(PassageReviewSurface):
                     for pane in self.evidence_panes:
                         pane.clear_passage(self.problem_panel.queue_text() + "；可从原录像打开画面校时或补记")
 
+    def _open_chip_reference(self, item) -> bool:
+        """Raw playback must not depend on detection, line setup or calibration."""
+        events = [self.passage_store.get(event_id) for event_id in item.event_ids]
+        event = next((event for event in events if event is not None and event.is_active), None)
+        if event is None:
+            reference = item.evidence.get("reference_frame")
+            if reference:
+                return self._open_problem_frame(dict(reference, reference_only=True))
+            return False
+        timestamp = self._evidence_timestamp(event)
+        if timestamp is None:
+            return False
+        timestamp = align_evidence_timestamp(timestamp, event.received_at_ms)
+        camera = int(item.evidence.get("camera_index") or self._camera_one_pane().camera_index)
+        # A chip reference uses the same session calibration as normal playback.
+        # Rebuild it on every open: a cached reference predates later calibration.
+        offsets = {self._clock_offset_for_camera(camera)}
+        for segment in self.timeline_store.segments():
+            if segment.camera_index == camera and segment.clock_source == DEFAULT_CLOCK_SOURCE:
+                key = self._recording_session_key_from_path(
+                    segment.source_id, self.timeline_store.resolve_video_path(segment))
+                offsets.add(self._calibrated_clock_offset(camera, key))
+        locations = []
+        for offset in offsets:
+            lookup = self.timeline_store.locate_passage(
+                timestamp, clock_offset_ms=offset, race_id=event.race_id,
+                pre_roll_ms=0, prefer_continuous_media=True,
+            )
+            locations.extend(location for location in lookup.locations
+                             if location.status == "located" and location.segment.camera_index == camera
+                             and location.segment.clock_source == DEFAULT_CLOCK_SOURCE
+                             and self._continuous_offset_for_location(location) == offset)
+        if not locations:
+            return False
+        # Immutable short clips are preferred, but a sealed archive can cover
+        # a missing clip without waiting for any analysis cache to catch up.
+        location = min(locations, key=lambda value: (
+            value.video_path.suffix.lower() == ".m3u8",
+            value.segment.media_duration_ms or 0,
+        ))
+        return self._open_problem_frame({
+            "camera_index": camera, "segment_id": location.segment.segment_id,
+            "video_path": str(location.video_path), "position_ms": location.passage_position_ms,
+            "reference_only": True,
+            "date_aligned": timestamp != event.timeline_timestamp_ms,
+        })
+
     def _on_preview_frame_ready(self, pane, image, position_ms, frame_index):
         super()._on_preview_frame_ready(pane, image, position_ms, frame_index)
         self._refresh_problem_finish_lines()
@@ -2841,7 +3078,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if getattr(self.problem_panel, "quick_review", False):
             # The red "待补录" identity guide is not the camera's finish line.
             pane.video_view.clear_marker()
-            pane.video_view.set_history_markers(())
+            pane.video_view.set_history_markers(self._problem_count_overlays(pane))
             self.problem_panel._sync_arrival_confirmation()
         if pane is not self._active_playback_pane():
             return
@@ -2916,6 +3153,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._problem_count_mode_changed(True)
 
     def _open_group_start(self):
+        if getattr(self.problem_panel, "open_wave_start", lambda: False)():
+            return
         context = self.problem_panel._inline_context()
         if context is None:
             return
@@ -2956,7 +3195,10 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         labels = [f"{event.bib} · {datetime.fromtimestamp(event.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]} · {event.event_id}"
                   for event in events]
-        label, ok = QInputDialog.getItem(self, "以当前帧校时", "当前画面压线的是哪位选手？", labels, 0, False)
+        selected = self.problem_panel._selected_arrival()
+        default = next((i for i, candidate in enumerate(events)
+                        if selected and selected.event and candidate.event_id == selected.event.event_id), 0)
+        label, ok = QInputDialog.getItem(self, "以当前帧校时", "当前画面压线的是哪位选手？", labels, default, False)
         if not ok or label not in labels:
             return
         event = events[labels.index(label)]
@@ -2992,7 +3234,11 @@ class FinishReviewWindow(PassageReviewSurface):
         workbench = getattr(self, "_problem_workbench_active", False)
         self.video_filmstrip.setVisible(bool(visible) or not workbench)
         self.crossing_cards.setVisible(workbench)
-
+        # Without the recording rail the bottom holds two buttons only: give the
+        # picture the height instead of leaving an empty band.
+        compact = workbench and not visible
+        self.preview_panel.setMinimumHeight(0 if compact else 190 if workbench else 420)
+        self.preview_panel.setMaximumHeight(self.crossing_cards.sizeHint().height() + 16 if compact else 16777215)
     def _refresh_crossing_cards(self):
         if not hasattr(self, "crossing_cards"):
             return
@@ -3038,6 +3284,12 @@ class FinishReviewWindow(PassageReviewSurface):
         if expanded:
             self._return_to_problem()
 
+    def _delete_problem_record(self, event_id: str) -> None:
+        event = self.passage_store.get(event_id)
+        if event is not None:
+            self._delete_record(event)
+            self.problem_panel.refresh()
+
     def _open_passages(self):
         self.problem_list_button.setChecked(False)
         self._open_problem_list()
@@ -3063,7 +3315,7 @@ class FinishReviewWindow(PassageReviewSurface):
         ) else None
         self.video_filmstrip.full_race.set_analysis_progress(ranges, timestamp, enabled=self._problem_workbench_active)
 
-    def _open_problem_frame(self, frame) -> None:
+    def _open_problem_frame(self, frame) -> bool:
         """Open the item's original frame in its camera's pane, without changing identity."""
 
         from .video_timeline import PassageVideoLocation
@@ -3074,24 +3326,81 @@ class FinishReviewWindow(PassageReviewSurface):
             path = self.output_dir / path
         if segment is None or not path.is_file():
             self.problem_panel.hint.setText("原录像缺失或不在本赛事的录像索引中，未跳转其他录像。")
-            return
+            return False
         position = int(frame.get("position_ms", 0))
         index = None if frame.get("frame_index") is None else int(frame["frame_index"])
+        camera = int(frame.get("camera_index", 1) or 1)
         location = PassageVideoLocation(segment, path, position, position, 0,
                                         segment.timing_error_ms, "located")
+        location, position, index = self._problem_frame_source(location, position, index)
         self._set_sync_playing(False, seek_final=False)
-        if segment.media_started_at_ms is not None:
-            self.video_filmstrip.full_race.browse_to(segment.media_started_at_ms + position)
-        if self._seek_retained_camera_frame(location, position, index, int(frame.get("camera_index", 1) or 1)):
+        if location.segment.media_started_at_ms is not None:
+            self.video_filmstrip.full_race.browse_to(location.segment.media_started_at_ms + position)
+        opened = self._seek_retained_camera_frame(location, position, index, camera)
+        if opened:
             # The pane is on the problem's own frame now, so the panel is not
             # browsing elsewhere and may be decided on: F would otherwise leave the
             # operator looking at the right picture while every button stays greyed.
-            self.problem_panel.set_browsing(False)
+            reference = bool(frame.get("reference_only"))
+            self.problem_panel.set_browsing(reference)
             target = f"第 {index + 1} 帧" if index is not None else f"片内 {position / 1000:.2f} 秒"
-            self.problem_panel.hint.setText(f"已定位原录像{target}，请逐帧核对后处理。")
+            self._active_playback_pane().set_reference_only(reference)
+            if reference:
+                date_note = "；芯片日期与接收日期不同，按接收日期查找，正式时间未改" if frame.get("date_aligned") else ""
+                self.problem_panel.hint.setText(
+                    f"参考录像 · {target}：尚未校时/匹配，不代表已确认过线{date_note}。请逐帧找到压线帧，左键点人。"
+                )
+            else:
+                self.problem_panel.hint.setText(f"已定位原录像{target}，请逐帧核对后处理。")
         # The problem's pane is the one that takes the counting clicks from here on.
         self._problem_count_mode_changed(True)
         self._problem_marks_changed(None)
+        return opened
+
+    def _archive_on_piece_clock(self) -> bool:
+        return bool(getattr(self, "_problem_workbench_active", False))
+
+    def _problem_frame_source(self, location, position, index):
+        """Where a row's frame is shown: (location, position, frame index).
+
+        A two-second buffer piece plays two seconds and stops, and a lead-in
+        before it (2 s for a crossing without a chip) falls in the piece
+        before (10-29: "2 秒割裂").  Once the five-minute archive of that moment
+        is sealed the frame opens there, on the very picture and on the pieces'
+        clock (see archive_alignment), so the rings saved on pieces stay on
+        their people; an archive whose picture is not found is not used.
+        Before that, a moment ahead of the piece opens in the piece holding it.
+        """
+
+        from .race_filmstrip import recording_sources
+
+        segment = location.segment
+        if segment.media_started_at_ms is None:
+            return location, max(0, position), index
+        moment = int(segment.media_started_at_ms) + int(position)
+        if self._is_archive(location):
+            return self._aligned_archive(location, moment), position, index
+        session = self._recording_session_key(location)
+        sources, _pending = recording_sources(
+            self.timeline_store, int(segment.camera_index), self._filmstrip_race_id(),
+            path_available=lambda _path, _live: True)  # only the files used are checked
+        holding = [source for source in sources
+                   if source.start_ms <= moment < source.end_ms
+                   and self._recording_session_key(source.location) == session
+                   and Path(source.location.video_path).is_file()]
+        archive = next((source.location for source in holding if self._is_archive(source.location)), None)
+        if archive is not None:
+            duration = max(1, int(segment.media_duration_ms or 1))
+            shown = int(segment.media_started_at_ms) + min(max(0, int(position)), duration - 1)
+            aligned = self._aligned_archive(archive, moment, (location, shown))
+            if aligned is not archive:
+                return aligned, max(0, moment - int(aligned.segment.media_started_at_ms)), None
+        if position >= 0:
+            return location, position, index
+        piece = next((source for source in holding if source.priority == 1), None)
+        if piece is not None:
+            return piece.location, moment - piece.start_ms, None
+        return location, 0, index
 
     def _init_operator_controls(self) -> None:
         self.operator_identity_label = self.current_context_label
@@ -3129,6 +3438,9 @@ class FinishReviewWindow(PassageReviewSurface):
         # window knows which frame it landed on, and the panel keeps the count.
         pane.video_view.count_mark_selected.connect(
             lambda x, y, pane=pane: self._problem_count_clicked(x, y, pane)
+        )
+        pane.video_view.count_mark_cancelled.connect(
+            lambda x, y, pane=pane: self._problem_count_cancelled(x, y, pane)
         )
         self._problem_count_mode_changed(True)
 
@@ -3475,6 +3787,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self._storage_snapshot = (self.output_dir, free_bytes / (1024**3), "")
         if free_bytes < 1024**3:
             raise RecordingError("赛事存储空间不足 1 GB，无法开始录像")
+        self._recording_lock.acquire(self.output_dir)
         archive_publishers = []
         recording_started_ms = int(time.time() * 1000)
         try:
@@ -3592,6 +3905,8 @@ class FinishReviewWindow(PassageReviewSurface):
                     self._archive_publishers.append(archive_publisher)
             if any(failure.still_running for failure in rollback_failures):
                 self._runtime_error = "录像启动失败，且部分录像进程仍在运行"
+            else:
+                self._recording_lock.release()
             for archive_publisher in archive_publishers:
                 if archive_publisher in self._archive_publishers:
                     self._archive_publishers.remove(archive_publisher)
@@ -4156,7 +4471,8 @@ class FinishReviewWindow(PassageReviewSurface):
                 and (
                     active_metadata is None
                     or (active_metadata.race_id != event.race_id
-                        and self._live_metadata_scope == (event.race_id, event.stage_id))
+                        and self._live_metadata_scope == (event.race_id, event.stage_id)
+                        and not self._other_race_while_recording(event.race_id, event.race_name))
                 )
             ):
                 self._activate_cyclerace_workspace(inbox_metadata)
@@ -4257,8 +4573,29 @@ class FinishReviewWindow(PassageReviewSurface):
         self._observe_runtime_metric("passage_batch_apply", started, item_count=len(changed))
         self._update_runtime_status()
 
+    def _other_race_while_recording(self, race_id: str, race_name: str = "") -> bool:
+        """A recording is never cut over to another race by itself; the operator decides.
+
+        10-28: CycleRace's test races (接力测试赛, 78 of them) reached the live
+        console and switched it every 3-4 s for 35 minutes, restarting the
+        finish recording each time and leaving 120 folders behind.
+        """
+        current = self.metadata_store.current() if self.metadata_store is not None else None
+        if current is None or current.race_id == race_id or not self._recording_any_active():
+            return False
+        self._workspace_notice = (f"收到其他赛事：{race_name or race_id}。正在录像，未切换；"
+                                  "要切换请先停止录像，再在“设置”中打开该赛事。")
+        if race_id not in self._held_race_ids:
+            self._held_race_ids.add(race_id)
+            logger.info("Live recording kept on %s; other race %s not switched to", current.race_id, race_id)
+        self._update_runtime_status()
+        return True
+
     def _on_metadata_received(self, metadata: RaceMetadata) -> None:
         if self._defer_capture_callback(self._on_metadata_received, metadata):
+            return
+        if self._workspace_mode != "archive" and self._other_race_while_recording(metadata.race_id,
+                                                                                 metadata.race_name):
             return
         self._live_metadata_scope = (metadata.race_id, metadata.stage_id)
         if self._workspace_mode == "archive":
@@ -5201,6 +5538,8 @@ class FinishReviewWindow(PassageReviewSurface):
             self._coordinator = self._coordinators.get(self.camera_index)
             self._publisher = self._publishers.get(self.camera_index)
         else:
+            # Another window may record into this folder once nothing here does.
+            self._recording_lock.release()
             self._recorder = None
             self._ring_buffer = None
             self._coordinator = None

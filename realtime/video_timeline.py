@@ -584,14 +584,16 @@ class VideoTimelineStore:
         with self._lock:
             return self._segments.get(str(segment_id))
 
-    def video_path_is_playable(self, video_path: str | Path) -> bool:
-        return self._video_path_is_playable(Path(video_path).expanduser().absolute())
+    def video_path_is_playable(self, video_path: str | Path, *, refresh: bool = False) -> bool:
+        return self._video_path_is_playable(
+            Path(video_path).expanduser().absolute(), refresh=refresh,
+        )
 
-    def _video_path_is_playable(self, video_path: Path) -> bool:
+    def _video_path_is_playable(self, video_path: Path, *, refresh: bool = False) -> bool:
         path_key = self._path_key(video_path)
         now = time.monotonic()
         cached = self._playability_cache.get(path_key)
-        if cached is not None and now - cached[2] <= _PLAYABILITY_CACHE_TTL_SECONDS:
+        if not refresh and cached is not None and now - cached[2] <= _PLAYABILITY_CACHE_TTL_SECONDS:
             return cached[3]
         try:
             stat = video_path.stat()

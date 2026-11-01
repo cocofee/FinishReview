@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 import realtime.launch_dialog as launch_dialog_module
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -40,6 +40,7 @@ from realtime.race_metadata import (
     RaceMetadata,
     RaceMetadataStore,
 )
+from realtime.recording_lock import FolderInUseError
 from realtime.review_export import REVIEW_SUMMARY_FILENAME
 from realtime.review_recorder import (
     DirectShowVideoDevice,
@@ -391,7 +392,8 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert window.problem_panel.table.isVisibleTo(window.problem_panel)
         assert not window.problem_panel.count_table.isVisibleTo(window.problem_panel)
         assert window.problem_panel.detail_scroll.isHidden()
-        assert window.problem_panel.table.columnCount() == 4
+        assert window.problem_panel.table.columnCount() == 6  # group and lap columns hide with one group, no laps
+        assert window.problem_panel.table.isColumnHidden(5)
         assert window.problem_panel._browsing
         window._return_to_problem()
         assert not window.problem_panel._browsing
@@ -408,6 +410,9 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         view.setFocus()
         qapp.processEvents()
         QTest.keyClick(view.viewport(), Qt.Key_F)
+        qapp.processEvents()
+        assert not window.problem_panel.big_view  # F enlarges nothing in the workbench
+        window.problem_panel.toggle_big_view()
         qapp.processEvents()
         assert window.problem_panel.big_view
         assert not window.preview_panel.isVisibleTo(window)
@@ -462,18 +467,22 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         qapp.processEvents()
         window.problem_panel.toggle_big_view()  # F: the picture takes the clicks
         qapp.processEvents()
-        assert not pane.video_view._count_mode
+        assert pane.video_view._count_mode
 
         target = view.viewport().rect().center()
         QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
         qapp.processEvents()
-        assert not window.problem_panel.current_marks()
+        assert len(window.problem_panel.current_marks()) == 1
+        assert window.problem_panel._category() is None
+        assert not window.problem_panel.confirm_arrival_button.isEnabled()
         target_event = _event(event_id="read-321", bib="321", passage_timestamp_ms=start + 1900)
         window.passage_store.append(target_event)
         window.problem_panel.refresh()
         for _ in range(5):
-            QTest.keyClick(view.viewport(), Qt.Key_1)
+            QTest.keyClick(view.viewport(), Qt.Key_5)  # 5 is no key any more
         assert not any(row.decision for row in window.problem_panel._arrival_rows)
+        assert "这个键不用了" in window.problem_panel.hint.text()
+        window.problem_panel._classify("bicycle")  # what the old 1 (运动员) did; the button is hidden
         target_row = next(i for i, row in enumerate(window.problem_panel._arrival_rows) if row.bib == "321")
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
         cell = window.problem_panel.table.item(target_row, 2)
@@ -495,7 +504,79 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         window.close()
 
 
-def test_raw_frame_can_be_classified_and_confirmed_without_analysis_or_f(qapp, tmp_path):
+def test_group_count_picture_drag_scrubs_active_pane_without_counting(qapp, tmp_path):
+    """The main counting picture takes a horizontal drag; it never becomes a mark."""
+
+    from PyQt5.QtCore import QEvent, QPoint, QPointF
+    from PyQt5.QtGui import QImage, QMouseEvent
+    from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
+    import json
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        start = 1_789_600_000_000
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1",
+        )
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test",
+                           evidence={"frame": frame})
+        path = tmp_path / "finish_problems/problem_list.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
+        window.problem_panel.refresh()
+        window.problem_panel.table.setCurrentCell(0, 0)
+        window._open_problem_frame(frame)
+        qapp.processEvents()
+
+        pane = window.regular_pane
+        view = pane.video_view
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+        window.problem_panel.toggle_big_view()
+        qapp.processEvents()
+        assert view._count_mode
+
+        worker = pane._worker
+        seeks = []
+        worker.seek = seeks.append
+        worker.seek_preview = seeks.append
+        marks_before = list(window.problem_panel.current_marks())
+
+        center = view.viewport().rect().center()
+        move = center + QPoint(90, 0)
+        for event_type, position, pressed, buttons in (
+            (QEvent.MouseButtonPress, center, Qt.LeftButton, Qt.LeftButton),
+            (QEvent.MouseMove, move, Qt.NoButton, Qt.LeftButton),
+        ):
+            QApplication.sendEvent(
+                view.viewport(),
+                QMouseEvent(event_type, QPointF(position), pressed, buttons, Qt.NoModifier),
+            )
+        QTest.qWait(120)  # let the pane's 80 ms preview timer fire once
+        assert seeks
+        QApplication.sendEvent(
+            view.viewport(),
+            QMouseEvent(QEvent.MouseButtonRelease, QPointF(move),
+                        Qt.LeftButton, Qt.NoButton, Qt.NoModifier),
+        )
+        QTest.qWait(10)
+
+        assert window.problem_panel.current_marks() == marks_before
+        assert seeks[-1] != 2000  # The release committed the frame-relative scrub.
+        assert pane._video_scrubbing is False
+    finally:
+        window.close()
+
+
+def test_a_lone_chip_row_is_saved_by_a_click_on_its_picture_and_never_by_a_number(qapp, tmp_path):
     from PyQt5.QtGui import QImage
     window = _window(tmp_path, workbench=True)
     try:
@@ -517,17 +598,128 @@ def test_raw_frame_can_be_classified_and_confirmed_without_analysis_or_f(qapp, t
                                        video_path=str(video), position_ms=2000, frame_index=50))
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
-        assert "1" in panel.confirmation_status.text()
-        panel._confirm_bicycle()
+        assert "按 1" not in panel.confirmation_status.text()
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # 不是运动员 needs the person clicked first
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert "321 号还没点人" in panel.hint.text()
+        window._problem_count_clicked(0.5, 0.5, pane)
+        qapp.processEvents()
         assert panel._selected_arrival().bib == "321"
-        assert panel.current_item().item_id.startswith("manual:")
         assert not panel.big_view
-        assert panel.confirm_arrival_button.isEnabled(), panel.confirmation_status.text()
         assert pane._current_frame_index == 50
-        panel.confirm_arrival_button.click()
         saved = next(row.decision for row in panel._arrival_rows if row.bib == "321")
         assert saved["frame"]["frame_index"] == 50
         assert saved["frame"]["segment_id"] == segment.segment_id
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert panel._selected_arrival().bib == "321"
+    finally:
+        window.close()
+
+
+def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path):
+    from PyQt5.QtGui import QImage
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.show()
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        target = _event(event_id="click-321", bib="21", passage_timestamp_ms=start + 2000)
+        window.passage_store.append(target)
+        panel = window.problem_panel
+        panel.refresh()
+        row_index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
+        panel._arrival_clicked(row_index)
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        window._open_problem_frame(frame)
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+
+        assert pane.video_view._count_mode
+        pane._identity = "待补录"
+        pane._pending_marker = (.55, .62, 50, 2000)
+        pane._on_detail_requested()
+        pane._worker.full_resolution_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert pane.video_view._marker is None
+        worker = pane._worker
+        window._problem_count_clicked(0.55, 0.62, pane)
+        qapp.processEvents()
+        assert pane._worker is worker
+        assert pane._current_frame_index == 50
+
+        assert panel._selected_arrival().bib == "21"
+        assert panel._selected_key == "event:click-321"
+        assert panel.current_item().evidence["frame"]["marker_x_normalized"] == pytest.approx(0.55)
+        assert panel.current_item().evidence["frame"]["marker_y_normalized"] == pytest.approx(0.62)
+        # The click on the rider is the save: no 1 needed.
+        assert panel._category()["action"] == "bicycle"
+        saved = next(row.decision for row in panel._arrival_rows if row.bib == "21")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.55)
+        assert saved["frame"]["marker_y_normalized"] == pytest.approx(0.62)
+        overlays = window._problem_count_overlays(pane)
+        assert len(overlays) == 1
+        assert overlays[0][0] == pytest.approx(0.55)
+        assert overlays[0][1] == pytest.approx(0.62)
+        assert overlays[0][2] == "21"
+        assert overlays[0][5] is True and overlays[0][6] is False
+        assert pane.video_view._history_markers[0][2] == "21"
+
+        assert panel.confirm_arrival_button.isHidden()
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_5)  # out of habit: harmless
+        assert "这个键不用了" in panel.hint.text()
+        assert panel._selected_arrival().bib == "21"
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+        target_row = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21")
+        assert panel.table.item(target_row, 3).text() == "已点"  # a click counts someone; it is not a confirmed identity
+        assert panel.table.item(target_row, 3).foreground().color().name() == "#126044"
+        panel.refresh()
+        panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21"))
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert pane.video_view._history_markers[0][2] == "21"
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Backspace)
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert panel._selected_arrival().bib == "21"
+        assert not panel.current_marks()
+        assert pane._worker is worker
+        assert pane._current_frame_index == 50
+        assert panel.table.item(panel.table.currentRow(), 3).text() == "待定"
+        assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#b42318"
+        window._problem_count_clicked(0.55, 0.62, pane)
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+        # 22 and 23 arrive within 2 s of 21: one wave, counted on this same picture,
+        # each circle labelled in chip order and saved at once. Re-clicking a circle adds no duplicate.
+        for bib in ("22", "23"):
+            window.passage_store.append(_event(event_id="click-" + bib, bib=bib,
+                                               passage_timestamp_ms=start + 2000 + int(bib)))
+        panel.refresh()
+        panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "22"))
+        candidate_id = panel.current_item().item_id
+        jumps = QSignalSpy(panel.jump_requested)
+        window._problem_count_clicked(.7, .62, pane)
+        window._problem_count_clicked(.8, .62, pane)
+        # 古浪 261：点第 5 个人时画面不能被拉回已保存的 69 那一帧。
+        assert len(jumps) == 0
+        assert len(panel.current_marks()) == 3
+        assert panel.current_item().item_id == candidate_id
+        assert panel._selected_arrival().bib == "23"  # the one just clicked, on the left
+        window._problem_count_clicked(.7, .62, pane)
+        assert len(panel.current_marks()) == 3
+        assert panel._selected_arrival().bib == "22"  # a click on a counted ring picks them out
+        assert len(jumps) == 0
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 3
+        window._problem_count_cancelled(.7, .62, pane)  # right click: 22 is taken back, 23 moves up
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22"]
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 2
     finally:
         window.close()
 
@@ -563,7 +755,13 @@ def test_real_finish_line_follows_session_time_and_clears_identity_guide(qapp, t
         assert pane.video_view._finish_line_points == ((.2, .1), (.5, .6), (.8, .9))
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 3500, 88)
         assert pane.video_view._finish_line_points == ((.7, .1), (.7, .9))
+        # A session without its own line shows the one it inherits, like the analysis.
         config.write_text(json.dumps({"sampling_profiles": [dict(line, session_id="another-session")]}), encoding="utf-8")
+        window._refresh_problem_finish_lines()
+        assert pane.video_view._finish_line_points == ((.2, .1), (.5, .6), (.8, .9))
+        # Another race's line never does.
+        config.write_text(json.dumps({"sampling_profiles": [
+            dict(line, session_id="another-session", race_id="race-other")]}), encoding="utf-8")
         window._refresh_problem_finish_lines()
         assert not pane.video_view._finish_line_points
         assert "未设置" in window.problem_panel.finish_line_status.text()
@@ -650,23 +848,23 @@ def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path)
 
         assert [panel.count_table.item(row, 0).text() for row in range(3)] == ["1 同时", "1 同时", "3"]
         overlays = window._problem_count_overlays(pane)
-        assert [(overlay[0], overlay[2]) for overlay in overlays] == [(.4, "1 同时"), (.6, "1 同时")]
+        assert [(overlay[0], overlay[2]) for overlay in overlays] == [(.4, "待选号码"), (.6, "待选号码")]
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 3000, 75)
-        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["3"]
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["待选号码"]
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2050, 51)
-        assert not window._problem_count_overlays(pane)
+        assert all(overlay[6] for overlay in window._problem_count_overlays(pane))  # faded, a frame later
 
         panel._exclude_mark(1, "工作人员")
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
-        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["排除 已排除：工作人员", "1"]
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["非运动员 已排除：工作人员", "待选号码"]
         assert [panel.count_table.item(row, 0).text() for row in range(3)] == ["排除", "1", "2"]
         assert [mark["recorder_ms"] for mark in panel.current_marks()] == [start + 3000, start + 2000, start + 2000]
     finally:
         window.close()
 
 
-def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_path):
-    """正常单人只留一行过线记录：翻出来是复查原帧，永远不会变成待处理。"""
+def test_a_normal_single_is_one_row_and_a_click_on_the_rider_confirms_it(qapp, tmp_path):
+    """正常单人只留一行过线记录；古浪 60 号：点到人就算数，自动对应的单人也一样。"""
 
     import json
     from PyQt5.QtGui import QImage
@@ -689,6 +887,7 @@ def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_pa
                      position_ms=2000, frame_index=50)
         passed = {"bib": "057", "event_id": "e-057", "chip_time_ms": start + 1900, "active_now": True,
                   "recorder_ms": start + 2000, "source": "auto", "frame": frame}
+        window.passage_store.append(_event(event_id="e-057", bib="057", passage_timestamp_ms=start + 1900))
         path = tmp_path / "finish_problems/problem_list.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"items": [], "summary": {"auto_passed": 1}, "auto_passed": [passed]}),
@@ -702,18 +901,17 @@ def test_a_normal_single_is_a_row_to_reopen_and_never_a_manual_task(qapp, tmp_pa
         assert len(auto) == 1
         qapp.processEvents()
 
-        # 点开这一行就是打开那条过线的原帧，并且说明这是复查。
+        # 点开这一行就打开那条过线的原帧；点中人就保存，不用再按 1。
+        assert window.problem_panel._selected_arrival().bib == "057"
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         qapp.processEvents()
-        assert window._opened_normal_crossing == auto[0].item_id
-        assert "057" in window.problem_panel.hint.text()
-
-        # 点画面是复查，不是计数：什么新问题都不会冒出来。
+        assert not window._opened_normal_crossing
         window._problem_count_clicked(0.5, 0.5, pane)
-        assert "已自动对应" in window.problem_panel.hint.text()
-        assert not window.problem_panel.current_marks()
-        assert [item.item_id for item in window.problem_panel.rows] == [auto[0].item_id]
+        saved = next(row.decision for row in window.problem_panel._arrival_rows if row.bib == "057")
+        assert saved["frame"]["frame_index"] == 50
+        assert saved["frame"]["marker_x_normalized"] == pytest.approx(0.5)
+        assert "记为 057 号" in window.problem_panel.hint.text()
     finally:
         window.close()
 
@@ -768,6 +966,101 @@ def test_the_first_rider_calibration_keeps_the_original_chip_record(qapp, tmp_pa
         window.close()
 
 
+@pytest.mark.parametrize("days", [0, 1])
+@pytest.mark.parametrize("offset", [0, 2714, -1500])
+def test_chip_click_opens_raw_reference_before_model_line_or_calibration(qapp, tmp_path, days, offset):
+    from PyQt5.QtGui import QImage
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        event = _event(passage_timestamp_ms=start + 2000 + days * 86_400_000,
+                       received_at_ms=start + 2200)
+        window.passage_store.append(event)
+        if offset:
+            key = window._recording_session_key_from_path(segment.source_id, video)
+            window._continuous_clock_offsets[(1, key)] = offset
+        panel = window.problem_panel
+        panel.refresh()
+        index = next(i for i, row in enumerate(panel._arrival_rows) if row.bib == event.bib)
+        panel._arrival_clicked(index)
+        pane = window.regular_pane
+        assert pane.location.segment.segment_id == segment.segment_id
+        assert pane.location.video_path == video
+        assert pane.location.playback_position_ms == 2000 + offset
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        assert "参考录像" in panel.hint.text() and "不代表已确认过线" in panel.hint.text()
+        assert pane._reference_only is True
+        assert not panel.confirm_arrival_button.isEnabled()
+        assert not any(row.decision for row in panel._arrival_rows)
+        assert window.passage_store.get(event.event_id).timeline_timestamp_ms == event.timeline_timestamp_ms
+        assert not (tmp_path / "video_clock_calibrations.jsonl").exists()
+        if days:
+            assert "正式时间未改" in panel.hint.text()
+        # Reference playback remains usable for the explicit manual workflow.
+        panel._confirm_bicycle()
+        assert panel.current_item().evidence.get("frame")
+        assert sum(row.decision is not None for row in panel._arrival_rows) == 1
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("mismatch", ["race", "camera", "time", "missing"])
+def test_chip_reference_does_not_borrow_unrelated_or_missing_video(qapp, tmp_path, mismatch):
+    window = _window(tmp_path, workbench=True)
+    try:
+        start = 1_789_600_000_000
+        video = tmp_path / "original.mkv"
+        if mismatch != "missing":
+            video.write_bytes(b"video")
+        window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=2 if mismatch == "camera" else 1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test",
+            race_id="other-race" if mismatch == "race" else "race-1")
+        event = _event(passage_timestamp_ms=start + (60_000 if mismatch == "time" else 2000),
+                       received_at_ms=start + (60_200 if mismatch == "time" else 2200))
+        window.passage_store.append(event)
+        window.problem_panel.refresh()
+        index = next(i for i, row in enumerate(window.problem_panel._arrival_rows) if row.bib == event.bib)
+        window.problem_panel._arrival_clicked(index)
+        assert window.regular_pane.location is None
+        assert not window.problem_panel.confirm_arrival_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_hls_windows_share_first_rider_calibration_including_legacy_key(qapp, tmp_path):
+    from realtime.analysis_workspace import session_id_for_path
+    window = _window(tmp_path, workbench=True)
+    try:
+        folder = tmp_path / "review_buffer" / "camera_01"
+        folder.mkdir(parents=True)
+        session = "camera_01_20261018_104528_433517"
+        first = folder / "evidence_shared_first.m3u8"
+        second = folder / "evidence_shared_second.m3u8"
+        for index, path in enumerate((first, second)):
+            path.write_text(f"#EXTM3U\n{session}_review_{index:016d}.ts\n#EXT-X-ENDLIST\n", encoding="utf-8")
+        key = window._recording_session_key_from_path("camera_01_review", second)
+        assert key == window._recording_session_key_from_path("camera_01_review", first)
+        assert key == window._recording_session_key_from_path("camera_01_review", tmp_path / "videos" / (session + "_archive_0000.mkv"))
+        assert session_id_for_path(first) == session_id_for_path(second) == session
+        window.calibration_store.record(
+            camera_index=1, session_key=f"camera_01_review|{folder}|{first.stem}",
+            offset_ms=2525, anchor_event_id="first", anchor_bib="901", calibrated_at_ms=1000)
+        assert window._calibrated_clock_offset(1, key) == 2525
+        window._continuous_clock_offsets[(1, key)] = 2714
+        assert window._calibrated_clock_offset(1, key) == 2714
+    finally:
+        window.close()
+
+
 def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_path):
     """The view does not split into a second counting screen when focus changes."""
 
@@ -804,6 +1097,9 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         qapp.processEvents()
         QTest.keyClick(rail.canvas.viewport(), Qt.Key_F)
         qapp.processEvents()
+        assert not panel.big_view
+        panel.toggle_big_view()
+        qapp.processEvents()
         assert panel.big_view
         assert panel.table.isVisibleTo(panel) and panel.detail_scroll.isHidden()
         assert not window.preview_panel.isVisibleTo(window)
@@ -811,14 +1107,11 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         panel.toggle_big_view()
         qapp.processEvents()
 
-        # A top-bar button leaves the key unhandled too; the window takes it.
         window.recheck_button.setFocus()
         qapp.processEvents()
         QTest.keyClick(window.recheck_button, Qt.Key_F)
         qapp.processEvents()
-        assert panel.big_view
-        panel.toggle_big_view()
-        qapp.processEvents()
+        assert not panel.big_view
 
         # A field that takes typing keeps the letter: the bib is typed, not enlarged.
         panel.bib_input.setText("")
@@ -1580,7 +1873,8 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     receiver.deliver_metadata(metadata)
     qapp.processEvents()
 
-    event_dir = root / "2026 城市公路自行车赛"
+    today = datetime.now(review_window_module.BEIJING_TIMEZONE).date().isoformat()
+    event_dir = root / f"{today} 2026 城市公路自行车赛"
     assert window.workspace_root == root.resolve()
     assert window.output_dir == event_dir.resolve()
     assert window.metadata_store.current() == metadata
@@ -1687,9 +1981,41 @@ def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
         stage_name="终点",
     )
 
-    event_dir = review_window_module._event_workspace_dir(root, metadata)
+    day = date(2026, 10, 28)
 
-    assert event_dir == (root / "城市赛_race-new").resolve()
+    assert review_window_module._event_workspace_dir(root, metadata, today=day) == (root / "2026-10-28 城市赛").resolve()
+    (root / "2026-10-28 城市赛" / "videos").mkdir(parents=True)
+    assert review_window_module._event_workspace_dir(root, metadata, today=day) == (
+        root / "2026-10-28 城市赛_race-new").resolve()
+
+
+def test_a_saved_race_is_found_under_its_old_or_dated_folder_on_any_day(qapp, tmp_path):
+    """10-28 起新赛事建“日期 赛事名”文件夹；之前建的、或前一天建的赛事，回来仍进原文件夹。"""
+    root = tmp_path / "events"
+    old = RaceMetadata(race_id="race-old", stage_id="stage-1", revision=1, emitted_at_ms=1, race_name="城市赛")
+    RaceMetadataStore(root / "城市赛_race-old" / "cyclerace_race_metadata.json").store(old)
+    dated = replace(old, race_id="race-dated")
+    RaceMetadataStore(root / "2026-10-28 城市赛" / "cyclerace_race_metadata.json").store(dated)
+
+    later = date(2026, 10, 30)
+    assert review_window_module._event_workspace_dir(root, old, today=later) == (root / "城市赛_race-old").resolve()
+    assert review_window_module._event_workspace_dir(root, dated, today=later) == (
+        root / "2026-10-28 城市赛").resolve()
+    fresh = replace(old, race_id="race-fresh")
+    assert review_window_module._event_workspace_dir(root, fresh, today=later) == (
+        root / "2026-10-30 城市赛").resolve()
+
+
+def test_a_race_kept_in_the_root_itself_is_its_own_workspace(qapp, tmp_path):
+    """古浪测试副本：CycleRace 切到别的赛事再切回来，录像仍在根目录，不另建空文件夹。"""
+    root = tmp_path / "gulang"
+    metadata = RaceMetadata(race_id="race-gulang", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                            race_name="古浪站", stage_name="终点")
+    RaceMetadataStore(root / "cyclerace_race_metadata.json").store(metadata)
+    assert review_window_module._event_workspace_dir(root, metadata) == root.resolve()
+    other = replace(metadata, race_id="race-other", race_name="特奥")
+    assert review_window_module._event_workspace_dir(root, other, today=date(2026, 10, 28)) == (
+        root / "2026-10-28 特奥").resolve()
 
 
 def test_switching_cyclerace_event_exports_previous_review_summary(qapp, tmp_path):
@@ -2013,6 +2339,19 @@ def test_clearing_the_race_data_removes_test_readings_and_keeps_settings(qapp, t
             end_reason="test", race_id="race-live",
         )
 
+        released = set()
+        for pane in window.all_evidence_panes:
+            shutdown = pane.shutdown
+            def release(*, wait=True, pane=pane, shutdown=shutdown):
+                shutdown(wait=wait)
+                released.add(pane)
+            monkeypatch.setattr(pane, "shutdown", release)
+        remove_data = window._remove_event_data
+        def remove_after_release(event_dir, root):
+            assert released == set(window.all_evidence_panes)
+            return remove_data(event_dir, root)
+        monkeypatch.setattr(window, "_remove_event_data", remove_after_release)
+
         window.problem_panel.clear_data_button.click()
 
         assert window.passage_store.events(include_inactive=True) == ()
@@ -2027,6 +2366,9 @@ def test_clearing_the_race_data_removes_test_readings_and_keeps_settings(qapp, t
         assert window._finish_line_rois[2] == pytest.approx((0.2, 0.1, 0.4, 0.9))
         assert window._workspace_mode == "live"
         assert window.record_button.text() == "开始录像"
+        # The folder was held while files went, and handed back afterwards.
+        assert not window._recording_lock.held
+        assert not (event_dir / "recording.lock").exists()
         # 草稿计时器不能在删除后把清掉的点数写回磁盘。
         qapp.processEvents()
         assert not (problems / "operator_drafts.json").exists()
@@ -2060,6 +2402,38 @@ def test_clearing_race_data_is_blocked_while_recording_or_in_history(qapp, tmp_p
         assert window.passage_store.get("test-read") is not None
     finally:
         window.close()
+
+
+def test_a_second_window_cannot_record_into_the_same_race_folder(qapp, tmp_path, monkeypatch):
+    # 古浪 2026-10-18: two builds recorded into one folder and every rider counted twice.
+    first = _window(tmp_path)
+    second = _window(tmp_path)
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning",
+                        lambda _parent, title, message: warnings.append((title, message)))
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    try:
+        assert second.output_dir == first.output_dir
+        second.passage_store.append(_event(event_id="test-read"))
+        first.start_recording()
+        _FakeRecorder.instances.clear()
+
+        with pytest.raises(FolderInUseError, match="另一个 FinishReview"):
+            second.start_recording()
+        assert _FakeRecorder.instances == []
+        # Clearing from the idle window would wipe the recording one's race.
+        second._clear_event_data()
+        assert warnings[-1][0] == "无法清空数据"
+        assert "未做任何改动" in warnings[-1][1]
+        assert second.passage_store.get("test-read") is not None
+
+        first.stop_recording()
+        second.start_recording()
+        assert second._recording_any_active()
+    finally:
+        second.stop_recording()
+        first.close()
+        second.close()
 
 
 def test_changing_the_recording_root_returns_to_the_field(qapp, tmp_path):
@@ -2132,6 +2506,34 @@ def test_deleting_passage_immediately_updates_review_export(qapp, tmp_path, monk
     monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("备用芯片", True))
     window.delete_record_button.click()
     assert window.table.rowCount() == 0
+    with summary.open(encoding="utf-8-sig", newline="") as handle:
+        assert len(list(csv.reader(handle))) == 1
+    window.close()
+
+
+def test_arrival_table_deletes_a_chip_and_the_old_records_page_has_no_entry(qapp, tmp_path, monkeypatch):
+    window = _window(tmp_path / "events")
+    assert window.problem_list_button.isHidden() and not hasattr(window, "passages_button")
+    metadata = RaceMetadata(
+        race_id="race-delete", stage_id="stage-1", revision=1,
+        emitted_at_ms=1, race_name="删除测试", stage_name="终点",
+    )
+    assert window._activate_cyclerace_workspace(metadata)
+    window.passage_store.append(_event(race_id="race-delete", event_id="spare"))
+    window.refresh()
+    window._export_review_summary()
+    panel = window.problem_panel
+    panel.refresh()
+    assert [entry.event.event_id for entry in panel._arrival_rows if entry.event] == ["spare"]
+    from PyQt5.QtWidgets import QInputDialog
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("", False))
+    panel._arrival_clicked(0)
+    panel._request_delete()  # cancelled: nothing happens
+    assert window.passage_store.get("spare") in window.passage_store.events()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("备用芯片", True))
+    panel._request_delete()
+    assert not [entry for entry in panel._arrival_rows if entry.event]
+    summary = window.output_dir / REVIEW_SUMMARY_FILENAME
     with summary.open(encoding="utf-8-sig", newline="") as handle:
         assert len(list(csv.reader(handle))) == 1
     window.close()
@@ -2251,6 +2653,33 @@ def test_live_formal_metadata_starts_recording_before_first_passage(
     assert window.recorder is not None and window.recorder.is_running
     assert len(_FakeRecorder.instances) == 1
     assert window.passage_store.events() == ()
+    window.close()
+
+
+def test_another_race_never_cuts_the_running_recording_over(qapp, tmp_path):
+    """10-28: CycleRace test races switched the live console every 3-4 s, restarting the recording."""
+    window = _window(tmp_path)
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[-1]
+    receiver.deliver_metadata(RaceMetadata(
+        race_id="race-formal", stage_id="stage-1", revision=1, emitted_at_ms=1,
+        race_name="正式赛事", stage_name="终点", groups=(RaceGroupMetadata("men-open", "男子公开组"),)))
+    qapp.processEvents()
+    recorder = window.recorder
+    folder = window.output_dir
+    assert recorder is not None and recorder.is_running
+
+    for index in range(3):
+        receiver.deliver_metadata(RaceMetadata(
+            race_id=f"legacy-db-{index}-race-1", stage_id="stage-1", revision=1, emitted_at_ms=2,
+            race_name="接力测试赛", stage_name="接力赛段", groups=(RaceGroupMetadata("1", "公开组"),)))
+        qapp.processEvents()
+
+    assert window.recorder is recorder and recorder.is_running and not recorder.stopped
+    assert window.output_dir == folder
+    assert window.metadata_store.current().race_id == "race-formal"
+    assert "接力测试赛" in window._workspace_notice and "未切换" in window._workspace_notice
+    assert not [path for path in tmp_path.rglob("cyclerace_race_metadata.json") if "接力测试赛" in str(path)]
     window.close()
 
 
@@ -4713,7 +5142,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.25.2 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.25.6 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -4727,7 +5156,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.25.2"
+    assert window.product_title_label.text() == "FinishReview v0.25.6"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()
@@ -5240,3 +5669,51 @@ def test_video_anomaly_can_quickly_focus_roster_bib_without_creating_passage(
     assert window.selected_identity_value.text() == "321"
     assert window.passage_store.events() == ()
     window.close()
+
+
+def test_a_row_opens_in_its_sealed_archive_on_the_same_picture(qapp, tmp_path):
+    """10-29「2 秒割裂」：归档后打开完整录像，按同一画面对齐，圈仍落在同一个人上。"""
+    import cv2
+    import numpy as np
+    from realtime.video_timeline import PassageVideoLocation
+
+    def write(path, indexes):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 20, (160, 120))
+        for index in indexes:
+            image = np.zeros((120, 160, 3), np.uint8)
+            cv2.rectangle(image, (index * 3 % 150, 40), (index * 3 % 150 + 10, 80), (255, 255, 255), -1)
+            writer.write(image)
+        writer.release()
+        return path
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        start = 1_789_600_000_000
+        stem = "camera_01_20261029_153844_113960"
+        archive = write(tmp_path / "videos" / f"{stem}_archive_0002.avi", range(300))
+        piece = write(tmp_path / "review_buffer" / "camera_01" / f"{stem}_review_0000000000000007.avi",
+                      range(100, 150))
+        add = window.timeline_store.add_completed_segment
+        add(source_id="camera_01_review", camera_index=1, video_path=archive, media_started_at_ms=start,
+            media_duration_ms=15_000, clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id="race-1")
+        # The archive's clock runs 150 ms late: the piece's picture 0 is archive frame 100.
+        piece_segment = add(source_id="camera_01_review", camera_index=1, video_path=piece,
+                            media_started_at_ms=start + 5000 - 150, media_duration_ms=2500,
+                            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0,
+                            end_reason="retained_problem_segment", race_id="race-1")
+        location = PassageVideoLocation(piece_segment, piece, 500, 500, 0, 0, "located")
+        window._problem_workbench_active = True
+        opened, position, index = window._problem_frame_source(location, 500, 10)
+        assert "archive" in Path(opened.video_path).stem
+        assert opened.segment.media_started_at_ms == start - 150  # on the pieces' clock
+        assert (position, index) == (5500, None)  # archive frame 110: the piece's frame 10
+        # 2 s before the piece starts is still in the archive, on the same clock.
+        assert window._problem_frame_source(location, -2000, None)[1] == 3000
+        window._problem_workbench_active = False  # elsewhere archives keep their own clock
+        window.__dict__.pop("_archive_shifts", None)
+        opened, position, _index = window._problem_frame_source(location, 500, 10)
+        assert opened is location and position == 500
+    finally:
+        window.close()

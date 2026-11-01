@@ -6,11 +6,24 @@ from pathlib import Path
 import re
 
 from .clock_sync import CLOCK_MODEL_FILENAME, ClockModelStore, ClockSyncError, MANUAL_ANCHOR_SOURCE
+from .passage_evidence import PassageEvidenceError, VideoClockCalibrationStore
+
+
+MANUAL_CALIBRATION_FILENAME = "video_clock_calibrations.jsonl"
 
 
 @lru_cache(maxsize=4)
 def _clock_snapshot(path, modified, size):
     return ClockModelStore(path)
+
+
+@lru_cache(maxsize=4)
+def _manual_offsets(path, modified, size):
+    store = VideoClockCalibrationStore(path, recover_incomplete_tail=False)
+    return {
+        (int(calibration.camera_index), str(calibration.session_key).rsplit("|", 1)[-1]): int(calibration.offset_ms)
+        for calibration in store.calibrations()
+    }
 
 
 def workspace_clocks(workspace):
@@ -20,6 +33,17 @@ def workspace_clocks(workspace):
         return _clock_snapshot(path, stamp.st_mtime_ns, stamp.st_size)
     except (OSError, ValueError, ClockSyncError):
         return None
+
+
+def manual_clock_offsets(workspace):
+    """First-rider offsets published by the live calibration journal."""
+
+    path = Path(workspace) / MANUAL_CALIBRATION_FILENAME
+    try:
+        stamp = path.stat()
+        return _manual_offsets(str(path), stamp.st_mtime_ns, stamp.st_size)
+    except (OSError, ValueError, PassageEvidenceError):
+        return {}
 
 
 @dataclass(frozen=True)
@@ -54,9 +78,18 @@ def recorder_crossing_time(recorder_ms, frame, workspace=None, *, context=None, 
         if segment is not None:
             session = segment.session_id
     if not session and frame.get("video_path"):
-        session = re.sub(r"_archive_\d+$", "", Path(str(frame["video_path"])).stem, flags=re.I)
+        from .runtime_paths import recording_session_path
+        session = re.sub(r"_review_\d+$", "", re.sub(
+            r"_archive_\d+$", "", recording_session_path(Path(str(frame["video_path"]))).stem, flags=re.I))
     if model and not (model.source == MANUAL_ANCHOR_SOURCE and session not in model.session_ids):
         return CrossingTime(int(model.to_chip(int(recorder_ms), session)), "aligned")
+    # The live first-rider calibration is written before offline analysis
+    # publishes an automatic model; without this fallback the table shows raw
+    # recorder time (about two seconds ahead of the camera OSD) until then.
+    if workspace is not None and camera and session:
+        offset = manual_clock_offsets(workspace).get((camera, session))
+        if offset is not None:
+            return CrossingTime(int(recorder_ms) - int(offset), "aligned")
     return CrossingTime(int(recorder_ms), "video")
 
 

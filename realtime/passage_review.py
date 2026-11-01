@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
+import math
 from pathlib import Path
 import re
 import time
@@ -149,6 +150,12 @@ UI_INFO_PANEL_MIN_WIDTH = 300
 UI_INFO_PANEL_MAX_WIDTH = 380
 UI_INFO_PANEL_DEFAULT_WIDTH = 330
 _ARCHIVE_SEGMENT_SUFFIX_RE = re.compile(r"_archive_\d+$", re.IGNORECASE)
+# The counting surface says the two gestures it accepts; the timeline under the
+# picture is too thin to steer frame by frame on a moving group.
+COUNT_MODE_HELP = (
+    "单击画面里的一位过线者就是一个人；"
+    "按住左键横向拖动回看前后帧；左右方向键逐帧"
+)
 
 
 def format_passage_time(timestamp_ms: int) -> str:
@@ -433,6 +440,7 @@ class EvidenceImageView(QGraphicsView):
     # Counting a crossing: one click lands on one person, position only — the moment
     # comes from whoever knows which frame is on screen.
     count_mark_selected = pyqtSignal(float, float)
+    count_mark_cancelled = pyqtSignal(float, float)
     marker_confirm_requested = pyqtSignal()
     marker_cancel_requested = pyqtSignal()
     marker_delete_requested = pyqtSignal()
@@ -445,6 +453,10 @@ class EvidenceImageView(QGraphicsView):
 
     MIN_SCALE = 0.25
     MAX_SCALE = 8.0
+    # A click that counts a person is a click, not a drag.  Past this many pixels
+    # the left button means "scrub the picture", so the two never fire together.
+    CLICK_SLOP_PX = 4
+    SCRUB_START_PX = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -485,7 +497,7 @@ class EvidenceImageView(QGraphicsView):
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
-            tuple[float, float, str, bool, bool], ...
+            tuple[float, float, str, bool, bool, bool, bool, bool], ...
         ] = ()
         self._show_marker_label = True
         self._show_identity_badge = True
@@ -839,26 +851,38 @@ class EvidenceImageView(QGraphicsView):
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        self.setToolTip(
-            "单击放置判读线；Shift + 左键拖动判读线；"
-            "中键拖动缩放后的画面"
-            if self._marker_mode
-            else ""
-        )
+        if self._marker_mode:
+            self.setToolTip(
+                "单击放置判读线；Shift + 左键拖动判读线；"
+                "中键拖动缩放后的画面"
+            )
+        elif self._count_mode:
+            self.setToolTip(COUNT_MODE_HELP)
+        else:
+            self.setToolTip("滚轮放大后，中键拖动查看号码")
 
     def set_count_mode(self, enabled: bool) -> None:
         """A click counts a person instead of placing the identity line.
 
         The frame is what the operator is looking at; counting must not make them
-        reach for another window, so the picture itself takes the click.
+        reach for another window, so the picture itself takes the click.  Dragging
+        the same button horizontally scrubs the frames around it, which is easier
+        to steer than the thin timeline under the picture.
         """
 
         self._count_mode = bool(enabled) and self.has_frame
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._count_mode and not self._marker_mode:
-            self.setToolTip("单击画面里的一位过线者就是一个人；左右方向键逐帧")
+        if self._marker_mode:
+            self.setToolTip(
+                "单击放置判读线；Shift + 左键拖动判读线；"
+                "中键拖动缩放后的画面"
+            )
+        elif self._count_mode:
+            self.setToolTip(COUNT_MODE_HELP)
+        else:
+            self.setToolTip("滚轮放大后，中键拖动查看号码")
 
     def set_marker(
         self,
@@ -896,8 +920,12 @@ class EvidenceImageView(QGraphicsView):
                 str(label),
                 bool(confirmed),
                 bool(simple),
+                bool(marker[5]) if len(marker) > 5 else False,
+                bool(marker[6]) if len(marker) > 6 else False,
+                bool(marker[7]) if len(marker) > 7 else False,
             )
-            for x_normalized, y_normalized, label, confirmed, simple in markers
+            for marker in markers
+            for x_normalized, y_normalized, label, confirmed, simple in [marker[:5]]
         )
         self.viewport().update()
 
@@ -936,6 +964,11 @@ class EvidenceImageView(QGraphicsView):
         super().wheelEvent(event)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.RightButton and self._count_mode and self.has_frame:
+            if self._scene.sceneRect().contains(self.mapToScene(event.pos())):
+                self.count_mark_cancelled.emit(*self._normalized_position(event.pos()))
+            event.accept()
+            return
         if event.button() == Qt.MiddleButton and self.has_frame:
             self._pan_dragging = True
             self._pan_last_position = event.pos()
@@ -977,7 +1010,8 @@ class EvidenceImageView(QGraphicsView):
             return
         if (
             self._mouse_press_position is not None
-            and (event.pos() - self._mouse_press_position).manhattanLength() > 4
+            and (event.pos() - self._mouse_press_position).manhattanLength()
+            > self.CLICK_SLOP_PX
         ):
             self._mouse_dragged = True
         if (
@@ -987,6 +1021,32 @@ class EvidenceImageView(QGraphicsView):
             self._select_marker_position(event.pos())
             event.accept()
             return
+        # Counting mode: a mostly-horizontal left drag scrubs the recording.
+        # Movement below SCRUB_START_PX stays a click, so one person is still one
+        # click; once the drag starts it never also counts on release.  Counting
+        # wins over the identity-line mode just as it does for a plain click;
+        # Shift + left still moves the line, and the middle button still pans.
+        if (
+            self._count_mode
+            and self.has_frame
+            and self._mouse_press_position is not None
+            and event.buttons() & Qt.LeftButton
+        ):
+            horizontal_delta = event.pos().x() - self._mouse_press_position.x()
+            if self._video_scrubbing or (
+                abs(horizontal_delta) > self.SCRUB_START_PX
+                and abs(horizontal_delta)
+                >= abs(event.pos().y() - self._mouse_press_position.y())
+            ):
+                if not self._video_scrubbing:
+                    self._video_scrubbing = True
+                    self.viewport().setCursor(Qt.SizeHorCursor)
+                    self.scrub_started.emit()
+                # The pane coalesces these pixel deltas on an 80 ms timer and
+                # snaps them to whole frames before asking the decoder to seek.
+                self.scrub_delta_requested.emit(horizontal_delta)
+                event.accept()
+                return
         if (
             self._mouse_dragged
             and self._mouse_press_position is not None
@@ -1001,7 +1061,9 @@ class EvidenceImageView(QGraphicsView):
             self._pan_dragging = False
             self._pan_last_position = None
             self.viewport().setCursor(
-                Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
+                Qt.CrossCursor
+                if (self._marker_mode or self._count_mode)
+                else Qt.ArrowCursor
             )
             event.accept()
             return
@@ -1013,7 +1075,8 @@ class EvidenceImageView(QGraphicsView):
             marker_dragging = self._marker_dragging
             was_click = (
                 not self._mouse_dragged
-                and (event.pos() - press_position).manhattanLength() <= 4
+                and (event.pos() - press_position).manhattanLength()
+                <= self.CLICK_SLOP_PX
             )
             self._mouse_press_position = None
             self._mouse_dragged = False
@@ -1021,7 +1084,9 @@ class EvidenceImageView(QGraphicsView):
             video_scrubbing = self._video_scrubbing
             self._video_scrubbing = False
             self.viewport().setCursor(
-                Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
+                Qt.CrossCursor
+                if (self._marker_mode or self._count_mode)
+                else Qt.ArrowCursor
             )
             if marker_dragging:
                 self._select_marker_position(event.pos())
@@ -1122,36 +1187,56 @@ class EvidenceImageView(QGraphicsView):
                 for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
                     painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
                                      QPointF(b[0] * self._source_width, b[1] * self._source_height))
-        for index, (x_normalized, y_normalized, label, confirmed, simple) in enumerate(
+        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost, auto) in enumerate(
             self._history_markers
         ):
             x = x_normalized * self._source_width
             y = y_normalized * self._source_height
-            color = QColor("#1bbf83" if confirmed else "#c0372b")
+            # Grey-blue and dashed: paired by the system (自动对上), nobody has counted them yet.
+            color = QColor("#8fb3d9" if auto else "#1bbf83" if confirmed else "#c0372b")
+            if ghost:
+                # Counted on a nearby frame: faded where they were, so they are not clicked twice.
+                color.setAlpha(150)
             pen = QPen(color, 2)
             pen.setCosmetic(True)
-            if not confirmed and not simple:
+            if (not confirmed and not simple) or ghost or auto:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
-            painter.drawLine(int(x), 0, int(x), self._source_height)
-            if not self._show_marker_label:
+            radius = (16.0 if ghost else 22.0) / scale
+            if dot:
+                # A large hollow ring with a dark rim reads on any kit, and leaves the rider visible.
+                painter.setBrush(Qt.NoBrush)
+                if not ghost:
+                    rim = QPen(QColor(0, 0, 0, 170), 6)
+                    rim.setCosmetic(True)
+                    painter.setPen(rim)
+                    painter.drawEllipse(QPointF(x, y), radius, radius)
+                    pen.setWidth(3)
+                    painter.setPen(pen)
+                painter.drawEllipse(QPointF(x, y), radius, radius)
+            else:
+                painter.drawLine(int(x), 0, int(x), self._source_height)
+            if not self._show_marker_label or ghost:
                 continue
             margin = 6.0 / scale
-            tag_width = max(52.0, 18.0 + len(label) * 18.0) / scale
+            size = 18.0
+            tag_width = max(52.0, 18.0 + len(label) * size) / scale
             tag_height = 30.0 / scale
-            tag_x = x + margin
+            # Beside the ring, not on the rider.
+            offset = radius + margin if dot else margin
+            tag_x = x + offset
             if tag_x + tag_width > self._source_width - margin:
-                tag_x = x - tag_width - margin
+                tag_x = x - tag_width - offset
             tag_x = max(margin, min(tag_x, self._source_width - tag_width - margin))
-            tag_y = margin + index * (tag_height + margin)
-            tag_y = min(tag_y, max(margin, self._source_height - tag_height - margin))
+            tag_y = y - tag_height / 2.0 if dot else margin + index * (tag_height + margin)
+            tag_y = max(margin, min(tag_y, max(margin, self._source_height - tag_height - margin)))
             tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(tag_rect, 2.0 / scale, 2.0 / scale)
             painter.setPen(QColor("#07120e" if confirmed else "#231703"))
             font = QFont(self.font())
-            font.setPixelSize(max(1, int(round(18.0 / scale))))
+            font.setPixelSize(max(1, int(round(size / scale))))
             font.setBold(True)
             painter.setFont(font)
             painter.drawText(tag_rect, Qt.AlignCenter, label)
@@ -1265,6 +1350,7 @@ class PassageEvidencePane(QFrame):
     open_requested = pyqtSignal(object, object)
     step_requested = pyqtSignal(int)
     step_boundary_reached = pyqtSignal(int)
+    playback_reached_end = pyqtSignal()
     play_requested = pyqtSignal()
     passage_delta_requested = pyqtSignal(int)
     selection_step_requested = pyqtSignal(int)
@@ -1321,6 +1407,7 @@ class PassageEvidencePane(QFrame):
         self._pending_marker_unknown = False
         self._pending_marker_label = ""
         self._marking_enabled = False
+        self._identity_marker_enabled = True
         self._identity = ""
         self._worker: Optional[object] = None
         self._idle_prefetch_enabled = False
@@ -1792,6 +1879,9 @@ class PassageEvidencePane(QFrame):
         return f"正在定位{source}"
 
     def _render_marker(self) -> None:
+        if not self._identity_marker_enabled:
+            self.video_view.clear_marker()
+            return
         marker = self._pending_marker
         if self.is_auyat_rgb:
             self.video_view.clear_identity_cue()
@@ -1842,6 +1932,11 @@ class PassageEvidencePane(QFrame):
                 )
                 return
         self.video_view.clear_marker()
+
+    def set_identity_marker_enabled(self, enabled: bool) -> None:
+        self._identity_marker_enabled = bool(enabled)
+        if not self._identity_marker_enabled:
+            self.video_view.clear_marker()
 
     def _association_is_visible(
         self,
@@ -1895,6 +1990,7 @@ class PassageEvidencePane(QFrame):
         self._last_full_resolution_request = -1
         self.quality_label.clear()
         self.timeline.setProperty("initial_frame_index", None)
+        self.timeline.setProperty("initial_adjacent_frame", None)
         self._full_resolution_timer.stop()
         self._reset_video_scrub()
         self.play_btn.setText("▶")
@@ -2014,6 +2110,8 @@ class PassageEvidencePane(QFrame):
         worker.playback_finished.connect(self._on_playback_finished)
         if hasattr(worker, "step_boundary_reached"):
             worker.step_boundary_reached.connect(self._on_step_boundary_reached)
+        if hasattr(worker, "step_failed"):
+            worker.step_failed.connect(self._on_step_failed)
         worker.playback_error.connect(self._on_playback_error)
         self._worker = worker
         if not defer_worker_start:
@@ -2154,7 +2252,11 @@ class PassageEvidencePane(QFrame):
         self._set_transport_enabled(True)
         initial_frame = self.timeline.property("initial_frame_index")
         self.timeline.setProperty("initial_frame_index", None)
-        if initial_frame is not None and hasattr(self._worker, "seek_frame"):
+        adjacent_frame = self.timeline.property("initial_adjacent_frame")
+        self.timeline.setProperty("initial_adjacent_frame", None)
+        if adjacent_frame is not None:
+            self.seek_adjacent_frame(*adjacent_frame)
+        elif initial_frame is not None and hasattr(self._worker, "seek_frame"):
             self._worker.seek_frame(int(initial_frame))
         else:
             self._worker.seek(target_ms)
@@ -2182,6 +2284,26 @@ class PassageEvidencePane(QFrame):
             worker.seek_frame(int(frame_index))
         else:
             worker.seek(int(position_ms))
+
+    def seek_adjacent_frame(self, boundary_position_ms: int, direction: int) -> None:
+        """Select the first frame strictly beyond a seam in the new file's FPS."""
+        worker = self._worker
+        if worker is None:
+            return
+        self.set_playing(False)
+        if self._fps <= 0:
+            self.timeline.setProperty("initial_adjacent_frame", (boundary_position_ms, direction))
+            return
+        boundary_frame = boundary_position_ms * self._fps / 1000.0
+        frame = (
+            math.ceil((boundary_position_ms + 1) * self._fps / 1000.0)
+            if direction > 0 else math.ceil(boundary_frame) - 1
+        )
+        frame = max(0, min(frame, self._frame_count - 1)) if self._frame_count else max(0, frame)
+        if hasattr(worker, "seek_frame"):
+            worker.seek_frame(frame)
+        else:
+            worker.seek(int(math.ceil(frame * 1000.0 / self._fps)))
 
     def _on_frame_ready(self, image, position_ms: int, frame_index: int) -> None:
         if self.sender() is not self._worker:
@@ -2441,14 +2563,26 @@ class PassageEvidencePane(QFrame):
     def _on_playback_finished(self) -> None:
         if self.sender() is not self._worker:
             return
+        was_playing = self._playing
         self._playing = False
         self.play_btn.setText("▶")
         self._schedule_paused_frame_detail()
+        if was_playing:
+            # The surface decides whether the next file carries on (2.5 s pieces, 10-29).
+            self.playback_reached_end.emit()
 
     def _on_step_boundary_reached(self, direction: int) -> None:
         if self.sender() is not self._worker:
             return
         self.step_boundary_reached.emit(1 if int(direction) > 0 else -1)
+
+    def show_navigation_notice(self, message: str) -> None:
+        self.quality_label.setText(message)
+        self.quality_label.setToolTip(message)
+
+    def _on_step_failed(self, message: str) -> None:
+        if self.sender() is self._worker:
+            self.show_navigation_notice(message)
 
     def _on_playback_error(self, message: str) -> None:
         if self.sender() is not self._worker:
@@ -3592,8 +3726,11 @@ class PassageReviewSurface(QDialog):
         )
         pane.step_boundary_reached.connect(
             lambda direction, current=pane: self._step_across_recording_boundary(
-                current, direction
+                current, direction, at_edge=True
             )
+        )
+        pane.playback_reached_end.connect(
+            lambda current=pane: self._continue_playback(current)
         )
         pane.play_requested.connect(lambda current=pane: self._toggle_pane(current))
         pane.detail_requested.connect(self._on_pane_detail_requested)
@@ -4440,6 +4577,20 @@ class PassageReviewSurface(QDialog):
 
     def _calibrated_clock_offset(self, camera_index: int, session_key: str) -> int:
         calibration = self.calibration_store.get(camera_index, session_key)
+        if calibration is None:
+            # Older versions keyed HLS calibrations by the generated window name.
+            aliases = []
+            for saved in self.calibration_store.calibrations():
+                if saved.camera_index != camera_index:
+                    continue
+                parts = saved.session_key.split("|", 2)
+                if len(parts) != 3:
+                    continue
+                path = Path(parts[1]) / (parts[2] + ".m3u8")
+                if path.is_file() and self._recording_session_key_from_path(parts[0], path) == session_key:
+                    aliases.append(saved)
+            if aliases:
+                calibration = max(aliases, key=lambda saved: saved.calibrated_at_ms)
         return int(
             self._continuous_clock_offsets.get(
                 (camera_index, session_key),
@@ -4604,7 +4755,8 @@ class PassageReviewSurface(QDialog):
 
     @staticmethod
     def _recording_session_key_from_path(source_id: str, video_path: Path) -> str:
-        path = Path(video_path).absolute()
+        from .runtime_paths import recording_session_path
+        path = recording_session_path(Path(video_path).absolute())
         stem = _ARCHIVE_SEGMENT_SUFFIX_RE.sub("", path.stem)
         match = re.fullmatch(
             r"(camera_\d+)_\d{8}_\d{6}_\d{6}(?:_review_\d+)?", stem,
@@ -6192,7 +6344,9 @@ class PassageReviewSurface(QDialog):
         row = self.table.currentRow()
         if not 0 <= row < len(self._visible_events):
             return
-        event = self._visible_events[row]
+        self._delete_record(self._visible_events[row])
+
+    def _delete_record(self, event: PassageEvent) -> None:
         store = self.passage_store
         identity = " ".join(value for value in (event.bib, event.athlete_name) if value)
         reason, accepted = QInputDialog.getText(
@@ -7292,6 +7446,7 @@ class PassageReviewSurface(QDialog):
     def _seek_retained_camera_frame(
         self, location: PassageVideoLocation, position_ms: int,
         frame_index: Optional[int] = None, camera_index: int = 1,
+        *, adjacent_boundary_ms: Optional[int] = None, adjacent_direction: int = 0,
     ) -> bool:
         """Open a pinned image's source independently of the overview window.
 
@@ -7328,7 +7483,10 @@ class PassageReviewSurface(QDialog):
         # moved elsewhere. Selection remains the operator's current identity.
         if not pane.rebind_passage(event, location, association):
             pane.set_passage(event, location, association)
-        pane.seek_media_frame(position_ms, frame_index)
+        if adjacent_boundary_ms is None:
+            pane.seek_media_frame(position_ms, frame_index)
+        else:
+            pane.seek_adjacent_frame(adjacent_boundary_ms, adjacent_direction)
         self._shared_delta_ms = position_ms - target
         self._update_shared_time_label()
         return True
@@ -8779,6 +8937,20 @@ class PassageReviewSurface(QDialog):
             self._update_shared_from_pane(pane)
         pane.seek_passage_delta(self._shared_delta_ms, linked_playing=True)
 
+    def _continue_playback(self, pane: PassageEvidencePane) -> None:
+        """▶ that ran to the last frame of a file plays on in the file that continues it.
+
+        Rows open 2.5 s review pieces, so ▶ used to stop every 2.5 s (现代五项
+        10-29, “2 秒割裂感”).  Only forward play of one pane at its file's last
+        frame carries on, through the same neighbour lookup as →; a gap in the
+        recording, synchronised play or reverse play just stops as before.
+        """
+
+        if self._sync_playing or pane not in self.evidence_panes:
+            return
+        if self._step_across_recording_boundary(pane, 1):
+            pane.set_playing(True)
+
     def _step_active_pane(self, frame_delta: int) -> None:
         self._step_pane(self._active_playback_pane(), frame_delta)
 
@@ -8835,8 +9007,12 @@ class PassageReviewSurface(QDialog):
         self,
         pane: PassageEvidencePane,
         frame_delta: int,
+        at_edge: bool = False,
     ) -> bool:
-        """Continue single-frame navigation into an adjacent recording file."""
+        """Continue single-frame navigation into an adjacent recording file.
+
+        AT_EDGE: the decoder itself found no further frame in this file.
+        """
 
         location = pane.location
         worker = getattr(pane, "_worker", None)
@@ -8850,40 +9026,22 @@ class PassageReviewSurface(QDialog):
         frame_count = int(getattr(pane, "_frame_count", 0))
         at_first_frame = frame_index == 0 if frame_index >= 0 else position_ms == 0
         at_last_frame = (
-            frame_count > 0 and frame_index >= frame_count - 1
-        ) or (
-            duration_ms > 0 and position_ms >= duration_ms - frame_ms
+            frame_index >= frame_count - 1
+            if frame_count > 0 and frame_index >= 0
+            else duration_ms > 0 and position_ms >= duration_ms - frame_ms
         )
-        if direction < 0 and not at_first_frame:
+        if not at_edge and direction < 0 and not at_first_frame:
             return False
-        if direction > 0 and not at_last_frame:
+        if not at_edge and direction > 0 and not at_last_frame:
             return False
 
         current = location.segment
-        if pane is self._camera_one_pane():
-            origin = int(current.media_started_at_ms or current.started_at_ms)
-            edge = origin + int(current.media_duration_ms or duration_ms)
-            index = self.video_filmstrip.full_race.index
-            span = index.span_at(edge if direction > 0 else origin - 1)
-            live_boundary = location.video_path.suffix.lower() == ".ts" or (
-                span is not None and span.source is not None
-                and span.source.location.video_path.suffix.lower() == ".ts"
-            )
-            if live_boundary:
-                # Cross closed live files and the archive/live seam without
-                # requiring the next TS to have been opened and saved already.
-                if span is None or span.source is None or not span.source.available:
-                    return False
-                if direction < 0 and span.end_ms < origin:
-                    return False
-                timestamp = edge if direction > 0 else origin - frame_ms
-                target = span.source.location
-                position = max(0, timestamp - span.source.start_ms)
-                fps = float(getattr(pane, "_fps", 0) or 1000 / frame_ms)
-                return self._seek_retained_camera_frame(target, position, round(position * fps / 1000))
         event = self.passage_store.get(self._selected_event_id)
-        if event is None:
-            return False
+        if pane is self._camera_one_pane() or event is None:
+            crossed = self._step_into_neighbour_recording(pane, direction, frame_ms, duration_ms)
+            if not crossed and at_edge:
+                pane.show_navigation_notice("相邻录像暂不可用或存在缺口，已保留当前画面。")
+            return crossed
         current_session_key = self._recording_session_key(location)
         segments = sorted(
             (
@@ -8973,6 +9131,144 @@ class PassageReviewSurface(QDialog):
         )
         self._update_shared_time_label()
         return True
+
+    def _step_into_neighbour_recording(
+        self, pane: PassageEvidencePane, direction: int, frame_ms: int, duration_ms: int,
+    ) -> bool:
+        """Open the frame right after (or before) the one shown, in the file that continues it.
+
+        The neighbour is looked up in the recording index itself, not in the
+        whole-race strip's copy of it (rebuilt in the background, so it can be
+        empty while a recorder reconnects) and not through the selected chip
+        record (the arrival workbench has none): stepping must not stop at the
+        end of a two-second file (古浪 548 → 261).  The same recording session
+        is preferred, then the long archive over its live copies.  A gap in
+        the recording, however short, is never bridged.
+        """
+
+        location = pane.location
+        current = location.segment
+        origin = int(current.media_started_at_ms if current.media_started_at_ms is not None
+                     else current.started_at_ms)
+        edge = origin + int(current.media_duration_ms or duration_ms)
+        boundary = edge if direction > 0 else origin - 1
+        shown = origin + int(getattr(pane, "_current_position_ms", 0))
+        if (direction > 0 and edge - shown - frame_ms
+                > max(frame_ms, PassageReviewSurface.FILMSTRIP_COVERAGE_TOLERANCE_MS)):
+            pane.show_navigation_notice("当前片段提前读取失败，未跳过剩余录像。")
+            return True
+        session = self._recording_session_key(location)
+        neighbours = sorted(
+            (source for source in self._recording_sources_for_step(pane)
+             if source.start_ms <= boundary < source.end_ms
+             and source.location.segment.segment_id != current.segment_id
+             and Path(source.location.video_path) != Path(location.video_path)),
+            key=lambda source: (self._recording_session_key(source.location) != session,
+                                source.priority, source.start_ms - source.end_ms),
+        )
+        for source in neighbours:
+            if not Path(source.location.video_path).is_file():
+                continue
+            store = getattr(self, "timeline_store", None)
+            if store is not None and not store.video_path_is_playable(
+                source.location.video_path, refresh=True,
+            ):
+                continue
+            target = self._aligned_archive(
+                source.location, shown, None if self._is_archive(location) else (location, shown))
+            start = int(target.segment.media_started_at_ms)
+            if direction > 0:  # the first frame after the one shown
+                frame = (shown + frame_ms // 2 - start) // frame_ms + 1
+            else:  # the last frame before it
+                frame = -((start - shown + frame_ms // 2) // frame_ms) - 1
+            last = max(0, -(-(source.end_ms - source.start_ms) // frame_ms) - 1)
+            frame = max(0, min(int(frame), last))
+            return self._seek_retained_camera_frame(
+                target, frame * frame_ms, frame, int(getattr(pane, "camera_index", 1) or 1),
+                adjacent_boundary_ms=shown - start, adjacent_direction=direction,
+            )
+        return False
+
+    @staticmethod
+    def _is_archive(location) -> bool:
+        return "archive" in Path(location.video_path).stem.lower()
+
+    def _archive_on_piece_clock(self) -> bool:
+        """Whether archives are shown on their buffer pieces' clock (the arrival workbench, 10-29)."""
+
+        return False
+
+    def _aligned_archive(self, location, moment_ms, piece=None):
+        """An archive's LOCATION with its clock moved onto its buffer pieces' (see archive_alignment).
+
+        PIECE: (location, recorder ms) of a buffer piece showing a picture of
+        this archive; else one at MOMENT_MS is looked up.  The shift found is
+        kept per archive file.  Anything else, or no picture matched, is
+        returned as it is.
+        """
+
+        segment = location.segment
+        if (not self._archive_on_piece_clock() or not self._is_archive(location)
+                or segment.media_started_at_ms is None):
+            return location
+        start = int(segment.media_started_at_ms)
+        shifts = self.__dict__.setdefault("_archive_shifts", {})  # segment id -> (start, shift)
+        shift = shifts.get(segment.segment_id, (start, None))[1]
+        if shift is None:
+            import cv2
+
+            from .archive_alignment import archive_shift_ms
+
+            piece = piece or self._piece_at(location, int(moment_ms))
+            if piece is None:
+                return location
+            piece_location, piece_ms = piece
+            if piece_location.segment.media_started_at_ms is None:
+                return location  # a piece not timed yet has no picture to match
+            # A picture tried once is not decoded again: unsure (a still scene) or not found.
+            tried = self.__dict__.setdefault("_archive_tries", {})
+            attempt = (segment.segment_id, str(piece_location.video_path), int(piece_ms))
+            if attempt not in tried:
+                # The drift grows from file to file: the nearest archive's shift is the first guess.
+                guess = min(shifts.values(), key=lambda known: abs(known[0] - start), default=(start, 0))[1]
+                try:
+                    tried[attempt] = archive_shift_ms(
+                        piece_location.video_path, piece_location.segment.media_started_at_ms, piece_ms,
+                        location.video_path, start, guess_ms=guess)
+                except (cv2.error, OSError, ValueError):
+                    tried[attempt] = (None, False)
+            shift, sure = tried[attempt]
+            if shift is None:
+                return location
+            if sure:
+                shifts[segment.segment_id] = (start, shift)
+        return replace(location, segment=replace(segment, media_started_at_ms=start - int(shift)))
+
+    def _piece_at(self, archive, moment_ms):
+        """(location, recorder ms) of a buffer piece of ARCHIVE's recording showing MOMENT_MS, or None."""
+
+        camera = int(archive.segment.camera_index)
+        session = self._recording_session_key(archive)
+        sources, _pending = recording_sources(
+            self.timeline_store, camera, self._filmstrip_race_id(),
+            path_available=lambda _path, _live: True)  # only the file used is checked
+        piece = next((source for source in sources
+                      if source.priority == 1 and not self._is_archive(source.location)
+                      and source.start_ms <= moment_ms < source.end_ms
+                      and self._recording_session_key(source.location) == session
+                      and Path(source.location.video_path).is_file()), None)
+        return (piece.location, int(moment_ms)) if piece is not None else None
+
+    def _recording_sources_for_step(self, pane: PassageEvidencePane):
+        """This camera's recordings, closed files and the live tail, read afresh."""
+
+        sources, _pending = recording_sources(
+            self.timeline_store, int(getattr(pane, "camera_index", 1) or 1), self._filmstrip_race_id(),
+            live_locations=self._live_locations_for_filmstrip(pane),
+            # Only the file actually opened is checked, not every file of the race.
+            path_available=lambda _path, _live: True,
+        )
+        return sources
 
     def _navigate_video_candidate(
         self,

@@ -12,6 +12,9 @@ from pathlib import Path
 
 CONFIG_PATH = Path("finish_problems/analysis_config.json")
 CROP_MODES = ("up", "side-right", "side-left")
+# A line drawn before the race scope was known may belong to an earlier race
+# of the same folder; it carries over to other sessions for a day only.
+PRE_RACE_LINE_CARRY_MS = 24 * 60 * 60 * 1000
 
 
 def read_settings(root: Path) -> dict:
@@ -66,10 +69,40 @@ def model_fingerprint(path: Path, input_size: int) -> str:
     return digest.hexdigest()
 
 
+def profile_scope_matches(profile, race_id: str, stage_id: str) -> bool:
+    """An empty race/stage is a pre-race line: it applies once the scope is known.
+
+    The session id still binds the profile to this recording, so the wildcard
+    cannot leak a line into another race of the same folder.
+    """
+
+    return ((not profile.get("race_id") or profile.get("race_id") == race_id)
+            and (not profile.get("stage_id") or profile.get("stage_id") == stage_id))
+
+
 def profile_for_segment(profiles, segment, race_id: str, stage_id: str) -> dict | None:
-    matches = [p for p in profiles if p.get("race_id") == race_id and p.get("stage_id", "") == stage_id
+    matches = [p for p in profiles if profile_scope_matches(p, race_id, stage_id)
                and int(p["camera_index"]) == segment.camera_index and p["session_id"] == segment.session_id
                and int(p["effective_from_ms"]) <= segment.start_ms]
+    if not matches:
+        return None
+    return max(matches, key=lambda p: (int(p["effective_from_ms"]), int(p["revision"])))
+
+
+def inherited_profile(profiles, camera_index: int, at_ms: int, race_id: str) -> dict | None:
+    """The camera's latest line drawn before ``at_ms``, from any recording session.
+
+    A restart, a build switch or a second instance starts a session without a
+    profile of its own, and re-saving the line later must not orphan it: the
+    camera did not move because the program restarted.  A line carries over
+    within its race (into later stages too, like the camera default); a
+    pre-race line only for ``PRE_RACE_LINE_CARRY_MS``.
+    """
+
+    matches = [p for p in profiles if int(p["camera_index"]) == int(camera_index)
+               and int(p["effective_from_ms"]) <= int(at_ms)
+               and (p.get("race_id") == race_id if p.get("race_id")
+                    else int(at_ms) - int(p["effective_from_ms"]) < PRE_RACE_LINE_CARRY_MS)]
     if not matches:
         return None
     return max(matches, key=lambda p: (int(p["effective_from_ms"]), int(p["revision"])))
@@ -78,7 +111,7 @@ def profile_for_segment(profiles, segment, race_id: str, stage_id: str) -> dict 
 def crosses_profile_boundary(profiles, segment, race_id: str, stage_id: str) -> bool:
     # A partially retained archive may straddle a later short-segment setting.
     # Do not sample its uncovered tail with the earlier geometry.
-    return any(p.get("race_id") == race_id and p.get("stage_id", "") == stage_id
+    return any(profile_scope_matches(p, race_id, stage_id)
                and int(p["camera_index"]) == segment.camera_index and p["session_id"] == segment.session_id
                and segment.start_ms < int(p["effective_from_ms"]) < segment.end_ms for p in profiles)
 
@@ -93,24 +126,41 @@ class AnalysisSettingsStore:
         self.payload = read_settings(root)
 
     def save(self, *, race_id: str, stage_id: str, segment, line: dict,
-             model_path: str, crop_mode: str) -> dict:
+             model_path: str, crop_mode: str, effective_from_ms: int | None = None) -> dict:
         points = normalized_points(line)
-        if not race_id or not segment.session_id or crop_mode not in CROP_MODES:
-            raise ValueError("缺少赛事/录制会话，或取景方式无效")
+        # An empty race_id is the pre-race case: the line is tied to the
+        # recording session now and picks up the race scope when it arrives.
+        if not segment.session_id or crop_mode not in CROP_MODES:
+            raise ValueError("缺少录制会话，或取景方式无效")
         current = self.path.read_bytes() if self.path.exists() else None
         if current != self.original:
             raise ValueError("配置已被其他窗口修改，请重新打开后编辑")
         payload = deepcopy(self.payload)
         profiles = payload.setdefault("sampling_profiles", [])
         revision = max((int(p["revision"]) for p in profiles), default=0) + 1
+        starts_at = int(effective_from_ms) if effective_from_ms is not None else int(segment.start_ms)
         profile = dict(camera_index=segment.camera_index, race_id=race_id, stage_id=stage_id,
-                       session_id=segment.session_id, effective_from_ms=segment.start_ms,
+                       session_id=segment.session_id, effective_from_ms=min(starts_at, int(segment.start_ms)),
                        revision=revision, points=points, snap=bool(line.get("snap", False)))
         previous = profile_for_segment(profiles, segment, race_id, stage_id)
         if previous and previous["points"] == points and bool(previous.get("snap")) == profile["snap"]:
             profile = previous
         else:
             profiles.append(profile)
+        # Draw once at the start of the race.  This copy is the camera's
+        # default line: a new recording session (app restart, build switch,
+        # second instance) has no profile of its own, and without a default
+        # the batch detector silently skips it.  A later session profile still
+        # overrides this copy when the camera moves.
+        defaults = payload.get("finish_lines")
+        defaults = defaults if isinstance(defaults, list) else []
+        camera_index = int(segment.camera_index)
+        defaults = [item for item in defaults
+                    if not (isinstance(item, dict) and int(item.get("camera_index", 0) or 0) == camera_index)]
+        defaults.append(dict(camera_index=camera_index, race_id=race_id, stage_id=stage_id,
+                             effective_from_ms=min(starts_at, int(segment.start_ms)),
+                             points=points, snap=bool(line.get("snap", False))))
+        payload["finish_lines"] = defaults
         payload["model_path"] = model_path.strip()
         payload.setdefault("crop_modes", {})[str(segment.camera_index)] = crop_mode
         payload["settings_revision"] = int(payload.get("settings_revision", 0)) + 1

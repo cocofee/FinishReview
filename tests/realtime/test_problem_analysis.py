@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ from realtime.problem_analysis import (
     analyse_camera,
     config_from_workspace,
     extract_strips,
+    missing_line_item,
     run_offline_analysis,
     write_problem_list,
 )
@@ -131,8 +133,10 @@ def test_settle_run_reports_a_chip_outside_the_recording_as_a_coverage_gap(synth
         PassageEvent(event_id=f"{RACE}-stage-1-passage-90", race_id=RACE, stage_id="stage-1", group_id="1",
                      sequence=90, bib="900", passage_time_ms=after - DAY, lap=0, passage_timestamp_ms=after,
                      received_at_ms=after + 300, group_name="男子组"),
+        # Sequence follows crossing order in the real feed; keep this synthetic
+        # feed consistent so the earlier read is not mistaken for a manual entry.
         PassageEvent(event_id=f"{RACE}-stage-1-passage-91", race_id=RACE, stage_id="stage-1", group_id="1",
-                     sequence=91, bib="901", passage_time_ms=before - DAY, lap=0, passage_timestamp_ms=before,
+                     sequence=89, bib="901", passage_time_ms=before - DAY, lap=0, passage_timestamp_ms=before,
                      received_at_ms=before + 300, group_name="男子组"),
     ])
     reads = (*workspace.reads, *outside)
@@ -185,8 +189,19 @@ def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_
         index += 1
     capture.release()
     config = AnalysisConfig(workspace=tmp_path, live=True, render_cards=False, min_available_mb=0)
-    live = run_offline_analysis(config, lower_priority=False)
+    publications = []
+
+    def progress(stage, done, total):
+        if stage == "清单已发布":
+            publications.append(json.loads((tmp_path / "finish_problems/problem_list.json").read_text(encoding="utf-8")))
+
+    live = run_offline_analysis(config, lower_priority=False, progress=progress)
     payload = json.loads((tmp_path / "finish_problems/problem_list.json").read_text(encoding="utf-8"))
+    assert len(publications) > 1
+    assert publications[0]["cameras"]["1"]["files"] < index
+    assert publications[0]["cameras"]["1"]["pending_segments"] > 0
+    assert publications[-1]["cameras"]["1"]["pending_segments"] == 0
+    assert live["performance"]["new_video_seconds"] == 95
     assert live["summary"]["auto_passed"] >= len(CROSSINGS_S) - 2
     before = {item["frame"]["segment_id"] for item in payload["auto_passed"]}
     archive = tmp_path / "camera_01_session_archive_0000.avi"
@@ -209,6 +224,25 @@ def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_
     repaired = json.loads((tmp_path / "finish_problems/problem_list.json").read_text(encoding="utf-8"))
     bibs = [item["bib"] for item in repaired["auto_passed"]]
     assert len(bibs) == len(set(bibs)) == len(CROSSINGS_S)
+
+
+def test_pending_cache_holes_wait_instead_of_reporting_missing_video():
+    from types import SimpleNamespace
+    from realtime.problem_items import KIND_NO_VIDEO, KIND_WAITING, ProblemItem, CATEGORY_VIDEO
+
+    segment = SimpleNamespace(start_ms=2000, end_ms=4000, excluded_ranges=(), segment=SimpleNamespace(segment_id="hole"))
+    reads = [SimpleNamespace(event_id=f"event{i}", read_id=f"read{i}", chip_ms=2500 + i * 200,
+                             bib=str(i), excluded=False, manual_entry=False) for i in range(2)]
+    result = dict(camera_index=1, coverage=[[0, 2000, "s"], [4000, 20000, "s"]], analyzed_through_ms=10000,
+                  model=SimpleNamespace(to_recorder=lambda t: t),
+                  items=[ProblemItem(f"gap{i}", KIND_NO_VIDEO, CATEGORY_VIDEO, "gap", chip_time_ms=r.chip_ms,
+                                     event_ids=(r.event_id,)) for i, r in enumerate(reads)])
+    problem_analysis._live_progress(result, [segment], [segment], [], AnalysisConfig(Path("."), live=True), reads)
+    assert result["pending_video_ranges"] == [[2000, 4000]]
+    assert result["scanned_through_ms"] == 2000
+    assert result["analyzed_through_ms"] <= 2000
+    assert [i.kind for i in result["items"]] == [KIND_WAITING, KIND_WAITING]
+    assert {r.event_id for r in reads} == {eid for i in result["items"] for eid in i.event_ids}
 
 
 def test_clean_race_auto_passes_every_rider(synthetic_race):
@@ -681,6 +715,26 @@ def test_without_a_usable_anchor_the_camera_still_waits(synthetic_race, tmp_path
     assert not (config.resolved_output() / "video_clock_models.jsonl").exists()
 
 
+@pytest.mark.parametrize("days", [0, 1])
+def test_uncalibrated_chip_keeps_reference_video_without_claiming_a_crossing(synthetic_race, tmp_path, days):
+    from realtime.problem_items import KIND_WAITING
+
+    _root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    original = workspace.reads[0]
+    read = replace(original, chip_ms=original.chip_ms + days * 86_400_000)
+    result = analyse_camera(replace(config, live=True), workspace, 1, strips, reads=(read,))
+
+    waiting, = result["items"]
+    assert waiting.kind == KIND_WAITING and waiting.status == "waiting"
+    assert waiting.chip_time_ms == read.chip_ms
+    assert "frame" not in waiting.evidence  # Not a detected/paired crossing.
+    reference = waiting.evidence["reference_frame"]
+    assert reference["reference_only"] is True and reference["date_aligned"] == bool(days)
+    assert reference["position_ms"] == pytest.approx(original.chip_ms - START, abs=50)
+    assert waiting.evidence["evidence_timestamp_ms"] == original.chip_ms
+    assert result["auto_passed"] == [] and result.get("model") is None
+
+
 def test_video_model_runs_before_first_rider_calibration(synthetic_race, tmp_path, monkeypatch):
     """A finish-line camera can be tested with a walking person before chips arrive."""
 
@@ -731,17 +785,44 @@ def test_obstructed_line_events_need_verified_crossings_before_entering_the_queu
 
     assert result["analyzed_through_ms"] > START
     assert result["calibration_pending"] and not result["auto_passed"]
-    assert result["crossings"] == (len(CROSSINGS_S) if state == "confirmed" else 0)
-    if state == "confirmed":
+    assert result["crossings"] == (0 if state == "not_crossed" else len(CROSSINGS_S))
+    if state in ("confirmed", "unverified"):
+        # Both are real line changes awaiting a clock; an unverified track is
+        # kept once as a crossing candidate, not duplicated as line_activity.
         assert all(i.status == "disputed" and i.kind == KIND_NO_CHIP_CROSSING for i in result["items"])
-    elif state == "unverified":
-        assert all(i.kind == "line_activity" and i.evidence["frame"] for i in result["items"])
         assert len(result["items"]) == len(CROSSINGS_S)
     else:
         assert result["items"] == []
     saved = json.loads((config.resolved_output() / "crossings_camera1.json").read_text(encoding="utf-8"))
     assert len(saved["crossings"]) == result["crossings"]
     assert len(saved["line_events"]) == len(CROSSINGS_S)
+
+
+def test_verification_runtime_reopens_a_replaced_video(tmp_path, monkeypatch):
+    opened, closed = [], []
+
+    class Reader:
+        def __init__(self, path, threads):
+            opened.append(self)
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(problem_analysis, "FrameReader", Reader)
+    video = tmp_path / "sealed.ts"
+    video.write_bytes(b"original")
+    runtime = problem_analysis._VerificationRuntime()
+    try:
+        first = runtime.reader(video, 1)
+        assert runtime.reader(video, 1) is first
+        video.write_bytes(b"replacement")
+        second = runtime.reader(video, 1)
+        assert second is not first and first in closed
+        assert runtime.reader(video, 2) is not second
+        assert second in closed
+    finally:
+        runtime.close()
+    assert len(opened) == len(closed) == 3
 
 
 def test_crossing_gate_can_read_context_across_two_second_segments(tmp_path, monkeypatch):
@@ -789,17 +870,33 @@ def test_crossing_gate_can_read_context_across_two_second_segments(tmp_path, mon
     monkeypatch.setattr(problem_analysis, "FrameReader", Reader)
     monkeypatch.setattr(problem_analysis, "YoloxDetector", Detector)
     config = AnalysisConfig(tmp_path, model_path=model)
+    runtime = problem_analysis._VerificationRuntime()
     result = problem_analysis._verify_crossing_candidates(
-        config, 1, files, [crossing], progress=lambda *a: None, checkpoint=None,
+        config, 1, files, [crossing], progress=lambda *a: None, checkpoint=None, runtime=runtime,
     )
     assert result[crossing.key].state == "confirmed"
     assert opened == [str(tmp_path / "part0.ts"), str(tmp_path / "part1.ts")]
     assert requested[-1] == (str(tmp_path / "part1.ts"), 560)
+    # Another event at the same crop/time reuses decoded detections, not a
+    # second three-frame model pass. A new batch also retains the model.
+    overlapping = replace(crossing, row=1)
+    again = problem_analysis._verify_crossing_candidates(
+        config, 1, files, [overlapping], progress=lambda *a: None, checkpoint=None, runtime=runtime,
+    )
+    assert again[overlapping.key].state == "confirmed"
+    assert len(requested) == 3 and len(opened) == 2
+    runtime.close()
     # A cached verified event does not repeat model inference.
     monkeypatch.setattr(problem_analysis, "YoloxDetector", lambda *a: pytest.fail("cache missed"))
     assert problem_analysis._verify_crossing_candidates(
         config, 1, files, [crossing], progress=lambda *a: None, checkpoint=None,
     )[crossing.key].state == "confirmed"
+    monkeypatch.setattr(problem_analysis, "VERIFICATION_VERSION", problem_analysis.VERIFICATION_VERSION + 1)
+    monkeypatch.setattr(problem_analysis, "YoloxDetector", Detector)
+    assert problem_analysis._verify_crossing_candidates(
+        config, 1, files, [crossing], progress=lambda *a: None, checkpoint=None,
+    )[crossing.key].state == "confirmed"
+    assert len(requested) == 6  # Old-rule verdicts cannot bypass a new gate.
     # A different line/profile cannot supply the missing neighbour.
     files[1].meta["line_digest"] = "changed"
     assert len(problem_analysis._verification_sources(files, crossing)) == 2
@@ -836,6 +933,28 @@ def test_scanned_empty_video_advances_without_chips_or_clock_calibration(synthet
     assert result["analyzed_through_ms"] == START + 85_000
     assert result["items"] == [] and result["crossings"] == 0
     assert result["bike_status"]["state"] == "no_candidates"
+    assert result["crossing_verification"]["state"] == "no_candidates"
+
+
+def test_calibrated_camera_does_not_relabel_model_failure_as_no_candidates(synthetic_race, tmp_path, monkeypatch):
+    from realtime.target_crossing import TargetCrossingCheck
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    _record_first_rider(root, workspace.reads[0])
+    workspace = AnalysisWorkspace(root)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
+        c.key: TargetCrossingCheck("unverified", "model_failed") for c in crossings
+    })
+
+    result = analyse_camera(replace(config, model_path=model), workspace, 1, strips)
+
+    assert result["calibration"]["source"] == "manual_anchor"
+    assert result["bike_status"]["state"] == "failed"
+    assert result["crossing_verification"]["state"] == "failed"
+    assert not result["auto_passed"]
+    assert len([i for i in result["items"] if i.kind == "line_activity"]) == len(CROSSINGS_S)
 
 
 def test_an_anchor_of_another_recording_session_cannot_start_pairing(synthetic_race, tmp_path):
@@ -929,3 +1048,15 @@ def test_an_anchor_serves_only_its_own_recording_session(synthetic_race, tmp_pat
     assert waiting.bibs == ("777",) and "235959" in waiting.detail
     assert result["waiting_reads"] == 1
     assert any("没有自动校时或人工首人锚点" in text for text in result["calibration_warnings"])
+
+
+def test_a_recording_without_a_line_names_its_hours_and_the_fix():
+    from types import SimpleNamespace
+    head = SimpleNamespace(start_ms=START, end_ms=START + 300_000, segment=SimpleNamespace(segment_id="a"),
+                           excluded_ranges=((START + 120_000, START + 300_000),))
+    tail = SimpleNamespace(start_ms=START + 301_000, end_ms=START + 360_000, segment=SimpleNamespace(segment_id="b"),
+                           excluded_ranges=())
+    item = missing_line_item(1, [head, tail])
+    assert item.evidence["ranges"] == [[START, START + 120_000], [START + 301_000, START + 360_000]]
+    assert item.detail.startswith("录像 10:00:00–10:02:00、10:05:01–10:06:00 没有终点线")
+    assert "未检测，不能算核清" in item.detail and "「终点线 / 模型」" in item.detail

@@ -40,7 +40,7 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
-def _write_list(root, items, auto_passed):
+def _write_list(root, items, auto_passed, cameras=None):
     directory = root / "finish_problems"
     (directory / "cards").mkdir(parents=True, exist_ok=True)
     ok, data = cv2.imencode(".jpg", np.full((120, 120, 3), 90, np.uint8))
@@ -51,6 +51,8 @@ def _write_list(root, items, auto_passed):
         "schema_version": 1, "summary": {"auto_passed": len(auto_passed), "unverifiable": 3},
         "items": [item.to_payload() for item in items], "auto_passed": auto_passed,
     }
+    if cameras is not None:
+        payload["cameras"] = cameras
     (directory / "problem_list.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
@@ -314,11 +316,28 @@ def test_live_scheduler_serializes_pauses_and_drains_last_segment(qapp, tmp_path
     panel.live_tick(True)
     assert panel._process is process
     panel._analysis_done(0)
+    import time
+    assert panel._next_analysis - time.monotonic() < 1
     panel._next_analysis = 0
     panel.live_tick(False)
     assert panel._process is not None
     assert "--live-problems" not in panel._process.arguments()
     assert "--finish-live-problems" in panel._process.arguments()
+    panel.stop_analysis()
+
+
+def test_incremental_publication_refreshes_before_worker_finishes(qapp, tmp_path, monkeypatch):
+    from PyQt5.QtCore import QProcess
+    monkeypatch.setattr(QProcess, "start", lambda self: None)
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    panel._start_analysis()
+    process = panel._process
+    refreshed = []
+    monkeypatch.setattr(panel, "refresh", lambda: refreshed.append(True))
+    panel._consume_progress((json.dumps({"stage": "清单已发布", "done": 1, "total": 1}) + "\n").encode("utf-8"))
+    assert refreshed == [True]
+    assert panel._process is process
     panel.stop_analysis()
 
 
@@ -334,6 +353,19 @@ def test_waiting_evidence_cannot_be_resolved(qapp, tmp_path):
     assert panel.current_item() == waiting
     assert not panel.action_buttons
     assert not panel.hold_button.isEnabled()
+
+
+def test_a_recording_without_a_finish_line_is_flagged_at_the_top(qapp, tmp_path):
+    _write_list(tmp_path, _items(), [], cameras={"1": {"missing_line_ranges": [[T, T + 172_000]],
+                                                       "missing_line_segments": ["a"]}})
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    assert not panel.coverage_alert.isHidden()
+    assert "未检测，不能算核清" in panel.coverage_alert.text()
+    assert "机位 1 录像 10:13:20–10:16:12" in panel.coverage_alert.text()
+    _write_list(tmp_path, _items(), [], cameras={"1": {"missing_line_ranges": []}})
+    panel.refresh()
+    assert panel.coverage_alert.isHidden()
 
 
 def test_superseded_problem_keeps_draft_but_cannot_be_submitted(qapp, tmp_path):
@@ -430,7 +462,10 @@ def test_crossing_order_survives_backtracking_editing_and_undo(qapp, tmp_path):
     assert panel.count_table.currentRow() == 1  # 新点的是第三条原记录、第二行过线
     assert [mark["recorder_ms"] for mark in panel.current_marks()] == [T + 300, T + 100, T + 100]
 
+    jumps = []
+    panel.jump_requested.connect(jumps.append)
     panel.count_table.setCurrentCell(0, 0)
+    assert jumps == []  # 换人不动画面：整团逐帧看，跳到某人的帧就认不出谁是谁。
     panel.bib_input.setText("057")
     panel.assign_button.click()
     assert panel.current_marks()[1]["bib"] == "057"
@@ -463,8 +498,11 @@ def test_the_chip_time_column_uses_each_events_official_time(qapp, tmp_path):
     assert [panel.count_table.item(row, 3).text() for row in range(2)] == [
         format_chip_time(T + 100), format_chip_time(T + 150)]
     assert [panel.count_table.item(row, 0).text() for row in range(2)] == ["待看", "待看"]
+    jumps = []
+    panel.jump_requested.connect(jumps.append)
     panel.count_table.setCurrentCell(0, 0)
     assert panel.person_box.isHidden()  # 芯片读数不是已确认的画面选手。
+    assert jumps == []
     panel.close()
 
 
