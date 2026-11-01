@@ -613,6 +613,136 @@ def test_playback_worker_decodes_frames_and_stops_cleanly(qapp):
     assert capture.released is True
 
 
+@pytest.mark.parametrize("direction,initial_frame", [(1, 3), (-1, 0)])
+def test_step_past_last_or_first_frame_emits_boundary(qapp, direction, initial_frame):
+    capture = _FakeCapture()
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"), capture_factory=lambda _path: capture,
+        reverse_prefetch=False, idle_prefetch=False,
+    )
+    frames, boundaries, errors = [], [], []
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def on_frame(_image, _position, frame_index):
+        frames.append(frame_index)
+        worker.step(direction)
+
+    worker.pause()
+    worker.metadata_ready.connect(lambda *_args: worker.seek_frame(initial_frame))
+    worker.frame_ready.connect(on_frame)
+    worker.step_boundary_reached.connect(boundaries.append)
+    worker.step_boundary_reached.connect(lambda _direction: finish())
+    worker.playback_error.connect(errors.append)
+    worker.step_failed.connect(errors.append)
+    timer.timeout.connect(finish)
+    timer.start(2000)
+    worker.start()
+    loop.exec_()
+    timer.stop()
+    assert worker.wait(2000)
+    assert boundaries == [direction]
+    assert frames == [initial_frame]
+    assert not errors
+
+
+@pytest.mark.parametrize("suffix", [".mkv", ".ts"])
+def test_step_emits_eof_boundary_before_inflated_reported_frame_count(qapp, suffix):
+    class InflatedCapture(_FakeCapture):
+        def get(self, property_id):
+            return 20 if property_id == cv2.CAP_PROP_FRAME_COUNT else super().get(property_id)
+
+    capture = InflatedCapture()
+    worker = VideoPlaybackWorker(
+        Path("recording" + suffix), capture_factory=lambda _path: capture,
+        reverse_prefetch=False, idle_prefetch=False,
+    )
+    frames, boundaries, errors = [], [], []
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    def on_frame(_image, _position, frame_index):
+        frames.append(frame_index)
+        worker.step(1)
+
+    worker.pause()
+    worker.metadata_ready.connect(lambda *_args: worker.seek_frame(3))
+    worker.frame_ready.connect(on_frame)
+    worker.step_boundary_reached.connect(boundaries.append)
+    worker.step_boundary_reached.connect(lambda _direction: finish())
+    worker.step_failed.connect(errors.append)
+    worker.playback_error.connect(errors.append)
+    timer.timeout.connect(finish)
+    timer.start(2000)
+    worker.start()
+    loop.exec_()
+    timer.stop()
+    assert worker.wait(2000)
+    assert boundaries == [1]
+    assert frames == [3]
+    assert not errors
+
+
+@pytest.mark.parametrize("failure", ["seek", "decode_exception", "wrong_frame"])
+def test_step_decode_failure_is_not_reported_as_recording_boundary(qapp, failure):
+    class FailedSeekCapture(_FakeCapture):
+        def set(self, property_id, value):
+            if failure == "seek" and property_id == cv2.CAP_PROP_POS_FRAMES and int(value) == 30:
+                return False
+            return super().set(property_id, value)
+
+        def read(self):
+            if failure == "decode_exception" and self.position == 30:
+                raise cv2.error("corrupt frame")
+            return super().read()
+
+        def get(self, property_id):
+            if failure == "wrong_frame" and property_id == cv2.CAP_PROP_POS_FRAMES and self.position == 31:
+                return 29
+            return super().get(property_id)
+
+    capture = FailedSeekCapture(frame_count=40)
+    worker = VideoPlaybackWorker(
+        Path("recording.mkv"), capture_factory=lambda _path: capture,
+        reverse_prefetch=False, idle_prefetch=False,
+    )
+    boundaries, errors = [], []
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+
+    def finish():
+        worker.stop()
+        loop.quit()
+
+    worker.pause()
+    worker.metadata_ready.connect(lambda *_args: worker.seek_frame(10))
+    worker.frame_ready.connect(lambda *_args: worker.step(20))
+    worker.step_boundary_reached.connect(boundaries.append)
+    worker.step_failed.connect(errors.append)
+    worker.step_failed.connect(lambda _message: finish())
+    timer.timeout.connect(finish)
+    timer.start(2000)
+    worker.start()
+    loop.exec_()
+    timer.stop()
+    assert worker.wait(2000)
+    assert not boundaries
+    assert len(errors) == 1
+    assert worker.current_frame_index == 10
+    assert worker._navigation_frame_index == 10
+
+
 def test_hls_worker_uses_sequential_timestamps_when_metadata_doubles_fps(
     qapp,
     tmp_path,
