@@ -414,6 +414,7 @@ class VideoPlaybackWorker(QThread):
     full_resolution_error = pyqtSignal(str, int)
     playback_finished = pyqtSignal()
     step_boundary_reached = pyqtSignal(int)
+    step_failed = pyqtSignal(str)
     playback_error = pyqtSignal(str)
 
     REVERSE_WINDOW_SECONDS = 0.5
@@ -446,6 +447,7 @@ class VideoPlaybackWorker(QThread):
         self._seek_frame: Optional[tuple[int, int]] = None
         self._full_resolution_frame: Optional[tuple[int, int]] = None
         self._step_frame: Optional[tuple[int, int]] = None
+        self._decode_read_failed_frame: Optional[int] = None
         self._navigation_frame_index = -1
         self._request_generation = 0
         self._anchor_reset = True
@@ -603,9 +605,10 @@ class VideoPlaybackWorker(QThread):
             base_frame = self._navigation_frame_index
             if base_frame < 0:
                 base_frame = self._current_frame_index
-            target = self._clamp_frame(max(0, base_frame) + frame_delta)
+            requested = max(0, base_frame) + frame_delta
+            target = self._clamp_frame(requested)
             self._navigation_frame_index = target
-            self._step_frame = (target, self._request_generation)
+            self._step_frame = (requested, self._request_generation)
             self._set_navigation_request_locked("step", target)
             self._condition.notify_all()
 
@@ -1235,6 +1238,7 @@ class VideoPlaybackWorker(QThread):
         reverse_window: bool = False,
     ) -> tuple[bool, int]:
         decode_started = time.perf_counter()
+        self._decode_read_failed_frame = None
         if self._decode_request_cancelled(generation):
             return True, capture_next_frame
         if reverse_window and generation is not None:
@@ -1318,6 +1322,7 @@ class VideoPlaybackWorker(QThread):
 
         ok, frame = capture.read()
         if not ok:
+            self._decode_read_failed_frame = target
             return False, capture_next_frame
         if self._sequential_capture:
             actual_frame_index = target
@@ -1375,6 +1380,7 @@ class VideoPlaybackWorker(QThread):
             frame_index = capture_next_frame
             ok, frame = capture.read()
             if not ok:
+                self._decode_read_failed_frame = frame_index
                 return False, capture_next_frame
             capture_next_frame = frame_index + 1
             if self._decode_request_cancelled(generation):
@@ -1624,17 +1630,31 @@ class VideoPlaybackWorker(QThread):
                         if not self._decode_request_cancelled(generation):
                             self.step_boundary_reached.emit(direction)
                         continue
-                    ok, capture_next_frame = self._decode_target(
-                        capture,
-                        target,
-                        capture_next_frame,
-                        generation=generation,
-                        reverse_window=target < last_frame_index,
-                    )
+                    try:
+                        ok, capture_next_frame = self._decode_target(
+                            capture,
+                            target,
+                            capture_next_frame,
+                            generation=generation,
+                            reverse_window=target < last_frame_index,
+                        )
+                    except cv2.error:
+                        ok = False
+                        self._decode_read_failed_frame = None
                     if ok and not self._decode_request_cancelled(generation):
                         last_frame_index = target
                     elif not self._decode_request_cancelled(generation):
-                        self.step_boundary_reached.emit(direction)
+                        # Only a failed read of the immediately following frame
+                        # is a possible EOF; seek/decoder errors are not seams.
+                        if (target == last_frame_index + 1
+                                and self._decode_read_failed_frame == target):
+                            with self._condition:
+                                self._navigation_frame_index = last_frame_index
+                            self.step_boundary_reached.emit(1)
+                        else:
+                            with self._condition:
+                                self._navigation_frame_index = last_frame_index
+                            self.step_failed.emit("逐帧读取失败，已保留当前画面，请重试。")
                     continue
 
                 if full_resolution_frame is not None:

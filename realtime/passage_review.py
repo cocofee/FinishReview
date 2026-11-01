@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
+import math
 from pathlib import Path
 import re
 import time
@@ -1986,6 +1987,7 @@ class PassageEvidencePane(QFrame):
         self._last_full_resolution_request = -1
         self.quality_label.clear()
         self.timeline.setProperty("initial_frame_index", None)
+        self.timeline.setProperty("initial_adjacent_frame", None)
         self._full_resolution_timer.stop()
         self._reset_video_scrub()
         self.play_btn.setText("▶")
@@ -2105,6 +2107,8 @@ class PassageEvidencePane(QFrame):
         worker.playback_finished.connect(self._on_playback_finished)
         if hasattr(worker, "step_boundary_reached"):
             worker.step_boundary_reached.connect(self._on_step_boundary_reached)
+        if hasattr(worker, "step_failed"):
+            worker.step_failed.connect(self._on_step_failed)
         worker.playback_error.connect(self._on_playback_error)
         self._worker = worker
         if not defer_worker_start:
@@ -2245,7 +2249,11 @@ class PassageEvidencePane(QFrame):
         self._set_transport_enabled(True)
         initial_frame = self.timeline.property("initial_frame_index")
         self.timeline.setProperty("initial_frame_index", None)
-        if initial_frame is not None and hasattr(self._worker, "seek_frame"):
+        adjacent_frame = self.timeline.property("initial_adjacent_frame")
+        self.timeline.setProperty("initial_adjacent_frame", None)
+        if adjacent_frame is not None:
+            self.seek_adjacent_frame(*adjacent_frame)
+        elif initial_frame is not None and hasattr(self._worker, "seek_frame"):
             self._worker.seek_frame(int(initial_frame))
         else:
             self._worker.seek(target_ms)
@@ -2273,6 +2281,26 @@ class PassageEvidencePane(QFrame):
             worker.seek_frame(int(frame_index))
         else:
             worker.seek(int(position_ms))
+
+    def seek_adjacent_frame(self, boundary_position_ms: int, direction: int) -> None:
+        """Select the first frame strictly beyond a seam in the new file's FPS."""
+        worker = self._worker
+        if worker is None:
+            return
+        self.set_playing(False)
+        if self._fps <= 0:
+            self.timeline.setProperty("initial_adjacent_frame", (boundary_position_ms, direction))
+            return
+        boundary_frame = boundary_position_ms * self._fps / 1000.0
+        frame = (
+            math.ceil((boundary_position_ms + 1) * self._fps / 1000.0)
+            if direction > 0 else math.ceil(boundary_frame) - 1
+        )
+        frame = max(0, min(frame, self._frame_count - 1)) if self._frame_count else max(0, frame)
+        if hasattr(worker, "seek_frame"):
+            worker.seek_frame(frame)
+        else:
+            worker.seek(int(math.ceil(frame * 1000.0 / self._fps)))
 
     def _on_frame_ready(self, image, position_ms: int, frame_index: int) -> None:
         if self.sender() is not self._worker:
@@ -2540,6 +2568,14 @@ class PassageEvidencePane(QFrame):
         if self.sender() is not self._worker:
             return
         self.step_boundary_reached.emit(1 if int(direction) > 0 else -1)
+
+    def show_navigation_notice(self, message: str) -> None:
+        self.quality_label.setText(message)
+        self.quality_label.setToolTip(message)
+
+    def _on_step_failed(self, message: str) -> None:
+        if self.sender() is self._worker:
+            self.show_navigation_notice(message)
 
     def _on_playback_error(self, message: str) -> None:
         if self.sender() is not self._worker:
@@ -7400,6 +7436,7 @@ class PassageReviewSurface(QDialog):
     def _seek_retained_camera_frame(
         self, location: PassageVideoLocation, position_ms: int,
         frame_index: Optional[int] = None, camera_index: int = 1,
+        *, adjacent_boundary_ms: Optional[int] = None, adjacent_direction: int = 0,
     ) -> bool:
         """Open a pinned image's source independently of the overview window.
 
@@ -7436,7 +7473,10 @@ class PassageReviewSurface(QDialog):
         # moved elsewhere. Selection remains the operator's current identity.
         if not pane.rebind_passage(event, location, association):
             pane.set_passage(event, location, association)
-        pane.seek_media_frame(position_ms, frame_index)
+        if adjacent_boundary_ms is None:
+            pane.seek_media_frame(position_ms, frame_index)
+        else:
+            pane.seek_adjacent_frame(adjacent_boundary_ms, adjacent_direction)
         self._shared_delta_ms = position_ms - target
         self._update_shared_time_label()
         return True
@@ -8962,9 +9002,9 @@ class PassageReviewSurface(QDialog):
         frame_count = int(getattr(pane, "_frame_count", 0))
         at_first_frame = frame_index == 0 if frame_index >= 0 else position_ms == 0
         at_last_frame = (
-            frame_count > 0 and frame_index >= frame_count - 1
-        ) or (
-            duration_ms > 0 and position_ms >= duration_ms - frame_ms
+            frame_index >= frame_count - 1
+            if frame_count > 0 and frame_index >= 0
+            else duration_ms > 0 and position_ms >= duration_ms - frame_ms
         )
         if not at_edge and direction < 0 and not at_first_frame:
             return False
@@ -8974,7 +9014,10 @@ class PassageReviewSurface(QDialog):
         current = location.segment
         event = self.passage_store.get(self._selected_event_id)
         if pane is self._camera_one_pane() or event is None:
-            return self._step_into_neighbour_recording(pane, direction, frame_ms, duration_ms)
+            crossed = self._step_into_neighbour_recording(pane, direction, frame_ms, duration_ms)
+            if not crossed and at_edge:
+                pane.show_navigation_notice("相邻录像暂不可用或存在缺口，已保留当前画面。")
+            return crossed
         current_session_key = self._recording_session_key(location)
         segments = sorted(
             (
@@ -9086,6 +9129,10 @@ class PassageReviewSurface(QDialog):
         edge = origin + int(current.media_duration_ms or duration_ms)
         boundary = edge if direction > 0 else origin - 1
         shown = origin + int(getattr(pane, "_current_position_ms", 0))
+        if (direction > 0 and edge - shown - frame_ms
+                > max(frame_ms, PassageReviewSurface.FILMSTRIP_COVERAGE_TOLERANCE_MS)):
+            pane.show_navigation_notice("当前片段提前读取失败，未跳过剩余录像。")
+            return True
         session = self._recording_session_key(location)
         neighbours = sorted(
             (source for source in self._recording_sources_for_step(pane)
@@ -9098,6 +9145,11 @@ class PassageReviewSurface(QDialog):
         for source in neighbours:
             if not Path(source.location.video_path).is_file():
                 continue
+            store = getattr(self, "timeline_store", None)
+            if store is not None and not store.video_path_is_playable(
+                source.location.video_path, refresh=True,
+            ):
+                continue
             if direction > 0:  # the first frame after the one shown
                 frame = (shown + frame_ms // 2 - source.start_ms) // frame_ms + 1
             else:  # the last frame before it
@@ -9106,6 +9158,7 @@ class PassageReviewSurface(QDialog):
             frame = max(0, min(int(frame), last))
             return self._seek_retained_camera_frame(
                 source.location, frame * frame_ms, frame, int(getattr(pane, "camera_index", 1) or 1),
+                adjacent_boundary_ms=shown - source.start_ms, adjacent_direction=direction,
             )
         return False
 
