@@ -51,7 +51,7 @@ def _integer(payload: Mapping[str, Any], name: str) -> int:
 
 
 def _optional_count(payload: Mapping[str, Any], name: str) -> int:
-    if name not in payload:
+    if name not in payload or payload[name] is None:
         return 0
     value = _integer(payload, name)
     if value < 0:
@@ -235,15 +235,15 @@ class RaceMetadataStore:
             )
             if same_context and metadata.revision < current.revision:
                 return RaceMetadataIngestResult.DUPLICATE
+            if same_context and current is not None:
+                metadata = _preserve_target_laps(metadata, current)
             if same_context and metadata.revision == current.revision:
                 if metadata == current:
                     return RaceMetadataIngestResult.DUPLICATE
-                if _without_target_laps(metadata) != current:
+                if _without_target_laps(metadata) != _without_target_laps(current):
                     raise RaceMetadataConflictError(
                         "race metadata revision was reused with different content"
                     )
-                # An older console kept this revision without the groups'
-                # target laps: the same revision sent again keeps them.
             encoded = json.dumps(
                 metadata.to_payload(),
                 ensure_ascii=False,
@@ -271,6 +271,22 @@ class RaceMetadataStore:
 
 def _without_target_laps(metadata: RaceMetadata) -> RaceMetadata:
     return replace(metadata, groups=tuple(replace(group, target_laps=0) for group in metadata.groups))
+
+
+def _preserve_target_laps(metadata: RaceMetadata, current: RaceMetadata) -> RaceMetadata:
+    """Keep known targets when an older sender omits them in a later revision."""
+    if (metadata.race_id, metadata.stage_id) != (current.race_id, current.stage_id):
+        return metadata
+    stored = {group.group_id: group.target_laps for group in current.groups}
+    groups = []
+    for group in metadata.groups:
+        old_target = stored.get(group.group_id, 0)
+        if (metadata.revision == current.revision and group.target_laps and old_target
+                and group.target_laps != old_target):
+            raise RaceMetadataConflictError("race metadata revision changed target_laps")
+        target = group.target_laps or old_target
+        groups.append(replace(group, target_laps=target))
+    return replace(metadata, groups=tuple(groups))
 
 
 __all__ = [

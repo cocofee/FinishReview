@@ -683,7 +683,8 @@ class _RaceMetadataIngestor:
         with self._delivery_lock:
             result = self.store.store(metadata)
             current = self.store.current()
-            if current != metadata:
+            if (current is None or (current.race_id, current.stage_id, current.revision)
+                    != (metadata.race_id, metadata.stage_id, metadata.revision)):
                 return result
             if self._on_accepted is not None and self._delivered != current:
                 try:

@@ -1,3 +1,5 @@
+import os
+import signal
 import subprocess
 import sys
 
@@ -6,11 +8,11 @@ import pytest
 from realtime.recording_lock import LOCK_FILENAME, FolderInUseError, RecordingFolderLock
 
 HOLDER = """
-import sys, time
+import os, sys, time
 from PyQt5.QtCore import QLockFile
 lock = QLockFile(sys.argv[1])
 lock.setStaleLockTime(0)
-print(lock.tryLock(0), flush=True)
+print(os.getpid(), lock.tryLock(0), flush=True)
 time.sleep(120)
 """
 
@@ -36,15 +38,29 @@ def test_another_process_holds_the_folder_only_while_it_lives(tmp_path):
     holder = subprocess.Popen([sys.executable, "-c", HOLDER, str(tmp_path / LOCK_FILENAME)],
                               stdout=subprocess.PIPE, text=True)
     lock = RecordingFolderLock()
+    owner_pid = None
     try:
-        assert holder.stdout.readline().strip() == "True"
+        # A Windows venv executable can launch another process: Popen.pid
+        # belongs to the launcher, not necessarily the process holding Qt's lock.
+        pid, acquired = holder.stdout.readline().strip().split()
+        owner_pid = int(pid)
+        assert acquired == "True"
         with pytest.raises(FolderInUseError) as refused:
             lock.acquire(tmp_path)
-        assert f"进程 {holder.pid}" in refused.value.owner
+        assert f"进程 {owner_pid}" in refused.value.owner
     finally:
-        holder.kill()
-        holder.wait()
-        holder.stdout.close()
+        if owner_pid is not None:
+            try:
+                os.kill(owner_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            holder.wait(timeout=10)
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait()
+            holder.stdout.close()
     # A killed owner leaves its file behind; that must not block the next race.
     lock.acquire(tmp_path)
     assert lock.held

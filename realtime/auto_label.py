@@ -14,18 +14,21 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
+from zipfile import BadZipFile
 
 import numpy as np
 
 from .bunch_review import CROSSINGS_NAME, detected_crossings
 from .clock_sync import CLOCK_MODEL_FILENAME
+from .crossing_pairing import WINDOW_MS
 from .crossing_time import MANUAL_CALIBRATION_FILENAME, recorder_crossing_time, workspace_clocks
 from .lap_wave import WaveMatch, match_wave
 
 STRIPS_DIR = "finish_problems/strips/camera_{:02d}"
 # A person is taken for a wave when they cross this close, in chip time, to its
 # first or last chip (the same reach the chip/crossing pairing uses).
-WAVE_REACH_MS = 700
+WAVE_REACH_MS = int(WINDOW_MS)
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,9 @@ def _geometry(path: Path):
             with np.load(path, allow_pickle=False) as data:
                 meta = json.loads(bytes(data["meta"]).decode("utf-8"))
                 found = {"xs": data["xs"].copy(), "ys": data["ys"].copy(), "meta": meta}
-        except (OSError, KeyError, ValueError):
+        except (OSError, EOFError, BadZipFile, KeyError, ValueError):
+            # A strip can be incomplete while analysis is copying it. Skip this
+            # file for now; one bad camera file must not stop the review table.
             found = None
         if len(_GEOMETRY) > 64:
             _GEOMETRY.clear()
@@ -110,6 +115,9 @@ def detected_people(workspace, camera, *, clocks=None) -> list[DetectedPerson]:
 
 
 _PEOPLE: dict[tuple, list[DetectedPerson]] = {}
+_STRIP_STAMPS: dict[tuple, tuple[float, tuple]] = {}
+# 原地修复不会可靠改变目录时间；最多每秒核对一次，避免每次 UI 刷新都扫描。
+STRIP_RECHECK_SECONDS = 1.0
 
 
 def _stamp(path: Path):
@@ -121,12 +129,28 @@ def _stamp(path: Path):
 
 
 def people_on_line(workspace, camera) -> list[DetectedPerson]:
-    """detected_people, read again only when the detections or the clocks change on disk."""
+    """detected_people, read again when detections, strips or clocks change on disk."""
     workspace = Path(workspace)
-    key = (str(workspace), int(camera), _stamp(workspace / CROSSINGS_NAME.format(int(camera))),
-           _stamp(workspace / CLOCK_MODEL_FILENAME), _stamp(workspace / MANUAL_CALIBRATION_FILENAME))
-    if key[2] is None:
+    crossings_stamp = _stamp(workspace / CROSSINGS_NAME.format(int(camera)))
+    entries = detected_crossings(workspace, camera)
+    if not entries:
         return []
+    strip_dir = workspace / STRIPS_DIR.format(int(camera))
+    stamp_key = (str(workspace), int(camera), crossings_stamp, _stamp(strip_dir))
+    now = monotonic()
+    checked = _STRIP_STAMPS.get(stamp_key)
+    if checked is None or now - checked[0] >= STRIP_RECHECK_SECONDS:
+        videos = {str(entry.get("video_path", "")) for entry in entries}
+        strip_stamps = tuple(sorted(
+            (video, _stamp(strip_dir / (Path(video).stem + ".npz"))) for video in videos
+        ))
+        if len(_STRIP_STAMPS) > 8:
+            _STRIP_STAMPS.clear()
+        _STRIP_STAMPS[stamp_key] = (now, strip_stamps)
+    else:
+        strip_stamps = checked[1]
+    key = (str(workspace), int(camera), crossings_stamp, strip_stamps,
+           _stamp(workspace / CLOCK_MODEL_FILENAME), _stamp(workspace / MANUAL_CALIBRATION_FILENAME))
     if key not in _PEOPLE:
         if len(_PEOPLE) > 4:
             _PEOPLE.clear()

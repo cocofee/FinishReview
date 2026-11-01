@@ -124,14 +124,16 @@ class ArrivalReviewStore:
                          binding=binding, action=action, saved_at_ms=int(time.time() * 1000))
             return self._append_locked(entry)
 
-    def undo(self, scope, *, key=None, wave=None):
-        """Take back the newest ruling, one row's (``key``), or one whole wave confirm (``wave``)."""
+    def undo(self, scope, *, key=None, wave=None, operation_id=None):
+        """Take back a row, wave, or the exact operation that just wrote entries."""
         with locked_jsonl(self.path):
             self._read_locked()
             active = self.active(scope)
             if not active:
                 return None
-            if wave is not None:
+            if operation_id is not None:
+                subject = [entry for entry in active if entry.get("operation_id") == operation_id]
+            elif wave is not None:
                 subject = [entry for entry in active if entry.get("wave") == wave]
             else:
                 subject = [entry for entry in active if entry["key"] == key] if key is not None else active[-1:]
@@ -139,7 +141,7 @@ class ArrivalReviewStore:
                 return None
             previous = subject[-1]
             operation = previous.get("operation_id")
-            if wave is not None:
+            if operation_id is not None or wave is not None:
                 targets = subject
             elif key is None:
                 targets = ([entry for entry in active if entry.get("operation_id") == operation]

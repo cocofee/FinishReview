@@ -4180,6 +4180,33 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     dialog.close()
 
 
+def test_metadata_same_revision_accepts_target_laps_in_either_direction(tmp_path):
+    store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    base = RaceMetadata(race_id="race", stage_id="stage", revision=1, emitted_at_ms=1,
+                        groups=(RaceGroupMetadata("g", "组"),))
+    with_laps = replace(base, groups=(RaceGroupMetadata("g", "组", 4),))
+    assert store.store(with_laps).value == "accepted"
+    assert store.store(base).value == "duplicate"
+    assert store.current().groups[0].target_laps == 4
+    changed_revision = replace(base, revision=2, emitted_at_ms=2)
+    assert store.store(changed_revision).value == "accepted"
+    assert store.current().groups[0].target_laps == 4
+    changed_laps = replace(changed_revision, revision=3, emitted_at_ms=3,
+                           groups=(RaceGroupMetadata("g", "组", 5),))
+    assert store.store(changed_laps).value == "accepted"
+    assert store.current().groups[0].target_laps == 5
+
+
+def test_metadata_null_target_laps_means_unknown(tmp_path):
+    payload = {
+        "schema_version": 1, "message_type": "race_metadata", "race_id": "race", "stage_id": "stage",
+        "revision": 1, "emitted_at_ms": 1,
+        "groups": [{"group_id": "g", "name": "组", "target_laps": None}], "athletes": [],
+    }
+    metadata = RaceMetadata.from_payload(payload)
+    assert metadata.groups[0].target_laps == 0
+
+
 def test_group_filter_popup_fits_long_group_names(qapp, tmp_path):
     long_group_name = "山地自行车男子公开组"
     metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")

@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import QApplication, QLabel
 from realtime.problem_items import (
     CATEGORY_VIDEO, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
 )
-from realtime.quick_review_panel import QuickReviewPanel
+from realtime.quick_review_panel import WAVE_REACH_MS, QuickReviewPanel
 from realtime.chip_history import format_chip_time
 from realtime.arrival_review import candidate_binding
 from tests.realtime.test_arrival_review import event, FRAME, SCOPE
@@ -1589,7 +1589,11 @@ def test_enter_counts_the_paired_people_as_if_clicked_once_the_wave_is_looked_th
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     wave_panel._enter_key()
     assert "没看" in wave_panel.hint.text() and not any(entry.decision for entry in wave_panel._arrival_rows)
-    look_through(wave_panel, -500, 1400)
+    look_through(wave_panel, -200, 1100)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel._enter_key()
+    assert "没看" in wave_panel.hint.text() and not any(entry.decision for entry in wave_panel._arrival_rows)
+    look_through(wave_panel, -WAVE_REACH_MS, 1400 + WAVE_REACH_MS)
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     wave_panel._enter_key()
     assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}

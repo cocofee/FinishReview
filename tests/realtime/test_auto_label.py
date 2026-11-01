@@ -47,6 +47,13 @@ def test_a_detected_person_has_a_place_on_the_frame_and_the_frame_to_count_them_
     assert second.key == f"1|{VIDEO}|0|0"
 
 
+def test_a_broken_strip_is_left_out_without_breaking_analysis(tmp_path):
+    base = workspace(tmp_path, [(START, 0, False)])
+    strip = next((base / "finish_problems" / "strips" / "camera_01").glob("*.npz"))
+    strip.write_bytes(b"PK\x03\x04" + b"\x00" * 12)
+    assert detected_people(base, 1) == []
+
+
 def test_a_detection_without_its_strip_is_left_out_and_no_analysis_is_no_one(tmp_path):
     assert detected_people(tmp_path, 1) == []
     base = workspace(tmp_path, [(START, 0, False), (START + 100, 9999, False)])  # row beyond the line

@@ -786,7 +786,7 @@ class QuickReviewPanel(ProblemListPanel):
         pairs = [(chip, self._auto_labels[chip.key]) for chip in wave if chip.key in self._auto_labels]
         if not pairs:
             return
-        unseen = self._span_unseen(wave)
+        unseen = self._span_unseen(wave, margin=WAVE_REACH_MS)
         if unseen:
             self.hint.setText(f"这一波还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看："
                               "看完整波再按回车。")
@@ -794,35 +794,104 @@ class QuickReviewPanel(ProblemListPanel):
         frames = [dict(person.frame, marker_x_normalized=person.x, marker_y_normalized=person.y)
                   for _chip, person in pairs]
         self.holds_picture = True  # the frame on screen stays where the operator looked
+        item = None
+        created = False
+        previous_marks = []
         try:
             item, refusal = self.picture_candidate(frames[0])
             if refusal:
                 self.hint.setText(refusal)
+                return
+            if item is not None:
+                previous_marks = list(self._marks.get(item.item_id, ()))
+                if previous_marks:
+                    self.hint.setText("这一波已有人工标记，请核对画面，不再自动添加。")
+                    return
+            counted = self.picture_marks()
+            if any(mark_on_frame(mark, frame, person.recorder_ms)
+                   and (mark["x"] - person.x) ** 2 + (mark["y"] - person.y) ** 2 < .02 ** 2
+                   for (_chip, person), frame in zip(pairs, frames) for _owner, mark in counted):
+                self.hint.setText("自动对上未保存：有人已点过，请核对原有标记，勿重复点人。")
                 return
             if item is None:
                 item = self.add_manual_problem(frames[0], reason=AUTO_PICTURE_REASON,
                                                recorder_ms=frames[0]["recorder_ms"])
                 if item is None:
                     return
+                created = True
                 self.adopt_picture_candidate(item, row.key)
             self.open_picture(item)
             for (_chip, person), frame in zip(pairs, frames):
                 before = len(self._marks.get(item.item_id, ()))
-                self.add_mark(person.x, person.y, person.recorder_ms, frame)
+                self.add_mark(person.x, person.y, person.recorder_ms, frame, save=False)
                 marks = self._marks.get(item.item_id, [])
                 if len(marks) > before:
                     marks[-1]["auto_label"] = True  # who was paired by the system, then looked at
+            operation_id = uuid.uuid4().hex
+            plan = self._wave_plan(item)
+            if plan is None or len(plan.marks) != len(pairs):
+                self._drop_auto_marks(item, previous_marks,
+                                      "自动对上未保存：人数标记未能完整添加，请核对原有标记。", created=created)
+                return
+            if not self._save_wave(plan, operation_id=operation_id):
+                self._drop_auto_marks(item, previous_marks, self.hint.text(), created=created)
+                return
         except (OSError, RuntimeError, ValueError) as error:
-            self.hint.setText(f"自动对上未保存：{error}")
+            self._drop_auto_marks(item, previous_marks, f"自动对上未保存：{error}", created=created)
             return
         finally:
             self.holds_picture = False
         self.save_drafts()
         plan = self._wave_plan(item)
-        if plan is not None and len(plan.marks) == len(pairs) and self._save_wave(plan):
+        if plan is not None and len(plan.marks) == len(pairs) and plan.marks and all(
+                row.decision is not None for row in plan.chips):
             self._next_wave(item)
         else:
             self.hint.setText("自动对上没有全部存上：请在画面上核对这一波。")
+
+    def _drop_auto_marks(self, item, previous_marks, message, *, created=False):
+        """只清理本次临时标记；撤回失败时保留已落盘判定及对应画面。"""
+        if item is not None:
+            try:
+                self._arrival_store.refresh()
+            except (OSError, RuntimeError, ValueError) as error:
+                self.hint.setText(f"{message}；无法核对已存状态：{error}，请勿重复点人。")
+                return
+            saved = any(entry.get("action") == "confirm" and entry.get("candidate_id") == item.item_id
+                        for entry in self._arrival_store.active(self._arrival_scope))
+            if saved:
+                message += "；已有部分保存，请核对已点标记，勿重复点人。"
+            else:
+                if created:
+                    path = self.problem_dir / "manual_problems.json"
+                    try:
+                        values = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+                        temporary = path.with_suffix(".tmp")
+                        temporary.write_text(json.dumps([value for value in values
+                                                         if value.get("item_id") != item.item_id], ensure_ascii=False),
+                                             encoding="utf-8")
+                        temporary.replace(path)
+                    except (OSError, ValueError, TypeError):
+                        message += "；自动创建的问题条目未能清理，请稍后手工删除。"
+                    self.items = [value for value in self.items if value.item_id != item.item_id]
+                    self._marks.pop(item.item_id, None)
+                    self._candidate_wave.pop(item.item_id, None)
+                    mapping = self._wave_candidates()
+                    for event_id in [key for key, value in mapping.items() if value == item.item_id]:
+                        del mapping[event_id]
+                    if self.current_item() is not None and self.current_item().item_id == item.item_id:
+                        self._active_item = None
+                elif previous_marks:
+                    self._marks[item.item_id] = previous_marks
+                else:
+                    self._marks.pop(item.item_id, None)
+                self._editing_mark = -1
+            self._plan_cache = None
+            self.save_drafts()
+            self._quick_render_signature = None
+            self._render()
+            self._sync_marks()
+        self.hint.setText(message)
 
     def _withdraw_auto_wave(self, row):
         """4 on a 自动对上 wave: its pairs are taken back for good, and the wave is counted by hand."""
@@ -979,9 +1048,12 @@ class QuickReviewPanel(ProblemListPanel):
         busy = self._earlier_shown = frozenset(key for key, arrival in self._earlier.items() if arrival is not None)
         signature = (self._arrival_scope, self._selected_key, tuple(sorted(counted.items())), self._attention_only,
                      busy, self._near_counted_items, tuple(sorted(self._target_laps.items())),
+                     self._intermediate_laps, self._short_bibs,
+                     tuple(sorted((index, reasons) for index, reasons in self._auto_reasons.items())),
                      tuple(sorted((key, person.key) for key, person in self._auto_labels.items())),
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
                             candidate_binding(row.item), self._wave_of.get(row.key), group, row.carrier,
+                            row.event.lap if row.event is not None else None,
                             tuple(piece.key for piece in row.fragments))
                            for row, group in zip(rows, groups)))
         if self._quick_ready and self.race_strip.view.pieces and not self._earlier_timer.isActive():
@@ -1608,9 +1680,11 @@ class QuickReviewPanel(ProblemListPanel):
             return None
         chips = self._waves[index]
         marks = self._marks.get(item.item_id, [])
-        key = (item.item_id, id(chips), len(self.items),
+        clocks = workspace_clocks(self.workspace_dir) if self.workspace_dir else None
+        key = (item.item_id, id(chips), len(self.items), id(clocks),
                tuple((mark["recorder_ms"], mark["x"], mark["y"], bool(mark.get("no_chip")),
-                      mark.get("exclusion_reason", "")) for mark in marks))
+                      mark.get("exclusion_reason", ""), (mark.get("frame") or {}).get("session_id", ""))
+                     for mark in marks))
         if self._plan_cache is not None and self._plan_cache[0] == key and self._plan_cache[1].marks is marks:
             return self._plan_cache[1]
         plan = WavePlan(item, chips, marks)
@@ -1623,8 +1697,14 @@ class QuickReviewPanel(ProblemListPanel):
                 matched.add(row.key)
         free = [row for row in chips if (row.decision is None or self._counted_here(row, item))
                 and row.note != "多余芯片"]
+        def crossing_order(index):
+            mark = marks[index]
+            crossing = recorder_crossing_time(mark["recorder_ms"], mark.get("frame") or {},
+                                              self.workspace_dir, clocks=clocks)
+            return (crossing.value_ms if crossing is not None else int(mark["recorder_ms"]), index)
+
         for i in sorted((i for i, mark in enumerate(marks) if i not in plan.labels and not is_excluded(mark)),
-                        key=lambda i: (int(marks[i]["recorder_ms"]), i)):
+                        key=crossing_order):
             if marks[i].get("no_chip"):
                 plan.no_chip.append(i)
                 plan.labels[i] = "无芯片"
@@ -1698,7 +1778,7 @@ class QuickReviewPanel(ProblemListPanel):
         if plan is not None and (plan.marks or plan.split):
             status, color = self._wave_status(plan)
         elif row is not None and row.key in self._auto_labels and wave is not None:
-            unseen = self._span_unseen(wave)
+            unseen = self._span_unseen(wave, margin=WAVE_REACH_MS)
             status = (f"自动对上 · 本波 {len(wave)} 人 {len(wave)} 芯片 · "
                       + (f"还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看" if unseen
                          else "已看完") + " · 回车记为已点 · 4 撤回逐个点")
@@ -1775,12 +1855,12 @@ class QuickReviewPanel(ProblemListPanel):
             return []
         return self._span_unseen(plan.chips, int((plan.item.evidence.get("frame") or {}).get("camera_index") or 1))
 
-    def _span_unseen(self, chips, camera=None):
-        """The parts of these chips' span, in chip time, that no decoded frame of CAMERA has shown yet."""
+    def _span_unseen(self, chips, camera=None, margin=WAVE_VIEW_MARGIN_MS):
+        """The parts of these chips' span that no decoded frame has shown yet."""
         stamps = [int(row.event.timeline_timestamp_ms) for row in chips]
         camera = str(int(camera if camera is not None else self.race_strip.camera or 1))
         seen = self._arrival_drafts.get("seen", {}).get(camera, [])
-        return uncovered_intervals(min(stamps) - WAVE_VIEW_MARGIN_MS, max(stamps) + WAVE_VIEW_MARGIN_MS,
+        return uncovered_intervals(min(stamps) - margin, max(stamps) + margin,
                                    seen, tolerance=100)
 
     def record_viewed_frame(self, frame, recorder_ms):
@@ -2378,7 +2458,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.marks_changed.emit(tuple(self.current_marks()))
         self.hint.setText(f"已确认 {event.bib} 过线；继续看下一位。")
 
-    def add_mark(self, x, y, recorder_ms, frame=None):
+    def add_mark(self, x, y, recorder_ms, frame=None, *, save=True):
         """A click on a person counts them; on a wave's picture it takes the next chip's bib at once.
 
         Someone already counted on this frame, those moved onto a 疑似漏读 row
@@ -2394,7 +2474,7 @@ class QuickReviewPanel(ProblemListPanel):
         before = len(self.current_marks())
         super().add_mark(x, y, recorder_ms, frame)
         plan = self._wave_plan()
-        if plan is not None and len(plan.marks) > before:
+        if save and plan is not None and len(plan.marks) > before:
             self._save_wave(plan)
             self.show_counted(self._editing_mark)
             self.marks_changed.emit(tuple(self.current_marks()))
@@ -2428,7 +2508,7 @@ class QuickReviewPanel(ProblemListPanel):
                 and abs(float(frame["marker_x_normalized"]) - mark["x"]) <= .001
                 and abs(float(frame["marker_y_normalized"]) - mark["y"]) <= .001)
 
-    def _save_wave(self, plan):
+    def _save_wave(self, plan, *, operation_id=None):
         """Make what is saved for a wave what its picture now counts.
 
         Runs on every click, right click, 1 and 3: each person counted is their
@@ -2445,6 +2525,7 @@ class QuickReviewPanel(ProblemListPanel):
         scope, binding = self._arrival_scope, candidate_binding(item)
         clocks = workspace_clocks(self.workspace_dir) if self.workspace_dir else None
         changed = []
+        operation_id = operation_id or getattr(self, "_shortcut_operation", None)
         self.confirmation_preparing.emit()
         try:
             category = self._category(item)
@@ -2452,7 +2533,7 @@ class QuickReviewPanel(ProblemListPanel):
                 picture = dict(item.evidence.get("frame") or {})
                 picture.setdefault("calibration_version", item.calibration_version)
                 self._arrival_store.save(scope, "candidate:" + item.item_id, binding, "bicycle",
-                                         candidate_id=item.item_id, frame=picture,
+                                         candidate_id=item.item_id, frame=picture, operation_id=operation_id,
                                          analysis_signature=item.evidence.get("analysis_signature", ""),
                                          calibration_version=item.calibration_version)
             for row in plan.chips:
@@ -2476,19 +2557,33 @@ class QuickReviewPanel(ProblemListPanel):
                     scope, row.key, event_binding(event), "confirm", event_id=event.event_id, bib=event.bib,
                     candidate_id=item.item_id, candidate_binding=binding, frame=frame,
                     crossing_ms=crossing.value_ms if crossing else None,
+                    operation_id=operation_id,
+                    auto_label=bool(mark.get("auto_label")),
+                    review_method="auto_label_operator_accepted" if mark.get("auto_label") else "manual_click",
                     calibration_version=item.calibration_version,
                 )
         except (OSError, RuntimeError, ValueError) as error:
+            rollback_error = self._rollback_wave_operation(scope, operation_id) if operation_id else ""
             self._quick_render_signature = None
             self._render()
-            self.hint.setText(f"过线未保存：{error}")
+            self.hint.setText(f"过线未保存：{error}{rollback_error}")
             return False
+        rollback_error = (self._rollback_wave_operation(scope, operation_id)
+                          if changed and operation_id else "")
         self._quick_render_signature = None
         self._render()
         if changed:
-            self.hint.setText(f"芯片记录已变化（{'、'.join(changed)}），请重新核对本波。")
+            self.hint.setText(f"芯片记录已变化（{'、'.join(changed)}），请重新核对本波。{rollback_error}")
             return False
         return True
+
+    def _rollback_wave_operation(self, scope, operation_id):
+        """精确撤回本次操作；不碰去重返回的旧记录或后来写入的其他判定。"""
+        try:
+            self._arrival_store.undo(scope, operation_id=operation_id)
+        except (OSError, RuntimeError, ValueError) as error:
+            return f"；本次操作撤回失败：{error}，请核对已点记录，勿重复点人"
+        return ""
 
     def _next_wave(self, item):
         """On to the next wave from its start, even if the end of this one was looked at nearly up to it.

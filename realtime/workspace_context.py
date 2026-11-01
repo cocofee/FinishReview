@@ -159,8 +159,11 @@ class EventWorkspaceMetadataStore(RaceMetadataStore):
 
     def store(self, metadata):
         # Recovered metadata is never passed to the server's revision logic.
-        result = super().store(metadata)
-        self._recovered = None
-        self.scope_path.unlink(missing_ok=True)
-        self._candidates[(metadata.race_id, metadata.stage_id)] = metadata
-        return result
+        with self._lock:
+            result = super().store(metadata)
+            current = self._current
+            self._recovered = None
+            self.scope_path.unlink(missing_ok=True)
+            if current is not None:
+                self._candidates[(current.race_id, current.stage_id)] = current
+            return result
