@@ -60,4 +60,13 @@
 - 锁定依赖 coverage 首轮完整运行未 native 崩溃，但 `1499 passed, 1 failed`（442.17 秒）；日志 `D:/tmp/fr_coverage_locked_1101/test.log`。唯一失败为录像锁测试将 Windows venv 启动器的 `Popen.pid`（6532）误认作实际持锁解释器 PID（30228）；程序确实拒绝了重复录像，不据此修改锁业务逻辑。
 - 修改范围新增 `tests/realtime/test_recording_lock.py`：让持锁测试进程自报 PID，以实际 PID 核对 owner，并在 finally 终止实际持锁进程、等待启动器退出，保留强杀后重新获得锁的断言。全局环境与锁定环境各 `4 passed`，日志 `D:/tmp/fr_recording_lock_followup_1101/`；全范围锁定 Ruff 通过。
 - 修正后的完整单进程 coverage 重跑中，日志 `D:/tmp/fr_coverage_locked_1101_retry/test.log`；结果到齐后补记，不以局部 4 项替代完整验证。
-- 用户随后明确授权“提交并推送”：本次仅提交上述修复、录像锁测试修正及本审核记录，共 12 个文件，推送至原分支 `cocofee/自动对上` 更新 PR #9，不改 PR 目标、不合并、不发布或安装。提交前远端分支仍为 e2d4690、差异检查通过；完整 coverage 及只读 Qt 生命周期分析尚未返回最终结论，作为待完成验证保留，不能记成已通过。实际提交、推送结果以 Git 回执为准。
+- 用户随后明确授权“提交并推送”：本次仅提交上述修复、录像锁测试修正及本审核记录，共 12 个文件，推送至原分支 `cocofee/自动对上` 更新 PR #9，不改 PR 目标、不合并、不发布或安装。提交前远端分支仍为 e2d4690、差异检查通过；完整 coverage 及只读 Qt 生命周期分析当时尚未返回最终结论。实际完成提交并推送 `b73072b8f8189484247576bcdaa83611490da5f9`。
+- 锁定依赖 coverage 重跑完成：`1500 passed in 411.36s`，测试和 coverage report 均退出 0，总覆盖率 82%；日志 `D:/tmp/fr_coverage_locked_1101_retry/test.log`。只读 Qt 分析返回生命周期风险假设，但未确定旧崩溃根因；未按假设修改 cleanup 或产品线程逻辑。历史崩溃不再复现不等于根因彻底修复。
+
+### 按用户授权合并到 main
+
+- 用户要求“合并”，随后在执行审核要求的独立确认中明确选择“改为 main 并合并”；PR #9 目标已实际改为 main，未关闭其他 PR、未打包安装。
+- b73072b 的远端两轮 Python 3.10/3.12 测试及 package 共 6 项全部通过；改目标后实际 mergeable 为 CONFLICTING，不能使用改目标前的 MERGEABLE 结论。
+- 合入最新 origin/main `b3f5bb2cc8fe9836c857c17f8628c1d57935ec52`，唯一冲突文件 `realtime/passage_review.py`。保留主线录像失效保护、新录像真实帧率邻帧定位，以及分支的 archive 校时；邻帧边界以校时后的 target origin 计算，不混用 source 原起点。
+- 新增 `test_boundary_seek_uses_aligned_archive_origin`，验证 120 ms 校时偏移在跨段时传到正确的邻帧边界；播放、校时和跨段相关测试 `291 passed in 82.52s`，日志 `D:/tmp/fr_merge_targeted_1101.log`。全范围锁定 Ruff、规则检查、compileall 通过。
+- 最新主线整合后的单进程完整 coverage 仍在运行，日志 `D:/tmp/fr_merge_coverage_1101/test.log`；提交主线整合后需推送并等待该整合头的远端 CI，不把 b73072b 的成功沿用为整合头结果。

@@ -196,7 +196,12 @@ def test_live_boundary_step_keeps_exact_neighbor_and_does_not_bridge_gaps(
     wire_archive_clock(window)
     opened = []
 
-    def seek(location, position, frame, camera_index=1):
+    def seek(location, position, frame, camera_index=1, **kwargs):
+        assert kwargs["adjacent_direction"] == direction
+        assert kwargs["adjacent_boundary_ms"] == (
+            pane.location.segment.media_started_at_ms + pane._current_position_ms
+            - location.segment.media_started_at_ms
+        )
         saved = ring.retain_filmstrip_segment(location.segment, store)
         opened.append((saved, position, frame))
         return True
@@ -262,7 +267,7 @@ def test_step_off_a_two_second_file_goes_on_without_the_strip_or_a_chip_record(
         _selected_event_id="", passage_store=SimpleNamespace(get=lambda _: None),
         _camera_one_pane=lambda: pane, _recording_sources_for_step=lambda _pane: sources,
         _recording_session_key=PassageReviewSurface._recording_session_key,
-        _seek_retained_camera_frame=lambda location, position, frame, camera_index=1: opened.append(
+        _seek_retained_camera_frame=lambda location, position, frame, camera_index=1, **_kwargs: opened.append(
             (location.segment.segment_id, position, frame)) or True,
     )
     window._step_into_neighbour_recording = (
