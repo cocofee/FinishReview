@@ -1213,11 +1213,64 @@ class EvidenceImageView(QGraphicsView):
             return
         super().keyPressEvent(event)
 
+    def _person_tag_rect(self, x, y, label, scale, visible, occupied):
+        """Place a small screen-sized tag near its point, inside the visible image."""
+        font = QFont(self.font())
+        font.setPixelSize(14)
+        font.setBold(True)
+        width = min(max(24, QFontMetrics(font).horizontalAdvance(label) + 12) / scale, visible.width())
+        height = min(22 / scale, visible.height())
+        gap = 10 / scale
+        candidates = []
+        for dx, dy in ((gap, -height - gap), (-width - gap, -height - gap),
+                       (gap, gap), (-width - gap, gap), (gap, -2 * height - gap)):
+            left = max(visible.left(), min(x + dx, visible.right() - width))
+            top = max(visible.top(), min(y + dy, visible.bottom() - height))
+            candidate = QRectF(left, top, width, height)
+            overlap = sum(candidate.intersected(other).width() * candidate.intersected(other).height()
+                          for other in occupied if candidate.intersects(other))
+            candidates.append((overlap, candidate))
+        return min(candidates, key=lambda value: value[0])[1]
+
+    def _draw_person_tag(self, painter, x, y, label, color, dashed, ghost, scale, visible, occupied):
+        """A point and number label, not a timing line or a tracking box."""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        radius = (4 if ghost else 5) / scale
+        pen = QPen(color, 1.5)
+        pen.setCosmetic(True)
+        if dashed or ghost:
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QPointF(x, y), radius, radius)
+        if self._show_marker_label and label and not ghost and not visible.isEmpty():
+            tag = self._person_tag_rect(x, y, label, scale, visible, occupied)
+            occupied.append(tag)
+            # The shortest connector ends at the label edge and outside the ring.
+            end = QPointF(max(tag.left(), min(x, tag.right())), max(tag.top(), min(y, tag.bottom())))
+            delta = end - QPointF(x, y)
+            length = (delta.x() ** 2 + delta.y() ** 2) ** .5
+            if length > radius:
+                painter.drawLine(QPointF(x, y) + delta * (radius / length), end)
+            painter.setBrush(QColor(20, 27, 35, 225))
+            painter.drawRoundedRect(tag, 4 / scale, 4 / scale)
+            font = QFont(self.font())
+            font.setPixelSize(max(1, round(14 / scale)))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(tag, Qt.AlignCenter, label)
+        painter.restore()
+
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
         if self._source_width <= 0 or self._source_height <= 0:
             return
         scale = max(0.001, abs(self.transform().m11()))
+        visible = self.mapToScene(self.viewport().rect()).boundingRect().intersected(
+            QRectF(0, 0, self._source_width, self._source_height))
+        occupied = []
         painter.save()
         if self._finish_line_points:
             painter.setRenderHint(QPainter.Antialiasing)
@@ -1239,25 +1292,17 @@ class EvidenceImageView(QGraphicsView):
             if ghost:
                 # Counted on a nearby frame: faded where they were, so they are not clicked twice.
                 color.setAlpha(150)
+            if self._workbench_compact or dot:
+                if visible.adjusted(-6 / scale, -6 / scale, 6 / scale, 6 / scale).contains(QPointF(x, y)):
+                    self._draw_person_tag(painter, x, y, label, color,
+                                          auto or (not confirmed and not simple), ghost, scale, visible, occupied)
+                continue
             pen = QPen(color, 2)
             pen.setCosmetic(True)
             if (not confirmed and not simple) or ghost or auto:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
-            radius = (16.0 if ghost else 22.0) / scale
-            if dot:
-                # A large hollow ring with a dark rim reads on any kit, and leaves the rider visible.
-                painter.setBrush(Qt.NoBrush)
-                if not ghost:
-                    rim = QPen(QColor(0, 0, 0, 170), 6)
-                    rim.setCosmetic(True)
-                    painter.setPen(rim)
-                    painter.drawEllipse(QPointF(x, y), radius, radius)
-                    pen.setWidth(3)
-                    painter.setPen(pen)
-                painter.drawEllipse(QPointF(x, y), radius, radius)
-            else:
-                painter.drawLine(int(x), 0, int(x), self._source_height)
+            painter.drawLine(int(x), 0, int(x), self._source_height)
             if not self._show_marker_label or ghost:
                 continue
             margin = 6.0 / scale
@@ -1265,12 +1310,12 @@ class EvidenceImageView(QGraphicsView):
             tag_width = max(52.0, 18.0 + len(label) * size) / scale
             tag_height = 30.0 / scale
             # Beside the ring, not on the rider.
-            offset = radius + margin if dot else margin
+            offset = margin
             tag_x = x + offset
             if tag_x + tag_width > self._source_width - margin:
                 tag_x = x - tag_width - offset
             tag_x = max(margin, min(tag_x, self._source_width - tag_width - margin))
-            tag_y = y - tag_height / 2.0 if dot else margin + index * (tag_height + margin)
+            tag_y = margin + index * (tag_height + margin)
             tag_y = max(margin, min(tag_y, max(margin, self._source_height - tag_height - margin)))
             tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
             painter.setPen(Qt.NoPen)
@@ -1290,6 +1335,11 @@ class EvidenceImageView(QGraphicsView):
         x = x_normalized * self._source_width
         y = y_normalized * self._source_height
         color = QColor("#1bbf83" if confirmed else "#c0372b")
+        if self._workbench_compact:
+            if visible.adjusted(-6 / scale, -6 / scale, 6 / scale, 6 / scale).contains(QPointF(x, y)):
+                self._draw_person_tag(painter, x, y, label, color, not confirmed and not simple,
+                                      False, scale, visible, occupied)
+            return
         pen = QPen(color, 3)
         pen.setCosmetic(True)
         if not confirmed and not simple:
