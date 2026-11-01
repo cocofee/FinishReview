@@ -38,14 +38,12 @@ from .race_strip import AUTO_LABELLED, RaceStripPanel, earlier_arrival, first_cr
 # the gaps cluster below 2 s and above 3 s, so the cut falls in the quiet.
 WAVE_GAP_MS = 2000
 KEEP = "keep"  # landing: the picture already shows this row's wave; leave it
-# A wave is looked at from a little before its first chip to a little after its
-# last: a rider without a chip may lead it or close it.
-WAVE_VIEW_MARGIN_MS = 500
-# A crossing without a chip is looked at from this much before it to this much
-# after its last piece.  Half a second each side was too much (10-30: the
-# runners were still metres off at the start, and with many crossings the
-# extra second each added up).
-PASSAGE_VIEW_MARGIN_MS = 250
+# Restore the final field adjustment from 58f2f99: no padding on chip waves.
+# Matching tolerance is independent of playback and of the operator's viewed span.
+WAVE_VIEW_MARGIN_MS = 0
+# Video-only passages keep a small browsing lead/tail; this is not a chip
+# matching tolerance and does not make a split recording continuous by itself.
+PASSAGE_VIEW_MARGIN_MS = 150
 # Crossings without a chip read for 可能多人 per pass, so the table never waits on the strip.
 EARLIER_BATCH = 8
 # A wave is swept by dragging the picture; a rider stays in view about a second
@@ -71,6 +69,8 @@ WAVE_NO_PERSON = "wave_no_person"
 # the rider counted for another bib carries it too, kept as carrier_bib.
 # Exported to 建议删除清单; the wave counts without it.
 EXTRA_CHIP = "extra_chip"
+# Operator-declared test/non-participant chip. Local only, never an export.
+LOCAL_CHIP_EXCLUSION = "local_chip_exclusion"
 # The number the operator read on the frame of a rider without a chip, kept
 # beside their 疑似漏读 row and exported to 补录清单.
 RECORD_BIB = "record_bib"
@@ -91,14 +91,14 @@ NEAR_COUNTED_TEXT = ("已点附近：这一刻 0.5 秒内已点过人，多半�
 GHOST_REACH_MS = 150
 # The left hand's keys (10-29): each does on the selected row what its right
 # click offers under these names; 4 is the same undo as Backspace.
-ROW_KEYS = {Qt.Key_1: ("这人不是运动员", "不是运动员"),
+ROW_KEYS = {Qt.Key_1: ("这人不是运动员", "不是运动员", "非运动员（本机排除）"),
             Qt.Key_2: ("双芯片：这条芯片是谁带的…", "改携带人…"),
             Qt.Key_3: ("这人没芯片：补录号码…", "补录号码…", "改号码…")}
 KEY_NAMES = {Qt.Key_1: "1 不是运动员", Qt.Key_2: "2 双芯片", Qt.Key_3: "3 补录号码"}
 NUMBER_KEYS = (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5)
-AUTO_PICTURE_REASON = "自动对上：按过线顺序对芯片，操作员看完整波按回车"
-AUTO_TEXT = ("自动对上：画面上检测到的人与芯片一样多，按过线先后对了号码（灰蓝虚线圈）；"
-             "不算确认、不导出。看完这一波按回车记为已点；号码不对按 4 撤回，再逐个点。")
+AUTO_PICTURE_REASON = "自动对上：按过线顺序对应芯片，操作员按回车接受"
+AUTO_TEXT = ("自动对上：芯片与检测过线人按时间、顺序对应（灰蓝竖虚线＋号码）；"
+             "不算人工点数或裁判确认、不导出。回车接受对应，不要求补看固定秒数；号码不对按 4 撤回，再逐个点。")
 
 
 @dataclass
@@ -193,6 +193,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._metadata_provider = lambda: None  # CycleRace's race metadata: the groups' target laps
         self._target_laps = {}  # group id -> target laps of this race (CycleRace's metadata), when sent
         self._intermediate_laps = 0  # chip reads of laps before the last, not listed
+        self._unknown_lap_groups = ()  # laps exist but CycleRace did not supply the target
         self._intermediate_ids = frozenset()  # their event ids: a crossing bound to one is not listed either
         self._short_bibs = ()  # riders whose last read is short of the target, once the group has a finisher
         self._intermediate_moments = ()  # chip times of those intermediate reads: lapped riders on the line
@@ -200,6 +201,7 @@ class QuickReviewPanel(ProblemListPanel):
         # for it, on waves nobody has counted yet.  Shown only, never saved.
         self._auto_labels = {}
         self._auto_reasons = {}  # wave index -> why it was not paired (shown on its rows)
+        self._auto_landing_key = None  # only keep a paired wave after opening its bound evidence
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
         self._near_counted_items = frozenset()  # item ids of crossings within COUNTED_REACH_MS of someone counted
         self._strip_end = (None, 0.0)  # (pieces, the strip's last chip-clock moment)
@@ -383,6 +385,9 @@ class QuickReviewPanel(ProblemListPanel):
         self._target_laps = ({group.group_id: group.target_laps for group in metadata.groups}
                              if metadata is not None and (metadata.race_id, metadata.stage_id) == self._arrival_scope
                              else {})
+        self._unknown_lap_groups = tuple(sorted({event.group_id for event in scoped
+                                                 if event.is_active and event.lap > 1
+                                                 and not self._target_laps.get(event.group_id, 0)}))
         listed = [event for event in scoped
                   if lap_role(event.lap, self._target_laps.get(event.group_id, 0)) != INTERMEDIATE]
         self._intermediate_laps = len(scoped) - len(listed)
@@ -479,6 +484,10 @@ class QuickReviewPanel(ProblemListPanel):
                 previous = self._arrival_store.latest(self._arrival_scope, row.key)
                 if previous is not None:
                     anchor = anchors.get(previous.get("candidate_id"))
+                    if (previous["action"] == "held" and previous.get("reason") == LOCAL_CHIP_EXCLUSION
+                            and previous["binding"] == event_binding(row.event)):
+                        row.note = "已排除"
+                        continue
                     if (previous["action"] == "held" and previous.get("reason") == EXTRA_CHIP
                             and previous["binding"] == event_binding(row.event)):
                         row.note = "多余芯片"  # needs no picture of its own: nobody crossed for it
@@ -579,7 +588,7 @@ class QuickReviewPanel(ProblemListPanel):
         return [row for row in rows if row.key not in folded]
 
     def _fragment_unseen(self, row, whole=False):
-        """What of a row, from where it is looked at from to its last piece + 0.25 s, nobody has looked at.
+        """What of a row, from its browsing lead to its last piece + 0.15 s, nobody has looked at.
 
         Only a folded row has to be seen whole before it is ruled on, or any row
         of a Shift+3 run (WHOLE).
@@ -593,7 +602,7 @@ class QuickReviewPanel(ProblemListPanel):
                                    seen, tolerance=100)
 
     def _passage_lead(self, row):
-        """How long before a crossing it is looked at from: a quarter second without a chip, half with one.
+        """Browsing lead: 0.15 s without a chip, no padding with one.
 
         可能多人: from the moment the other one came onto the line (15:50,
         10-29: the first two of 4 came on 1.9 s before the row's moment).  2 s
@@ -694,7 +703,8 @@ class QuickReviewPanel(ProblemListPanel):
 
     def _index_waves(self):
         """Chain the chips into waves by their official time; rows keep table order."""
-        chips = sorted((row for row in self._arrival_rows if row.event is not None and row.event.is_active),
+        chips = sorted((row for row in self._arrival_rows if row.event is not None and row.event.is_active
+                        and row.note != "已排除"),
                        key=lambda row: (int(row.event.timeline_timestamp_ms), row.key))
         waves, previous = [], None
         for row in chips:
@@ -741,8 +751,8 @@ class QuickReviewPanel(ProblemListPanel):
         Only where every condition of auto_label.label_wave holds: as many
         people as chips, timed, apart enough, nobody on another lap and no 可能多人
         or 已点附近 close by.  Any doubt leaves the whole wave to hand.  Nothing
-        is saved: the pairs are shown until the operator presses Enter (counted
-        as if clicked) or 4 (withdrawn for good).
+        is saved until Enter explicitly accepts the bound evidence; its automatic
+        origin remains distinct from manual clicks. 4 withdraws the proposal.
         """
         self._auto_labels, self._auto_reasons = {}, {}
         if not self.workspace_dir or not self._waves:
@@ -777,19 +787,17 @@ class QuickReviewPanel(ProblemListPanel):
                 self._auto_labels[chip_key] = by_key[person_key]
 
     def _accept_auto_wave(self, row):
-        """Enter on a 自动对上 wave, looked through: its people counted as if clicked, each on their own frame.
+        """Accept the existing pairs on Enter, preserving their original frames.
 
-        The picture is made as a click makes it; from then on the wave is an
-        ordinary counted one (已点), with right click, 4 and Backspace as usual.
+        Acceptance is an explicit operator action, not proof of viewing a fixed
+        span or a manual count. Existing undo and durable rollback still apply.
         """
         wave = self._row_wave(row) or ()
         pairs = [(chip, self._auto_labels[chip.key]) for chip in wave if chip.key in self._auto_labels]
         if not pairs:
             return
-        unseen = self._span_unseen(wave, margin=WAVE_REACH_MS)
-        if unseen:
-            self.hint.setText(f"这一波还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看："
-                              "看完整波再按回车。")
+        if len(pairs) != len(wave):
+            self.hint.setText("自动对应不完整，请重新核对本波。")
             return
         frames = [dict(person.frame, marker_x_normalized=person.x, marker_y_normalized=person.y)
                   for _chip, person in pairs]
@@ -826,7 +834,7 @@ class QuickReviewPanel(ProblemListPanel):
                 self.add_mark(person.x, person.y, person.recorder_ms, frame, save=False)
                 marks = self._marks.get(item.item_id, [])
                 if len(marks) > before:
-                    marks[-1]["auto_label"] = True  # who was paired by the system, then looked at
+                    marks[-1]["auto_label"] = True  # system pairing explicitly accepted, not a manual click
             operation_id = uuid.uuid4().hex
             plan = self._wave_plan(item)
             if plan is None or len(plan.marks) != len(pairs):
@@ -936,7 +944,7 @@ class QuickReviewPanel(ProblemListPanel):
         return merged + extra
 
     def _row_wave(self, row):
-        if row is None:
+        if row is None or row.note == "已排除":
             return None
         index = self._wave_of.get(row.key, self._candidate_wave.get(row.item.item_id))
         return self._waves[index] if index is not None else None
@@ -960,6 +968,8 @@ class QuickReviewPanel(ProblemListPanel):
         if row.decision:
             # A click on someone only counts them; their bib is the chip's turn in
             # the wave, so it is 已点, not a confirmed identity (10-29).
+            if row.decision.get("auto_label"):
+                return "已接受对应"
             return "已点" if (row.decision.get("frame") or {}).get("marker_x_normalized") is not None else "已确认"
         if row.note:
             return row.note
@@ -1006,6 +1016,8 @@ class QuickReviewPanel(ProblemListPanel):
         self.delete_requested.emit(row.event.event_id)
 
     def _row_category(self, row):
+        if row.note == "已排除":
+            return "非运动员"
         if row.decision:
             return "运动员"
         category = self._category(row.item)
@@ -1026,8 +1038,25 @@ class QuickReviewPanel(ProblemListPanel):
         plans = self._wave_plans()
         self._auto_label_waves(plans)
         self.race_strip.set_chips([(int(row.event.timeline_timestamp_ms), row.bib,
-                                    AUTO_LABELLED if row.key in self._auto_labels else row.decision is not None)
-                                   for row in rows if row.event is not None and row.event.is_active])
+                                    AUTO_LABELLED if row.key in self._auto_labels or row.decision and row.decision.get("auto_label")
+                                    else row.decision is not None)
+                                   for row in rows if row.event is not None and row.event.is_active and row.note != "已排除"])
+        positions = {}
+        for row in rows:
+            if row.event is None or not row.event.is_active:
+                continue
+            person = self._auto_labels.get(row.key)
+            saved_frame = (row.decision or {}).get("frame") or {}
+            if person is not None:
+                stamp = person.chip_ms
+            elif saved_frame.get("marker_x_normalized") is not None and row.time_ms is not None:
+                # _build_rows already resolves legacy recorder times versus
+                # saved calibrated crossing times. Do not recalibrate twice.
+                stamp = row.time_ms
+            else:
+                continue
+            positions[(int(row.event.timeline_timestamp_ms), row.bib)] = stamp
+        self.race_strip.view.set_line_positions(positions)
         outdated = set()
         for index, plan in plans.items():
             if plan.marks or plan.split:
@@ -1114,19 +1143,24 @@ class QuickReviewPanel(ProblemListPanel):
                     foreground, background = {"自动对上": ("#3b5b7a", "#e6edf5"),
                                               "已确认": ("#126044", "#e5f4ec"),
                                               "已点": ("#126044", "#e5f4ec"),
-                                              "已排除": ("#1d4ed8", "#e6f0ff"),
-                                              "待定": ("#b42318", "#fdecec"),
-                                              "多出": ("#b42318", "#fdecec"),
+                                              "已接受对应": ("#3b5b7a", "#e6edf5"),
+                                              "已排除": ("#4b5563", "#f1f3f5"),
+                                              "待定": ("#9a3412", "#ffedd5"),
+                                              "多出": ("#9a3412", "#ffedd5"),
                                               "疑似漏读": ("#9a3412", "#ffedd5"),
                                               "疑似双芯片": ("#9a3412", "#ffedd5"),
-                                              "补录": ("#0f766e", "#ccfbf1"),
-                                              "多余芯片": ("#0f766e", "#ccfbf1")}["自动对上" if auto else state]
+                                              "补录": ("#9a3412", "#ffedd5"),
+                                              "多余芯片": ("#9a3412", "#ffedd5")}["自动对上" if auto else state]
                     cell.setForeground(QColor(foreground))
                     cell.setBackground(QColor(background))
                     cell.setTextAlignment(Qt.AlignCenter)
                 tooltip = ("点击回看保存原帧" if row.decision else
-                           f"点击回看这一刻（从过线前 {self._passage_lead(row) / 1000:g} 秒看起）；"
+                           f"点击回看这一刻（{'从过线那一刻看起' if not self._passage_lead(row) else f'从过线前 {self._passage_lead(row) / 1000:g} 秒看起'}）；"
                            "选中按 1/2/3/4 或右键处理这一行")
+                if row.note == "已排除":
+                    exclusion = self._arrival_store.latest(self._arrival_scope, row.key) or {}
+                    tooltip = ("本机排除（测试／非参赛）：" + exclusion.get("exclusion_reason", "")
+                               + "；原始芯片保留，不导出建议删除；按 4 撤回。")
                 if row.mark is not None:
                     tooltip = "比芯片多点出的人：点这一行回到点他的那一帧；按 3 补录号码或 1 不是运动员，点错在画面上右键去掉"
                 tooltip = {"疑似漏读": "画面上有人却没有芯片：核对原帧号码后按 3 补录号码，导出到补录清单；"
@@ -1192,7 +1226,8 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.verticalScrollBar().setValue(scroll)
         self.table.blockSignals(False)
         confirmed = sum(row.decision is not None for row in rows)
-        self.quick_title.setText(f"到达记录 {len(rows)} 条 · 已对上 {confirmed} 个芯片"
+        self.quick_title.setText(f"到达记录 {len(rows)} 条 · 自动对应 {len(self._auto_labels)} 个 · 已处理 {confirmed} 个芯片"
+                                 + (" · 目标圈数未收到，暂列全部圈次" if self._unknown_lap_groups else "")
                                  + (f" · 中间圈 {self._intermediate_laps} 条不列" if self._intermediate_laps else "")
                                  + (f" · 圈数不足 {len(self._short_bibs)} 人" if self._short_bibs else ""))
         self.quick_title.setToolTip(
@@ -1240,14 +1275,12 @@ class QuickReviewPanel(ProblemListPanel):
     def _landing(self, row, keep=True):
         """Where the picture goes when this row is opened; the one rule for every way in.
 
-        A decided row: the frame it was decided on.  A chip row: half a second
-        before its wave's first rider meets the line as the strip sees it (the
-        chip time alone lands on the wrong rider of a bunch), unless the picture
-        already shows this wave: switching riders inside a wave never moves it.
-        A crossing without a chip nobody ruled on: 2 s before it, so a passage
-        of several people is seen from its start (15:50, 10-29: the row's own
-        frame showed 2 of 4, the first two crossed 1.7 s before).  KEEP means stay; None means the row's
-        own stored frame or chip reference.
+        A decided row uses its saved frame. A proposed automatic wave opens its
+        first paired person's exact frame; member changes keep the picture.
+        Unpaired chips use the strip's first crossing without playback padding,
+        falling back to chip time. Video-only passages use their small lead, or
+        the earlier arrival when several people may share one crossing.
+        KEEP means stay; None means the row's stored frame or chip reference.
         """
         self._landing_pending = None
         if row.decision and row.decision.get("frame"):
@@ -1260,12 +1293,24 @@ class QuickReviewPanel(ProblemListPanel):
             return self._passage_start(row)
         if not self._quick_ready:
             return None
-        if not self.race_strip.view.pieces:
-            self._landing_pending = row.key  # the strip is still loading: land when it is read
-            return None
         first, last = min(stamps), max(stamps)
-        if keep and self._shown_ms is not None and first - WAVE_GAP_MS / 2 <= self._shown_ms <= last + WAVE_GAP_MS / 2:
+        wave = self._row_wave(row) or ()
+        paired = [self._auto_labels[chip.key] for chip in wave if chip.key in self._auto_labels]
+        visible = self._shown_ms is not None and first - WAVE_GAP_MS / 2 <= self._shown_ms <= last + WAVE_GAP_MS / 2
+        if paired and len(paired) == len(wave):
+            binding = (str(self.workspace_dir), self._arrival_scope,
+                       tuple((chip.key, self._auto_labels[chip.key].key) for chip in wave))
+            if keep and visible and self._auto_landing_key == binding:
+                return KEEP
+            self._auto_landing_key = binding
+            # Same evidence as the labels and acceptance, not another strip search.
+            person = min(paired, key=lambda entry: entry.chip_ms)
+            return dict(person.frame, reference_only=True, auto_pair=True)
+        if keep and visible:
             return KEEP
+        if not self.race_strip.view.pieces:
+            self._landing_pending = row.key  # unpaired reference awaits the strip
+            return None
         pieces, cache = self.race_strip.view.pieces, self.race_strip.view.cache
         moment = first_crossing(pieces, cache, first)
         moment = first if moment is None else moment
@@ -1420,6 +1465,9 @@ class QuickReviewPanel(ProblemListPanel):
 
     def _show_row_hint(self, row):
         """What settles a row still to handle at the end (see 只看要处理的)."""
+        if row.note == "已排除":
+            self.hint.setText("本次芯片已在本机排除（测试／非参赛）；原始记录保留，不导出，按 4 撤回。")
+            return
         text = {"疑似漏读": "疑似漏读：核对原帧上的号码，按 3 补录号码（导出到补录清单）；不是运动员按 1。",
                 "补录": f"补录 {row.bib} 号：按 3 改号码，4 撤回。",
                 "疑似双芯片": f"{row.bib} 号这一波看完了却没对上人：漏点了就在画面上补点；"
@@ -1487,12 +1535,16 @@ class QuickReviewPanel(ProblemListPanel):
         if row.event is not None:
             if not row.event.is_active:
                 return []
+            if row.note == "已排除":
+                return [("撤销本机排除", lambda: self._undo_key(key))]
             if state == "多余芯片":
                 return [("改携带人…", lambda: self._mark_extra_chip(key)),
                         ("撤回双芯片", lambda: self._take_back_extra_chip(key))]
             counted = self._counted_person(row) is not None
             actions = [("这人没芯片：补录号码…", lambda: self._person_no_chip(key)),
                        ("这人不是运动员", lambda: self._person_flag(key, "exclusion_reason"))] if counted else []
+            if not counted and row.decision is None:
+                actions.append(("非运动员（本机排除）", lambda: self._exclude_local_chip(key)))
             actions.append(("双芯片：这条芯片是谁带的…", lambda: self._mark_extra_chip(key)))
             if counted:
                 actions.append(("撤销：去掉这个人", lambda: self._drop_person(key)))
@@ -1742,6 +1794,8 @@ class QuickReviewPanel(ProblemListPanel):
 
     def _sync_arrival_confirmation(self):
         row = self._selected_arrival()
+        self.race_strip.view.set_selected_chip(
+            (int(row.event.timeline_timestamp_ms), row.bib) if row is not None and row.event is not None else None)
         item = self._candidate_item()
         category = self._category()
         frame = self._frame_provider()
@@ -1749,7 +1803,9 @@ class QuickReviewPanel(ProblemListPanel):
                            and frame.get("position_ms", -1) >= 0
                            and frame.get("segment_id") and frame.get("video_path")
                            and frame.get("recorder_ms") is not None)
-        if row is None or row.event is None or not row.event.is_active or not row.bib:
+        if row is not None and row.note == "已排除":
+            reason = "这条芯片已在本机排除，按 4 撤回后再处理"
+        elif row is None or row.event is None or not row.event.is_active or not row.bib:
             reason = "可先在画面点圈；确认过线前请选择对应芯片记录"
         elif row.decision is not None:
             reason = "该运动员已确认；修改前请先撤销"
@@ -1775,14 +1831,14 @@ class QuickReviewPanel(ProblemListPanel):
         plan = self._wave_plan()
         wave = plan.chips if plan is not None else self._row_wave(row)
         color = ""
-        if plan is not None and (plan.marks or plan.split):
+        if row is not None and row.note == "已排除":
+            status, color = "本机已排除（测试／非参赛） · 原始记录保留 · 不导出 · 4 撤回", "#4b5563"
+        elif plan is not None and (plan.marks or plan.split):
             status, color = self._wave_status(plan)
         elif row is not None and row.key in self._auto_labels and wave is not None:
-            unseen = self._span_unseen(wave, margin=WAVE_REACH_MS)
             status = (f"自动对上 · 本波 {len(wave)} 人 {len(wave)} 芯片 · "
-                      + (f"还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看" if unseen
-                         else "已看完") + " · 回车记为已点 · 4 撤回逐个点")
-            color = "#9a5b12" if unseen else "#3b5b7a"
+                      "回车接受对应（不算人工点数） · 4 撤回逐个点")
+            color = "#3b5b7a"
         elif row is not None and wave is None and self._row_state(row) == "待定" and row.time_ms is not None:
             # A crossing without a chip may be several people: it is looked at
             # from a quarter second before (可能多人: from when the first came on)
@@ -1805,7 +1861,9 @@ class QuickReviewPanel(ProblemListPanel):
     def _wave_status(self, plan):
         """The count of a wave against its chips, and its color: green 已核, red 多/少, amber not all seen."""
         chips, people = len(plan.chips) - len(plan.extra_chips), plan.people
-        status = f"芯片 {chips} · 已点 {people}"
+        automatic = sum(bool(mark.get("auto_label")) for mark in plan.marks)
+        status = (f"芯片 {chips} · 已接受对应 {automatic} · 人工点数 {people - automatic}" if automatic
+                  else f"芯片 {chips} · 已点 {people}")
         if plan.extra_chips:
             status += f" · 双芯片 {len(plan.extra_chips)}"
         if plan.extra:
@@ -1815,7 +1873,8 @@ class QuickReviewPanel(ProblemListPanel):
         missing = len(plan.no_chip) + plan.split
         if missing:
             status += f" · 无芯片 {missing}"
-        unseen = self._unseen(plan)
+        accepted = bool(automatic and automatic == len(plan.marks) and plan.matches)
+        unseen = [] if accepted else self._unseen(plan)
         if unseen:
             status += f" · 还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看"
         if self._wave_outdated(plan):
@@ -1826,7 +1885,7 @@ class QuickReviewPanel(ProblemListPanel):
             return status, "#b42318"
         if unseen:
             return status, "#9a5b12"
-        return status + " · 已核", "#126044"
+        return status + (" · 不算人工确认" if accepted else " · 已核"), "#3b5b7a" if accepted else "#126044"
 
     def _wave_outdated(self, plan):
         """What is saved for a wave is not what its picture now counts (see _save_wave)."""
@@ -1860,8 +1919,11 @@ class QuickReviewPanel(ProblemListPanel):
         stamps = [int(row.event.timeline_timestamp_ms) for row in chips]
         camera = str(int(camera if camera is not None else self.race_strip.camera or 1))
         seen = self._arrival_drafts.get("seen", {}).get(camera, [])
-        return uncovered_intervals(min(stamps) - margin, max(stamps) + margin,
-                                   seen, tolerance=100)
+        start, end = min(stamps) - margin, max(stamps) + margin
+        if start == end:
+            shown = any(left - 100 <= start <= right + 100 for left, right in seen)
+            return [] if shown else [[start, start + 100]]
+        return uncovered_intervals(start, end, seen, tolerance=100)
 
     def record_viewed_frame(self, frame, recorder_ms):
         """Remember, in chip time, what of the recording the operator has looked at."""
@@ -1896,6 +1958,8 @@ class QuickReviewPanel(ProblemListPanel):
         wave lasts, and only on the camera it was started on.
         """
         row = self._selected_arrival()
+        if row is not None and row.note == "已排除":
+            return None, "这条芯片已在本机排除，请先按 4 撤回或选择其他记录。"
         wave = self._wave_for_frame(frame)
         if wave is not None:
             item = self._wave_candidate(wave)
@@ -2014,12 +2078,11 @@ class QuickReviewPanel(ProblemListPanel):
         return marks
 
     def picture_overlays(self, frame):
-        """Rings for the people counted, as (x, y, label, confirmed, alert, dot, ghost, auto).
+        """Vertical lines: (x, y, label, manual, alert, dot=False, ghost, auto).
 
-        Someone clicked on a frame up to GHOST_REACH_MS before this one is drawn
-        as a faded ring where they were, without a tag (a crowd of tags is only
-        noise), so identical kits do not get counted twice while stepping frame
-        by frame.  AUTO: paired by 自动对上, nobody has counted them yet.
+        Bindings are visible without selecting their chip row. Nearby-frame
+        ghosts are faded and unlabelled: these are positions, not tracking.
+        AUTO describes the source, never an operator's identity confirmation.
         """
         if frame is None:
             return []
@@ -2033,7 +2096,18 @@ class QuickReviewPanel(ProblemListPanel):
                 continue
             here = mark_on_frame({"recorder_ms": person.recorder_ms, "frame": person.frame}, frame, current)
             if here or abs(current - person.recorder_ms) <= GHOST_REACH_MS:
-                automatic.append((person.x, person.y, bibs.get(key, ""), False, False, True, not here, True))
+                automatic.append((person.x, person.y, bibs.get(key, ""), False, False, False, not here, True))
+        # Saved bindings also remain visible when another table row is selected.
+        for row in self._arrival_rows:
+            decision = row.decision or {}
+            saved = decision.get("frame") or {}
+            if (saved.get("marker_x_normalized") is None or saved.get("marker_y_normalized") is None
+                    or saved.get("recorder_ms") is None or int(saved.get("camera_index") or 1) != camera):
+                continue
+            if mark_on_frame({"recorder_ms": saved["recorder_ms"], "frame": saved}, frame, current):
+                auto = bool(decision.get("auto_label"))
+                automatic.append((float(saved["marker_x_normalized"]), float(saved["marker_y_normalized"]),
+                                  row.bib, not auto, False, False, False, auto))
         item = self.current_item()
         if item is None:
             return automatic
@@ -2046,12 +2120,17 @@ class QuickReviewPanel(ProblemListPanel):
                 alert = bool(self.picture_mark_warning(mark))
             else:
                 label, alert = "无芯片", True
+            auto = bool(mark.get("auto_label"))
             if mark_on_frame(mark, frame, current):
-                shown.append((float(mark["x"]), float(mark["y"]), label, not alert, alert, True, False, False))
+                shown.append((float(mark["x"]), float(mark["y"]), label, not alert and not auto, alert, False, False, auto))
             elif (int((mark.get("frame") or {}).get("camera_index") or camera) == camera
                   and 0 < current - int(mark["recorder_ms"]) <= GHOST_REACH_MS):
-                ghosts.append((float(mark["x"]), float(mark["y"]), label, not alert, alert, True, True, False))
-        return automatic + ghosts + shown  # the marks of this very frame are drawn on top
+                ghosts.append((float(mark["x"]), float(mark["y"]), label, not alert and not auto, alert, False, True, auto))
+        # A saved binding may also be a current picture mark; draw it only once.
+        unique = {}
+        for overlay in automatic + ghosts + shown:
+            unique[(round(overlay[0], 4), round(overlay[1], 4), overlay[2], overlay[6])] = overlay
+        return list(unique.values())
 
     def set_finish_line_status(self, configured):
         self.finish_line_status.setText("" if configured else "终点线未设置：请先在实际画面上画线")
@@ -2407,6 +2486,9 @@ class QuickReviewPanel(ProblemListPanel):
         self.hint.setText(message)
 
     def _confirm_arrival(self, row):
+        if row.note == "已排除":
+            self.hint.setText("这条芯片已在本机排除，按 4 撤回后再处理。")
+            return
         if row.decision:
             self.hint.setText("该运动员已确认；若要修改，请先撤销误确认，再重新定位压线帧。")
             return
@@ -2704,6 +2786,37 @@ class QuickReviewPanel(ProblemListPanel):
         text, ok = QInputDialog.getText(self, "双芯片", f"{bib} 号芯片是谁带的？核对后填携带人的号码：",
                                         text=current)
         return text if ok else None
+
+    def _exclude_local_chip(self, key):
+        """Exclude an operator-declared test chip, without inventing video evidence."""
+        row = self._row_by_key(key)
+        if (row is None or row.event is None or not row.event.is_active or self._arrival_store is None
+                or row.decision is not None or self._counted_person(row) is not None or row.note == "多余芯片"):
+            self.hint.setText("已有点人或确认记录，请先按 4 撤销，再做本机排除。")
+            return
+        scope, binding = self._arrival_scope, event_binding(row.event)
+        store = self._arrival_store
+        # One explicit row action is enough on site; keep its meaning in the
+        # journal instead of asking the operator to type the same reason.
+        reason = "非运动员（本机排除）"
+        self._render()  # refresh the exact chip binding before saving
+        row = self._row_by_key(key)
+        if (self._arrival_scope != scope or self._arrival_store is not store or row is None or row.event is None
+                or event_binding(row.event) != binding or row.decision is not None
+                or self._counted_person(row) is not None or row.note == "多余芯片"):
+            self.hint.setText("这条芯片或处理状态已变化，未排除，请重新核对。")
+            return
+        try:
+            self._arrival_store.save(scope, key, binding, "held", reason=LOCAL_CHIP_EXCLUSION,
+                                     exclusion_reason=reason, event_id=row.event.event_id, bib=row.bib)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.hint.setText(f"本机排除未保存：{error}")
+            return
+        self._quick_render_signature = None
+        self._render()
+        self._select_key(key)
+        self._last_saved_key = key
+        self.hint.setText(f"{row.bib} 号本次记录已在本机排除；原始芯片保留，不导出，按 4 撤回。")
 
     def _mark_extra_chip(self, key):
         """双芯片 (right click on a chip row): the chip is a second chip of the rider with the bib given.
@@ -3018,6 +3131,9 @@ class QuickReviewPanel(ProblemListPanel):
     def _undo_arrival(self):
         plan = self._wave_plan()
         row = self._selected_arrival()
+        if row is not None and row.note == "已排除":
+            self._undo_key(row.key)
+            return
         if row is not None and row.key in self._auto_labels:
             self._withdraw_auto_wave(row)
             return
@@ -3104,6 +3220,7 @@ class QuickReviewPanel(ProblemListPanel):
             self.marks_changed.emit(tuple(self.current_marks()))
         undone = (None if previous is None
                   else f" {previous.get('bib')} 号确认" if previous["action"] == "confirm"
+                  else "本机排除" if previous.get("reason") == LOCAL_CHIP_EXCLUSION
                   else {"not_rider": "排除", "held": "暂放"}.get(previous["action"], "运动员标记"))
         self.hint.setText(f"已撤销{undone}；可重新点人或按 1/2/3 重判。" if undone
                           else "这一行没有可撤销的判定。")
@@ -3186,6 +3303,8 @@ class QuickReviewPanel(ProblemListPanel):
     def _attention(self, row, outdated, counted):
         """What is left at the end: pending, done (to export), or nothing to do (None)."""
         state = self._row_state(row)
+        if row.note == "已排除":
+            return None
         if state in ("补录", "多余芯片"):
             return "done"
         wave = self._wave_of.get(row.key) if row.event is not None else None

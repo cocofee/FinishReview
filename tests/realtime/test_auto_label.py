@@ -87,3 +87,13 @@ def test_two_people_for_one_chip_are_left_to_hand(tmp_path):
                                      1))
     match = label_wave([("c1", people[0].chip_ms)], people, clock_ok=True)
     assert match.pairs == () and any("不一致" in reason for reason in match.reasons)
+
+
+def test_equal_counts_that_are_offset_in_time_are_not_labelled(tmp_path):
+    # Two chips and two people, but the first chip is 500 ms away from the
+    # person it would be zipped with: the wave stays for hand review.
+    people = aligned(detected_people(workspace(tmp_path, [(START + 5_000, 100, False), (START + 6_000, 300, False)]),
+                                     1))
+    chips = [("c1", people[0].chip_ms - 500), ("c2", people[1].chip_ms)]
+    match = label_wave(chips, people, clock_ok=True)
+    assert match.pairs == () and any("对不上" in reason for reason in match.reasons)

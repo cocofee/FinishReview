@@ -117,6 +117,7 @@ class ArrivalReviewStore:
             self._read_locked()
             previous = self.latest(scope, key, binding)
             if (previous is not None and previous["action"] == action
+                    and (action != "held" or previous.get("reason") == values.get("reason"))
                     and (action != "confirm" or
                          previous.get("candidate_binding") == values.get("candidate_binding"))):
                 return previous
