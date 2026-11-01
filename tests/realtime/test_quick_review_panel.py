@@ -1148,33 +1148,42 @@ def test_a_chip_row_nobody_was_counted_for_offers_only_double_chip_and_a_click_j
         "这人没芯片：补录号码…", "这人不是运动员", "双芯片：这条芯片是谁带的…", "撤销：去掉这个人"]
 
 
-def test_keys_1_2_3_4_do_on_the_selected_row_what_its_right_click_offers(wave_panel):
-    """10-29：左手操作。1 不是运动员、2 双芯片、3 补录号码、4 撤销，作用在左边选中的那一行。"""
+@pytest.mark.parametrize("use_buttons", [False, True], ids=["keyboard", "buttons"])
+def test_keys_1_2_3_4_do_on_the_selected_row_what_its_right_click_offers(wave_panel, use_buttons):
+    """键盘和按钮处理左侧选中行，与右键的判定一致。"""
+    def press(key):
+        if use_buttons:
+            button = wave_panel.quick_undo_button if key == Qt.Key_4 else wave_panel.row_action_buttons[key]
+            assert not button.isHidden()
+            QTest.mouseClick(button, Qt.LeftButton)
+        else:
+            QTest.keyClick(wave_panel, key)
+
     wave_panel._ask_bib = lambda current: None  # the bib is not read yet
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     count_on_picture(wave_panel, .2, 100)
     count_on_picture(wave_panel, .4, 500)
     assert saved(wave_panel) == {"61": 100, "20": 500}
     assert wave_panel._selected_arrival().bib == "20"  # the click picked out the person's row
-    QTest.keyClick(wave_panel, Qt.Key_3)  # this one has no chip: a 疑似漏读 row of their own
+    press(Qt.Key_3)  # this one has no chip: a 疑似漏读 row of their own
     assert saved(wave_panel) == {"61": 100}
     miss = wave_panel._selected_arrival()
     assert miss.event is None and wave_panel._row_state(miss) == "疑似漏读"
-    QTest.keyClick(wave_panel, Qt.Key_4)  # 4 takes it back, as Backspace does
+    press(Qt.Key_4)  # 4 takes it back, as Backspace does
     assert saved(wave_panel) == {"61": 100, "20": 500}
 
     wave_panel._ask_carrier = lambda bib, current: "61"
     wave_panel._arrival_clicked(row(wave_panel, "76"))
-    QTest.keyClick(wave_panel, Qt.Key_2)
+    press(Qt.Key_2)
     assert wave_panel._arrival_rows[row(wave_panel, "76")].carrier == "61"
     assert "61号带的" == wave_panel.table.item(row(wave_panel, "76"), 3).text()
-    QTest.keyClick(wave_panel, Qt.Key_1)  # nothing to exclude on a second chip
+    press(Qt.Key_1)  # nothing to exclude on a second chip
     assert "这一行不能按 1" in wave_panel.hint.text() and "2 双芯片、4 撤销" in wave_panel.hint.text()
-    QTest.keyClick(wave_panel, Qt.Key_4)
+    press(Qt.Key_4)
     assert wave_panel._arrival_rows[row(wave_panel, "76")].carrier == ""
 
     wave_panel._arrival_clicked(row(wave_panel, "20"))
-    QTest.keyClick(wave_panel, Qt.Key_1)  # the person counted for 20 is no rider
+    press(Qt.Key_1)  # the person counted for 20 is no rider
     assert saved(wave_panel) == {"61": 100}
     assert "非运动员" in wave_panel.hint.text()
 

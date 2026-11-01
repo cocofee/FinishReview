@@ -13,7 +13,7 @@ from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication, QAbstractSpinBox, QComboBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QMenu, QPlainTextEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget,
+    QMenu, QPlainTextEdit, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .auto_label import WAVE_REACH_MS, label_wave, people_on_line
@@ -254,16 +254,30 @@ class QuickReviewPanel(ProblemListPanel):
         self.splitter.insertWidget(0, column)
         column_layout.addWidget(self.table)
         self.quick_toolbar = QWidget(self)
-        bar = QHBoxLayout(self.quick_toolbar)
-        bar.setContentsMargins(2, 3, 2, 3)
-        self.quick_title = QLabel("到达记录", self.quick_toolbar)
-        bar.addWidget(self.quick_title, 1)
+        toolbar_layout = QVBoxLayout(self.quick_toolbar)
+        toolbar_layout.setContentsMargins(2, 3, 2, 3)
+        toolbar_layout.setSpacing(3)
+        self.status_widget = QWidget(self.quick_toolbar)
+        self.status_bar = QHBoxLayout(self.status_widget)
+        self.status_bar.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        toolbar_layout.addLayout(bar)
+        bar.addWidget(self.status_widget, 1)
+        self.quick_title = QLabel("到达记录", column)
+        column_layout.insertWidget(0, self.quick_title)
+        self.row_action_buttons = {}
+        for key, label in ((Qt.Key_1, "1 非运动员"), (Qt.Key_2, "2 双芯片"), (Qt.Key_3, "3 补录")):
+            button = QPushButton(label, self.quick_toolbar)
+            button.setToolTip("处理左侧选中行")
+            button.clicked.connect(lambda _checked=False, value=key: self._row_key(value))
+            self.row_action_buttons[key] = button
+            bar.addWidget(button)
         self.defer_button = QPushButton("暂放", self.quick_toolbar)
         self.confirm_arrival_button = QPushButton("确认过线", self.quick_toolbar)
         self.confirm_arrival_button.setToolTip(
             "先选左侧运动员，再将画面停在其前轮压终点线的一帧，最后点击确认过线"
         )
-        self.quick_undo_button = QPushButton("撤销 4", self.quick_toolbar)
+        self.quick_undo_button = QPushButton("4 撤销", self.quick_toolbar)
         for button in (self.defer_button, self.confirm_arrival_button, self.quick_undo_button):
             bar.addWidget(button)
         self.confirm_arrival_button.hide()
@@ -283,19 +297,20 @@ class QuickReviewPanel(ProblemListPanel):
         more.setMenu(menu)
         bar.addWidget(more)
         self.layout().insertWidget(0, self.quick_toolbar)
-        # One row: count and status on the left, then line setup and the judging keys.
+        # Judging actions stay visible; routine pipeline details belong in hover text.
         self.finish_line_button = QPushButton("终点线 / 模型", self.quick_toolbar)
         self.finish_line_button.setToolTip(
             "绘制本机位终点线，选择本机 YOLOX ONNX 模型并试运行；只分析已封存录像"
         )
         self.finish_line_button.clicked.connect(self._configure_sampling)
-        self.finish_line_status = QLabel("终点线未设置：请先在实际画面上画线", self.quick_toolbar)
+        self.finish_line_status = QLabel("未设终点线", self.quick_toolbar)
         self.confirmation_status = QLabel("", self.quick_toolbar)
         self.confirmation_status.setStyleSheet("color:#374151;")
-        bar.insertWidget(1, self.confirmation_status, 1)
-        bar.insertWidget(2, self.finish_line_status)
-        bar.insertWidget(3, self.finish_line_button)
-        bar.setStretchFactor(self.quick_title, 0)
+        self.confirmation_status.setMinimumWidth(0)
+        self.confirmation_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status_bar.addWidget(self.confirmation_status, 1)
+        self.status_bar.addWidget(self.finish_line_status)
+        bar.addWidget(self.finish_line_button)
         self.race_strip = RaceStripPanel(self)
         self.race_strip.seek_requested.connect(self._seek_race_strip)
         self.race_strip.ready.connect(self._strip_ready)
@@ -1192,7 +1207,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.verticalScrollBar().setValue(scroll)
         self.table.blockSignals(False)
         confirmed = sum(row.decision is not None for row in rows)
-        self.quick_title.setText(f"到达记录 {len(rows)} 条 · 已对上 {confirmed} 个芯片"
+        self.quick_title.setText(f"到达 {len(rows)} · 已对上 {confirmed}"
                                  + (f" · 中间圈 {self._intermediate_laps} 条不列" if self._intermediate_laps else "")
                                  + (f" · 圈数不足 {len(self._short_bibs)} 人" if self._short_bibs else ""))
         self.quick_title.setToolTip(
@@ -1432,7 +1447,7 @@ class QuickReviewPanel(ProblemListPanel):
         if self._row_state(row) == "待定" and row.item.item_id in self._near_counted_items:
             text = NEAR_COUNTED_TEXT
         if self._row_state(row) == "待定" and row.key in self._auto_labels:
-            text = AUTO_TEXT
+            text = "自动对上 · 未人工确认、不导出 · 看完本波回车记录"
         if text:
             self.hint.setText(text)
 
@@ -1771,7 +1786,8 @@ class QuickReviewPanel(ProblemListPanel):
         # The old confirm path's reasons only explain its hidden button; the
         # status says what the picture and the table do now.
         count = sum(not mark.get("exclusion_reason") for mark in self.current_marks())
-        status = "左键点压线的人即保存 · 右键去掉 · 1 非运动员 2 双芯片 3 补录 4 撤销" + (f" · 已圈 {count}" if count else "")
+        selected = f"{row.bib} 号" if row is not None and row.bib else "无芯片记录" if row is not None else "未选中"
+        status = selected + (f" · 已点 {count}" if count else "")
         plan = self._wave_plan()
         wave = plan.chips if plan is not None else self._row_wave(row)
         color = ""
@@ -1781,7 +1797,7 @@ class QuickReviewPanel(ProblemListPanel):
             unseen = self._span_unseen(wave, margin=WAVE_REACH_MS)
             status = (f"自动对上 · 本波 {len(wave)} 人 {len(wave)} 芯片 · "
                       + (f"还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看" if unseen
-                         else "已看完") + " · 回车记为已点 · 4 撤回逐个点")
+                         else "已看完 · 回车记录"))
             color = "#9a5b12" if unseen else "#3b5b7a"
         elif row is not None and wave is None and self._row_state(row) == "待定" and row.time_ms is not None:
             # A crossing without a chip may be several people: it is looked at
@@ -1793,13 +1809,14 @@ class QuickReviewPanel(ProblemListPanel):
             if self._earlier_arrival(row, read=False) is not None:
                 span = "可能多人 · " + span
             status = (span + (f"还差 {sum(right - left for left, right in unseen) / 1000:.1f} 秒没看" if unseen
-                              else "已看完") + " · 看到几个人就点几个；3 补录、1 不是运动员")
+                              else "已看完"))
             color = "#9a5b12" if unseen else "#126044"
         elif wave is not None and len(wave) > 1 and any(chip.decision is None for chip in wave):
-            status = f"本波 {wave[0].bib}→{wave[-1].bib}（{len(wave)} 个芯片）：点一个人存一个"
+            status = f"本波 {wave[0].bib}→{wave[-1].bib} · {len(wave)} 芯片"
         if plan is not None and plan.unmatched:
-            status += f" · 再点一人 = {plan.unmatched[0].bib} 号"
+            status += f" · 下一位 {plan.unmatched[0].bib} 号"
         self.confirmation_status.setText(status)
+        self.confirmation_status.setToolTip(status)
         self.confirmation_status.setStyleSheet(f"color:{color}; font-weight:600;" if color else "")
 
     def _wave_status(self, plan):
@@ -1809,7 +1826,7 @@ class QuickReviewPanel(ProblemListPanel):
         if plan.extra_chips:
             status += f" · 双芯片 {len(plan.extra_chips)}"
         if plan.extra:
-            status += f" · 多 {len(plan.extra)} 人（选中那一行按 3 补录号码或 1 不是运动员）"
+            status += f" · 多 {len(plan.extra)} 人"
         if plan.unmatched:
             status += f" · 少 {len(plan.unmatched)} 人"
         missing = len(plan.no_chip) + plan.split
@@ -1958,7 +1975,7 @@ class QuickReviewPanel(ProblemListPanel):
         index = self._editing_mark if 0 <= self._editing_mark < len(plan.marks) else None
         label = plan.labels.get(index, "")
         if index in plan.extra:
-            head = "多出一人：按 3 补录号码，或按 1 标不是运动员"
+            head = "多出一人 · 待处理"
         elif index in plan.no_chip:
             head = "这一位无芯片"
         elif label and not is_excluded(plan.marks[index]):
@@ -1968,7 +1985,7 @@ class QuickReviewPanel(ProblemListPanel):
         near = self._near_counted(plan, index)
         if near:
             head += f"；{near}，若是同一人请右键取消它"
-        return head + "；点错右键取消。"
+        return head
 
     def _near_counted(self, plan, index):
         """Someone already counted close by on a nearby frame: likely the same rider clicked twice."""
@@ -2053,9 +2070,16 @@ class QuickReviewPanel(ProblemListPanel):
                 ghosts.append((float(mark["x"]), float(mark["y"]), label, not alert, alert, True, True, False))
         return automatic + ghosts + shown  # the marks of this very frame are drawn on top
 
+    def refresh_status_visibility(self):
+        labels = self.status_widget.findChildren(QLabel)
+        for label in labels:
+            label.setVisible(bool(label.text()))
+        self.status_widget.setVisible(any(label.text() for label in labels))
+
     def set_finish_line_status(self, configured):
-        self.finish_line_status.setText("" if configured else "终点线未设置：请先在实际画面上画线")
+        self.finish_line_status.setText("" if configured else "未设终点线")
         self.finish_line_status.setStyleSheet("color:#17675b;" if configured else "color:#9a5b12;")
+        self.refresh_status_visibility()
 
     def _configure_sampling(self):
         self.sampling_preparing.emit()

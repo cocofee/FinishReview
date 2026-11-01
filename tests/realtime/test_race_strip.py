@@ -19,6 +19,36 @@ def piece(tmp_path, start=T, end=T + 60_000):
     return StripPiece(tmp_path / "strip.npz", 1, "archive", video, start, end, True, 300)
 
 
+def test_initial_view_starts_near_first_chip_without_removing_empty_extent(qapp):
+    view = RaceStripView()
+    view.resize(1280, view.height())
+    view.set_chips([(T, "19", False)])
+    assert view.view_ms == T - 1000
+    assert view.extent() == (T - 30_000, T + 30_000)
+    view.set_view(T - 30_000)
+    assert view.view_ms == T - 30_000  # still reachable by manual browsing
+
+
+def test_label_band_only_reserves_rows_needed_by_visible_chips(qapp):
+    view = RaceStripView()
+    view.resize(1800, view.height())
+    view.set_chips([(T, "19", False)])
+    assert view.STRIP_TOP == view.LABEL_ROWS[0] + 3
+    view.set_chips([(T, "19", False), (T + 1, "20", False), (T + 2, "21", False)])
+    assert view.STRIP_TOP == view.LABEL_ROWS[2] + 3
+    view.set_chips([(T, "19", False)])
+    assert view.STRIP_TOP == view.LABEL_ROWS[0] + 3
+
+
+def test_cursor_near_right_edge_recenters_to_leave_room_after_rider(qapp):
+    view = RaceStripView()
+    view.resize(1800, view.height())
+    view.set_chips([(T, "19", False)])
+    view.set_view(T - 30_000)
+    view.set_cursor(T)
+    assert view.x_of(T) == pytest.approx(view.width() / 2)
+
+
 def test_zoom_keeps_the_point_under_the_pointer_and_scroll_stays_in_range(qapp, tmp_path):
     view = RaceStripView()
     view.resize(800, view.height())

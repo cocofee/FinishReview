@@ -7021,3 +7021,180 @@ def test_real_decoder_crosses_seam_and_saves_256_frame(
         assert saved.position_ms == (first_index + 1) * 1000 // next_fps
     finally:
         dialog.close()
+
+
+def test_workbench_compact_hides_rare_controls_and_keeps_reset(qapp):
+    """The workbench keeps one reset button and drops the rare picture controls."""
+
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE, camera_index=1)
+    try:
+        pane.set_workbench_compact(True)
+        for button in (
+            pane.zoom_out_btn,
+            pane.zoom_in_btn,
+            pane.actual_size_btn,
+            pane.hd_btn,
+            pane.maximize_btn,
+            pane.open_btn,
+        ):
+            assert button.isHidden()
+        assert not pane.fit_btn.isHidden()
+        assert pane.fit_btn.text() == "复位画面"
+        assert "复位画面" in pane.fit_btn.toolTip()
+        assert not pane._maximize_shortcut.isEnabled()
+
+        pane.video_view.set_frame(
+            QImage(640, 360, QImage.Format_RGB32),
+            source_width=640,
+            source_height=360,
+        )
+        pane.video_view.zoom_by(2.0)
+        assert not pane.video_view._fit_mode
+        pane.fit_btn.click()
+        assert pane.video_view._fit_mode
+
+        pane.set_workbench_compact(False)
+        for button in (
+            pane.zoom_out_btn,
+            pane.zoom_in_btn,
+            pane.actual_size_btn,
+            pane.hd_btn,
+            pane.maximize_btn,
+            pane.open_btn,
+        ):
+            assert not button.isHidden()
+        assert pane.fit_btn.text() == "适应"
+        assert pane._maximize_shortcut.isEnabled()
+    finally:
+        pane.close()
+
+
+def test_workbench_compact_count_mode_clears_marker_and_blocks_expand(qapp):
+    view = passage_review.EvidenceImageView()
+    view.resize(640, 480)
+    view.show()
+    view.set_frame(QImage(640, 480, QImage.Format_RGB32))
+    view.set_marker_mode(True)
+    assert view._marker_mode
+    try:
+        view.set_workbench_compact(True)
+        assert not view._marker_mode
+        assert "单击放置判读线" not in view.toolTip()
+        # Marker mode cannot be re-armed behind the count gesture.
+        view.set_marker_mode(True)
+        assert not view._marker_mode
+        assert "单击放置判读线" not in view.toolTip()
+        view.set_count_mode(True)
+        assert view._count_mode
+        assert not view._marker_mode
+        emitted = []
+        view.maximize_requested.connect(lambda: emitted.append(True))
+        QTest.mouseDClick(
+            view.viewport(), Qt.LeftButton, pos=view.viewport().rect().center()
+        )
+        qapp.processEvents()
+        assert emitted == []
+
+        # Outside the workbench both the old marker/count coexistence and the
+        # double-click enlarge path are untouched.
+        view.set_workbench_compact(False)
+        view.set_marker_mode(True)
+        view.set_count_mode(True)
+        assert view._marker_mode and view._count_mode
+        view.set_marker_mode(True)
+        assert view._marker_mode
+        view.set_marker_mode(False)
+        QTest.mouseDClick(
+            view.viewport(), Qt.LeftButton, pos=view.viewport().rect().center()
+        )
+        qapp.processEvents()
+        assert emitted == [True]
+    finally:
+        view.close()
+
+
+def test_workbench_compact_enables_paused_original_and_retries_same_frame(qapp):
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE, camera_index=1)
+    pane.resize(900, 500)
+    pane.show()
+    worker = _FakePlaybackWorker(Path("camera_01.mkv"))
+    pane._worker = worker
+    pane._duration_ms = 20_000
+    pane._fps = 25.0
+    pane._current_frame_index = 250
+    pane._current_position_ms = 10_000
+    pane._full_resolution_enabled = False
+    try:
+        pane.set_workbench_compact(True)
+        assert pane._full_resolution_enabled
+        assert _wait_until(
+            lambda: worker.full_resolution_calls == [250],
+            timeout_ms=pane.FULL_RESOLUTION_IDLE_MS + 500,
+        )
+
+        worker.full_resolution_error.connect(pane._on_full_resolution_error)
+        worker.full_resolution_error.emit("decode failed", 250)
+        qapp.processEvents()
+        assert pane.quality_label.text() == "原图失败，点此重试"
+        assert "复位画面" in pane.quality_label.toolTip()
+
+        worker.full_resolution_calls.clear()
+        QTest.mouseClick(pane.quality_label, Qt.LeftButton)
+        qapp.processEvents()
+        assert worker.full_resolution_calls == [250]
+
+        pane._last_full_resolution_request = -1
+        pane._full_resolution_error_frame = 250
+        worker.full_resolution_calls.clear()
+        QTest.mouseClick(pane.fit_btn, Qt.LeftButton)
+        qapp.processEvents()
+        assert worker.full_resolution_calls == [250]
+
+        # A retry belongs to the erroring frame, never to whatever is newer.
+        pane._last_full_resolution_request = -1
+        pane._full_resolution_error_frame = 249
+        worker.full_resolution_calls.clear()
+        QTest.mouseClick(pane.fit_btn, Qt.LeftButton)
+        qapp.processEvents()
+        assert worker.full_resolution_calls == []
+
+        # Ordinary review keeps its old error hint and never retries by click.
+        pane.set_workbench_compact(False)
+        worker.full_resolution_error.emit("decode failed", 250)
+        qapp.processEvents()
+        assert pane.quality_label.text() == "原图读取失败，可点高清重试"
+        assert pane._retry_paused_frame_detail() is False
+    finally:
+        pane.close()
+
+
+def test_surface_workbench_compact_mode_controls_multi_camera_maximize(
+    qapp, tmp_path
+):
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        regular_camera_indexes=(1, 2),
+        show_high_speed_pane=False,
+        include_recorded_evidence=False,
+    )
+    qapp.processEvents()
+    panes = dialog.evidence_panes
+    try:
+        assert len(panes) == 2
+        dialog.set_workbench_compact_mode(True)
+        for pane in panes:
+            assert pane._workbench_compact
+            assert pane.maximize_btn.isHidden()
+
+        dialog.set_workbench_compact_mode(True, allow_multi_camera_maximize=True)
+        for pane in panes:
+            assert not pane.maximize_btn.isHidden()
+
+        dialog.set_workbench_compact_mode(False)
+        for pane in panes:
+            assert not pane._workbench_compact
+            assert not pane.maximize_btn.isHidden()
+            assert pane.fit_btn.text() == "适应"
+    finally:
+        dialog.close()

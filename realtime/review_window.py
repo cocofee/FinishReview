@@ -2470,6 +2470,7 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _set_problem_list_layout(self, expanded: bool) -> None:
         self._problem_workbench_active = expanded
+        self.set_workbench_compact_mode(expanded, allow_multi_camera_maximize=True)
         # Workbench: F belongs to the problem's own picture.  The time rail would
         # otherwise swallow the press for its own judging window (operator: "F does
         # not work"), and the press has to land wherever the hands are.
@@ -2600,7 +2601,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.crossing_cards.toolbar.addWidget(self.calibrate_crossing_button)
         self.group_start_button = QPushButton("回到团首", self)
         self.group_start_button.clicked.connect(self._open_group_start)
-        self.problem_panel.big_bar.insertWidget(0, self.group_start_button)
+        self.evidence_panes[0].controls_layout.addWidget(self.group_start_button)
         self.group_start_button.hide()
         self.return_problem_button = QPushButton("回到当前问题", self)
         self.return_problem_button.clicked.connect(self._return_to_problem)
@@ -2613,16 +2614,12 @@ class FinishReviewWindow(PassageReviewSurface):
         rail.follow_button.show()
         rail.navigation_started.connect(self._problem_browse_started)
         rail.follow_button.toggled.connect(lambda enabled: self._problem_browse_started() if enabled else None)
-        self.pipeline_label = QLabel("录像未启动 · 封存到 等待首段 ｜ 分析到 等待录像 / 校时 ｜ 积压 0 秒", self)
-        toolbar = getattr(self.problem_panel, "quick_toolbar", None)
-        if toolbar is not None:
-            # Same row as the record count and judging keys: no separate band.
-            self.pipeline_label.setStyleSheet("color:#17675b;")
-            toolbar.layout().insertWidget(0, self.pipeline_label)
-        else:
-            self.pipeline_label.setWordWrap(True)
-            self.pipeline_label.setStyleSheet("background:#eaf4f2; color:#17675b; padding:6px;")
-            self.layout().insertWidget(1, self.pipeline_label)
+        self.pipeline_label = QLabel("", self.problem_panel.status_widget)
+        self.pipeline_label.setStyleSheet("color:#17675b;")
+        self.pipeline_label.setWordWrap(True)
+        self.pipeline_label.setMinimumWidth(0)
+        self.pipeline_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.problem_panel.status_bar.insertWidget(0, self.pipeline_label, 1)
         self.problem_panel.set_workspace(self.output_dir)
 
     def _problem_selection_changed(self, item):
@@ -4160,13 +4157,13 @@ class FinishReviewWindow(PassageReviewSurface):
         live_cameras = (panel.payload or {}).get("cameras", {})
         through = [value.get("analyzed_through_ms") for value in live_cameras.values() if value.get("analyzed_through_ms")]
         analyzed = datetime.fromtimestamp(min(through) / 1000).strftime("%H:%M:%S") if through else "等待录像 / 校时"
-        self.pipeline_label.setToolTip(panel.chip_status + "\n" + panel.analysis_status
-                                       + "\n" + panel.health_text() + "\n" + panel.summary.toolTip())
         analysis_state = panel.analysis_status.replace("\n", " ")
-        # Routine progress already reads as "分析到 HH:MM:SS" below; only a
-        # stopped or failed analysis adds a note here, and only its first clause.
-        healthy = any(word in analysis_state for word in ("等待", "空闲", "后台分析中", "本轮分析完成"))
-        analysis_note = "" if healthy else analysis_state.split("；")[0].split("，")[0].split("：")[0]
+        # Only routine states may disappear. Failure/paused/configuration states
+        # take priority even if their longer explanation also contains “等待”.
+        actionable = any(word in analysis_state for word in ("失败", "错误", "暂停", "无法", "未完成", "跳过", "终点线"))
+        routine = any(word in analysis_state for word in ("等待", "空闲", "后台分析中", "后台分析：", "本轮分析完成"))
+        analysis_note = (analysis_state.split("；")[0].split("，")[0].split("：")[0]
+                         if actionable or not routine else "")
         short_ends = [segment.media_started_at_ms + segment.media_duration_ms for segment in self.timeline_store.segments()
                       if segment.end_reason == "retained_problem_segment" and segment.media_started_at_ms is not None
                       and segment.media_duration_ms is not None and (not panel._scope[0] or segment.race_id == panel._scope[0])]
@@ -4174,18 +4171,20 @@ class FinishReviewWindow(PassageReviewSurface):
         seconds = max(0, int(time.monotonic() - self._recording_started_at)) if recording else 0
         duration = f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
         backlog_seconds = max(0, (max(short_ends) - min(through)) // 1000) if short_ends and through else 0
-        # One short line, not a sentence: is the recording running, how fresh the
-        # sealed evidence is, whether the chip check has something to report, and
-        # what is still to look at.  Race, sampling, clock and the per-camera wording
-        # are a hover away and in the header above — the operator works from the
-        # queue and the picture, not from this bar.
-        chip_note = panel.chip_status.split("（")[0] if "发现" in panel.chip_status else ""
-        self.pipeline_label.setText(
-            f"{'● 录像 ' + duration if recording else '录像未启动'} · 封存到 {sealed}"
-            + (f" ｜ {chip_note}" if chip_note else "")
-            + (f" ｜ 分析 {analysis_note}" if analysis_note else "")
-            + f" ｜ 分析到 {analyzed} ｜ 积压 {backlog_seconds} 秒 ｜ {panel.evidence_gap_text()}"
+        chip_note = (panel.chip_status.split("（")[0].split("：")[0]
+                     if any(word in panel.chip_status for word in ("发现", "失败", "错误")) else "")
+        gap = panel.evidence_gap_text()
+        notes = [f"● 录像 {duration}" if recording else "", chip_note, analysis_note,
+                 f"分析落后 {backlog_seconds} 秒" if backlog_seconds else "",
+                 gap if gap != "证据缺口 无" else ""]
+        self.pipeline_label.setText(" ｜ ".join(note for note in notes if note))
+        self.pipeline_label.setToolTip(
+            f"封存到 {sealed} · 分析到 {analyzed} · 积压 {backlog_seconds} 秒\n"
+            + panel.chip_status + "\n" + panel.analysis_status + "\n" + panel.health_text()
+            + "\n" + panel.summary.toolTip()
         )
+        panel.quick_toolbar.setToolTip(self.pipeline_label.toolTip())
+        self.problem_panel.refresh_status_visibility()
         self._poll_recording_health()
         self._update_runtime_status()
 
