@@ -95,11 +95,20 @@ class ArrivalReviewStore:
         entry = self._latest.get((tuple(scope), key))
         return entry if entry is not None and (binding is None or entry["binding"] == binding) else None
 
+    def _refresh_locked(self):
+        """Reuse our committed snapshot; another writer still invalidates it under the lock."""
+        stamp = self.path.stat() if self.path.exists() else None
+        current = (stamp.st_mtime_ns, stamp.st_size) if stamp else None
+        if current != self._stamp:
+            self._read_locked()
+
     def _append_locked(self, entry):
         append_jsonl_records(self.path, [json.dumps(entry, ensure_ascii=False).encode("utf-8")],
                              description="arrival reviews", already_locked=True)
         self._entries.append(entry)
-        self._reindex()
+        scope = tuple(entry["scope"])
+        self._active.setdefault(scope, []).append(entry)
+        self._latest[(scope, entry["key"])] = entry
         self._update_stamp()
         return entry
 
@@ -114,7 +123,7 @@ class ArrivalReviewStore:
                     or frame.get("recorder_ms") is None or values.get("crossing_ms") is None):
                 raise ValueError("确认过线需要明确事件、号码和正在显示的原帧")
         with locked_jsonl(self.path):
-            self._read_locked()
+            self._refresh_locked()
             previous = self.latest(scope, key, binding)
             if (previous is not None and previous["action"] == action
                     and (action != "confirm" or
@@ -127,7 +136,7 @@ class ArrivalReviewStore:
     def undo(self, scope, *, key=None, wave=None):
         """Take back the newest ruling, one row's (``key``), or one whole wave confirm (``wave``)."""
         with locked_jsonl(self.path):
-            self._read_locked()
+            self._refresh_locked()
             active = self.active(scope)
             if not active:
                 return None

@@ -755,3 +755,135 @@ def test_enter_answers_the_rows_first_button(qapp, tmp_path):
     QTest.keyClick(panel, Qt.Key_Return)
     assert panel.store.get("near:1").action == "record_bib"
     assert panel.store.get("near:1").bib == "307"
+
+
+def test_storage_backoff_grows_and_chip_updates_do_not_break_it(qapp, tmp_path, monkeypatch):
+    import time
+
+    from PyQt5.QtCore import QProcess
+
+    monkeypatch.setattr(QProcess, "start", lambda self: None)
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    (tmp_path / "finish_lines.json").write_text("{}")
+    panel._live, panel._live_paused = True, False
+
+    def fail(code=3, kind="storage"):
+        panel._start_analysis()
+        panel._consume_progress((json.dumps({"stage": "failed", "kind": kind,
+                                             "message": "disk full"}) + "\n").encode("utf-8"))
+        panel._analysis_done(code)
+
+    fail()
+    first = panel._next_analysis - time.monotonic()
+    assert 55 <= first <= 65
+    assert panel._failure_streak == 1 and panel._retry_kind == "storage"
+    assert "保留上一版清单" in panel.analysis_status and "写盘" in panel.analysis_status
+
+    # Ordinary chip/video updates must not cut a storage backoff short.
+    before = panel._next_analysis
+    panel._failed_signature = (("old", 1, 1),)
+    (tmp_path / "cyclerace_passage_events.jsonl").write_text("")
+    panel.live_tick(True)
+    assert panel._process is None and panel._next_analysis == before
+
+    panel._next_analysis = 0
+    fail()
+    assert panel._next_analysis - time.monotonic() > first
+    # The operator's own 分析 press is the manual recovery path.
+    panel._start_analysis()
+    assert panel._process is not None
+    panel.stop_analysis()
+
+    # An input-side failure *is* retried when new input arrives.
+    panel._retry_kind, panel._failed_signature = "input", (("old", 1, 1),)
+    panel._next_analysis = time.monotonic() + 999
+    (tmp_path / "cyclerace_passage_events.jsonl").write_text("changed")
+    panel.live_tick(True)
+    assert panel._process is not None and panel._failure_streak == 0
+    panel.stop_analysis()
+
+
+def test_low_memory_skip_is_a_wait_not_a_failure(qapp):
+    import time
+
+    panel = ProblemListPanel()
+    panel._consume_progress((json.dumps({"stage": "skipped", "message": "可用内存只有 1000 MB"},
+                                        ensure_ascii=False) + "\n").encode("utf-8"))
+    panel._analysis_done(1)
+
+    assert panel.analysis_status == "可用内存只有 1000 MB"
+    assert "失败" not in panel.analysis_status
+    assert panel._retry_kind == "memory" and panel._failure_streak == 1
+    assert 110 <= panel._next_analysis - time.monotonic() <= 130
+
+
+def test_partial_video_failure_keeps_published_result_and_retries_later(qapp):
+    import time
+
+    panel = ProblemListPanel()
+    panel._consume_progress((json.dumps({"stage": "done", "summary": {},
+                                         "failed": {"segments": 1, "saves": 0, "cameras": 0,
+                                                    "first": "bad.avi"}}) + "\n").encode("utf-8"))
+    panel._analysis_done(0)
+
+    assert "部分录像未能读取" in panel.analysis_status and "bad.avi" in panel.analysis_status
+    assert panel._retry_kind == "video" and panel._failure_streak == 1
+    assert 25 <= panel._next_analysis - time.monotonic() <= 35
+
+
+def test_refresh_reuses_stores_until_their_files_change(qapp, tmp_path, monkeypatch):
+    import realtime.bunch_review as bunch_module
+    import realtime.problem_panel as panel_module
+
+    _write_list(tmp_path, [], [])
+    calls = {"batch": 0, "bunch": 0, "manual": 0}
+
+    class CountingBatch(panel_module.BatchDecisionStore):
+        def __init__(self, directory):
+            calls["batch"] += 1
+            super().__init__(directory)
+
+    class CountingBunch(bunch_module.BunchReviewStore):
+        def __init__(self, directory):
+            calls["bunch"] += 1
+            super().__init__(directory)
+
+    monkeypatch.setattr(panel_module, "BatchDecisionStore", CountingBatch)
+    monkeypatch.setattr(bunch_module, "BunchReviewStore", CountingBunch)
+    panel = ProblemListPanel()
+    original_manual = panel._load_manual_items
+    monkeypatch.setattr(panel, "_load_manual_items",
+                        lambda: calls.__setitem__("manual", calls["manual"] + 1) or original_manual())
+    panel.set_workspace(tmp_path)
+    base = dict(calls)
+
+    panel.refresh()
+    panel.refresh()
+    assert calls == base
+
+    directory = tmp_path / "finish_problems"
+    (directory / "batch_member_decisions.jsonl").write_text("", encoding="utf-8")
+    (directory / "bunch_reviews.jsonl").write_text("", encoding="utf-8")
+    (directory / "manual_problems.json").write_text("[]", encoding="utf-8")
+    panel.refresh()
+    assert calls["batch"] == base["batch"] + 1
+    assert calls["bunch"] == base["bunch"] + 1
+    assert calls["manual"] == base["manual"] + 1
+    after = dict(calls)
+
+    # A missing manual file keeps the operator's in-memory rows, as before.
+    manual = panel.add_manual_problem(FRAME, "check jersey")
+    (directory / "manual_problems.json").unlink()
+    panel.refresh()
+    assert any(item.item_id == manual.item_id for item in panel.items)
+
+    # A corrupt journal is reported on every refresh instead of being cached away.
+    (directory / "batch_member_decisions.jsonl").write_text("{broken\n", encoding="utf-8")
+    panel.refresh()
+    assert "批次日志不可用" in panel.hint.text()
+    failed_count = calls["batch"]
+    panel.refresh()
+    assert calls["batch"] == failed_count + 1
+    assert "批次日志不可用" in panel.hint.text()
+    assert calls["bunch"] >= after["bunch"]

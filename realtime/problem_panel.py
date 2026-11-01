@@ -10,6 +10,7 @@ lists for CycleRace are exported from them.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 import uuid
@@ -40,8 +41,8 @@ from .bunch_timeline import BunchTimeline
 from .chip_history import format_chip_time
 from .live_chip_checks import LIVE_CHIP_FILENAME, input_signature, merge_chip_snapshot
 from .analysis_settings import read_settings, settings_token
-from .batch_review import (BATCH_IDENTITY_FILENAME, BatchDecisionStore, aggregate_batches, identity_chain,
-                           previous_items, save_identity)
+from .batch_review import (BATCH_DECISIONS, BATCH_IDENTITY_FILENAME, BatchDecisionStore, aggregate_batches,
+                           identity_chain, previous_items, save_identity)
 from .problem_analysis import OUTPUT_DIRNAME, PROBLEM_LIST_FILENAME
 from .problem_items import (
     ACTION_CHANGE,
@@ -94,6 +95,16 @@ from .problem_resolutions import (
 )
 
 
+logger = logging.getLogger("FinishReview.ProblemPanel")
+
+
+def _safe_count(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _progress_group(stage: str) -> str:
     """Which of sampling / clock / analysis a worker message belongs to."""
 
@@ -142,6 +153,20 @@ STATE_WAITING = "待证据"
 STATE_HANDOFF = "待 CycleRace"
 # 正常单人的行：芯片已经答过，不是待处理，只是一条可复查的过线记录。
 STATE_AUTO = "自动对应"
+
+MANUAL_PROBLEMS_FILENAME = "manual_problems.json"
+
+# A failed worker is retried, but never every five seconds: storage and input
+# faults wait longer and grow.  Low memory is a wait, not a failure.
+RETRY_DELAYS_SECONDS = {
+    "memory": (120, 300, 600),
+    "storage": (60, 120, 300, 600),
+    "video": (30, 60, 120, 300),
+    "input": (60, 120, 300, 600),
+    "analysis": (30, 60, 120, 300),
+    "internal": (30, 60, 120, 300),
+    "unknown": (15, 30, 60, 120),
+}
 
 
 class ProblemListPanel(QFrame):
@@ -225,6 +250,13 @@ class ProblemListPanel(QFrame):
         self._last_live_signature = None
         self._final_analysis_pending = False
         self._finalizing_live = False
+        self._failure_streak = 0
+        self._failed_signature = None
+        self._retry_kind = ""
+        self._failure_kind = ""
+        self._failure_message = ""
+        self._done_failed: dict = {}
+        self._stat_cache: dict = {}
         self._draft_timer = QTimer(self)
         self._draft_timer.setSingleShot(True)
         self._draft_timer.setInterval(400)
@@ -608,6 +640,8 @@ class ProblemListPanel(QFrame):
         self._live = False
         self._browsing = False
         self._next_analysis = 0.0
+        self._stat_cache = {}
+        self._clear_failure_backoff()
         self._drafts, self._held, self._marks, self._operator_items, self._viewed = {}, {}, {}, {}, {}
         self._arrival_drafts = {}
         self._open_doubts = {}
@@ -646,6 +680,8 @@ class ProblemListPanel(QFrame):
         self._render_signature = None
         self._last_live_signature = None
         self._next_analysis = 0.0
+        self._stat_cache = {}
+        self._clear_failure_backoff()
         self._final_analysis_pending = False
         self._finalizing_live = False
         self._drafts, self._held = {}, {}
@@ -684,6 +720,8 @@ class ProblemListPanel(QFrame):
         self._render_signature = None
         self._last_live_signature = None
         self.items, self.rows = [], []
+        self._stat_cache = {}
+        self._clear_failure_backoff()
         self._shown_id = None
         self.stage_health = dict.fromkeys(("接收", "录制", "取样", "校时", "分析"), "")
         self.bib_input.clear()
@@ -696,6 +734,51 @@ class ProblemListPanel(QFrame):
 
     def set_events_provider(self, provider: Callable[[], object]) -> None:
         self._events_provider = provider
+
+    @staticmethod
+    def _stat_stamp(path: Path):
+        """Path identity for the narrow cache; ``None`` bypasses it."""
+
+        try:
+            stat = Path(path).stat()
+            return (str(path), stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            return (str(path), None, None)
+        except OSError:
+            return None
+
+    def _cached_file_load(self, slot: str, path: Path, loader):
+        """Reuse a store/read until that file changes; never cache a failure."""
+
+        stamp = self._stat_stamp(path)
+        cached = self._stat_cache.get(slot)
+        if stamp is not None and cached is not None and cached[0] == stamp:
+            return cached[1]
+        value = loader()
+        if stamp is None:
+            self._stat_cache.pop(slot, None)
+        else:
+            self._stat_cache[slot] = (stamp, value)
+        return value
+
+    def _clear_failure_backoff(self) -> None:
+        self._failure_streak = 0
+        self._next_analysis = 0.0
+        self._failed_signature = None
+        self._retry_kind = ""
+
+    def _load_manual_items(self):
+        path = self.problem_dir / MANUAL_PROBLEMS_FILENAME
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # None keeps the manual items already held in memory: the file may
+            # only be missing because it was never written yet.
+            return None
+
+    def _retry_delay(self, kind: str) -> float:
+        steps = RETRY_DELAYS_SECONDS.get(kind, RETRY_DELAYS_SECONDS["unknown"])
+        return float(steps[min(max(self._failure_streak, 1), len(steps)) - 1])
 
     def refresh(self) -> None:
         if self.problem_dir is None:
@@ -759,18 +842,21 @@ class ProblemListPanel(QFrame):
         if self.store is None:
             self.store = ProblemResolutionStore(self.problem_dir / RESOLUTIONS_FILENAME)
         try:
-            self.batch_store = BatchDecisionStore(self.problem_dir)
+            self.batch_store = self._cached_file_load(
+                "batch_store", self.problem_dir / BATCH_DECISIONS,
+                lambda: BatchDecisionStore(self.problem_dir),
+            )
         except (OSError, ValueError) as error:
             self.batch_store = None
             self.hint.setText(f"批次日志不可用：{error}")
         ids = {item.item_id for item in self.items}
         self.items += [ProblemItem.from_payload(value) for key, value in self._operator_items.items() if key not in ids]
         try:
-            manual = json.loads((self.problem_dir / "manual_problems.json").read_text(encoding="utf-8"))
-            self.items = [item for item in self.items if item.kind != KIND_MANUAL_REVIEW]
-            self.items += [ProblemItem.from_payload(item) for item in manual]
-        except FileNotFoundError:
-            pass
+            manual = self._cached_file_load("manual_problems", self.problem_dir / MANUAL_PROBLEMS_FILENAME,
+                                            self._load_manual_items)
+            if manual is not None:
+                self.items = [item for item in self.items if item.kind != KIND_MANUAL_REVIEW]
+                self.items += [ProblemItem.from_payload(item) for item in manual]
         except (OSError, ValueError, TypeError, KeyError) as error:
             self.hint.setText(f"人工问题读取失败：{error}")
         # 正常单人有自己的一行，但不在队列里：芯片已经答过，它们让「全部」成为
@@ -821,6 +907,9 @@ class ProblemListPanel(QFrame):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
                 if value.get("pending_segments"):
                     detail += f"；{value['pending_segments']} 个片段排队中"
+                failed = value.get("failed_segments") or []
+                if failed:
+                    detail += f"；{len(failed)} 个片段读取失败，未检测（稍后重试）"
                 statuses.append(f"机位 {camera}：{detail}")
             self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
         # A manual count of several people becomes one independent crossing per
@@ -849,9 +938,12 @@ class ProblemListPanel(QFrame):
     def _load_bunch_store(self) -> None:
         """Re-read the group journal, so a count saved here shows on the row at once."""
 
-        from .bunch_review import BunchReviewStore
+        from .bunch_review import JOURNAL_NAME, BunchReviewStore
         try:
-            self.bunch_store = BunchReviewStore(self.problem_dir)
+            self.bunch_store = self._cached_file_load(
+                "bunch_store", self.problem_dir / JOURNAL_NAME,
+                lambda: BunchReviewStore(self.problem_dir),
+            )
         except (OSError, ValueError) as error:
             self.hint.setText(f"集团核对记录读取失败：{error}")
         self._sync_differences()
@@ -1913,7 +2005,7 @@ class ProblemListPanel(QFrame):
 
         from .problem_items import stable_item_id
         marks = self.current_marks()
-        path = self.problem_dir / "manual_problems.json"
+        path = self.problem_dir / MANUAL_PROBLEMS_FILENAME
         try:
             children = []
             for mark in marks:
@@ -2160,6 +2252,7 @@ class ProblemListPanel(QFrame):
 
     def _set_coverage_alert(self, cameras) -> None:
         parts = []
+        failed_parts = []
         for camera, value in sorted(cameras.items(), key=lambda pair: str(pair[0])):
             ranges = value.get("missing_line_ranges") or []
             if ranges:
@@ -2168,9 +2261,13 @@ class ProblemListPanel(QFrame):
                 parts.append(f"机位 {camera} 录像 {shown}" + (f" 等 {len(ranges)} 段" if len(ranges) > 3 else ""))
             elif value.get("missing_line_segments"):
                 parts.append(f"机位 {camera} 有 {len(value['missing_line_segments'])} 段录像")
-        self.coverage_alert.setText("⚠ 未检测，不能算核清：" + "；".join(parts)
-                                    + " 没有终点线。点「终点线 / 模型」给这段录像画线。" if parts else "")
-        self.coverage_alert.setVisible(bool(parts))
+            if value.get("failed_segments"):
+                failed_parts.append(f"机位 {camera} 有 {len(value['failed_segments'])} 段录像读取失败")
+        missing_text = "⚠ 未检测，不能算核清：" + "；".join(parts) + " 没有终点线。点「终点线 / 模型」给这段录像画线。" if parts else ""
+        failed_text = ("⚠ 未检测，不能算核清：" + "；".join(failed_parts)
+                       + "。请检查录像文件或重新导出后重试。") if failed_parts else ""
+        self.coverage_alert.setText(" ".join(text for text in (missing_text, failed_text) if text))
+        self.coverage_alert.setVisible(bool(parts or failed_parts))
 
     def health_text(self) -> str:
         parts = [f"{name} {self.stage_health.get(name) or '—'}" for name in ("接收", "录制", "取样", "校时", "分析")]
@@ -2509,7 +2606,7 @@ class ProblemListPanel(QFrame):
                 and self.analysis_status == "等待已封存录像"):
             self.analysis_status = "视频分析等待录像；芯片自检独立运行"
         self.stage_health["分析"] = self.analysis_status
-        if (not recording and not self._final_analysis_pending) or self._live_paused or self._process is not None or time.monotonic() < self._next_analysis:
+        if (not recording and not self._final_analysis_pending) or self._live_paused or self._process is not None:
             return
         if not any((self.workspace_dir / name).exists() for name in ("finish_lines.json", "long_image_lines.json", "finish_problems/analysis_config.json")):
             self.analysis_status = "等待终点线配置（在“终点线 / 模型”中配置）"
@@ -2530,7 +2627,16 @@ class ProblemListPanel(QFrame):
             self.analysis_status = f"分析配置错误：{error}"
             self.stage_health["分析"] = self.analysis_status
             return
-        if not signature or (signature == self._last_live_signature and not self._final_analysis_pending):
+        if not signature:
+            return
+        if (self._failed_signature is not None and signature != self._failed_signature
+                and self._retry_kind in ("input", "internal", "unknown")):
+            # A new input may fix an input/programming fault, but ordinary chip
+            # and video updates must not break storage or low-memory backoff.
+            self._clear_failure_backoff()
+        if signature == self._last_live_signature and not self._final_analysis_pending:
+            return
+        if time.monotonic() < self._next_analysis:
             return
         self._last_live_signature = signature
         self._finalizing_live = self._final_analysis_pending
@@ -2551,7 +2657,7 @@ class ProblemListPanel(QFrame):
             card.parent.mkdir(parents=True, exist_ok=True)
             if thumbnail.scaled(360, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation).save(str(card), "JPG", 85):
                 evidence["card"] = f"cards/{card.name}"
-        path = self.problem_dir / "manual_problems.json"
+        path = self.problem_dir / MANUAL_PROBLEMS_FILENAME
         items = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
         items.append(item.to_payload())
         self.problem_dir.mkdir(parents=True, exist_ok=True)
@@ -2598,11 +2704,15 @@ class ProblemListPanel(QFrame):
         self._process = process
         self._progress_buffer = b""
         self._skip_message = ""
+        self._failure_kind = ""
+        self._failure_message = ""
+        self._done_failed = {}
         if not self._live:
             self._final_analysis_pending = False
         self.analyze_button.setText("停止分析")
         self.analysis_status = "后台分析中（低优先级）"
         self.stage_health["分析"] = self.analysis_status
+        logger.info("analysis process starting live=%s finalizing=%s", self._live, self._finalizing_live)
         process.start()
 
     def _analysis_error(self, error):
@@ -2628,9 +2738,15 @@ class ProblemListPanel(QFrame):
             except ValueError:
                 continue
             if message.get("stage") == "done":
+                reported = message.get("failed")
+                self._done_failed = dict(reported) if isinstance(reported, dict) else {}
                 continue
             if message.get("stage") == "skipped":
                 self._skip_message = str(message.get("message", ""))
+                continue
+            if message.get("stage") == "failed":
+                self._failure_kind = str(message.get("kind") or "unknown")
+                self._failure_message = str(message.get("message") or "")
                 continue
             if message.get("stage") == "清单已发布":
                 self.refresh()
@@ -2648,23 +2764,51 @@ class ProblemListPanel(QFrame):
         error = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")[-400:] if process else ""
         if process is not None:
             process.deleteLater()
-        self._next_analysis = time.monotonic() + (5 if _args and _args[0] != 0 else 0.25)
-        if _args and _args[0] != 0:
-            self._last_live_signature = None
-            self._final_analysis_pending = self._finalizing_live
-        self._finalizing_live = False
-        self.analyze_button.setText(("恢复实时分析" if self._live_paused else "暂停实时分析") if self._live else "分析录像")
-        self._signature = None
-        self.refresh()
+        code = _args[0] if _args else 0
+        failed = dict(self._done_failed or {})
         skipped, self._skip_message = getattr(self, "_skip_message", ""), ""
+        failure_kind, failure_message = self._failure_kind, self._failure_message
+        self._failure_kind = self._failure_message = ""
+        self._done_failed = {}
+        finalizing = self._finalizing_live
+        self._finalizing_live = False
+        logger.info("analysis process exited code=%s live=%s finalizing=%s failed_segments=%s failed_cameras=%s",
+                    code, self._live, finalizing, _safe_count(failed.get("segments")),
+                    _safe_count(failed.get("cameras")))
+        retry_kind = ""
         if skipped:
+            retry_kind = "memory"
             self.analysis_status = skipped
         elif self._live_paused:
             self.analysis_status = "分析已暂停；录像继续"
-        elif _args and _args[0] != 0:
-            self.analysis_status = "分析失败，已保留上一版清单：" + (error.strip() or "请查看日志")
+        elif code != 0:
+            retry_kind = failure_kind or "unknown"
+            message = (failure_message or error.strip() or "请查看日志").strip()
+            if retry_kind == "storage":
+                self.analysis_status = "分析无法写盘，已保留上一版清单；稍后重试：" + message
+            else:
+                self.analysis_status = "分析失败，已保留上一版清单；稍后重试：" + message
+        elif failed.get("segments") or failed.get("cameras"):
+            retry_kind = "storage" if failed.get("saves") else "video"
+            first = str(failed.get("first") or "").strip()
+            self.analysis_status = ("部分录像未能读取，已发布其余结果；稍后重试"
+                                    + (f"：{first}" if first else ""))
         else:
             self.analysis_status = "本轮分析完成，等待新短段" if self.payload else "录像分析未完成，请查看日志"
+        if retry_kind:
+            self._retry_kind = retry_kind
+            self._failure_streak += 1
+            self._failed_signature = self._last_live_signature
+            self._last_live_signature = None
+            self._next_analysis = time.monotonic() + self._retry_delay(retry_kind)
+            self._final_analysis_pending = finalizing
+        else:
+            self._failure_streak = 0
+            self._failed_signature = None
+            self._next_analysis = time.monotonic() + 0.25
+        self.analyze_button.setText(("恢复实时分析" if self._live_paused else "暂停实时分析") if self._live else "分析录像")
+        self._signature = None
+        self.refresh()
         self.stage_health["分析"] = self.analysis_status
         self.analysis_finished.emit()
 

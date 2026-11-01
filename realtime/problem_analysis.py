@@ -138,6 +138,71 @@ class AnalysisConfig:
 ProgressCallback = Callable[[str, int, int], None]
 
 
+# A corrupt or unreadable recording, an unreadable cache or a bad configured
+# line are isolated to that segment/camera.  ``Exception`` is deliberately not
+# used: SystemExit and KeyboardInterrupt must still stop the worker.
+RECOVERABLE_ERRORS = (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, ArithmeticError)
+
+
+@dataclass(frozen=True)
+class SegmentFailure:
+    """One sealed recording that could not be sampled or analysed.
+
+    The ranges it covered were never looked at.  Keeping them in the result
+    makes that hole visible and lets the next run retry only these files.
+    """
+
+    camera_index: int
+    segment_id: str
+    video_path: str
+    stage: str
+    error_type: str
+    message: str
+    start_ms: int = 0
+    end_ms: int = 0
+    ranges: tuple[tuple[int, int], ...] = ()
+    retryable: bool = True
+
+    @classmethod
+    def from_segment(cls, segment: ArchiveSegment, stage: str, error: Exception) -> "SegmentFailure":
+        return cls(
+            camera_index=segment.camera_index,
+            segment_id=str(segment.segment.segment_id),
+            video_path=str(segment.path),
+            stage=stage,
+            error_type=type(error).__name__,
+            message=str(error),
+            start_ms=segment.start_ms,
+            end_ms=segment.end_ms,
+            ranges=tuple(uncovered_ranges(segment.start_ms, segment.end_ms, segment.excluded_ranges)),
+        )
+
+    def to_payload(self) -> dict:
+        return {
+            "camera_index": self.camera_index,
+            "segment_id": self.segment_id,
+            "video_path": self.video_path,
+            "stage": self.stage,
+            "error_type": self.error_type,
+            "message": self.message,
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "ranges": [list(value) for value in self.ranges],
+            "retryable": self.retryable,
+        }
+
+
+def segment_failure_ranges(failures) -> list[list[int]]:
+    spans = sorted(span for failure in failures for span in (failure.ranges or ((failure.start_ms, failure.end_ms),)))
+    merged: list[list[int]] = []
+    for left, right in spans:
+        if merged and left - merged[-1][1] <= COVERAGE_MARGIN_MS:
+            merged[-1][1] = max(merged[-1][1], right)
+        else:
+            merged.append([left, right])
+    return merged
+
+
 def _noop_progress(_stage: str, _done: int, _total: int) -> None:
     return None
 
@@ -171,8 +236,13 @@ def extract_strips(
     progress: ProgressCallback = _noop_progress,
     checkpoint: Optional[Callable[[], None]] = None,
     cancelled: Callable[[], bool] = lambda: False,
+    failures: Optional[list[SegmentFailure]] = None,
 ) -> list[Path]:
-    """Sample every recording file of one camera; reuse up-to-date strips."""
+    """Sample every recording file of one camera; reuse up-to-date strips.
+
+    One unreadable recording is recorded in ``failures`` and skipped; the other
+    recordings of the camera are still sampled and published.
+    """
 
     output_dir = config.resolved_output()
     if config.sampling_profiles and not config.race_id:
@@ -202,35 +272,48 @@ def extract_strips(
         digest = line_config_digest(effective)
         target = strip_path(output_dir, segment)
         progress("线取样", index, len(segments))
-        if not _strip_is_current(target, segment, digest, config.samples):
-            started = time.perf_counter()
-            strip = sample_video_file(
-                segment.path, effective,
-                samples=config.samples, threads=config.decode_threads,
-                snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
-                fast_decode=config.fast_decode,
-            )
+        phase = "sampling"
+        try:
+            if not _strip_is_current(target, segment, digest, config.samples):
+                started = time.perf_counter()
+                strip = sample_video_file(
+                    segment.path, effective,
+                    samples=config.samples, threads=config.decode_threads,
+                    snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
+                    fast_decode=config.fast_decode,
+                )
+                if cancelled():
+                    break
+                save_started = time.perf_counter()
+                phase = "save"
+                save_strip(target, strip, {
+                    "line_digest": digest,
+                    "line_config": dict(effective),
+                    "samples": config.samples,
+                    "segment_id": segment.segment.segment_id,
+                    "session_id": segment.session_id,
+                    "camera_index": segment.camera_index,
+                    "media_started_at_ms": segment.start_ms,
+                    "media_duration_ms": segment.end_ms - segment.start_ms,
+                    "video_size": segment.path.stat().st_size,
+                    "excluded_ranges": [list(value) for value in segment.excluded_ranges],
+                })
+                logger.info(
+                    "sampled %s: %d frames in %.3f s (%s line); stages=%s save=%.3fs size=%dx%d backend=%s",
+                    segment.path.name, strip.frame_count, time.perf_counter() - started, strip.geometry.source,
+                    strip.stage_seconds, time.perf_counter() - save_started, strip.geometry.width, strip.geometry.height,
+                    strip.decode_backend,
+                )
+        except InterruptedError:
+            break  # cancellation, not a bad recording
+        except RECOVERABLE_ERRORS as error:
             if cancelled():
                 break
-            save_started = time.perf_counter()
-            save_strip(target, strip, {
-                "line_digest": digest,
-                "line_config": dict(effective),
-                "samples": config.samples,
-                "segment_id": segment.segment.segment_id,
-                "session_id": segment.session_id,
-                "camera_index": segment.camera_index,
-                "media_started_at_ms": segment.start_ms,
-                "media_duration_ms": segment.end_ms - segment.start_ms,
-                "video_size": segment.path.stat().st_size,
-                "excluded_ranges": [list(value) for value in segment.excluded_ranges],
-            })
-            logger.info(
-                "sampled %s: %d frames in %.3f s (%s line); stages=%s save=%.3fs size=%dx%d backend=%s",
-                segment.path.name, strip.frame_count, time.perf_counter() - started, strip.geometry.source,
-                strip.stage_seconds, time.perf_counter() - save_started, strip.geometry.width, strip.geometry.height,
-                strip.decode_backend,
-            )
+            logger.warning("recording %s could not be sampled (%s): %s",
+                           segment.path.name, type(error).__name__, error)
+            if failures is not None:
+                failures.append(SegmentFailure.from_segment(segment, phase, error))
+            continue
         paths.append(target)
     progress("线取样", len(paths), len(segments))
     return paths
@@ -1516,10 +1599,83 @@ def missing_line_item(camera: int, missing) -> ProblemItem:
         evidence={"segments": [segment.segment.segment_id for segment in missing], "ranges": ranges})
 
 
-def _live_progress(result, segments, pending, missing, config, reads):
+def failed_segments_item(camera: int, failures) -> ProblemItem:
+    """A recording that could not be read was never looked at either."""
+
+    ranges = segment_failure_ranges(failures)
+    shown = "、".join(f"{format_chip_time(left)[:8]}–{format_chip_time(right)[:8]}" for left, right in ranges[:3])
+    more = f" 等 {len(ranges)} 段" if len(ranges) > 3 else ""
+    messages = "；".join(dict.fromkeys(f.message for f in failures if f.message))
+    return ProblemItem(
+        stable_item_id(KIND_WAITING, camera, "failed_segments"), KIND_WAITING, CATEGORY_VIDEO,
+        f"录像 {shown}{more} 读取失败，这段没有检测，不能算核清，也不能判为漏读；"
+        f"请检查录像文件或重新导出后重试" + (f"（{messages[:160]}）" if messages else ""),
+        status=STATUS_WAITING,
+        evidence={"segments": [f.segment_id for f in failures], "ranges": ranges,
+                  "failure": [f.to_payload() for f in failures]})
+
+
+def _apply_failure_metadata(result: dict, failures) -> list[list[int]]:
+    ranges = segment_failure_ranges(failures)
+    result["failed_segments"] = [failure.to_payload() for failure in failures]
+    result["failed_video_ranges"] = ranges
+    if not ranges:
+        return ranges
+    # A failed file is a hole in the coverage: never let the headline jump it.
+    scanned = max((end for _start, end, _session in result.get("coverage", [])), default=None)
+    if scanned is not None:
+        frontier = min([scanned, *(left for left, _right in ranges)])
+        result["scanned_through_ms"] = frontier
+        if result.get("analyzed_through_ms") is not None:
+            result["analyzed_through_ms"] = min(int(result["analyzed_through_ms"]), frontier)
+    return ranges
+
+
+def _defer_no_video_items(result: dict, reads, reasons) -> None:
+    """Within an unscanned hole a chip is waiting, not a missing recording.
+
+    ``reasons`` is ordered by priority: first a range that contains the
+    expected time decides the wording.
+    """
+
+    model = result.get("model")
+    ranges = [(ranges, reason) for ranges, reason in reasons if ranges]
+    if model is None or not ranges:
+        return
+    deferred = []
+    for item in result["items"]:
+        expected = model.to_recorder(item.chip_time_ms) if item.chip_time_ms is not None else None
+        reason = None
+        if item.kind == KIND_NO_VIDEO and expected is not None:
+            reason = next((text for spans, text in ranges if any(
+                left - COVERAGE_MARGIN_MS <= expected <= right + COVERAGE_MARGIN_MS for left, right in spans)), None)
+        if reason is None:
+            deferred.append(item)
+        else:
+            deferred.extend(waiting_items(
+                [read for read in reads if read.event_id in item.event_ids], result["camera_index"], reason,
+            ))
+    result["items"] = deferred
+
+
+FAILED_VIDEO_REASON = "录像读取失败或损坏，这段没有检测，暂不判定漏读；请检查录像文件后重试"
+PENDING_VIDEO_REASON = "录像已封存，等待分析或终点线配置，暂不判定缺少录像"
+
+
+def _apply_offline_failures(result: dict, failures, reads) -> None:
+    ranges = _apply_failure_metadata(result, failures)
+    if not ranges:
+        return
+    _defer_no_video_items(result, reads, [(ranges, FAILED_VIDEO_REASON)])
+    result["items"].append(failed_segments_item(result["camera_index"], failures))
+
+
+def _live_progress(result, segments, pending, missing, config, reads, failures=()):
     """Do not turn an unfinished batch (or a cache hole) into missing evidence."""
     pending_ranges = [list(span) for segment in pending for span in uncovered_ranges(
         segment.start_ms, segment.end_ms, segment.excluded_ranges)]
+    failed_ranges = _apply_failure_metadata(result, failures)
+    missing_ranges = [[segment.start_ms, segment.end_ms] for segment in missing]
     result["sealed_through_ms"] = max((s.end_ms for s in segments), default=None)
     result["pending_video_ranges"] = pending_ranges
     result["pending_segments"] = len(pending)
@@ -1528,30 +1684,21 @@ def _live_progress(result, segments, pending, missing, config, reads):
     coverage = result.get("coverage", [])
     scanned = max((end for _start, end, _session in coverage), default=None)
     # Coverage remains explicit; the headline never jumps over an unscanned hole.
-    blocked_ranges = list(pending_ranges)
-    blocked_ranges.extend([s.start_ms, s.end_ms] for s in missing)
+    blocked_ranges = [tuple(span) for span in [*pending_ranges, *failed_ranges, *missing_ranges]]
     if scanned is not None:
         frontier = min([scanned, *(left for left, _right in blocked_ranges)])
-        result["scanned_through_ms"] = frontier
+        prior_frontier = result.get("scanned_through_ms")
+        result["scanned_through_ms"] = frontier if prior_frontier is None else min(int(prior_frontier), frontier)
         previous = result.get("analyzed_through_ms")
         if previous is not None:
-            result["analyzed_through_ms"] = min(previous, frontier - config.evidence_delay_ms)
-    model = result.get("model")
-    if model is not None and blocked_ranges:
-        deferred = []
-        for item in result["items"]:
-            expected = model.to_recorder(item.chip_time_ms) if item.chip_time_ms is not None else None
-            if item.kind == KIND_NO_VIDEO and expected is not None and any(
-                left - COVERAGE_MARGIN_MS <= expected <= right + COVERAGE_MARGIN_MS
-                for left, right in blocked_ranges
-            ):
-                deferred.extend(waiting_items(
-                    [read for read in reads if read.event_id in item.event_ids],
-                    result["camera_index"], "录像已封存，等待分析或终点线配置，暂不判定缺少录像",
-                ))
-            else:
-                deferred.append(item)
-        result["items"] = deferred
+            result["analyzed_through_ms"] = min(int(previous), frontier - config.evidence_delay_ms)
+    _defer_no_video_items(result, reads, [
+        (failed_ranges, FAILED_VIDEO_REASON),
+        (pending_ranges, PENDING_VIDEO_REASON),
+        (missing_ranges, PENDING_VIDEO_REASON),
+    ])
+    if failures:
+        result["items"].append(failed_segments_item(result["camera_index"], failures))
     if missing:
         result["items"].append(missing_line_item(result["camera_index"], missing))
 
@@ -1572,7 +1719,8 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 ready.append(path)
             else:
                 pending.append(segment)
-        jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing))
+        jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing,
+                         failed=[], camera_failures=[]))
     runtime = _VerificationRuntime()
 
     def input_stamp():
@@ -1617,6 +1765,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 job["ready"].extend(extract_strips(
                     config, tuple(batch), line_for_camera(config, workspace, camera) or {}, progress=progress,
                     checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
+                    failures=job["failed"],
                 ))
                 sampling_seconds = time.perf_counter() - sample_started
                 if cancelled():
@@ -1626,15 +1775,35 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 current_config = replace(config, evidence_delay_ms=max(10_000, config.evidence_delay_ms)) if pending else config
                 analysis_started = time.perf_counter()
                 if job["ready"]:
-                    result = analyse_camera(
-                        current_config, workspace, camera, job["ready"], progress=progress,
-                        checkpoint=lambda: governor.checkpoint(cancelled), runtime=runtime,
-                    )
+                    try:
+                        result = analyse_camera(
+                            current_config, workspace, camera, job["ready"], progress=progress,
+                            checkpoint=lambda: governor.checkpoint(cancelled), runtime=runtime,
+                        )
+                    except RECOVERABLE_ERRORS as error:
+                        if cancelled():
+                            return
+                        logger.warning("camera %s analysis failed (%s): %s", camera, type(error).__name__, error)
+                        reason = f"分析失败，本机位本轮跳过，其他机位照常发布：{error}"
+                        result = dict(
+                            camera_index=camera, error=reason,
+                            items=waiting_items(workspace.reads, camera, reason),
+                            auto_passed=[], waiting_reason="analysis_failed",
+                            sealed_through_ms=max((s.end_ms for s in job["segments"]), default=None),
+                        )
+                        job["camera_failures"].append(
+                            {"camera_index": camera, "stage": "analysis", "error": str(error)})
                 else:
-                    reason = "等待已封存录像" if not job["segments"] else "等待实际终点线或不跨改线边界的封存片段"
+                    if job["failed"]:
+                        reason = f"录像读取失败，等待下次重试：{job['failed'][0].message}"
+                        waiting_reason = "video_unreadable"
+                    else:
+                        reason = "等待已封存录像" if not job["segments"] else "等待实际终点线或不跨改线边界的封存片段"
+                        waiting_reason = "recording" if not job["segments"] else "finish_line"
                     result = dict(camera_index=camera, error=reason, items=waiting_items(workspace.reads, camera, reason),
-                                  auto_passed=[], waiting_reason="recording" if not job["segments"] else "finish_line")
-                _live_progress(result, job["segments"], pending, job["missing"], current_config, workspace.reads)
+                                  auto_passed=[], waiting_reason=waiting_reason)
+                _live_progress(result, job["segments"], pending, job["missing"], current_config, workspace.reads,
+                               job["failed"])
                 result["performance"] = dict(
                     new_video_seconds=round(duration_ms / 1000, 3),
                     sampling_seconds=round(sampling_seconds, 3),
@@ -1659,6 +1828,10 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 }
             first_round = False
         elapsed = time.perf_counter() - started
+        summary["failed"] = {
+            "segments": [failure.to_payload() for job in jobs for failure in job["failed"]],
+            "cameras": [entry for job in jobs for entry in job["camera_failures"]],
+        }
         summary["performance"] = dict(new_video_seconds=round(new_video_seconds, 3), elapsed_seconds=round(elapsed, 3),
                                       processing_ratio=round(elapsed / new_video_seconds, 3) if new_video_seconds else None,
                                       publications=batches)
@@ -1678,13 +1851,13 @@ def run_offline_analysis(
 
     It does not start while free memory is below ``config.min_available_mb``
     (the recorder and CycleRace come first) and records the peak working set
-    per stage in ``summary["memory"]``.
+    per stage in ``summary["memory"]``.  The memory gate runs before the
+    workspace journals are parsed, so a low-memory run does no analysis work
+    at all.
     """
 
-    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
-                                  include_review_segments=True, allow_empty_scope=True)
-    config = replace(config, race_id=workspace.race_id, stage_id=workspace.stage_id)
-    summary: dict = {"race_id": workspace.race_id, "cameras": {}}
+    summary: dict = {"race_id": config.race_id, "cameras": {},
+                     "failed": {"segments": [], "cameras": []}}
     free = available_memory_mb()
     memory: dict = {"available_at_start_mb": free, "stage_peaks_mb": {}}
     summary["memory"] = memory
@@ -1693,7 +1866,12 @@ def run_offline_analysis(
             f"可用内存只有 {free} MB，少于 {int(config.min_available_mb)} MB；"
             "为保护 CycleRace 和录像，暂不分析，请关闭其他程序后再试。"
         )
+        summary["skipped_kind"] = "memory"
         return summary
+    workspace = AnalysisWorkspace(config.workspace, race_id=config.race_id, stage_id=config.stage_id,
+                                  include_review_segments=True, allow_empty_scope=True)
+    config = replace(config, race_id=workspace.race_id, stage_id=workspace.stage_id)
+    summary["race_id"] = workspace.race_id
     if lower_priority:
         lower_process_priority()
     limit_opencv_threads(1)
@@ -1709,6 +1887,7 @@ def run_offline_analysis(
         outer_progress(stage_name, done, total)
     if config.live and stage != "strips":
         _run_live_batches(config, workspace, cameras, governor, summary, progress, cancelled)
+        summary.setdefault("failed", {"segments": [], "cameras": []})
         summary["paused_seconds"] = round(governor.paused_seconds, 1)
         memory["peak_mb"] = peak_memory_mb()
         return summary
@@ -1726,23 +1905,75 @@ def run_offline_analysis(
             results.append(result)
             summary["cameras"][camera] = {"skipped": reason}
             continue
-        paths = extract_strips(
-            config, segments, line or {}, progress=progress,
-            checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
-        )
-        summary["cameras"][camera] = {"strips": len(paths)}
+        failures: list[SegmentFailure] = []
+        camera_error = ""
+        try:
+            paths = extract_strips(
+                config, segments, line or {}, progress=progress,
+                checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
+                failures=failures,
+            )
+        except InterruptedError:
+            break  # cancellation, not a bad recording
+        except RECOVERABLE_ERRORS as error:
+            if cancelled():
+                break
+            logger.warning("camera %s sampling failed (%s): %s", camera, type(error).__name__, error)
+            paths, camera_error = [], f"取样失败，本机位本轮跳过：{error}"
+            summary["failed"]["cameras"].append(
+                {"camera_index": camera, "stage": "sampling", "error": str(error)})
+        summary["cameras"][camera] = {"strips": len(paths), "failed_segments": len(failures)}
         if stage == "strips" or cancelled():
+            summary["failed"]["segments"].extend(failure.to_payload() for failure in failures)
             continue
-        result = analyse_camera(
-            config, workspace, camera, paths, progress=progress,
-            checkpoint=lambda: governor.checkpoint(cancelled),
-        )
-        result["missing_line_segments"] = [segment.segment.segment_id for segment in missing]
-        result["missing_line_ranges"] = missing_line_ranges(missing)
-        result["sealed_through_ms"] = max(segment.end_ms for segment in segments)
-        if missing:
-            result["items"].append(missing_line_item(camera, missing))
+        if not paths:
+            if camera_error:
+                reason = camera_error
+                waiting_reason = "sampling_failed"
+            elif failures:
+                reason = f"录像读取失败，等待下次重试：{failures[0].message}"
+                waiting_reason = "video_unreadable"
+            else:
+                reason = "等待实际终点线或不跨改线边界的封存片段"
+                waiting_reason = "finish_line"
+            result = dict(
+                camera_index=camera, error=reason,
+                items=waiting_items(workspace.reads, camera, reason),
+                auto_passed=[], waiting_reason=waiting_reason,
+                sealed_through_ms=max((segment.end_ms for segment in segments), default=None),
+                missing_line_segments=[segment.segment.segment_id for segment in missing],
+                missing_line_ranges=missing_line_ranges(missing),
+            )
+            _apply_offline_failures(result, failures, workspace.reads)
+            if missing:
+                result["items"].append(missing_line_item(camera, missing))
+        else:
+            try:
+                result = analyse_camera(
+                    config, workspace, camera, paths, progress=progress,
+                    checkpoint=lambda: governor.checkpoint(cancelled),
+                )
+            except RECOVERABLE_ERRORS as error:
+                if cancelled():
+                    break
+                logger.warning("camera %s analysis failed (%s): %s", camera, type(error).__name__, error)
+                reason = f"分析失败，本机位本轮跳过，其他机位照常发布：{error}"
+                result = dict(
+                    camera_index=camera, error=reason,
+                    items=waiting_items(workspace.reads, camera, reason),
+                    auto_passed=[], waiting_reason="analysis_failed",
+                    sealed_through_ms=max((segment.end_ms for segment in segments), default=None),
+                )
+                summary["failed"]["cameras"].append(
+                    {"camera_index": camera, "stage": "analysis", "error": str(error)})
+            _apply_offline_failures(result, failures, workspace.reads)
+            result["missing_line_segments"] = [segment.segment.segment_id for segment in missing]
+            result["missing_line_ranges"] = missing_line_ranges(missing)
+            result["sealed_through_ms"] = max(segment.end_ms for segment in segments)
+            if missing:
+                result["items"].append(missing_line_item(camera, missing))
         results.append(result)
+        summary["failed"]["segments"].extend(failure.to_payload() for failure in failures)
         summary["cameras"][camera] = {
             key: value for key, value in result.items() if key not in ("items", "auto_passed", "model")
         }
@@ -1863,11 +2094,14 @@ __all__ = [
     "AnalysisConfig",
     "OUTPUT_DIRNAME",
     "PROBLEM_LIST_FILENAME",
+    "SegmentFailure",
     "analyse_camera",
     "detect_session_crossings",
     "extract_strips",
+    "failed_segments_item",
     "line_for_camera",
     "load_line_overrides",
+    "segment_failure_ranges",
     "strip_path",
     "summarize_items",
     "write_problem_list",

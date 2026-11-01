@@ -60,6 +60,68 @@ def test_problem_worker_progress_is_ascii_json(monkeypatch, capsys):
     assert messages[1] == {"stage": "skipped", "message": "可用内存只有 1000 MB，少于 1536 MB"}
 
 
+def test_problem_worker_classifies_storage_failure_for_the_panel(monkeypatch, capsys):
+    from realtime import problem_analysis
+
+    monkeypatch.setattr(problem_analysis, "config_from_workspace",
+                        lambda path: SimpleNamespace(live=False, evidence_delay_ms=0))
+
+    def run(config, progress):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(problem_analysis, "run_offline_analysis", run)
+
+    assert review_main.run_problem_analysis("synthetic-workspace") == 3
+    messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert messages[-1]["stage"] == "failed" and messages[-1]["kind"] == "storage"
+    assert "No space left" in messages[-1]["message"]
+
+
+def test_problem_worker_classifies_a_broken_configuration(monkeypatch, capsys):
+    from realtime import problem_analysis
+
+    def refuse(path):
+        raise ValueError("analysis_config.json is not an object")
+
+    monkeypatch.setattr(problem_analysis, "config_from_workspace", refuse)
+
+    assert review_main.run_problem_analysis("synthetic-workspace") == 4
+    messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert messages[-1]["stage"] == "failed" and messages[-1]["kind"] == "input"
+
+
+def test_problem_worker_still_lets_system_exit_through(monkeypatch):
+    from realtime import problem_analysis
+
+    monkeypatch.setattr(problem_analysis, "config_from_workspace",
+                        lambda path: SimpleNamespace(live=False, evidence_delay_ms=0))
+
+    def stop(config, progress):
+        raise SystemExit(7)
+
+    monkeypatch.setattr(problem_analysis, "run_offline_analysis", stop)
+    with pytest.raises(SystemExit) as raised:
+        review_main.run_problem_analysis("synthetic-workspace")
+    assert raised.value.code == 7
+
+
+def test_problem_worker_done_reports_partial_failed_segments(monkeypatch, capsys):
+    from realtime import problem_analysis
+
+    monkeypatch.setattr(problem_analysis, "config_from_workspace",
+                        lambda path: SimpleNamespace(live=False, evidence_delay_ms=0))
+    monkeypatch.setattr(problem_analysis, "run_offline_analysis",
+                        lambda config, progress: {"summary": {"auto_passed": 3},
+                                                  "failed": {"segments": [{"stage": "sampling",
+                                                                           "message": "无法打开录像"}],
+                                                             "cameras": []}})
+
+    assert review_main.run_problem_analysis("synthetic-workspace") == 0
+    message = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert message["stage"] == "done" and message["summary"] == {"auto_passed": 3}
+    assert message["failed"] == {"segments": 1, "saves": 0, "cameras": 0, "first": "无法打开录像"}
+
+
 def test_main_shows_real_window_before_entering_event_loop(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     captured_windows = []

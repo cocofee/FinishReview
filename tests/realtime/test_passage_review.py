@@ -150,6 +150,25 @@ def fake_playback(monkeypatch):
     return _FakePlaybackWorker
 
 
+class _DelayedMetadataPlaybackWorker(_FakePlaybackWorker):
+    """A decoder whose metadata arrives only after the UI has been used."""
+
+    def start(self):
+        self.start_calls += 1
+        self.running = True
+
+
+@pytest.fixture
+def delayed_playback(monkeypatch):
+    _FakePlaybackWorker.instances.clear()
+    monkeypatch.setattr(
+        passage_review,
+        "VideoPlaybackWorker",
+        _DelayedMetadataPlaybackWorker,
+    )
+    return _DelayedMetadataPlaybackWorker
+
+
 def _event(
     passage_time_ms=15_000,
     passage_timestamp_ms=None,
@@ -327,6 +346,226 @@ def test_retained_image_time_only_seek_waits_for_metadata(qapp, tmp_path, fake_p
     assert worker.seek_calls[seam:] == [33, 66]
     assert exact == []
     dialog.close()
+
+
+def _delayed_pane(tmp_path, *, event=None):
+    event = event or _event(passage_time_ms=15_000)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline,
+        tmp_path / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    location = timeline.locate_passage(15_000).locations[0]
+    pane = PassageEvidencePane("普通录像", REGULAR_SOURCE)
+    pane.set_passage(event, location)
+    return pane, pane._worker
+
+
+def test_step_before_metadata_keeps_accumulated_frames(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+    assert pane._metadata_pending
+    initial_position_ms = int(
+        pane.timeline.property("initial_position_ms") or 0
+    )
+
+    pane.step(1)
+    pane.step(2)
+    pane.step(1)
+
+    assert worker.step_calls == []
+    assert worker.seek_calls == []
+    worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+    assert worker.seek_calls == [initial_position_ms + 4 * 20]
+    assert worker.step_calls == []
+    assert pane._metadata_pending is False
+    assert pane._pending_navigation == []
+    pane.shutdown()
+
+
+def test_step_before_metadata_accumulates_exact_frames(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+    initial_position_ms = int(
+        pane.timeline.property("initial_position_ms") or 0
+    )
+    exact_frames = []
+    worker.seek_frame = exact_frames.append
+
+    pane.step(1)
+    pane.step(2)
+
+    worker.metadata_ready.emit(60_000, 29.97, 2560, 1440, 1_798)
+    expected_frame = int(initial_position_ms * 29.97 / 1_000.0) + 3
+    assert exact_frames == [expected_frame]
+    assert worker.seek_calls == []
+    pane.shutdown()
+
+
+def test_seek_before_metadata_keeps_last_seek_and_later_steps(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+    target_position_ms = pane._target_position_ms
+
+    pane.step(1)
+    pane.step(2)
+    pane.seek_passage_delta(300)
+    pane.step(1)
+    pane.seek_passage_delta(500)
+    pane.step(1)
+    pane.step(1)
+
+    assert pane._pending_navigation == [("seek", 500, False), ("step", 2, False)]
+    assert worker.seek_calls == []
+    worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+    assert worker.seek_calls == [target_position_ms + 500 + 2 * 20]
+    assert worker.preview_seek_calls == []
+    pane.shutdown()
+
+
+def test_exact_frame_seek_before_metadata_supersedes_queued_navigation(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+    exact_frames = []
+    worker.seek_frame = exact_frames.append
+
+    pane.step(2)
+    pane.seek_passage_delta(500)
+    assert pane._pending_navigation
+
+    pane.seek_media_frame(1_234, 50)
+    assert pane._pending_navigation == []
+    worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+
+    assert exact_frames == [50]
+    assert worker.seek_calls == []
+    pane.shutdown()
+
+
+def test_time_only_seek_before_metadata_supersedes_queued_navigation(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+
+    pane.step(2)
+    pane.seek_passage_delta(500)
+    pane.seek_media_frame(1_234, None)
+    assert pane._pending_navigation == []
+    worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+
+    assert worker.seek_calls == [1_234]
+    assert worker.step_calls == []
+    pane.shutdown()
+
+
+def test_same_worker_passage_switch_before_metadata_uses_new_initial_position(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+    first_initial_position_ms = int(
+        pane.timeline.property("initial_position_ms") or 0
+    )
+
+    pane.step(1)
+    pane.set_passage(
+        _event(event_id="passage-2", sequence=2, passage_time_ms=15_000),
+        pane.location,
+        initial_delta_ms=1_000,
+    )
+
+    assert pane._worker is worker
+    assert pane._metadata_pending
+    assert pane._pending_navigation == []
+    expected_position_ms = first_initial_position_ms + 1_000
+    assert int(pane.timeline.property("initial_position_ms")) == expected_position_ms
+    assert worker.seek_calls == []
+
+    worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+    assert worker.seek_calls == [expected_position_ms]
+    pane.shutdown()
+
+
+def test_preview_seek_before_metadata_stays_a_preview_seek(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+    target_position_ms = pane._target_position_ms
+
+    pane.seek_passage_delta(300, preview=True)
+    assert worker.preview_seek_calls == []
+    worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+    assert worker.preview_seek_calls == [target_position_ms + 300]
+    assert worker.seek_calls == []
+    pane.shutdown()
+
+
+def test_metadata_without_navigation_keeps_normal_initial_position(
+    qapp, tmp_path, delayed_playback,
+):
+    pane, worker = _delayed_pane(tmp_path)
+    initial_position_ms = int(
+        pane.timeline.property("initial_position_ms") or 0
+    )
+
+    worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+    assert worker.seek_calls == [initial_position_ms]
+    assert worker.step_calls == []
+    pane.shutdown()
+
+
+def test_pending_step_does_not_leak_across_recording_files(
+    qapp, tmp_path, delayed_playback,
+):
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline,
+        tmp_path / "camera_01_0000.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    _add_segment(
+        timeline,
+        tmp_path / "camera_01_0001.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=20_000,
+        ended_at_ms=30_000,
+    )
+    event = _event(passage_time_ms=15_000)
+    first_location = timeline.locate_passage(15_000).locations[0]
+    second_location = timeline.locate_passage(25_000).locations[0]
+    pane = PassageEvidencePane("普通录像", REGULAR_SOURCE)
+    pane.set_passage(event, first_location)
+    first_worker = pane._worker
+
+    pane.step(1)
+    assert pane._pending_navigation
+
+    pane.set_passage(event, second_location, initial_delta_ms=0)
+    second_worker = pane._worker
+    second_initial_position_ms = int(
+        pane.timeline.property("initial_position_ms") or 0
+    )
+    assert second_worker is not first_worker
+    assert pane._metadata_pending
+    assert pane._pending_navigation == []
+
+    pane.step(1)
+    second_worker.metadata_ready.emit(60_000, 50.0, 2560, 1440, 3_000)
+
+    assert first_worker.seek_calls == []
+    assert second_worker.seek_calls == [second_initial_position_ms + 20]
+    pane.shutdown()
 
 
 def test_retained_seek_hands_a_missing_frame_to_the_pane(qapp, tmp_path, fake_playback):

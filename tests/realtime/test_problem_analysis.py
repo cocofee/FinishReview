@@ -1060,3 +1060,240 @@ def test_a_recording_without_a_line_names_its_hours_and_the_fix():
     assert item.evidence["ranges"] == [[START, START + 120_000], [START + 301_000, START + 360_000]]
     assert item.detail.startswith("录像 10:00:00–10:02:00、10:05:01–10:06:00 没有终点线")
     assert "未检测，不能算核清" in item.detail and "「终点线 / 模型」" in item.detail
+
+
+def _write_clip(source, target, first_frame, last_frame):
+    """Write a real decodable clip of the synthetic race (not a mock)."""
+
+    capture = cv2.VideoCapture(str(source))
+    writer = cv2.VideoWriter(str(target), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (WIDTH, HEIGHT))
+    try:
+        index = 0
+        while index < last_frame:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if index >= first_frame:
+                writer.write(frame)
+            index += 1
+    finally:
+        writer.release()
+        capture.release()
+
+
+def _finish_lines(*cameras):
+    return json.dumps({"schema_version": 1, "finish_lines": [
+        {"camera_index": camera, "x1": 0.5, "y1": 0.15, "x2": 0.5, "y2": 0.85, "band_width": 0.08}
+        for camera in cameras
+    ]})
+
+
+def test_a_bad_recording_is_isolated_from_healthy_segments_and_cameras(synthetic_race, tmp_path):
+    """A real unreadable .avi must not erase readable parts or another camera."""
+
+    from realtime.problem_items import KIND_WAITING
+
+    root = synthetic_race[0]
+    (tmp_path / "cyclerace_passage_events.jsonl").write_bytes(
+        (root / "cyclerace_passage_events.jsonl").read_bytes())
+    (tmp_path / "finish_lines.json").write_text(_finish_lines(1, 2), encoding="utf-8")
+    source = next((root / "videos").glob("*.avi"))
+    first = tmp_path / "camera_01_20260919_100000_000000_archive_0000.avi"
+    _write_clip(source, first, 0, 800)
+    bad = tmp_path / "camera_01_20260919_100000_000000_archive_0001.avi"
+    bad.write_bytes(b"this is not a decodable recording")
+    last = tmp_path / "camera_01_20260919_100000_000000_archive_0002.avi"
+    _write_clip(source, last, 1000, 1900)
+    bad_other = tmp_path / "camera_02_20260919_100000_000000_archive_0000.avi"
+    bad_other.write_bytes(b"this is not a decodable recording")
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for path, start, duration, camera in (
+        (first, 0, 40_000, 1), (bad, 40_000, 10_000, 1), (last, 50_000, 45_000, 1),
+        (bad_other, 0, 95_000, 2),
+    ):
+        timeline.add_completed_segment(
+            source_id=f"camera_0{camera}_review", camera_index=camera, video_path=path,
+            media_started_at_ms=START + start, media_duration_ms=duration,
+            clock_source="videopipe_system_clock", timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id=RACE,
+        )
+
+    summary = run_offline_analysis(AnalysisConfig(workspace=tmp_path, min_available_mb=0, render_cards=False),
+                                   lower_priority=False)
+    payload = json.loads((tmp_path / "finish_problems" / "problem_list.json").read_text(encoding="utf-8"))
+
+    camera_one = payload["cameras"]["1"]
+    assert camera_one["failed_video_ranges"] == [[START + 40_000, START + 50_000]]
+    assert camera_one["failed_segments"][0]["stage"] == "sampling"
+    # The hole is neither scanned nor analysed, even though later video exists.
+    assert camera_one["scanned_through_ms"] == START + 40_000
+    assert camera_one["analyzed_through_ms"] <= START + 40_000
+    camera_two = payload["cameras"]["2"]
+    assert camera_two["error"] and camera_two["failed_video_ranges"] == [[START, START + 95_000]]
+    assert not camera_two.get("scanned_through_ms")
+    assert len(summary["failed"]["segments"]) == 2 and summary["failed"]["cameras"] == []
+
+    # The failed recording is its own visible row; the hole is not claimed.
+    visible = [item for item in payload["items"] if item["kind"] == KIND_WAITING
+               and item["evidence"].get("ranges") == [[START + 40_000, START + 50_000]]]
+    assert len(visible) == 1 and "不能算核清" in visible[0]["detail"]
+    # No chip inside the hole is called a missing recording.
+    assert not [item for item in payload["items"] if item["kind"] == "no_video"
+                and item["chip_time_ms"] is not None
+                and START + 40_000 <= item["chip_time_ms"] <= START + 50_000]
+    # Healthy recordings of the same camera still count riders.
+    assert len({entry["bib"] for entry in payload["auto_passed"]}) >= 10
+
+
+def test_live_first_round_bad_recording_is_a_failed_hole_not_scanned(synthetic_race, tmp_path, monkeypatch):
+    """The first live publication must say "failed", not claim a scanned span."""
+
+    root = synthetic_race[0]
+    (tmp_path / "cyclerace_passage_events.jsonl").write_bytes(
+        (root / "cyclerace_passage_events.jsonl").read_bytes())
+    (tmp_path / "finish_lines.json").write_text(_finish_lines(1), encoding="utf-8")
+    source = next((root / "videos").glob("*.avi"))
+    bad = tmp_path / "camera_01_20260919_100000_000000_archive_0000.avi"
+    bad.write_bytes(b"decoder cannot open this")
+    healthy = tmp_path / "camera_01_20260919_100000_000000_archive_0001.avi"
+    _write_clip(source, healthy, 1000, 1900)
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    for path, start, duration in ((bad, 0, 50_000), (healthy, 50_000, 45_000)):
+        timeline.add_completed_segment(
+            source_id="camera_01_review", camera_index=1, video_path=path,
+            media_started_at_ms=START + start, media_duration_ms=duration,
+            clock_source="videopipe_system_clock", timing_error_ms=0,
+            end_reason="continuous_archive_fallback", race_id=RACE,
+        )
+    original = problem_analysis.sample_video_file
+
+    def sample(path, *args, **kwargs):
+        if Path(path).name.endswith("0000.avi"):
+            raise RuntimeError("decoder unavailable")  # simulated media failure, real pipeline
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(problem_analysis, "sample_video_file", sample)
+    publications = []
+
+    def progress(stage, done, total):
+        if stage == "清单已发布":
+            publications.append(json.loads((tmp_path / "finish_problems" / "problem_list.json")
+                                           .read_text(encoding="utf-8")))
+
+    summary = run_offline_analysis(
+        AnalysisConfig(workspace=tmp_path, live=True, min_available_mb=0, render_cards=False),
+        lower_priority=False, progress=progress,
+    )
+
+    first = publications[0]["cameras"]["1"]
+    assert first["failed_video_ranges"] == [[START, START + 50_000]]
+    assert first["pending_segments"] == 1
+    assert not first.get("scanned_through_ms")
+    final = publications[-1]["cameras"]["1"]
+    # The hole begins at the first frame, so nothing beyond it is claimed.
+    assert final["scanned_through_ms"] == START
+    assert final["analyzed_through_ms"] <= START + 40_000
+    assert len(summary["failed"]["segments"]) == 1
+    failed_payload = summary["failed"]["segments"][0]
+    assert failed_payload["error_type"] == "RuntimeError" and failed_payload["retryable"] is True
+    # Chips inside the unnamed hole are not reported as missing recordings.
+    assert not [item for item in publications[-1]["items"] if item["kind"] == "no_video"
+                and item["chip_time_ms"] is not None
+                and START <= item["chip_time_ms"] <= START + 50_000]
+
+
+def test_one_camera_analysis_failure_does_not_stop_other_cameras(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    def segment(camera):
+        return SimpleNamespace(
+            camera_index=camera, start_ms=START, end_ms=START + 10_000, session_id="session",
+            path=tmp_path / f"camera_{camera}.avi", excluded_ranges=(),
+            segment=SimpleNamespace(segment_id=f"seg{camera}"),
+        )
+
+    fake_workspace = SimpleNamespace(
+        race_id="race", stage_id="stage", root=tmp_path, reads=(),
+        archive_segments=lambda camera: (segment(camera),) if camera in (1, 2) else (),
+        finish_lines=lambda: {1: {"camera_index": 1, "x1": .5, "y1": .1, "x2": .5, "y2": .9},
+                              2: {"camera_index": 2, "x1": .5, "y1": .1, "x2": .5, "y2": .9}},
+        camera_indexes=lambda: (1, 2), metadata=lambda: None, latest_event=lambda event_id: None,
+    )
+    monkeypatch.setattr(problem_analysis, "AnalysisWorkspace", lambda *args, **kwargs: fake_workspace)
+    monkeypatch.setattr(problem_analysis, "available_memory_mb", lambda: 8_000)
+    monkeypatch.setattr(problem_analysis, "extract_strips",
+                        lambda config, segments, line, **kwargs: [tmp_path / f"strip{segments[0].camera_index}.npz"])
+
+    def analyse(config, workspace, camera, paths, **kwargs):
+        if camera == 2:
+            raise RuntimeError("decoder exploded")
+        return dict(camera_index=camera, items=[], auto_passed=[],
+                    coverage=[[START, START + 10_000, "session"]])
+
+    monkeypatch.setattr(problem_analysis, "analyse_camera", analyse)
+    published = []
+
+    def write(config, workspace, results, progress=None):
+        published.extend(results)
+        path = tmp_path / "finish_problems" / "problem_list.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"summary": {"ok": True}}), encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(problem_analysis, "write_problem_list", write)
+    summary = run_offline_analysis(AnalysisConfig(workspace=tmp_path, cameras=(1, 2)), lower_priority=False)
+
+    assert [result["camera_index"] for result in published] == [1, 2]
+    assert published[1]["error"].startswith("分析失败")
+    assert summary["failed"]["cameras"] == [
+        {"camera_index": 2, "stage": "analysis", "error": "decoder exploded"}]
+    assert summary["failed"]["segments"] == [] and summary["summary"] == {"ok": True}
+
+
+def test_memory_gate_runs_before_workspace_journals(monkeypatch, tmp_path):
+    parsed = []
+
+    def refuse(*args, **kwargs):
+        parsed.append(True)
+        raise AssertionError("workspace must not be parsed below the memory gate")
+
+    monkeypatch.setattr(problem_analysis, "AnalysisWorkspace", refuse)
+    monkeypatch.setattr(problem_analysis, "available_memory_mb", lambda: 1_000)
+
+    summary = run_offline_analysis(
+        AnalysisConfig(workspace=tmp_path, race_id="race", stage_id="stage", min_available_mb=4_096),
+        lower_priority=False,
+    )
+
+    assert parsed == []
+    assert summary["skipped_kind"] == "memory" and "1000 MB" in summary["skipped"]
+    assert summary["race_id"] == "race" and summary["cameras"] == {}
+
+
+def test_a_chip_inside_a_failed_recording_is_waiting_not_missing_video():
+    from types import SimpleNamespace
+
+    from realtime.problem_analysis import SegmentFailure, _apply_offline_failures
+    from realtime.problem_items import CATEGORY_VIDEO, KIND_WAITING, ProblemItem
+
+    failure = SegmentFailure(
+        camera_index=1, segment_id="bad", video_path="bad.avi", stage="sampling",
+        error_type="LineSamplingError", message="无法打开录像", start_ms=2000, end_ms=4000,
+        ranges=((2000, 4000),),
+    )
+    read = SimpleNamespace(event_id="e1", read_id="r1", bib="105", chip_ms=2500,
+                           excluded=False, manual_entry=False)
+    result = {
+        "camera_index": 1, "coverage": [[0, 2000, "s"], [4000, 10000, "s"]],
+        "analyzed_through_ms": 10000, "model": SimpleNamespace(to_recorder=lambda t: t),
+        "items": [ProblemItem("gap", "no_video", CATEGORY_VIDEO, "gap", chip_time_ms=2500,
+                              bibs=("105",), event_ids=("e1",))],
+    }
+
+    _apply_offline_failures(result, [failure], [read])
+
+    assert result["failed_video_ranges"] == [[2000, 4000]]
+    assert result["scanned_through_ms"] == 2000 and result["analyzed_through_ms"] <= 2000
+    assert [item.kind for item in result["items"]] == [KIND_WAITING, KIND_WAITING]
+    assert result["items"][0].bibs == ("105",) and "读取失败" in result["items"][0].detail
+    assert result["items"][1].evidence["ranges"] == [[2000, 4000]]

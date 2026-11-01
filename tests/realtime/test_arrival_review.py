@@ -140,6 +140,47 @@ def test_two_store_instances_do_not_duplicate_same_event(tmp_path):
     assert len(first.active(SCOPE)) == 1
 
 
+def test_local_saves_do_not_reparse_committed_history(tmp_path, monkeypatch):
+    store = ArrivalReviewStore(tmp_path / "review.jsonl")
+    confirm(store)
+    reads = []
+    original = store._read_locked
+
+    def counted():
+        reads.append(True)
+        original()
+
+    monkeypatch.setattr(store, "_read_locked", counted)
+    for index in range(20):
+        confirm(store, event(str(index), f"next-{index}"))
+    assert reads == []
+    assert len(store.active(SCOPE)) == 21
+    assert len(ArrivalReviewStore(store.path).active(SCOPE)) == 21
+
+
+def test_cached_writer_observes_external_append_and_undo(tmp_path):
+    path = tmp_path / "review.jsonl"
+    first, second = ArrivalReviewStore(path), ArrivalReviewStore(path)
+    confirm(first)
+    confirm(second, event("258", "two"))
+    first.undo(SCOPE, key="event:two")
+    confirm(second, event("259", "three"))
+    first.refresh()
+    assert [entry["event_id"] for entry in first.active(SCOPE)] == ["one", "three"]
+    assert second.latest(SCOPE, "event:two") is None
+
+
+def test_cached_writer_recovers_external_partial_tail(tmp_path):
+    path = tmp_path / "review.jsonl"
+    store = ArrivalReviewStore(path)
+    confirm(store)
+    with path.open("ab") as output:
+        output.write(b'{"action":"con')
+    confirm(store, event("258", "two"))
+    assert len(ArrivalReviewStore(path).active(SCOPE)) == 2
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_changed_candidate_can_be_confirmed_again_and_undone(tmp_path):
     store = ArrivalReviewStore(tmp_path / "review.jsonl")
     target = event()

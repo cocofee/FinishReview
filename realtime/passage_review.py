@@ -1406,6 +1406,8 @@ class PassageEvidencePane(QFrame):
         self._identity_marker_enabled = True
         self._identity = ""
         self._worker: Optional[object] = None
+        self._metadata_pending = False
+        self._pending_navigation: list[tuple[str, int, bool]] = []
         self._idle_prefetch_enabled = False
         self._target_position_ms = 0
         self._playing = False
@@ -2019,6 +2021,9 @@ class PassageEvidencePane(QFrame):
             return
 
         self._target_position_ms = int(location.passage_position_ms)
+        # A new passage selection must not inherit navigation queued for the
+        # previous passage while its recording metadata was still loading.
+        self._pending_navigation = []
         self._update_status_label()
         if not same_context:
             self.video_label.clear_frame(self._locating_message())
@@ -2056,6 +2061,18 @@ class PassageEvidencePane(QFrame):
         ):
             worker.pause()
             self.timeline.set_target_position(self._target_position_ms)
+            if self._metadata_pending:
+                # The same decoder is still opening. Record the new passage's
+                # initial position for the pending metadata seek instead of
+                # seeking frame 0 and later restoring the previous passage.
+                self.timeline.setProperty(
+                    "initial_position_ms", int(initial_position_ms)
+                )
+                self.timeline.setProperty("initial_frame_index", None)
+                self.timeline.setValue(0)
+                self.timeline.setEnabled(False)
+                self._set_transport_enabled(True)
+                return
             self.timeline.setValue(min(initial_position_ms, self._duration_ms))
             self.timeline.setEnabled(self._duration_ms > 0)
             worker.seek(min(initial_position_ms, self._duration_ms))
@@ -2107,6 +2124,7 @@ class PassageEvidencePane(QFrame):
             worker.step_boundary_reached.connect(self._on_step_boundary_reached)
         worker.playback_error.connect(self._on_playback_error)
         self._worker = worker
+        self._metadata_pending = True
         if not defer_worker_start:
             track_qthread(worker)
             worker.start()
@@ -2231,13 +2249,19 @@ class PassageEvidencePane(QFrame):
     ) -> None:
         if self.sender() is not self._worker:
             return
+        self._metadata_pending = False
         self._duration_ms = max(0, int(duration_ms))
         self._fps = max(0.0, float(fps))
         self._frame_count = max(0, int(_frame_count))
         self._source_width = max(0, int(width))
         self._source_height = max(0, int(height))
         initial_position_ms = int(self.timeline.property("initial_position_ms") or 0)
-        target_ms = min(max(0, initial_position_ms), max(0, duration_ms))
+        if self._pending_navigation:
+            # Navigation issued while the recording was still opening belongs
+            # on top of the pending initial position, not under it.
+            target_ms = self._resolved_pending_position(initial_position_ms)
+        else:
+            target_ms = min(max(0, initial_position_ms), max(0, duration_ms))
         self.timeline.setRange(0, self._duration_ms)
         self.timeline.set_target_position(self._target_position_ms)
         self.timeline.setValue(target_ms)
@@ -2245,10 +2269,103 @@ class PassageEvidencePane(QFrame):
         self._set_transport_enabled(True)
         initial_frame = self.timeline.property("initial_frame_index")
         self.timeline.setProperty("initial_frame_index", None)
+        if self._apply_pending_navigation(target_ms, initial_position_ms, initial_frame):
+            return
         if initial_frame is not None and hasattr(self._worker, "seek_frame"):
             self._worker.seek_frame(int(initial_frame))
         else:
             self._worker.seek(target_ms)
+
+    def _resolved_pending_position(self, initial_position_ms: int) -> int:
+        target_ms = max(0, int(initial_position_ms))
+        frame_ms = self.frame_duration_ms()
+        for kind, value, _preview in self._pending_navigation:
+            if kind == "step":
+                target_ms += int(value) * frame_ms
+            else:
+                target_ms = self._target_position_ms + int(value)
+            target_ms = max(0, min(target_ms, self._duration_ms))
+        return target_ms
+
+    def _queue_pending_navigation(
+        self,
+        kind: str,
+        value: int,
+        *,
+        preview: bool = False,
+    ) -> None:
+        value = int(value)
+        if kind == "step":
+            if not value:
+                return
+            if (
+                self._pending_navigation
+                and self._pending_navigation[-1][0] == "step"
+            ):
+                last_kind, last_value, _ = self._pending_navigation[-1]
+                self._pending_navigation[-1] = (
+                    last_kind,
+                    last_value + value,
+                    False,
+                )
+            else:
+                self._pending_navigation.append(("step", value, False))
+            return
+        entry = ("seek", value, bool(preview))
+        # A seek is absolute relative to the passage target, so it discards
+        # earlier steps/seeks. Consecutive steps after it still accumulate.
+        self._pending_navigation = [entry]
+
+    def _apply_pending_navigation(
+        self,
+        target_ms: int,
+        initial_position_ms: int,
+        initial_frame,
+    ) -> bool:
+        navigation = self._pending_navigation
+        self._pending_navigation = []
+        if not navigation:
+            return False
+        worker = self._worker
+        if worker is None:
+            return True
+        if (
+            all(kind == "step" for kind, _value, _preview in navigation)
+            and hasattr(worker, "seek_frame")
+        ):
+            if initial_frame is not None:
+                base_frame = int(initial_frame)
+            elif self._fps > 0.1:
+                base_frame = int(
+                    min(max(0, int(initial_position_ms)), self._duration_ms)
+                    * self._fps
+                    / 1000.0
+                )
+            else:
+                base_frame = None
+            if base_frame is not None:
+                frame_index = base_frame + sum(
+                    int(value) for _kind, value, _preview in navigation
+                )
+                if self._frame_count > 0:
+                    frame_index = max(0, min(frame_index, self._frame_count - 1))
+                else:
+                    frame_index = max(0, frame_index)
+                worker.seek_frame(frame_index)
+                return True
+        preview = bool(navigation[-1][2])
+        if preview:
+            preview_seek = getattr(worker, "seek_preview", None)
+            if callable(preview_seek):
+                preview_seek(target_ms)
+                return True
+        if self._playing:
+            seek_and_play = getattr(worker, "seek_and_play", None)
+            if callable(seek_and_play):
+                seek_and_play(target_ms, 1.0)
+                return True
+        worker.seek(target_ms)
+        return True
 
     def seek_media_frame(self, position_ms: int, frame_index: Optional[int]) -> None:
         """Seek a retained original frame without millisecond rounding loss.
@@ -2264,6 +2381,9 @@ class PassageEvidencePane(QFrame):
         self._full_resolution_timer.stop()
         self._last_full_resolution_request = -1
         self._reset_video_scrub()
+        # An exact frame/time seek is the operator's latest navigation and
+        # supersedes any step/seek queued while metadata was loading.
+        self._pending_navigation = []
         if self._fps <= 0:
             self.timeline.setProperty("initial_position_ms", int(position_ms))
             self.timeline.setProperty(
@@ -2544,6 +2664,8 @@ class PassageEvidencePane(QFrame):
     def _on_playback_error(self, message: str) -> None:
         if self.sender() is not self._worker:
             return
+        self._metadata_pending = False
+        self._pending_navigation = []
         self._playing = False
         self.play_btn.setText("▶")
         self._set_status_label(self._availability_status(), message)
@@ -2587,9 +2709,15 @@ class PassageEvidencePane(QFrame):
         self.start_deferred_worker()
         self._full_resolution_timer.stop()
         self._last_full_resolution_request = -1
-        worker.step(frame_delta)
         self._playing = False
         self.play_btn.setText("▶")
+        if self._metadata_pending:
+            # The decoder has no frame size yet, so a step issued now cannot
+            # be converted to a position. Keep the accumulated intent and let
+            # the pending initial seek replay it once metadata arrives.
+            self._queue_pending_navigation("step", int(frame_delta))
+            return
+        worker.step(frame_delta)
 
     def frame_duration_ms(self) -> int:
         if self._fps <= 0.1:
@@ -2619,6 +2747,12 @@ class PassageEvidencePane(QFrame):
         self._last_full_resolution_request = -1
         bounds = self.available_delta_bounds()
         if bounds is None:
+            if self._metadata_pending:
+                if preview:
+                    self._video_scrubbing = True
+                self._playing = bool(linked_playing)
+                self._queue_pending_navigation("seek", int(delta_ms), preview=preview)
+                self.play_btn.setText("Ⅱ" if self._playing else "▶")
             return
         lower, upper = bounds
         clamped_delta_ms = max(lower, min(int(delta_ms), upper))
@@ -2766,6 +2900,8 @@ class PassageEvidencePane(QFrame):
 
     def _stop_worker(self, *, wait: bool = False) -> None:
         self._reset_video_scrub()
+        self._metadata_pending = False
+        self._pending_navigation = []
         worker = self._worker
         self._worker = None
         if worker is None:

@@ -87,6 +87,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+ANALYSIS_FAILURE_EXIT_CODES = {"storage": 3, "input": 4, "analysis": 5, "internal": 6}
+
+
+def analysis_failure_kind(error: BaseException) -> str:
+    """Which retry pace a failed worker deserves; the operator still sees why."""
+
+    if isinstance(error, OSError):
+        return "storage"
+    if isinstance(error, (ValueError, KeyError, TypeError)):
+        return "input"
+    if isinstance(error, RuntimeError):
+        return "analysis"
+    return "internal"
+
+
 def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: bool = False) -> int:
     """Headless offline problem-list run, started by the console in its own process."""
 
@@ -99,17 +114,34 @@ def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: boo
         # keeps the pipe protocol independent of the system code page.
         print(_json.dumps({"stage": stage, "done": done, "total": total}, ensure_ascii=True), flush=True)
 
-    config = config_from_workspace(event_dir)
-    if live or finish_live:
-        config.live = True
-    if finish_live:
-        config.evidence_delay_ms = 0
-    summary = run_offline_analysis(config, progress=report)
+    try:
+        config = config_from_workspace(event_dir)
+        if live or finish_live:
+            config.live = True
+        if finish_live:
+            config.evidence_delay_ms = 0
+        summary = run_offline_analysis(config, progress=report)
+    except Exception as error:  # noqa: BLE001 - the worker must report a bounded failure.
+        # SystemExit and KeyboardInterrupt are not Exception and still stop the
+        # process; expected I/O and input errors are classified for the panel.
+        logger.exception("Problem analysis failed")
+        kind = analysis_failure_kind(error)
+        print(_json.dumps({"stage": "failed", "kind": kind,
+                           "message": sanitize_recording_message(error)[:400]}, ensure_ascii=True), flush=True)
+        return ANALYSIS_FAILURE_EXIT_CODES[kind]
     if summary.get("skipped"):
         print(_json.dumps({"stage": "skipped", "message": summary["skipped"]}, ensure_ascii=True), flush=True)
         return 1
-    print(_json.dumps({"stage": "done", "summary": summary.get("summary", {})}, ensure_ascii=True, default=str),
-          flush=True)
+    failed = summary.get("failed") or {}
+    failures = failed.get("segments") or []
+    cameras = failed.get("cameras") or []
+    first = failures[0].get("message", "") if failures else cameras[0].get("error", "") if cameras else ""
+    print(_json.dumps({"stage": "done", "summary": summary.get("summary", {}),
+                       "failed": {"segments": len(failures),
+                                  "saves": sum(1 for item in failures if item.get("stage") == "save"),
+                                  "cameras": len(cameras),
+                                  "first": sanitize_recording_message(first)[:300]}},
+                      ensure_ascii=True, default=str), flush=True)
     return 0
 
 

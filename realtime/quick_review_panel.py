@@ -114,6 +114,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._decided = {}
         self._plan_cache = None
         self._quick_render_signature = None
+        self._quick_row_signatures = []
         self._simultaneous = Counter()
         self._frame_provider = lambda: None
         self._shown_ms = None
@@ -570,14 +571,28 @@ class QuickReviewPanel(ProblemListPanel):
         self.rows = [row.item for row in rows]
         groups = [self._row_group(row) for row in rows]
         counted = {index: plan.matches for index, plan in plans.items() if plan.marks or plan.split}
-        signature = (self._arrival_scope, self._selected_key, tuple(sorted(counted.items())),
-                     tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
-                            candidate_binding(row.item), self._wave_of.get(row.key), group)
-                           for row, group in zip(rows, groups)))
+        wave_signatures = {index: tuple((member.key, member.bib) for member in wave)
+                           for index, wave in enumerate(self._waves)}
+        row_signatures = [
+            (row.key, row.bib, row.time_ms, row.recorder_ms, row.reference,
+             self._row_state(row), self._row_category(row), candidate_binding(row.item),
+             self._wave_of.get(row.key), group, row.mark is not None,
+             counted.get(self._wave_of.get(row.key)),
+             wave_signatures.get(self._wave_of.get(row.key), ()))
+            for row, group in zip(rows, groups)
+        ]
+        signature = (self._arrival_scope, tuple(row_signatures))
         if signature == self._quick_render_signature:
+            selected = next((i for i, row in enumerate(rows) if row.key == self._selected_key), -1)
+            if selected >= 0:
+                self.table.blockSignals(True)
+                self.table.setCurrentCell(selected, 0)
+                self.table.blockSignals(False)
             self._sync_arrival_confirmation()
             return
+        previous_signatures = self._quick_row_signatures
         self._quick_render_signature = signature
+        self._quick_row_signatures = [None] * len(row_signatures)
         several_groups = len({group for group in groups if group}) > 1
         self.table.setColumnHidden(4, not several_groups)
         # Room for a name like 男子山地精英组 beside the state.
@@ -598,6 +613,14 @@ class QuickReviewPanel(ProblemListPanel):
                 chip_number += 1
                 if category != "非运动员":
                     number = str(chip_number)
+            cell_signature = (self._arrival_scope, number, row_signatures[index])
+            self._quick_row_signatures[index] = cell_signature
+            if (index < len(previous_signatures)
+                    and previous_signatures[index] == cell_signature
+                    and all(self.table.item(index, column) is not None for column in range(5))):
+                if row.key == self._selected_key:
+                    selected = index
+                continue
             for column, text in enumerate((number, row.bib or "—", time, state, groups[index])):
                 from PyQt5.QtWidgets import QTableWidgetItem
                 cell = QTableWidgetItem(text)
@@ -1328,6 +1351,15 @@ class QuickReviewPanel(ProblemListPanel):
         self._render()
         self.marks_changed.emit(tuple(self.current_marks()))
         self.hint.setText(f"已确认 {event.bib} 过线；继续看下一位。")
+
+    def _marks_updated(self):
+        super()._marks_updated()
+        # The inherited legacy counter writes into the current row directly.
+        # Do not let the incremental table cache retain that temporary note/style.
+        index = self.table.currentRow()
+        if 0 <= index < len(self._quick_row_signatures):
+            self._quick_row_signatures[index] = None
+        self._quick_render_signature = None
 
     def add_mark(self, x, y, recorder_ms, frame=None):
         """A click on a person counts them; on a wave's picture it is their chip's crossing at once."""

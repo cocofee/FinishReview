@@ -58,6 +58,59 @@ def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
         assert "自行车" not in " ".join(panel.table.item(i, j).text() for j in range(4))
 
 
+def test_selection_refresh_preserves_existing_table_cells(panel):
+    panel._render()
+    original = [[panel.table.item(i, j) for j in range(5)]
+                for i in range(panel.table.rowCount())]
+    panel._selected_key = panel._arrival_rows[-1].key
+    panel._render()
+    assert panel.table.currentRow() == len(panel._arrival_rows) - 1
+    for i, cells in enumerate(original):
+        assert all(panel.table.item(i, j) is cell for j, cell in enumerate(cells))
+
+
+def test_changing_one_bib_keeps_other_rows_cells(panel):
+    # A different wave has no tooltip or count dependency on the changed bib.
+    panel.events[1] = replace(panel.events[1], passage_timestamp_ms=FRAME["recorder_ms"] + 10_000)
+    panel._render()
+    untouched_index = row(panel, "321")
+    cells = [panel.table.item(untouched_index, j) for j in range(5)]
+    panel.events[1] = replace(panel.events[1], bib="999", revision=2)
+    panel._render()
+    assert panel.table.item(row(panel, "999"), 1).text() == "999"
+    assert all(panel.table.item(untouched_index, j) is cell for j, cell in enumerate(cells))
+
+
+def test_same_wave_bib_change_updates_neighbour_tooltip(panel):
+    first = row(panel, "321")
+    assert "258" in panel.table.item(first, 0).toolTip()
+    panel.events[1] = replace(panel.events[1], bib="999", revision=2)
+    panel._render()
+    assert "999" in panel.table.item(first, 0).toolTip()
+    assert "258" not in panel.table.item(first, 0).toolTip()
+
+
+def test_incremental_refresh_clears_removed_and_reinserted_rows(panel):
+    original = panel.events.pop()
+    panel._render()
+    # The original problem still references the absent chip: this is a retained
+    # evidence row, not permission to silently drop it or change its identity.
+    panel.events.append(replace(original, bib="999", revision=2))
+    panel._render()
+    assert panel.table.item(row(panel, "999"), 1).text() == "999"
+    assert panel.table.rowCount() == len(panel._arrival_rows)
+
+
+def test_legacy_count_note_is_repaired_by_incremental_render(panel):
+    index = row(panel, "321")
+    panel.table.setCurrentCell(index, 0)
+    panel._render()
+    panel._marks_updated()
+    panel._render()
+    assert panel.table.item(index, 2).text() == format_chip_time(panel._arrival_rows[index].time_ms)
+    assert panel.table.item(index, 0).foreground().color().name() != "#8a8f98"
+
+
 def test_finish_line_has_one_visible_entry(panel):
     from PyQt5.QtWidgets import QPushButton
 
