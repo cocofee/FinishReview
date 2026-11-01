@@ -604,9 +604,12 @@ def test_a_lone_chip_row_is_saved_by_a_click_on_its_picture_and_never_by_a_numbe
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         assert "按 1" not in panel.confirmation_status.text()
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # 不是运动员 needs the person clicked first
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # uncounted test chip: local exclusion, never confirmation
         assert not any(row.decision for row in panel._arrival_rows)
-        assert "321 号还没点人" in panel.hint.text()
+        assert panel._row_state(panel._selected_arrival()) == "已排除"
+        assert window.passage_store.get(target.event_id).is_active
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_4)
+        assert panel._row_state(panel._selected_arrival()) == "待定"
         window._problem_count_clicked(0.5, 0.5, pane)
         qapp.processEvents()
         assert panel._selected_arrival().bib == "321"

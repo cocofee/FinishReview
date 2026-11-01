@@ -1131,15 +1131,16 @@ def test_excluding_on_to_the_next_chip_takes_the_pictures_after_it_up_to_a_long_
     assert not panel._arrival_store.active(SCOPE)
 
 
-def test_a_chip_row_nobody_was_counted_for_offers_only_double_chip_and_a_click_just_counts(wave_panel):
-    """10-29：左键只有一个意思（点人）；1 / 3 要先点中这个人，号码、双芯片按键或右键。"""
+def test_uncounted_chip_offers_local_exclusion_and_double_chip_but_picture_only_counts(wave_panel):
+    """未点人的测试读数可直接本机排除；补录仍须先在画面点人。"""
     wave_panel._arrival_clicked(row(wave_panel, "61"))
-    assert menu_labels(wave_panel) == ["双芯片：这条芯片是谁带的…"]
-    for key in (Qt.Key_1, Qt.Key_3):
-        QTest.keyClick(wave_panel, key)
-        assert "61 号还没点人" in wave_panel.hint.text() and "可以按：2 双芯片" in wave_panel.hint.text()
+    assert menu_labels(wave_panel) == ["非运动员（本机排除）", "双芯片：这条芯片是谁带的…"]
+    QTest.keyClick(wave_panel, Qt.Key_3)
+    assert "61 号还没点人" in wave_panel.hint.text() and "2 双芯片" in wave_panel.hint.text()
+    QTest.keyClick(wave_panel, Qt.Key_1)
+    assert wave_panel._row_state(wave_panel._selected_arrival()) == "已排除"
     QTest.keyClick(wave_panel, Qt.Key_4)
-    assert "没有可撤销" in wave_panel.hint.text()
+    assert wave_panel._row_state(wave_panel._selected_arrival()) == "待定"
     assert not wave_panel._arrival_store.active(SCOPE)
     count_on_picture(wave_panel, .2, 100)
     assert saved(wave_panel) == {"61": 100}
