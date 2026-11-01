@@ -14,12 +14,13 @@ from realtime.bunch_dialog import BunchDecoder, BunchReviewDialog, CountView
 from realtime.bunch_review import (
     BunchChip, BunchReviewStore, align_counts, completion_issue, count_differences, detected_crossings,
     load_context, add_viewed, uncovered_intervals, review_candidates, group_member_batch,
-    mark_on_frame, review_completion_issue, unresolved_crossing_conflicts, view_reach,
+    mark_on_frame, counted_person_on_child_frame, review_completion_issue, unresolved_crossing_conflicts, view_reach,
 )
 from realtime.clock_sync import ClockModel, ClockModelStore
 from realtime.passage_receiver import PassageEvent
 from realtime.problem_items import (
-    ACTION_KEEP, ACTION_RECORD_BIB, ACTION_SIDE_BY_SIDE, CATEGORY_VIDEO, KIND_BUNCH, KIND_CHIP_NO_CROSSING,
+    ACTION_INSUFFICIENT, ACTION_KEEP, ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_SIDE_BY_SIDE,
+    CATEGORY_VIDEO, KIND_BUNCH, KIND_CHIP_NO_CROSSING,
     KIND_NEAR_CROSSING, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
 )
 from realtime.problem_panel import ProblemListPanel
@@ -1091,7 +1092,7 @@ def test_a_normal_group_closes_without_numbers_when_the_count_answers_the_child(
     context = load_context(root, item)
     child = crossing_child(item, KIND_NEAR_CROSSING, 'e-1', recorder_ms=context.chips[1].recorder_ms,
                            frame=frame_at(context, context.chips[1].recorder_ms, session_id='s',
-                                          calibration_version=context.model.version))
+                                          calibration_version=context.model.version), position=[.3, .5])
     write_children(root, item, [child])
     counts = [counted(context, chip.recorder_ms) for chip in context.chips]
     result = align_counts(context.chips, counts)
@@ -1389,6 +1390,150 @@ def test_a_confirmed_group_lists_the_doubts_it_still_holds_as_rows(synthetic_bun
     finally:
         panel.close()
         app.processEvents()
+
+
+@pytest.mark.parametrize('kind', [KIND_NEAR_CROSSING, KIND_NO_CHIP_CROSSING])
+def test_same_frame_other_person_stays_pending_without_reopening_group(synthetic_bunch, kind):
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    first = context.chips[0]
+    child = crossing_child(item, kind, 'other-person', recorder_ms=first.recorder_ms,
+                           frame=frame_at(context, first.recorder_ms), position=[.8, .5])
+    write_children(root, item, [child])
+    marks = [counted(context, chip.recorder_ms) for chip in context.chips]
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
+    original = store.path.read_bytes()
+    assert store.get(context)['completed']
+    assert store.open_doubts(context) == [child.item_id]
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(root)
+        assert panel.state(item).startswith('已处理')
+        assert [row.item_id for row in panel.rows] == [child.item_id]
+        assert panel.state(panel.rows[0]) == '待处理'
+        panel.store.resolve(panel.rows[0], ACTION_SAME_CROSSING if kind == KIND_NEAR_CROSSING else ACTION_RECORD_BIB,
+                            bib='319' if kind == KIND_NO_CHIP_CROSSING else '', reason='核对原帧及位置后处理')
+        panel.refresh()
+        assert panel.rows == []
+        assert store.open_doubts(context) == []
+    finally:
+        panel.close()
+        app.processEvents()
+    assert store.path.read_bytes() == original
+
+
+@pytest.mark.parametrize('kind', [KIND_NEAR_CROSSING, KIND_CHIP_NO_CROSSING])
+def test_insufficient_overrides_matching_count_and_member_answer_but_not_group(synthetic_bunch, kind):
+    from realtime.batch_review import BatchDecisionStore
+
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    first = context.chips[0]
+    child = crossing_child(item, kind, 'held', recorder_ms=first.recorder_ms,
+                           frame=frame_at(context, first.recorder_ms), position=[.3, .5],
+                           bibs=(first.bib,), event_ids=(first.event_id,))
+    write_children(root, item, [child])
+    marks = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips]
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
+    if kind == KIND_CHIP_NO_CROSSING:
+        BatchDecisionStore(root / 'finish_problems').save(
+            group_member_batch(context), [first.event_id], 'keep', '先前已核对')
+    assert store.open_doubts(context) == []
+    resolutions = ProblemResolutionStore(root / 'finish_problems/problem_resolutions.jsonl')
+    resolutions.resolve(child, ACTION_INSUFFICIENT)
+    assert store.get(context)['completed']
+    assert store.open_doubts(context) == [child.item_id]
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(root)
+        assert [row.item_id for row in panel.rows] == [child.item_id]
+        assert panel.state(panel.rows[0]) == '待处理'
+        action = ACTION_SAME_CROSSING if kind == KIND_NEAR_CROSSING else ACTION_KEEP
+        panel.store.resolve(panel.rows[0], action, reason='重新核对原帧及身份')
+        panel.refresh()
+        assert panel.rows == []
+        assert store.open_doubts(context) == []
+    finally:
+        panel.close()
+        app.processEvents()
+    actions = [json.loads(line)['action'] for line in resolutions.journal_path.read_text(encoding='utf-8').splitlines()]
+    assert actions == [ACTION_INSUFFICIENT, action]
+
+
+@pytest.mark.parametrize('geometry', [
+    {}, {'contact': [.3, .5]}, {'row': 250}, {'position': [300, 500]},
+    {'position': [float('nan'), .5]}, {'position': [.3]},
+    {'position': [.3, .5], 'members': [{'row': 100}, {'row': 400}]},
+])
+def test_ambiguous_position_does_not_borrow_another_count(synthetic_bunch, geometry):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    first = context.chips[0]
+    child = crossing_child(item, KIND_NEAR_CROSSING, 'geometry', recorder_ms=first.recorder_ms,
+                           frame=frame_at(context, first.recorder_ms), **geometry)
+    marks = [counted(context, first.recorder_ms)]
+    assert not counted_person_on_child_frame(child, marks)
+
+
+def test_insufficient_on_generated_chip_difference_overrides_member_keep(synthetic_bunch):
+    from realtime.batch_review import BatchDecisionStore
+
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    marks = [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips[:-1]]
+    write_children(root, item, [])
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
+    [difference] = store.differences(item, root)
+    assert difference.kind == KIND_CHIP_NO_CROSSING
+    BatchDecisionStore(root / 'finish_problems').save(
+        group_member_batch(context), list(difference.event_ids), 'keep', '先前已核对')
+    assert store.open_doubts(context) == []
+    resolutions = ProblemResolutionStore(root / 'finish_problems/problem_resolutions.jsonl')
+    resolutions.resolve(difference, ACTION_INSUFFICIENT)
+    assert store.open_doubts(context) == [difference.item_id]
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(root)
+        assert panel.state(item).startswith('已处理')
+        assert [row.item_id for row in panel.rows] == [difference.item_id]
+        assert panel.state(panel.rows[0]) == '待处理'
+    finally:
+        panel.close()
+        app.processEvents()
+
+
+def test_detector_candidate_without_operator_position_keeps_its_own_row(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    first = context.chips[0]
+    child = crossing_child(item, KIND_NEAR_CROSSING, 'detector', recorder_ms=first.recorder_ms,
+                           frame=frame_at(context, first.recorder_ms), contact=[48, 60],
+                           members=[{'row': 100, 'contact': [48, 60]}])
+    write_children(root, item, [child])
+    marks = [counted(context, chip.recorder_ms) for chip in context.chips]
+    store = BunchReviewStore(root / 'finish_problems')
+    store.save(context, marks, 20, completed=True, fully_viewed=True, viewed_ranges=full_view(context))
+    assert store.get(context)['completed']
+    assert store.open_doubts(context) == [child.item_id]
+
+
+def test_matching_position_needs_camera_and_ignores_only_rounding(synthetic_bunch):
+    root, item, _events = synthetic_bunch
+    context = load_context(root, item)
+    first = context.chips[0]
+    child = crossing_child(item, KIND_NEAR_CROSSING, 'position', recorder_ms=first.recorder_ms,
+                           frame=frame_at(context, first.recorder_ms), position=[.30004, .5])
+    mark = counted(context, first.recorder_ms)
+    assert counted_person_on_child_frame(child, [mark])
+    assert not counted_person_on_child_frame(child, [dict(mark, x=.301)])
+    assert not counted_person_on_child_frame(child, [dict(mark, frame={})])
+    assert not counted_person_on_child_frame(child, [dict(mark, exclusion_reason='行人')])
 
 
 def test_a_released_doubt_never_exports_a_number_the_group_already_exports(synthetic_bunch):

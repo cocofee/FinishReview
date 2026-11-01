@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import statistics
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
@@ -56,16 +57,17 @@ COMPLETION_POLICY_VERSION = 2
 # retained copy of the same actual frame (extra metadata, a rebuilt stamp) also
 # counts. Neighboring frames are 50 ms apart, so the moment stays unambiguous.
 MARK_TIME_TOLERANCE_MS = 20
+# Normalized operator positions are rounded to four decimals when saved.
+MARK_POSITION_TOLERANCE = 0.0001
 
 # The doubts a group's children can carry, and the operator's own answers to
 # them. Only the answers below close one: equal totals never can, and "confirm
 # the crossing, number later" leaves the question open on purpose.
 CHILD_ANSWERS = {
     KIND_TWO_CHIPS_ONE_CROSSING: (ACTION_DELETE_EXTRA_CHIP, ACTION_SIDE_BY_SIDE),
-    KIND_CHIP_NO_CROSSING: (ACTION_DELETE_CHIP, ACTION_KEEP, ACTION_INSUFFICIENT),
+    KIND_CHIP_NO_CROSSING: (ACTION_DELETE_CHIP, ACTION_KEEP),
     KIND_NO_CHIP_CROSSING: (ACTION_RECORD_BIB, ACTION_NOT_RIDER, ACTION_RIDE_BACK),
-    KIND_NEAR_CROSSING: (ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK,
-                         ACTION_INSUFFICIENT),
+    KIND_NEAR_CROSSING: (ACTION_RECORD_BIB, ACTION_SAME_CROSSING, ACTION_NOT_RIDER, ACTION_RIDE_BACK),
 }
 RESOLVED_STATUSES = (STATUS_CLOSED_UPSTREAM, STATUS_EXCLUDED, STATUS_INFO)
 
@@ -356,22 +358,45 @@ def pending_member_decisions(context):
                for member in batch.evidence["batch_members"])
 
 
-def counted_person_on_child_frame(child, marks) -> bool:
-    """A person was counted on the child's own frame; the crossing is accounted.
+def _normalized_position(value):
+    """Detector contacts and strip rows are not normalized operator positions."""
 
-    The number may stay unread: one counted person at that moment is the
-    operator's answer that the line change was a rider, not a total that happens
-    to match. The frame comparison tolerates the extra metadata and retained
-    copies that saved marks carry.
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    try:
+        point = tuple(float(coordinate) for coordinate in value)
+    except (TypeError, ValueError):
+        return None
+    return point if all(math.isfinite(coordinate) and 0 <= coordinate <= 1 for coordinate in point) else None
+
+
+def counted_person_on_child_frame(child, marks) -> bool:
+    """A count answers only the same frame AND explicitly comparable position.
+
+    Missing geometry or an aggregate candidate stays on its own doubt row;
+    another rider on the same frame cannot silently answer it. No bib is
+    required here, and keeping a doubt never blocks the group's confirmation.
     """
 
+    position = _normalized_position(child.evidence.get("position"))
+    if position is None or child.evidence.get("members"):
+        return False
     frame = child.evidence.get("frame") or {}
     stamp = child.evidence.get("recorder_ms")
     if stamp is None:
         stamp = child.evidence.get("expected_recorder_ms")
-    if stamp is None:
+    if stamp is None or frame.get("camera_index") is None:
         return False
-    return any(not is_excluded(mark) and mark_on_frame(mark, frame, int(stamp)) for mark in marks)
+    for mark in marks:
+        marked = _normalized_position((mark.get("x"), mark.get("y")))
+        if (is_excluded(mark) or marked is None
+                or (mark.get("frame") or {}).get("camera_index") is None):
+            continue
+        if (mark_on_frame(mark, frame, int(stamp))
+                and all(math.isclose(left, right, rel_tol=0, abs_tol=MARK_POSITION_TOLERANCE)
+                        for left, right in zip(marked, position))):
+            return True
+    return False
 
 
 def chip_answered_by_count(context, child, marks, result) -> bool:
@@ -451,6 +476,9 @@ def unresolved_crossing_conflicts(context, marks, result):
         if answers is None or child.status in RESOLVED_STATUSES:
             continue
         decision, stale = store.state(child)
+        if decision is not None and not stale and decision.action == ACTION_INSUFFICIENT:
+            conflicts.append(child)
+            continue  # A current hold overrides counts and earlier member answers.
         if decision is not None and not stale and decision.action in answers:
             continue
         if child.kind in (KIND_CHIP_NO_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING):
@@ -481,6 +509,9 @@ def unanswered_differences(context, rows) -> list[ProblemItem]:
     unanswered = []
     for row in rows:
         decision, stale = store.state(row)
+        if decision is not None and not stale and decision.action == ACTION_INSUFFICIENT:
+            unanswered.append(row)
+            continue
         if decision is not None and not stale and decision.action in CHILD_ANSWERS[row.kind]:
             continue
         if row.kind == KIND_CHIP_NO_CROSSING:
@@ -659,8 +690,17 @@ def count_differences(item: ProblemItem, camera: int, chips: list[BunchChip], ma
 
     lines = [child for child in children if child.kind in (KIND_NO_CHIP_CROSSING, KIND_NEAR_CROSSING)]
     surplus = max(0, len(unread) - len(free))
+    def frame_has_doubt(index):
+        # A same-frame candidate is a ranking hint, never an answer to a doubt.
+        # Detector candidates lack normalized operator positions.
+        for child in lines:
+            stamp = child.evidence.get("recorder_ms", child.evidence.get("expected_recorder_ms"))
+            if stamp is not None and mark_on_frame(marks[index], child.evidence.get("frame") or {}, int(stamp)):
+                return True
+        return False
+
     guessed = sorted((index for index in extras if not read(index)), key=lambda index: (
-        not any(counted_person_on_child_frame(child, [marks[index]]) for child in lines),
+        not frame_has_doubt(index),
         -min((gap(index, chip) for chip in free), default=0), marks[index]["recorder_ms"]))
     for index in [index for index in extras if read(index)] + guessed[:surplus]:
         extra, mark = extras[index], marks[index]
