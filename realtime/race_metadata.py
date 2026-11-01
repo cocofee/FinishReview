@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -50,10 +50,22 @@ def _integer(payload: Mapping[str, Any], name: str) -> int:
     return value
 
 
+def _optional_count(payload: Mapping[str, Any], name: str) -> int:
+    if name not in payload or payload[name] is None:
+        return 0
+    value = _integer(payload, name)
+    if value < 0:
+        raise RaceMetadataError(f"{name} must be non-negative")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class RaceGroupMetadata:
     group_id: str
     name: str
+    # The group's target laps in this stage, as CycleRace sets them for its
+    # results; 0: not sent (CycleRace before it).  Only the last lap is judged.
+    target_laps: int = 0
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "RaceGroupMetadata":
@@ -62,7 +74,14 @@ class RaceGroupMetadata:
         return cls(
             group_id=_required_string(payload, "group_id"),
             name=_required_string(payload, "name"),
+            target_laps=_optional_count(payload, "target_laps"),
         )
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        if not self.target_laps:  # a snapshot without it stays as it was sent
+            del payload["target_laps"]
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +183,7 @@ class RaceMetadata:
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["groups"] = [asdict(group) for group in self.groups]
+        payload["groups"] = [group.to_payload() for group in self.groups]
         payload["athletes"] = [
             {
                 **asdict(athlete),
@@ -216,12 +235,15 @@ class RaceMetadataStore:
             )
             if same_context and metadata.revision < current.revision:
                 return RaceMetadataIngestResult.DUPLICATE
+            if same_context and current is not None:
+                metadata = _preserve_target_laps(metadata, current)
             if same_context and metadata.revision == current.revision:
-                if metadata != current:
+                if metadata == current:
+                    return RaceMetadataIngestResult.DUPLICATE
+                if _without_target_laps(metadata) != _without_target_laps(current):
                     raise RaceMetadataConflictError(
                         "race metadata revision was reused with different content"
                     )
-                return RaceMetadataIngestResult.DUPLICATE
             encoded = json.dumps(
                 metadata.to_payload(),
                 ensure_ascii=False,
@@ -245,6 +267,26 @@ class RaceMetadataStore:
     def current(self) -> Optional[RaceMetadata]:
         with self._lock:
             return self._current
+
+
+def _without_target_laps(metadata: RaceMetadata) -> RaceMetadata:
+    return replace(metadata, groups=tuple(replace(group, target_laps=0) for group in metadata.groups))
+
+
+def _preserve_target_laps(metadata: RaceMetadata, current: RaceMetadata) -> RaceMetadata:
+    """Keep known targets when an older sender omits them in a later revision."""
+    if (metadata.race_id, metadata.stage_id) != (current.race_id, current.stage_id):
+        return metadata
+    stored = {group.group_id: group.target_laps for group in current.groups}
+    groups = []
+    for group in metadata.groups:
+        old_target = stored.get(group.group_id, 0)
+        if (metadata.revision == current.revision and group.target_laps and old_target
+                and group.target_laps != old_target):
+            raise RaceMetadataConflictError("race metadata revision changed target_laps")
+        target = group.target_laps or old_target
+        groups.append(replace(group, target_laps=target))
+    return replace(metadata, groups=tuple(groups))
 
 
 __all__ = [

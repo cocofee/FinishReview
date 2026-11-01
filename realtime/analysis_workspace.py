@@ -20,6 +20,7 @@ from .chip_history import (
     read_passage_history,
 )
 from .clock_sync import ClockAnchor
+from .evidence_clock import align_evidence_timestamp
 from .passage_evidence import (
     REGULAR_SOURCE,
     PassageEvidenceAssociationStore,
@@ -56,7 +57,11 @@ def race_clock_window(reads) -> Optional[tuple[int, int]]:
     the caller keeps everything.
     """
 
-    times = [int(read.chip_ms) for read in reads if int(read.chip_ms) > 0]
+    # A live read whose CycleRace stage carries the wrong date counts on the
+    # day it arrived (official time unchanged), else today's recordings fall
+    # outside the window and the race shows no strip at all.
+    times = [align_evidence_timestamp(int(read.chip_ms), int(getattr(read, "received_at_ms", 0) or 0))
+             for read in reads if int(read.chip_ms) > 0]
     if not times:
         return None
     return min(times) - RACE_CLOCK_MARGIN_MS, max(times) + RACE_CLOCK_MARGIN_MS

@@ -42,6 +42,23 @@ def _unprotect_for_test(value: str) -> str:
     return bytes.fromhex(value.removeprefix(prefix)).decode("utf-8")
 
 
+def test_problem_worker_stops_quietly_once_the_console_is_gone(monkeypatch):
+    """10-28: the console was ended mid-analysis; the worker's next progress line hit a closed pipe."""
+    from realtime import problem_analysis
+
+    monkeypatch.setattr(problem_analysis, "config_from_workspace", lambda path: path)
+    def run(config, progress):
+        progress("strips", 1, 2)
+        raise AssertionError("analysis went on with nobody listening")
+    monkeypatch.setattr(problem_analysis, "run_offline_analysis", run)
+    def closed_pipe(*_args, **_kwargs):
+        raise OSError(22, "Invalid argument")
+    monkeypatch.setattr("builtins.print", closed_pipe)
+
+    with pytest.raises(SystemExit):
+        review_main.run_problem_analysis("synthetic-workspace")
+
+
 def test_problem_worker_progress_is_ascii_json(monkeypatch, capsys):
     from realtime import problem_analysis
 

@@ -3274,6 +3274,63 @@ def test_previous_frame_crosses_into_adjacent_recording_without_changing_rider(
     dialog.close()
 
 
+def test_play_runs_on_into_the_next_recording_and_stops_only_at_a_real_end(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    """现代五项 10-29：每条 2.5 秒的录像播完 ▶ 就停（“2 秒割裂感”）。"""
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    event = _event(event_id="passage-plays-on", sequence=1, passage_time_ms=19_000, bib="35")
+    passage_store.append(event)
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first = _add_segment(timeline_store, tmp_path / "videos" / "camera_01_archive_0000.mkv",
+                         source_id="camera_01_review", camera_index=1, started_at_ms=10_000, ended_at_ms=20_000)
+    second = _add_segment(timeline_store, tmp_path / "videos" / "camera_01_archive_0001.mkv",
+                          source_id="camera_01_review", camera_index=1, started_at_ms=20_000, ended_at_ms=30_000)
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    pane = dialog.regular_pane
+    assert pane.location.segment.segment_id == first.segment_id
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+
+    # A stop in the middle of the file (a decode failure) does not jump anywhere.
+    pane._worker.frame_ready.emit(frame, 5_000, 125)
+    pane.set_playing(True)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == first.segment_id and not pane.is_playing
+
+    # A pause by the operator is not an end either.
+    pane._worker.frame_ready.emit(frame, 9_960, 249)
+    pane.set_playing(True)
+    pane.set_playing(False)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == first.segment_id
+
+    # Played to the last frame: the next file opens at its start and plays on.
+    pane.set_playing(True)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert dialog._selected_event_id == event.event_id
+    assert pane.location.segment.segment_id == second.segment_id
+    assert pane._worker.video_path == pane.location.video_path
+    assert pane._worker.seek_calls[-1] == 0
+    assert pane.is_playing and pane._worker.speed_calls[-1] == 1.0
+
+    # The last file of the recording: ▶ just stops.
+    pane._worker.metadata_ready.emit(10_000, 25.0, 1280, 720, 250)
+    pane._worker.frame_ready.emit(frame, 9_960, 249)
+    pane._worker.playback_finished.emit()
+    qapp.processEvents()
+    assert pane.location.segment.segment_id == second.segment_id and not pane.is_playing
+    dialog.close()
+
+
 def test_next_frame_crosses_when_decoder_is_on_last_frame_before_reported_duration(
     qapp,
     tmp_path,
@@ -4122,6 +4179,33 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     assert dialog.group_combo.itemText(1) == "男子公开组"
     assert dialog.group_combo.itemData(1) == "men-open"
     dialog.close()
+
+
+def test_metadata_same_revision_accepts_target_laps_in_either_direction(tmp_path):
+    store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    base = RaceMetadata(race_id="race", stage_id="stage", revision=1, emitted_at_ms=1,
+                        groups=(RaceGroupMetadata("g", "组"),))
+    with_laps = replace(base, groups=(RaceGroupMetadata("g", "组", 4),))
+    assert store.store(with_laps).value == "accepted"
+    assert store.store(base).value == "duplicate"
+    assert store.current().groups[0].target_laps == 4
+    changed_revision = replace(base, revision=2, emitted_at_ms=2)
+    assert store.store(changed_revision).value == "accepted"
+    assert store.current().groups[0].target_laps == 4
+    changed_laps = replace(changed_revision, revision=3, emitted_at_ms=3,
+                           groups=(RaceGroupMetadata("g", "组", 5),))
+    assert store.store(changed_laps).value == "accepted"
+    assert store.current().groups[0].target_laps == 5
+
+
+def test_metadata_null_target_laps_means_unknown(tmp_path):
+    payload = {
+        "schema_version": 1, "message_type": "race_metadata", "race_id": "race", "stage_id": "stage",
+        "revision": 1, "emitted_at_ms": 1,
+        "groups": [{"group_id": "g", "name": "组", "target_laps": None}], "athletes": [],
+    }
+    metadata = RaceMetadata.from_payload(payload)
+    assert metadata.groups[0].target_laps == 0
 
 
 def test_group_filter_popup_fits_long_group_names(qapp, tmp_path):
@@ -6761,6 +6845,28 @@ def test_decoder_eof_crosses_and_confirms_256_in_next_recording(qapp, boundary_r
     original_worker.step_boundary_reached.emit(1)
     qapp.processEvents()
     assert pane._worker is current_worker
+
+
+def test_boundary_seek_uses_aligned_archive_origin(qapp, boundary_review, monkeypatch):
+    dialog, _first, second, _image = boundary_review()
+    pane = dialog.regular_pane
+    opened = []
+
+    def align(location, *_args):
+        assert location.segment.segment_id == second.segment_id
+        return replace(location, segment=replace(location.segment, media_started_at_ms=19_880))
+
+    def seek(location, position_ms, frame_index, camera_index, **kwargs):
+        opened.append((location, position_ms, frame_index, camera_index, kwargs))
+        return True
+
+    monkeypatch.setattr(dialog, "_aligned_archive", align)
+    monkeypatch.setattr(dialog, "_seek_retained_camera_frame", seek)
+    assert dialog._step_into_neighbour_recording(pane, 1, 40, 10_000)
+    location, position, frame_index, camera, options = opened[0]
+    assert location.segment.media_started_at_ms == 19_880
+    assert (position, frame_index, camera) == (120, 3, 1)
+    assert options == {"adjacent_boundary_ms": 80, "adjacent_direction": 1}
 
 
 def test_reported_duration_does_not_override_known_frame_count(qapp, boundary_review):
