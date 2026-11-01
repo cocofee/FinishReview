@@ -76,14 +76,20 @@ def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
 def test_finish_line_has_one_visible_entry(panel):
     from PyQt5.QtWidgets import QPushButton
 
-    assert panel.finish_line_button.text() == "终点线 / 模型"
+    assert panel.finish_line_button.text() == "设置终点线"
+    assert not panel.finish_line_button.isHidden()
+    panel.set_finish_line_status(True)
+    assert panel.finish_line_button.isHidden()
+    panel.set_finish_line_status(False)
+    assert not panel.finish_line_button.isHidden()
     menu_texts = [
         action.text()
         for button in panel.quick_toolbar.findChildren(QPushButton)
         if button.menu() is not None
         for action in button.menu().actions()
     ]
-    assert "终点线 / 模型" not in menu_texts
+    assert "终点线 / 模型" in menu_texts
+    assert "显示已排除" in menu_texts
 
 
 def test_search_jumps_to_the_bib_and_leaves_the_judging_keys_on_the_table(panel, qapp):
@@ -1138,7 +1144,9 @@ def test_uncounted_chip_offers_local_exclusion_and_double_chip_but_picture_only_
     QTest.keyClick(wave_panel, Qt.Key_3)
     assert "61 号还没点人" in wave_panel.hint.text() and "2 双芯片" in wave_panel.hint.text()
     QTest.keyClick(wave_panel, Qt.Key_1)
-    assert wave_panel._row_state(wave_panel._selected_arrival()) == "已排除"
+    assert wave_panel._row_state(wave_panel._arrival_rows[row(wave_panel, "61")]) == "已排除"
+    assert wave_panel.table.isRowHidden(row(wave_panel, "61"))
+    assert wave_panel._selected_arrival().bib == "20"
     QTest.keyClick(wave_panel, Qt.Key_4)
     assert wave_panel._row_state(wave_panel._selected_arrival()) == "待定"
     assert not wave_panel._arrival_store.active(SCOPE)
@@ -1489,7 +1497,7 @@ def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel
     wave_panel._render()
     bibs = [wave_panel.table.item(index, 1).text() for index in range(wave_panel.table.rowCount())]
     assert bibs.count("16") == 1
-    assert "中间圈 2 条不列" in wave_panel.quick_title.text()
+    assert "中间圈 2 条不列" in wave_panel.quick_title.toolTip()
 
 
 def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(wave_panel):
@@ -1538,7 +1546,7 @@ def test_the_crossing_of_an_intermediate_lap_is_not_listed_with_its_bib(panel):
     panel._quick_render_signature = None
     panel._render()
     assert [entry.bib for entry in panel._arrival_rows] == ["258"]
-    assert "中间圈 1 条不列" in panel.quick_title.text()
+    assert "中间圈 1 条不列" in panel.quick_title.toolTip()
 
 
 def test_target_laps_of_another_race_are_not_used(wave_panel):

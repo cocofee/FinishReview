@@ -606,7 +606,9 @@ def test_a_lone_chip_row_is_saved_by_a_click_on_its_picture_and_never_by_a_numbe
         assert "按 1" not in panel.confirmation_status.text()
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # uncounted test chip: local exclusion, never confirmation
         assert not any(row.decision for row in panel._arrival_rows)
-        assert panel._row_state(panel._selected_arrival()) == "已排除"
+        assert panel._row_state(panel._arrival_rows[row_index]) == "已排除"
+        assert panel.table.isRowHidden(row_index)
+        assert panel._selected_arrival() is None
         assert window.passage_store.get(target.event_id).is_active
         QTest.keyClick(pane.video_view.viewport(), Qt.Key_4)
         assert panel._row_state(panel._selected_arrival()) == "待定"
@@ -1198,6 +1200,7 @@ def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
     ("分析已暂停；录像继续", "芯片自检等待更新", "证据缺口 无", "分析已暂停"),
     ("等待已封存录像", "芯片自检读取失败：磁盘错误", "证据缺口 无", "芯片自检读取失败"),
     ("空闲", "芯片自检等待更新", "证据缺口 2 条待证据", "2 条待证据"),
+    ("空闲", "芯片自检等待更新", "证据缺口 0 条待证据 · 2 人无录像可核", "2 人无录像可核"),
 ])
 def test_workbench_pipeline_only_shows_actionable_state(qapp, tmp_path, monkeypatch, analysis, chip, gap, expected):
     window = _window(tmp_path, workbench=True)

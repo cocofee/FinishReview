@@ -25,7 +25,7 @@ def test_unmatched_test_chip_excludes_without_frame_then_restarts_and_undoes(wav
     original = tuple(wave_panel.events)
     wave_panel.set_frame_provider(lambda: None)
     exclude(wave_panel, monkeypatch, "19")
-    entry = wave_panel._arrival_store.latest(wave_panel._arrival_scope, wave_panel._selected_key)
+    entry = wave_panel._arrival_store.latest(wave_panel._arrival_scope, wave_panel._last_saved_key)
     assert entry["reason"] == LOCAL_CHIP_EXCLUSION
     assert entry["exclusion_reason"] == "非运动员（本机排除）"
     assert not entry.get("frame") and not entry.get("candidate_id")
@@ -34,6 +34,9 @@ def test_unmatched_test_chip_excludes_without_frame_then_restarts_and_undoes(wav
     assert target.key not in wave_panel._wave_of
     assert wave_panel._row_wave(target) is None
     assert all(bib != "19" for _stamp, bib, _source in wave_panel.race_strip.view.chips)
+    assert wave_panel.table.isRowHidden(row(wave_panel, "19"))
+    wave_panel.show_excluded_action.setChecked(True)
+    wave_panel._arrival_clicked(row(wave_panel, "19"))
     assert menu_labels(wave_panel) == ["撤销本机排除"]
     assert "先按 4" in wave_panel.picture_candidate(dict(wave_panel.frame))[1]
     assert wave_panel._arrival_exports() == ([], [], 0)
@@ -45,6 +48,8 @@ def test_unmatched_test_chip_excludes_without_frame_then_restarts_and_undoes(wav
     restored.set_frame_provider(lambda: None)
     restored.set_workspace(tmp_path)
     restored.set_scope(*wave_panel._arrival_scope)
+    assert restored.table.isRowHidden(row(restored, "19"))
+    restored.show_excluded_action.setChecked(True)
     restored._arrival_clicked(row(restored, "19"))
     assert restored._row_state(restored._selected_arrival()) == "已排除"
     QTest.keyClick(restored, Qt.Key_4)
@@ -62,7 +67,8 @@ def test_right_menu_directly_excludes_without_input_and_four_undoes(wave_panel, 
     monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: pytest.fail("must not ask for input"))
     actions = dict(wave_panel._row_actions(wave_panel._selected_arrival()))
     actions["非运动员（本机排除）"]()
-    assert wave_panel._row_state(wave_panel._selected_arrival()) == "已排除"
+    assert wave_panel._row_state(wave_panel._arrival_rows[row(wave_panel, "5")]) == "已排除"
+    assert wave_panel.table.isRowHidden(row(wave_panel, "5"))
     QTest.keyClick(wave_panel, Qt.Key_4)
     assert wave_panel._row_state(wave_panel._selected_arrival()) == "待定"
 
@@ -240,6 +246,8 @@ def test_exclusion_button_and_repeated_keys_need_no_input(wave_panel, monkeypatc
     wave_panel._arrival_clicked(row(wave_panel, "5"))
     monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: pytest.fail("must not ask for input"))
     wave_panel.row_action_buttons[Qt.Key_1].click()
+    wave_panel.show_excluded_action.setChecked(True)
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
     for key in (Qt.Key_1, Qt.Key_3):
         QTest.keyClick(wave_panel, key)
         assert "本机已排除" in wave_panel.hint.text()
@@ -263,7 +271,7 @@ def test_failed_refresh_after_save_does_not_claim_success(wave_panel, monkeypatc
     monkeypatch.setattr(wave_panel, "_build_rows", fail_after_save)
     QTest.keyClick(wave_panel, Qt.Key_1)
     assert "读取失败" in wave_panel.hint.text()
-    entry = wave_panel._arrival_store.latest(wave_panel._arrival_scope, wave_panel._selected_key)
+    entry = wave_panel._arrival_store.latest(wave_panel._arrival_scope, wave_panel._last_saved_key)
     assert entry["reason"] == LOCAL_CHIP_EXCLUSION
     monkeypatch.setattr(wave_panel, "_build_rows", build)
     wave_panel.refresh()
