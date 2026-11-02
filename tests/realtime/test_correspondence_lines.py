@@ -1,9 +1,9 @@
 """Correspondence is visible without counting or changing the selected row."""
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor, QImage, QPainter
+from PyQt5.QtGui import QColor
 
-from realtime.passage_review import EvidenceImageView
+from tests.realtime.test_person_marker_style import painted, view_with_frame
 from realtime.race_strip import AUTO_LABELLED, RaceStripView
 from realtime.review_marker_style import AUTO_COLOR, LEGEND, MANUAL_COLOR, PENDING_COLOR, marker_style
 from tests.realtime.test_quick_review_panel import (
@@ -91,20 +91,33 @@ def test_strip_line_uses_bound_video_time_without_rewriting_chip_time(qapp, tmp_
     view.close()
 
 
-def test_video_numbered_line_replaces_ring(qapp):
-    view = EvidenceImageView()
-    view._source_width, view._source_height = 400, 300
-    view._count_mode = True
-    view.set_history_markers(((.5, .7, "2", False, False, False, False, True),))
-    image = QImage(400, 300, QImage.Format_RGB32)
-    image.fill(QColor("#dddddd"))
-    painter = QPainter(image)
-    view.drawForeground(painter, view.sceneRect())
-    painter.end()
-    # Medium-length line above the position, with no stroke across empty road.
-    assert any(image.pixelColor(200, y).name() == AUTO_COLOR for y in range(80, 200))
-    assert image.pixelColor(197, 180).name() == "#ffffff"  # white rim separates green/blue from video
-    assert image.pixelColor(200, 270).name() == "#dddddd"
-    assert image.pixelColor(200, 30).name() == "#dddddd"
-    assert view._history_markers[0][5] is False
-    view.close()
+def test_compact_video_auto_binding_uses_small_tag_and_ring(qapp, monkeypatch):
+    view = view_with_frame()
+    try:
+        view.set_workbench_compact(True)
+        view.set_count_mode(True)
+        view.set_history_markers(((.5, .5, "2", False, False, False, False, True),))
+        before = tuple(view._history_markers)
+        drawn = []
+        draw_tag = view._draw_person_tag
+
+        def record_tag(painter, x, y, label, color, dashed, ghost, scale, visible, occupied):
+            draw_tag(painter, x, y, label, color, dashed, ghost, scale, visible, occupied)
+            drawn.append((x, y, label, color.name(), dashed, ghost, scale, visible, occupied[-1]))
+
+        monkeypatch.setattr(view, "_draw_person_tag", record_tag)
+        image = painted(view)
+        assert len(drawn) == 1
+        x, y, label, color, dashed, ghost, scale, visible, tag = drawn[0]
+        assert (x, y, label) == (320, 240, "2")
+        assert (color, dashed, ghost) == (AUTO_COLOR, True, False)
+        assert visible.contains(tag)
+        assert 0 < tag.width() * scale < 60
+        assert 0 < tag.height() * scale <= 22
+        assert image.pixelColor(320, 80) == QColor("#606060")
+        assert image.pixelColor(320, 400) == QColor("#606060")
+        assert any(image.pixelColor(px, py) != QColor("#606060")
+                   for px in range(313, 328) for py in range(233, 248))
+        assert tuple(view._history_markers) == before
+    finally:
+        view.close()

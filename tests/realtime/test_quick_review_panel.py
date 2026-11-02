@@ -76,14 +76,20 @@ def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
 def test_finish_line_has_one_visible_entry(panel):
     from PyQt5.QtWidgets import QPushButton
 
-    assert panel.finish_line_button.text() == "终点线 / 模型"
+    assert panel.finish_line_button.text() == "设置终点线"
+    assert not panel.finish_line_button.isHidden()
+    panel.set_finish_line_status(True)
+    assert panel.finish_line_button.isHidden()
+    panel.set_finish_line_status(False)
+    assert not panel.finish_line_button.isHidden()
     menu_texts = [
         action.text()
         for button in panel.quick_toolbar.findChildren(QPushButton)
         if button.menu() is not None
         for action in button.menu().actions()
     ]
-    assert "终点线 / 模型" not in menu_texts
+    assert "终点线 / 模型" in menu_texts
+    assert "显示已排除" in menu_texts
 
 
 def test_search_jumps_to_the_bib_and_leaves_the_judging_keys_on_the_table(panel, qapp):
@@ -1132,18 +1138,18 @@ def test_excluding_on_to_the_next_chip_takes_the_pictures_after_it_up_to_a_long_
     assert not panel._arrival_store.active(SCOPE)
 
 
-def test_uncounted_chip_offers_local_exclusion_and_a_click_still_only_counts(wave_panel, monkeypatch):
-    """1 directly excludes the chip, 4 restores it; neither invents a person."""
-    from PyQt5.QtWidgets import QInputDialog
-    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: pytest.fail("no input required"))
+def test_uncounted_chip_offers_local_exclusion_and_double_chip_but_picture_only_counts(wave_panel):
+    """未点人的测试读数可直接本机排除；补录仍须先在画面点人。"""
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     assert menu_labels(wave_panel) == ["非运动员（本机排除）", "双芯片：这条芯片是谁带的…"]
     QTest.keyClick(wave_panel, Qt.Key_3)
     assert "61 号还没点人" in wave_panel.hint.text() and "2 双芯片" in wave_panel.hint.text()
     QTest.keyClick(wave_panel, Qt.Key_1)
-    assert wave_panel._row_state(wave_panel._selected_arrival()) == "已排除"
+    assert wave_panel._row_state(wave_panel._arrival_rows[row(wave_panel, "61")]) == "已排除"
+    assert wave_panel.table.isRowHidden(row(wave_panel, "61"))
+    assert wave_panel._selected_arrival().bib == "20"
     QTest.keyClick(wave_panel, Qt.Key_4)
-    assert "已撤销本机排除" in wave_panel.hint.text()
+    assert wave_panel._row_state(wave_panel._selected_arrival()) == "待定"
     assert not wave_panel._arrival_store.active(SCOPE)
     count_on_picture(wave_panel, .2, 100)
     assert saved(wave_panel) == {"61": 100}
@@ -1152,33 +1158,42 @@ def test_uncounted_chip_offers_local_exclusion_and_a_click_still_only_counts(wav
         "这人没芯片：补录号码…", "这人不是运动员", "双芯片：这条芯片是谁带的…", "撤销：去掉这个人"]
 
 
-def test_keys_1_2_3_4_do_on_the_selected_row_what_its_right_click_offers(wave_panel):
-    """10-29：左手操作。1 不是运动员、2 双芯片、3 补录号码、4 撤销，作用在左边选中的那一行。"""
+@pytest.mark.parametrize("use_buttons", [False, True], ids=["keyboard", "buttons"])
+def test_keys_1_2_3_4_do_on_the_selected_row_what_its_right_click_offers(wave_panel, use_buttons):
+    """键盘和按钮处理左侧选中行，与右键的判定一致。"""
+    def press(key):
+        if use_buttons:
+            button = wave_panel.quick_undo_button if key == Qt.Key_4 else wave_panel.row_action_buttons[key]
+            assert not button.isHidden()
+            QTest.mouseClick(button, Qt.LeftButton)
+        else:
+            QTest.keyClick(wave_panel, key)
+
     wave_panel._ask_bib = lambda current: None  # the bib is not read yet
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     count_on_picture(wave_panel, .2, 100)
     count_on_picture(wave_panel, .4, 500)
     assert saved(wave_panel) == {"61": 100, "20": 500}
     assert wave_panel._selected_arrival().bib == "20"  # the click picked out the person's row
-    QTest.keyClick(wave_panel, Qt.Key_3)  # this one has no chip: a 疑似漏读 row of their own
+    press(Qt.Key_3)  # this one has no chip: a 疑似漏读 row of their own
     assert saved(wave_panel) == {"61": 100}
     miss = wave_panel._selected_arrival()
     assert miss.event is None and wave_panel._row_state(miss) == "疑似漏读"
-    QTest.keyClick(wave_panel, Qt.Key_4)  # 4 takes it back, as Backspace does
+    press(Qt.Key_4)  # 4 takes it back, as Backspace does
     assert saved(wave_panel) == {"61": 100, "20": 500}
 
     wave_panel._ask_carrier = lambda bib, current: "61"
     wave_panel._arrival_clicked(row(wave_panel, "76"))
-    QTest.keyClick(wave_panel, Qt.Key_2)
+    press(Qt.Key_2)
     assert wave_panel._arrival_rows[row(wave_panel, "76")].carrier == "61"
     assert "61号带的" == wave_panel.table.item(row(wave_panel, "76"), 3).text()
-    QTest.keyClick(wave_panel, Qt.Key_1)  # nothing to exclude on a second chip
+    press(Qt.Key_1)  # nothing to exclude on a second chip
     assert "这一行不能按 1" in wave_panel.hint.text() and "2 双芯片、4 撤销" in wave_panel.hint.text()
-    QTest.keyClick(wave_panel, Qt.Key_4)
+    press(Qt.Key_4)
     assert wave_panel._arrival_rows[row(wave_panel, "76")].carrier == ""
 
     wave_panel._arrival_clicked(row(wave_panel, "20"))
-    QTest.keyClick(wave_panel, Qt.Key_1)  # the person counted for 20 is no rider
+    press(Qt.Key_1)  # the person counted for 20 is no rider
     assert saved(wave_panel) == {"61": 100}
     assert "非运动员" in wave_panel.hint.text()
 
@@ -1483,7 +1498,7 @@ def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel
     wave_panel._render()
     bibs = [wave_panel.table.item(index, 1).text() for index in range(wave_panel.table.rowCount())]
     assert bibs.count("16") == 1
-    assert "中间圈 2 条不列" in wave_panel.quick_title.text()
+    assert "中间圈 2 条不列" in wave_panel.quick_title.toolTip()
 
 
 def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(wave_panel):
@@ -1532,7 +1547,7 @@ def test_the_crossing_of_an_intermediate_lap_is_not_listed_with_its_bib(panel):
     panel._quick_render_signature = None
     panel._render()
     assert [entry.bib for entry in panel._arrival_rows] == ["258"]
-    assert "中间圈 1 条不列" in panel.quick_title.text()
+    assert "中间圈 1 条不列" in panel.quick_title.toolTip()
 
 
 def test_target_laps_of_another_race_are_not_used(wave_panel):

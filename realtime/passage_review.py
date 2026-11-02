@@ -12,7 +12,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable, Iterable, Mapping, Optional
 
-from PyQt5.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
     QColor,
@@ -494,6 +494,9 @@ class EvidenceImageView(QGraphicsView):
         self._fit_mode = True
         self._marker_mode = False
         self._count_mode = False
+        # Compact workbench mode: one click counts, and neither a marker prompt
+        # nor a second maximised picture may open behind the operator's back.
+        self._workbench_compact = False
         self._finish_line_points = ()
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
@@ -848,6 +851,17 @@ class EvidenceImageView(QGraphicsView):
         self._batch_roster_panel.hide()
 
     def set_marker_mode(self, enabled: bool) -> None:
+        if self._workbench_compact:
+            # In the compact workbench a plain click means "one more person".
+            # Never arm the identity line or show its placement prompt there.
+            self._marker_mode = False
+            self.viewport().setCursor(
+                Qt.CrossCursor if self._count_mode else Qt.ArrowCursor
+            )
+            self.setToolTip(
+                COUNT_MODE_HELP if self._count_mode else "滚轮放大后，中键拖动查看号码"
+            )
+            return
         self._marker_mode = bool(enabled) and self.has_frame
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
@@ -872,6 +886,29 @@ class EvidenceImageView(QGraphicsView):
         """
 
         self._count_mode = bool(enabled) and self.has_frame
+        if self._count_mode and self._workbench_compact:
+            # Counting wins in the workbench: never leave the marker prompt
+            # armed underneath it.  Ordinary review keeps its previous mode.
+            self._marker_mode = False
+        self.viewport().setCursor(
+            Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
+        )
+        if self._marker_mode:
+            self.setToolTip(
+                "单击放置判读线；Shift + 左键拖动判读线；"
+                "中键拖动缩放后的画面"
+            )
+        elif self._count_mode:
+            self.setToolTip(COUNT_MODE_HELP)
+        else:
+            self.setToolTip("滚轮放大后，中键拖动查看号码")
+
+    def set_workbench_compact(self, enabled: bool) -> None:
+        """Switch the picture into the compact workbench interaction model."""
+
+        self._workbench_compact = bool(enabled)
+        if self._workbench_compact:
+            self._marker_mode = False
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
@@ -1130,6 +1167,11 @@ class EvidenceImageView(QGraphicsView):
         self.marker_position_selected.emit(*self._normalized_position(viewport_position))
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if self._workbench_compact and event.button() == Qt.LeftButton:
+            # The workbench picture already fills its space; a double click
+            # must not open a second copy of the same camera.
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self.has_frame and not self._marker_mode:
             self.maximize_requested.emit()
             event.accept()
@@ -1172,11 +1214,64 @@ class EvidenceImageView(QGraphicsView):
             return
         super().keyPressEvent(event)
 
+    def _person_tag_rect(self, x, y, label, scale, visible, occupied):
+        """Place a small screen-sized tag near its point, inside the visible image."""
+        font = QFont(self.font())
+        font.setPixelSize(14)
+        font.setBold(True)
+        width = min(max(24, QFontMetrics(font).horizontalAdvance(label) + 12) / scale, visible.width())
+        height = min(22 / scale, visible.height())
+        gap = 10 / scale
+        candidates = []
+        for dx, dy in ((gap, -height - gap), (-width - gap, -height - gap),
+                       (gap, gap), (-width - gap, gap), (gap, -2 * height - gap)):
+            left = max(visible.left(), min(x + dx, visible.right() - width))
+            top = max(visible.top(), min(y + dy, visible.bottom() - height))
+            candidate = QRectF(left, top, width, height)
+            overlap = sum(candidate.intersected(other).width() * candidate.intersected(other).height()
+                          for other in occupied if candidate.intersects(other))
+            candidates.append((overlap, candidate))
+        return min(candidates, key=lambda value: value[0])[1]
+
+    def _draw_person_tag(self, painter, x, y, label, color, dashed, ghost, scale, visible, occupied):
+        """A point and number label, not a timing line or a tracking box."""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        radius = (4 if ghost else 5) / scale
+        pen = QPen(color, 1.5)
+        pen.setCosmetic(True)
+        if dashed or ghost:
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QPointF(x, y), radius, radius)
+        if self._show_marker_label and label and not ghost and not visible.isEmpty():
+            tag = self._person_tag_rect(x, y, label, scale, visible, occupied)
+            occupied.append(tag)
+            # The shortest connector ends at the label edge and outside the ring.
+            end = QPointF(max(tag.left(), min(x, tag.right())), max(tag.top(), min(y, tag.bottom())))
+            delta = end - QPointF(x, y)
+            length = (delta.x() ** 2 + delta.y() ** 2) ** .5
+            if length > radius:
+                painter.drawLine(QPointF(x, y) + delta * (radius / length), end)
+            painter.setBrush(QColor(20, 27, 35, 225))
+            painter.drawRoundedRect(tag, 4 / scale, 4 / scale)
+            font = QFont(self.font())
+            font.setPixelSize(max(1, round(14 / scale)))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(tag, Qt.AlignCenter, label)
+        painter.restore()
+
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
         if self._source_width <= 0 or self._source_height <= 0:
             return
         scale = max(0.001, abs(self.transform().m11()))
+        visible = self.mapToScene(self.viewport().rect()).boundingRect().intersected(
+            QRectF(0, 0, self._source_width, self._source_height))
+        occupied = []
         painter.save()
         if self._finish_line_points:
             painter.setRenderHint(QPainter.Antialiasing)
@@ -1199,39 +1294,17 @@ class EvidenceImageView(QGraphicsView):
             if ghost:
                 # Counted on a nearby frame: faded where they were, so they are not clicked twice.
                 color.setAlpha(150)
+            if self._workbench_compact or dot:
+                if visible.adjusted(-6 / scale, -6 / scale, 6 / scale, 6 / scale).contains(QPointF(x, y)):
+                    self._draw_person_tag(painter, x, y, label, color,
+                                          auto or (not confirmed and not simple), ghost, scale, visible, occupied)
+                continue
             pen = QPen(color, 2)
             pen.setCosmetic(True)
             if dashed or ghost:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
-            radius = (16.0 if ghost else 22.0) / scale
-            if dot:
-                # A large hollow ring with a dark rim reads on any kit, and leaves the rider visible.
-                painter.setBrush(Qt.NoBrush)
-                if not ghost:
-                    rim = QPen(QColor(0, 0, 0, 170), 6)
-                    rim.setCosmetic(True)
-                    painter.setPen(rim)
-                    painter.drawEllipse(QPointF(x, y), radius, radius)
-                    pen.setWidth(3)
-                    painter.setPen(pen)
-                painter.drawEllipse(QPointF(x, y), radius, radius)
-            else:
-                # Medium-length pointer with contrasting rims on both dark and
-                # bright backgrounds. Width/length are screen pixels, not source pixels.
-                short = self._count_mode
-                line_top = max(0.0, y - 140.0 / scale) if short else 0
-                line_bottom = min(self._source_height, y + 8.0 / scale) if short else self._source_height
-                for rim_color, rim_width in ((QColor(0, 0, 0, 200), 9 if short else 5),
-                                             (QColor("#ffffff"), 7 if short else 3)):
-                    rim = QPen(rim_color, rim_width)
-                    rim.setCosmetic(True)
-                    painter.setPen(rim)
-                    painter.drawLine(QPointF(x, line_top), QPointF(x, line_bottom))
-                if short:
-                    pen.setWidth(4)
-                painter.setPen(pen)
-                painter.drawLine(QPointF(x, line_top), QPointF(x, line_bottom))
+            painter.drawLine(int(x), 0, int(x), self._source_height)
             if not self._show_marker_label or ghost:
                 continue
             margin = 6.0 / scale
@@ -1240,14 +1313,12 @@ class EvidenceImageView(QGraphicsView):
             tag_width = max(52.0, 18.0 + len(label) * size) / scale
             tag_height = 30.0 / scale
             # Beside the ring, not on the rider.
-            offset = radius + margin if dot else margin
+            offset = margin
             tag_x = x + offset
             if tag_x + tag_width > self._source_width - margin:
                 tag_x = x - tag_width - offset
             tag_x = max(margin, min(tag_x, self._source_width - tag_width - margin))
-            tag_y = (y - tag_height / 2.0 if dot else
-                     y - 140.0 / scale - tag_height - margin if self._count_mode else
-                     margin + index * (tag_height + margin))
+            tag_y = margin + index * (tag_height + margin)
             tag_y = max(margin, min(tag_y, max(margin, self._source_height - tag_height - margin)))
             tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
             painter.setPen(Qt.NoPen)
@@ -1267,6 +1338,11 @@ class EvidenceImageView(QGraphicsView):
         x = x_normalized * self._source_width
         y = y_normalized * self._source_height
         color = QColor("#1bbf83" if confirmed else "#c0372b")
+        if self._workbench_compact:
+            if visible.adjusted(-6 / scale, -6 / scale, 6 / scale, 6 / scale).contains(QPointF(x, y)):
+                self._draw_person_tag(painter, x, y, label, color, not confirmed and not simple,
+                                      False, scale, visible, occupied)
+            return
         pen = QPen(color, 3)
         pen.setCosmetic(True)
         if not confirmed and not simple:
@@ -1442,6 +1518,9 @@ class PassageEvidencePane(QFrame):
         self._timeline_dragging = False
         self._last_full_resolution_request = -1
         self._full_resolution_enabled = True
+        self._full_resolution_error_frame = -1
+        self._workbench_compact = False
+        self._workbench_allow_maximize = False
         self._scrub_origin_delta_ms = 0
         self._video_scrubbing = False
         self._pending_scrub_delta_ms: Optional[int] = None
@@ -1490,6 +1569,7 @@ class PassageEvidencePane(QFrame):
         self._set_status_label("未选择")
         self.quality_label = QLabel("")
         self.quality_label.setVisible(self.source_kind == REGULAR_SOURCE and self.camera_index == 1)
+        self.quality_label.installEventFilter(self)
         header.addWidget(self.title_label)
         header.addWidget(self.active_badge)
         header.addWidget(self.frame_indicator_label)
@@ -1507,7 +1587,7 @@ class PassageEvidencePane(QFrame):
             self._on_detail_requested
         )
         self.video_view.maximize_requested.connect(
-            lambda: self.maximize_requested.emit(self)
+            self._on_maximize_requested
         )
         self.video_view.marker_position_selected.connect(
             self._on_marker_position_selected
@@ -1596,16 +1676,14 @@ class PassageEvidencePane(QFrame):
         self.next_frame_btn.clicked.connect(lambda: self.step_requested.emit(1))
         self.zoom_out_btn.clicked.connect(lambda: self.video_view.zoom_by(1.0 / 1.2))
         self.actual_size_btn.clicked.connect(self.video_view.set_actual_size)
-        self.fit_btn.clicked.connect(self.video_view.fit_to_window)
+        self.fit_btn.clicked.connect(self._on_fit_requested)
         self.zoom_in_btn.clicked.connect(lambda: self.video_view.zoom_by(1.2))
         self.hd_btn.clicked.connect(self._on_detail_requested)
-        self.maximize_btn.clicked.connect(lambda: self.maximize_requested.emit(self))
+        self.maximize_btn.clicked.connect(self._on_maximize_button)
         self._maximize_shortcut = QShortcut(QKeySequence(Qt.Key_F), self)
         self._maximize_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._maximize_shortcut.setAutoRepeat(False)
-        self._maximize_shortcut.activated.connect(
-            lambda: self.maximize_requested.emit(self)
-        )
+        self._maximize_shortcut.activated.connect(self._on_maximize_requested)
         self.mark_btn.clicked.connect(lambda: self.marking_requested.emit(self))
         self.confirm_btn.clicked.connect(
             lambda: self.confirmation_requested.emit(self)
@@ -1652,6 +1730,85 @@ class PassageEvidencePane(QFrame):
             button.setVisible(not compact)
         self.open_btn.setText("回放" if compact else "定点回放")
         self.controls_layout.setSpacing(4 if compact else 6)
+
+    def set_workbench_compact(
+        self, enabled: bool, *, allow_maximize: bool = False
+    ) -> None:
+        """Strip the workbench picture down to one click and one reset button.
+
+        Rare controls stay in ordinary review: manual zoom, 100%, HD, the
+        single-camera enlarge button and short-clip playback.  The fit button
+        remains as "reset picture"; the underlying maximize behaviour and
+        automatic paused-frame original reads are preserved.
+        """
+
+        self._workbench_compact = bool(enabled)
+        self._workbench_allow_maximize = bool(allow_maximize)
+        compact = self._workbench_compact
+        self.zoom_out_btn.setVisible(not compact)
+        self.actual_size_btn.setVisible(not compact)
+        self.zoom_in_btn.setVisible(not compact)
+        self.hd_btn.setVisible(
+            not compact
+            and self.source_kind == REGULAR_SOURCE
+            and self.camera_index == 1
+        )
+        self.open_btn.setVisible(not compact and self.source_kind == REGULAR_SOURCE)
+        self.maximize_btn.setVisible(not compact or self._workbench_allow_maximize)
+        self.fit_btn.setText("复位画面" if compact else "适应")
+        self.fit_btn.setToolTip(
+            "复位画面；原图读取失败时重试当前帧"
+            if compact
+            else "适应当前窗格"
+        )
+        # F and double-click are duplicate ways into a second enlarged copy.
+        # The workbench already owns the screen, so both are closed there.
+        self._maximize_shortcut.setEnabled(not compact)
+        self.video_view.set_workbench_compact(compact)
+        if compact:
+            # Workbench pauses are for reading the number: fetch the original
+            # automatically instead of adding a permanent HD button.
+            self.set_full_resolution_enabled(True)
+
+    def _on_fit_requested(self) -> None:
+        self.video_view.fit_to_window()
+        self._retry_paused_frame_detail()
+
+    def _on_maximize_requested(self) -> None:
+        if self._workbench_compact:
+            return
+        self.maximize_requested.emit(self)
+
+    def _on_maximize_button(self) -> None:
+        if self._workbench_compact and not self._workbench_allow_maximize:
+            return
+        self.maximize_requested.emit(self)
+
+    def _retry_paused_frame_detail(self) -> bool:
+        """Re-read the original of the failed frame, never a newer one."""
+
+        frame_index = self._current_frame_index
+        if (
+            not self._workbench_compact
+            or not self._full_resolution_enabled
+            or frame_index < 0
+            or self._full_resolution_error_frame != frame_index
+        ):
+            return False
+        self._full_resolution_error_frame = -1
+        self._last_full_resolution_request = -1
+        self._request_full_resolution()
+        return True
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            watched is self.quality_label
+            and event.type() == QEvent.MouseButtonRelease
+            and event.button() == Qt.LeftButton
+            and self._retry_paused_frame_detail()
+        ):
+            return True
+        return super().eventFilter(watched, event)
 
     @property
     def location(self) -> Optional[PassageVideoLocation]:
@@ -2339,6 +2496,8 @@ class PassageEvidencePane(QFrame):
         # A cached preview can replace a previously refined copy of this frame.
         # Let the next idle request restore the original pixels in that case too.
         self._last_full_resolution_request = -1
+        if previous_frame_index != self._current_frame_index:
+            self._full_resolution_error_frame = -1
         if (
             self._pending_marker is not None
             and previous_frame_index >= 0
@@ -2389,6 +2548,7 @@ class PassageEvidencePane(QFrame):
             source_height=self._source_height,
         )
         self._current_position_ms = int(position_ms)
+        self._full_resolution_error_frame = -1
         self._update_frame_quality(image)
         self._render_marker()
         self._update_time_label(position_ms)
@@ -2406,7 +2566,17 @@ class PassageEvidencePane(QFrame):
                 or (frame_index is not None and int(frame_index) != self._current_frame_index)):
             return
         self._last_full_resolution_request = -1
-        self.quality_label.setText("原图读取失败，可点高清重试")
+        self._full_resolution_error_frame = self._current_frame_index
+        if self._workbench_compact:
+            # The workbench has no HD button: make the short label itself the
+            # retry target for this exact frame.
+            self.quality_label.setText("原图失败，点此重试")
+            self.quality_label.setToolTip(
+                "点击此处或“复位画面”重读当前帧原图"
+            )
+            self.quality_label.setCursor(Qt.PointingHandCursor)
+        else:
+            self.quality_label.setText("原图读取失败，可点高清重试")
         self._set_status_label(self._availability_status(), str(message))
 
     def _update_frame_quality(self, image) -> None:
@@ -2415,6 +2585,7 @@ class PassageEvidencePane(QFrame):
                     and image.height() >= self._source_height)
         kind = "原图" if original else "预览"
         self.quality_label.setText(f"{kind} {image.width()}×{image.height()}")
+        self.quality_label.setCursor(Qt.ArrowCursor)
 
     def set_full_resolution_enabled(self, enabled: bool) -> None:
         """Only the judging popup needs original pixels in single-camera mode."""
@@ -2979,6 +3150,8 @@ class PassageReviewSurface(QDialog):
         }
         self.pre_roll_ms = max(0, int(pre_roll_ms))
         self._low_resource_mode = bool(low_resource_mode)
+        self._workbench_compact_mode = False
+        self._workbench_allow_multi_camera_maximize = False
         self._open_location = open_location
         self._high_speed_locator = high_speed_locator
         requested_high_speed = (
@@ -3742,6 +3915,39 @@ class PassageReviewSurface(QDialog):
             panes.append(self.high_speed_pane)
         return tuple(panes)
 
+    def set_workbench_compact_mode(
+        self,
+        enabled: bool,
+        *,
+        allow_multi_camera_maximize: bool = False,
+    ) -> None:
+        """Let the main window switch the evidence panes into workbench mode.
+
+        The main thread owns *when* the problem workbench is open; this surface
+        only applies the compact picture controls.  A multi-camera review may
+        keep its explicit enlarge button through the keyword argument.
+        """
+
+        self._workbench_compact_mode = bool(enabled)
+        self._workbench_allow_multi_camera_maximize = bool(
+            allow_multi_camera_maximize
+        )
+        self._apply_workbench_compact_controls()
+
+    def _apply_workbench_compact_controls(self) -> None:
+        enabled = self._workbench_compact_mode
+        allow_maximize = (
+            enabled
+            and self._workbench_allow_multi_camera_maximize
+            and len(self.evidence_panes) > 1
+        )
+        visible = set(self.evidence_panes)
+        for pane in self.all_evidence_panes:
+            pane.set_workbench_compact(
+                enabled,
+                allow_maximize=allow_maximize and pane in visible,
+            )
+
     def _connect_evidence_pane(self, pane: PassageEvidencePane) -> None:
         if pane.source_kind == REGULAR_SOURCE:
             pane.open_requested.connect(self._open_location_if_available)
@@ -3828,6 +4034,8 @@ class PassageReviewSurface(QDialog):
         else:
             self.evidence_splitter.addWidget(pane)
         self.evidence_pane_added.emit(pane)
+        if self._workbench_compact_mode:
+            self._apply_workbench_compact_controls()
         return pane
 
     def configure_evidence_panes(
@@ -3869,6 +4077,8 @@ class PassageReviewSurface(QDialog):
             pane.set_compact_controls(compact and pane in self.evidence_panes)
             pane.maximize_btn.setText("放大")
             pane.maximize_btn.setToolTip("放大该机位（双击画面或按 F）")
+        if self._workbench_compact_mode:
+            self._apply_workbench_compact_controls()
         for index in range(self.evidence_splitter.count()):
             self.evidence_splitter.setStretchFactor(index, 1)
         self._distribute_evidence_panes()

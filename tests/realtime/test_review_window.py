@@ -421,12 +421,17 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         assert not window.problem_panel.big_view
         assert window.preview_panel.isVisibleTo(window)
 
-        window.regular_pane.maximize_btn.click()
-        qapp.processEvents()
-        assert window.problem_panel.big_view
+        # Single-camera workbench has no redundant enlarge entry, even when
+        # an old caller tries the hidden button programmatically.
+        assert window.regular_pane.maximize_btn.isHidden()
         window.regular_pane.maximize_btn.click()
         qapp.processEvents()
         assert not window.problem_panel.big_view
+        assert window.regular_pane.fit_btn.text() == "复位画面"
+        for button in (window.regular_pane.zoom_out_btn, window.regular_pane.zoom_in_btn,
+                       window.regular_pane.actual_size_btn, window.regular_pane.hd_btn,
+                       window.regular_pane.open_btn):
+            assert button.isHidden()
     finally:
         window.close()
 
@@ -599,9 +604,14 @@ def test_a_lone_chip_row_is_saved_by_a_click_on_its_picture_and_never_by_a_numbe
         pane = window.regular_pane
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         assert "按 1" not in panel.confirmation_status.text()
-        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # 不是运动员 needs the person clicked first
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_1)  # uncounted test chip: local exclusion, never confirmation
         assert not any(row.decision for row in panel._arrival_rows)
-        assert "321 号还没点人" in panel.hint.text()
+        assert panel._row_state(panel._arrival_rows[row_index]) == "已排除"
+        assert panel.table.isRowHidden(row_index)
+        assert panel._selected_arrival() is None
+        assert window.passage_store.get(target.event_id).is_active
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_4)
+        assert panel._row_state(panel._selected_arrival()) == "待定"
         window._problem_count_clicked(0.5, 0.5, pane)
         qapp.processEvents()
         assert panel._selected_arrival().bib == "321"
@@ -670,7 +680,7 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert overlays[0][0] == pytest.approx(0.55)
         assert overlays[0][1] == pytest.approx(0.62)
         assert overlays[0][2] == "21"
-        assert overlays[0][5] is False and overlays[0][6] is False  # numbered line, no circle
+        assert overlays[0][5] is False and overlays[0][6] is False  # compact view renders a tag and ring
         assert pane.video_view._history_markers[0][2] == "21"
 
         assert panel.confirm_arrival_button.isHidden()
@@ -764,7 +774,8 @@ def test_real_finish_line_follows_session_time_and_clears_identity_guide(qapp, t
             dict(line, session_id="another-session", race_id="race-other")]}), encoding="utf-8")
         window._refresh_problem_finish_lines()
         assert not pane.video_view._finish_line_points
-        assert "未设置" in window.problem_panel.finish_line_status.text()
+        assert window.problem_panel.finish_line_status.text() == "未设终点线"
+        assert not window.problem_panel.status_widget.isHidden()
     finally:
         window.close()
 
@@ -1164,11 +1175,56 @@ def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
     assert window.height() <= 720
     assert window.video_filmstrip.height() >= 180
     assert not window.evidence_splitter.isHidden()
+    panel = window.problem_panel
+    buttons = list(panel.row_action_buttons.values()) + [panel.quick_undo_button, panel.finish_line_button]
+    assert [button.text() for button in buttons[:4]] == ["1 非运动员", "2 双芯片", "3 补录", "4 撤销"]
+    for button in buttons:
+        assert button.isVisible()
+        assert panel.quick_toolbar.rect().contains(button.mapTo(panel.quick_toolbar, button.rect().topLeft()))
+        assert panel.quick_toolbar.rect().contains(button.mapTo(panel.quick_toolbar, button.rect().bottomRight()))
+    assert window.evidence_panes[0].controls_layout.indexOf(window.group_start_button) >= 0
+    status_y = panel.status_widget.mapTo(panel.quick_toolbar, panel.status_widget.rect().center()).y()
+    action_y = buttons[0].mapTo(panel.quick_toolbar, buttons[0].rect().center()).y()
+    assert abs(status_y - action_y) <= 2  # no separate status band above the actions
     assert not window.video_filmstrip.full_race.follow_button.isHidden()
     window.video_filmstrip.full_race.follow_button.setChecked(True)
     window.video_filmstrip.full_race.follow_button.setChecked(False)
     assert not window.video_filmstrip.full_race.follow_button.isHidden()
     window.close()
+
+
+@pytest.mark.parametrize("analysis,chip,gap,expected", [
+    ("本轮分析完成，等待新短段", "芯片自检等待更新", "证据缺口 无", ""),
+    ("后台分析：检测 1/10", "芯片自检等待更新", "证据缺口 无", ""),
+    ("分析失败，等待重试", "芯片自检等待更新", "证据缺口 无", "分析失败"),
+    ("分析已暂停；录像继续", "芯片自检等待更新", "证据缺口 无", "分析已暂停"),
+    ("等待已封存录像", "芯片自检读取失败：磁盘错误", "证据缺口 无", "芯片自检读取失败"),
+    ("空闲", "芯片自检等待更新", "证据缺口 2 条待证据", "2 条待证据"),
+    ("空闲", "芯片自检等待更新", "证据缺口 0 条待证据 · 2 人无录像可核", "2 人无录像可核"),
+])
+def test_workbench_pipeline_only_shows_actionable_state(qapp, tmp_path, monkeypatch, analysis, chip, gap, expected):
+    window = _window(tmp_path, workbench=True)
+    try:
+        panel = window.problem_panel
+        monkeypatch.setattr(window, "_refresh_problem_list", lambda: None)
+        monkeypatch.setattr(window, "_recording_any_active", lambda: False)
+        monkeypatch.setattr(window, "_poll_recording_health", lambda: None)
+        monkeypatch.setattr(window, "_update_runtime_status", lambda: None)
+        monkeypatch.setattr(panel, "live_tick", lambda active: None)
+        monkeypatch.setattr(panel, "evidence_gap_text", lambda: gap)
+        panel.payload = {}
+        panel.analysis_status, panel.chip_status = analysis, chip
+        panel.set_finish_line_status(True)
+        window._on_clock_tick()
+        text = window.pipeline_label.text()
+        assert expected in text
+        assert all(word not in text for word in ("未启动", "封存到", "积压 0", "分析到", "证据缺口 无"))
+        assert "封存到" in window.pipeline_label.toolTip()
+        assert window.pipeline_label.isHidden() == (not expected)
+        # The selected-row status now shares the same line with alerts and keys.
+        assert not panel.confirmation_status.isHidden()
+    finally:
+        window.close()
 
 
 def _legacy_mixed_workspace(path):

@@ -132,7 +132,8 @@ def test_missing_target_laps_warns_without_hiding_reads_or_guessing(wave_panel):
     wave_panel.events = [replace(event, lap=2) for event in wave_panel.events]
     wave_panel._quick_render_signature = None
     wave_panel._render()
-    assert "目标圈数未收到，暂列全部圈次" in wave_panel.quick_title.text()
+    assert wave_panel.lap_status.text() == "圈数未知 · 显示全部圈次"
+    assert "未收到" in wave_panel.lap_status.toolTip()
     assert len(wave_panel._arrival_rows) == 4
     assert wave_panel._target_laps == {}
 

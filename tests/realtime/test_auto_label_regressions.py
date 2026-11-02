@@ -288,6 +288,14 @@ def test_refusal_reason_refreshes_without_row_or_pair_changes(wave_panel, monkey
     assert "视线被挡" in tip()
 
 
+def test_auto_row_tooltip_keeps_only_the_short_acceptance_hint(wave_panel, monkeypatch):
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    tooltip = wave_panel.table.item(row(wave_panel, "61"), 3).toolTip()
+    assert tooltip == "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；回车接受对应，号码不对按 4 撤回。"
+    assert "点击回看" not in tooltip
+    assert "按 1/2/3/4" not in tooltip
+
+
 def test_same_revision_conflicting_target_is_rejected(tmp_path):
     from realtime.race_metadata import RaceMetadataConflictError
 

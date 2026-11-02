@@ -462,7 +462,7 @@ class RaceStripView(QWidget):
         self.cursor = None if chip_ms is None else int(chip_ms)
         if self.cursor is not None and self.view_ms is not None:
             span = self.span_ms()
-            if not self.view_ms + span * 0.05 <= self.cursor <= self.view_ms + span * 0.95:
+            if not self.view_ms + span * 0.15 <= self.cursor <= self.view_ms + span * 0.75:
                 self.set_view(self.cursor - span / 2)
                 return
         self._settle()
@@ -475,7 +475,14 @@ class RaceStripView(QWidget):
             if extent is None:
                 self.update()
                 return
-            start = self.cursor - self.span_ms() / 2 if self.cursor is not None else extent[0]
+            if self.cursor is not None:
+                start = self.cursor - self.span_ms() / 2
+            else:
+                # Keep the full extent available, but do not open on thirty
+                # seconds of synthetic padding before the first useful time.
+                starts = [stamp for stamp, _bib, _done in self.chips]
+                starts.extend(piece.chip_start for piece in self.pieces if piece.aligned)
+                start = min(starts) - 1000 if starts else extent[0]
             self.set_view(start)
             return
         self.set_view(self.view_ms)
@@ -485,8 +492,29 @@ class RaceStripView(QWidget):
         if extent is not None:
             view_ms = max(extent[0], min(view_ms, extent[1] - self.span_ms()))
         self.view_ms = float(view_ms)
+        self._compact_label_band()
         self.view_changed.emit()
         self.update()
+
+    def _compact_label_band(self):
+        """Reserve only the label rows needed by visible chips, up to three."""
+        ends = [-1e9] * len(self.LABEL_ROWS)
+        rows = 1
+        metrics = self.fontMetrics()
+        for stamp, bib, done in self.chips:
+            x = self.x_of(stamp)
+            if not -40 <= x <= self.width() + 40:
+                continue
+            width = metrics.horizontalAdvance(bib or "?") + (8 if done else 0)
+            left = max(0, min(x - width // 2, self.width() - width))
+            row = next((i for i, end in enumerate(ends) if left > end + 3), None)
+            if row is not None:
+                ends[row] = left + width
+                rows = max(rows, row + 1)
+        top = self.LABEL_ROWS[rows - 1] + 3
+        if top != self.STRIP_TOP:
+            self.STRIP_TOP = top
+            self.setFixedHeight(top + STRIP_ROWS + self.AXIS_HEIGHT)
 
     def zoom(self, direction, anchor_x=None):
         index = ZOOM_LEVELS.index(self.px_per_s) if self.px_per_s in ZOOM_LEVELS else ZOOM_LEVELS.index(DEFAULT_ZOOM)
@@ -662,10 +690,11 @@ class RaceStripPanel(QWidget):
         self.legend = QLabel(LEGEND, self)
         self.legend.setWordWrap(True)
         self.legend.setStyleSheet("color:#374151;font-size:11px;")
-        self.legend.setToolTip("加粗并带边框的号码是左表当前选中记录；灰色状态为已排除。"
-                               "上下同号竖线表示已有对应；待核芯片只有时间参考，不强贴到人。"
-                               "视频标记只在绑定帧附近显示，不跟踪移动；灰色图像缺口不代表无人。")
-        column.addWidget(self.legend)
+        self.view.setToolTip(self.view.toolTip() + "\n" + LEGEND + "\n"
+                             "加粗并带边框的号码是左表当前选中记录；灰色状态为已排除。"
+                             "上方时间线和下方同号标签表示已有对应；待核芯片只有时间参考，不强贴到人。"
+                             "视频标记只在绑定帧附近显示，不跟踪移动；灰色图像缺口不代表无人。")
+        self.legend.hide()  # Keep the source legend in hover help, not a permanent extra row.
         column.addWidget(self.view)
         column.addWidget(self.scroll)
         layout.addLayout(column, 1)
