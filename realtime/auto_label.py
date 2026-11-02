@@ -1,6 +1,6 @@
 """The people the analysis saw cross the line, where each stood, and the chips they can be labelled with.
 
-A wave whose picture holds exactly as many people as it has final-lap chips
+A wave whose picture holds exactly as many people as it has passage chips
 can be labelled by itself only when the chips and crossings also line up
 through the time-ordered pairing, one to one and in the same order (see
 lap_wave.match_wave for every condition).  The labels are a shortcut for the
@@ -173,7 +173,7 @@ def label_wave(
     maybe_several: bool = False,
     near_counted: bool = False,
 ) -> WaveMatch:
-    """Pair a wave's final-lap CHIPS ((key, chip ms)) with the PEOPLE seen crossing for it, or say why not.
+    """Pair a wave's passage CHIPS ((key, chip ms)) with the PEOPLE seen crossing for it, or say why not.
 
     The pairs are (chip key, person key).  A person seen with the view blocked
     cannot be trusted to be one person, so the wave is left to hand.

@@ -1001,27 +1001,20 @@ def analyse_camera(
         crossing_checks = _verify_crossing_candidates(
             config, camera, files, line_candidates, progress=progress, checkpoint=checkpoint, runtime=runtime,
         )
-        # A line change the tracker cannot follow (bunch, shadow, occlusion) is
-        # still evidence that somebody crossed.  Dropping those candidates made
-        # the whole main bunch unpaired and left hundreds of "line activity"
-        # rows with no answer; only a clearly absent target is discarded.
-        crossings = [c for c in line_candidates
-                     if crossing_checks[c.key].state != "not_crossed"
-                     and crossing_checks[c.key].reason != "model_failed"]
+        # Pixel changes without a verified target trajectory are not crossings.
+        # Keep ambiguous/occluded candidates separately as line_activity evidence;
+        # they must not calibrate the clock, absorb chips or create arrival times.
+        crossings = [c for c in line_candidates if crossing_checks[c.key].state == "confirmed"]
         verified_verdicts = {}
         periods = merge_obstructions(obstructions)
         for crossing in crossings:
             check = crossing_checks[crossing.key]
             crowded = crossing.in_obstruction or any(a - 5_000 <= crossing.recorder_ms <= b + 5_000 for a, b in periods)
-            if check.state == "confirmed":
-                reason = ("遮挡时段，目标跨线已验证，仍需人工确认" if crowded
-                          else "目标轨迹跨线已验证；不自动判定选手身份")
-                decision = DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP
-            else:
-                reason = "目标轨迹不足，按芯片时间参与配对，仍需人工确认"
-                decision = DECISION_DISPUTED
+            reason = ("遮挡时段，目标跨线已验证，仍需人工确认" if crowded
+                      else "目标轨迹跨线已验证；不自动判定选手身份")
+            decision = DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP
             verified_verdicts[crossing.key] = BikeVerdict(
-                check.label if check.state == "confirmed" else LABEL_UNCHECKED,
+                check.label,
                 check.score, decision, reason,
                 len(check.observed_ms), vehicle=check.vehicle,
             )
@@ -1031,12 +1024,10 @@ def analyse_camera(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"crossings_camera{camera}.json").write_text(json.dumps(
         {"schema_version": 1, "camera_index": camera,
-         # Group counting needs every line change the camera saw; an
-         # "unverified" track is still a person-sized crossing.  Only a target
-         # the model positively ruled out is dropped from this list.
+         # Raw changes remain in line_events; automatic counting uses only
+         # verified crossings when a target model is configured.
          "crossings": [entry for entry in raw if not crossing_checks
-                       or (entry["crossing_check"]["state"] != "not_crossed"
-                           and entry["crossing_check"].get("reason") != "model_failed")],
+                       or entry["crossing_check"]["state"] == "confirmed"],
          "line_events": raw,
          "coverage": [list(item) for item in coverage],
          "obstructions": [[item.start_ms, item.end_ms] for item in obstructions]},
@@ -1044,8 +1035,7 @@ def analyse_camera(
     ), encoding="utf-8")
 
     # A confirmed non-bicycle target (pedestrian, vehicle) must never absorb a
-    # chip.  An unverified candidate, on the other hand, is exactly the rider
-    # the model lost track of, so it stays eligible for time pairing.
+    # chip. Unverified line changes have already been separated from crossings.
     pairing_crossings = [c for c in crossings if verified_verdicts is None
                          or crossing_checks[c.key].state != "confirmed"
                          or verified_verdicts[c.key].label == "bicycle"]
@@ -1141,9 +1131,8 @@ def analyse_camera(
                     state="failed",
                     message=f"认车加载/推理失败，候选保留：{error}",
                 )
-            # Candidates already rendered from ``crossings`` must not appear
-            # again as a second "line activity" row; only a candidate excluded
-            # from pairing (e.g. the model failed on it) remains here.
+            # Confirmed crossings and unverified line evidence are disjoint;
+            # keeping the latter never claims that somebody crossed.
             paired_keys = {item.key for item in crossings}
             result["items"] = video_items + _unchecked_line_items(
                 [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera,
@@ -1372,9 +1361,8 @@ def analyse_camera(
     result["fragments"] = outcome.fragments
     result["near_crossings"] = outcome.near_crossings
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
-    # Once calibrated, an unverified crossing is paired or listed as a
-    # video-only rider; only a candidate excluded from pairing (model failure)
-    # still needs its own "line changed, not verified" row.
+    # Unverified line evidence stays available for manual review, but never
+    # participates in pairing or becomes a video-only rider.
     paired_keys = {item.key for item in crossings}
     result["items"] = list(outcome.items) + _unchecked_line_items(
         [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera, model,
@@ -1392,6 +1380,11 @@ def analyse_camera(
                     geometry_path=meta.get("geometry_path", ""),
                     snap_offset_px=meta.get("snap_offset_px", 0))
 
+    for item in result["items"]:
+        frame = item.evidence.get("frame") or {}
+        key = f"{camera}|{frame.get('video_path')}|{frame.get('frame_index')}|{item.evidence.get('row')}"
+        if key in crossing_checks:
+            item.evidence["crossing_check"] = asdict(crossing_checks[key])
     result["items"] = [replace(item, evidence=dict(item.evidence, analysis_signature=evidence_signature,
                         **({"frame": evidence_frame(item.evidence["frame"])} if item.evidence.get("frame") else {})))
                        for item in result["items"]]

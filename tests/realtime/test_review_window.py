@@ -322,7 +322,8 @@ def test_workbench_is_default_and_incoming_passages_do_not_take_over(qapp, tmp_p
     )
     frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
                  position_ms=2000, frame_index=50)
-    item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": frame})
+    item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test",
+                           evidence={"frame": frame, "crossing_check": {"state": "confirmed"}})
     path = tmp_path / "finish_problems/problem_list.json"
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
@@ -373,7 +374,8 @@ def test_workbench_keeps_picture_and_unified_table_visible_on_f(qapp, tmp_path):
         )
         frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
                      position_ms=2000, frame_index=50)
-        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": frame})
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test",
+                           evidence={"frame": frame, "crossing_check": {"state": "confirmed"}})
         path = tmp_path / "finish_problems/problem_list.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
@@ -457,7 +459,8 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
         )
         frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
                      position_ms=2000, frame_index=50)
-        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": frame})
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test",
+                           evidence={"frame": frame, "crossing_check": {"state": "confirmed"}})
         path = tmp_path / "finish_problems/problem_list.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
@@ -842,7 +845,8 @@ def test_picture_numbers_follow_crossing_time_after_backtracking(qapp, tmp_path)
         early = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
                      position_ms=2000, frame_index=50)
         late = dict(early, position_ms=3000, frame_index=75)
-        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": early})
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test",
+                           evidence={"frame": early, "crossing_check": {"state": "confirmed"}})
         path = tmp_path / "finish_problems/problem_list.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")
@@ -1091,7 +1095,8 @@ def test_workbench_keys_from_other_widgets_keep_the_unified_layout(qapp, tmp_pat
         )
         frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
                      position_ms=2000, frame_index=50)
-        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test", evidence={"frame": frame})
+        item = ProblemItem("test:1", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "test",
+                           evidence={"frame": frame, "crossing_check": {"state": "confirmed"}})
         path = tmp_path / "finish_problems/problem_list.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"items": [item.to_payload()], "summary": {}}), encoding="utf-8")

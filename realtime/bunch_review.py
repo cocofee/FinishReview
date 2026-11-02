@@ -124,7 +124,11 @@ def detected_crossings(workspace: Path, camera: int) -> list[dict] | None:
     if stamp not in _DETECTIONS:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            crossings: list[dict] | None = [entry for entry in payload["crossings"] if isinstance(entry, dict)]
+            # Old outputs may contain unverified pixel changes in crossings.
+            # They remain in the file as evidence, never as detected people.
+            crossings: list[dict] | None = [entry for entry in payload["crossings"]
+                                           if isinstance(entry, dict)
+                                           and (entry.get("crossing_check") or {}).get("state") == "confirmed"]
         except (OSError, ValueError, TypeError, KeyError):
             crossings = None
         if len(_DETECTIONS) > 4:

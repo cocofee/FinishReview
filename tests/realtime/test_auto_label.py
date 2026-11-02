@@ -25,7 +25,7 @@ def workspace(tmp_path, detections, clock=False):
              meta=np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8))
     (folder / "crossings_camera1.json").write_text(json.dumps({"crossings": [
         {"recorder_ms": recorder, "session_id": SESSION, "frame_index": index, "video_path": VIDEO, "row": row,
-         "in_obstruction": blocked}
+         "in_obstruction": blocked, "crossing_check": {"state": "confirmed"}}
         for index, (recorder, row, blocked) in enumerate(detections)]}), encoding="utf-8")
     _DETECTIONS.clear()
     return tmp_path
@@ -45,6 +45,18 @@ def test_a_detected_person_has_a_place_on_the_frame_and_the_frame_to_count_them_
     assert second.frame == {"camera_index": 1, "segment_id": "seg1", "video_path": VIDEO, "frame_index": 0,
                             "session_id": SESSION, "recorder_ms": START + 2_000, "position_ms": 2_000}
     assert second.key == f"1|{VIDEO}|0|0"
+
+
+def test_cached_unverified_line_changes_cannot_be_automatically_numbered(tmp_path):
+    base = workspace(tmp_path, [(START, 0, False), (START + 1000, 1, False), (START + 2000, 2, False)])
+    path = base / "finish_problems" / "crossings_camera1.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["crossings"][0]["crossing_check"] = {"state": "unverified", "reason": "insufficient_track"}
+    payload["crossings"][1].pop("crossing_check")  # Older output without any proof of target crossing.
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    people = detected_people(base, 1)
+    assert [person.recorder_ms for person in people] == [START + 2000]
+    assert len(json.loads(path.read_text(encoding="utf-8"))["crossings"]) == 3
 
 
 def test_a_broken_strip_is_left_out_without_breaking_analysis(tmp_path):
