@@ -33,6 +33,15 @@ def test_repeated_classification_never_creates_rider_and_persists(tmp_path):
     assert ArrivalReviewStore(path).latest(SCOPE, "candidate:1")["action"] == "bicycle"
 
 
+def test_distinct_held_reasons_on_one_chip_are_not_deduplicated(tmp_path):
+    store = ArrivalReviewStore(tmp_path / "review.jsonl")
+    first = store.save(SCOPE, "event:one", "binding", "held", reason="wave_no_person")
+    excluded = store.save(SCOPE, "event:one", "binding", "held", reason="local_chip_exclusion")
+    assert excluded["id"] != first["id"]
+    assert store.latest(SCOPE, "event:one")["reason"] == "local_chip_exclusion"
+    assert store.save(SCOPE, "event:one", "binding", "held", reason="local_chip_exclusion")["id"] == excluded["id"]
+
+
 def test_same_event_deduplicates_but_same_bib_different_event_does_not(tmp_path):
     store = ArrivalReviewStore(tmp_path / "review.jsonl")
     first = confirm(store)

@@ -218,22 +218,18 @@ def test_wave_plan_orders_sessions_by_aligned_time(wave_panel, monkeypatch):
     assert saved(wave_panel) == {"61": 5000, "20": 4000, "76": 3000}
 
 
-def test_auto_status_and_enter_use_exact_same_view_interval(wave_panel, monkeypatch):
-    from tests.realtime.test_quick_review_panel import T0
-
+def test_auto_status_and_acceptance_do_not_require_a_view_interval(wave_panel, monkeypatch):
     auto_people(wave_panel, monkeypatch, (100, 500, 1000))
     wave_panel._arrival_clicked(row(wave_panel, "61"))
-    wave_panel._arrival_drafts["seen"] = {"1": [[T0 - 500, T0 + 1400]]}
+    wave_panel._arrival_drafts["seen"] = {}
     wave_panel._sync_arrival_confirmation()
-    assert "没看" in wave_panel.confirmation_status.text()
-    wave_panel._enter_key()
-    assert saved(wave_panel) == {}
-    assert "没看" in wave_panel.hint.text()
-    wave_panel._arrival_drafts["seen"] = {"1": [[T0 - 700, T0 + 1600]]}
-    wave_panel._sync_arrival_confirmation()
-    assert "已看完" in wave_panel.confirmation_status.text()
+    assert "回车接受对应" in wave_panel.confirmation_status.text()
+    assert "没看" not in wave_panel.confirmation_status.text()
+    assert "已看完" not in wave_panel.confirmation_status.text()
     wave_panel._enter_key()
     assert len(saved(wave_panel)) == 3
+    assert set(states(wave_panel).values()) == {"已接受对应", "待定"}
+    assert wave_panel._arrival_drafts["seen"] == {}
 
 
 def test_auto_duplicate_is_rejected_before_creating_candidate(wave_panel, monkeypatch):
@@ -290,6 +286,14 @@ def test_refusal_reason_refreshes_without_row_or_pair_changes(wave_panel, monkey
     monkeypatch.setattr(module, "people_on_line", lambda *_args: [replace(p, in_obstruction=True) for p in people])
     wave_panel._render()
     assert "视线被挡" in tip()
+
+
+def test_auto_row_tooltip_keeps_only_the_short_acceptance_hint(wave_panel, monkeypatch):
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    tooltip = wave_panel.table.item(row(wave_panel, "61"), 3).toolTip()
+    assert tooltip == "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；回车接受对应，号码不对按 4 撤回。"
+    assert "点击回看" not in tooltip
+    assert "按 1/2/3/4" not in tooltip
 
 
 def test_same_revision_conflicting_target_is_rejected(tmp_path):

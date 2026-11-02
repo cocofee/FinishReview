@@ -1,12 +1,13 @@
 """The people the analysis saw cross the line, where each stood, and the chips they can be labelled with.
 
 A wave whose picture holds exactly as many people as it has final-lap chips
-can be labelled by itself: the chips in time order take the people in the
-order they crossed (see lap_wave.match_wave for every condition).  The
-labels are a shortcut for the operator and nothing more: they are never
-saved, never exported and never a confirmation; the operator looks the wave
-through and presses Enter, which counts those people as if they had been
-clicked.  CycleRace keeps the official time.
+can be labelled by itself only when the chips and crossings also line up
+through the time-ordered pairing, one to one and in the same order (see
+lap_wave.match_wave for every condition).  The labels are a shortcut for the
+operator and nothing more: proposed pairs are not saved or exported and never
+confirm a rider's identity. Enter explicitly accepts the bound evidence, with
+its automatic origin retained separately from manual clicks or viewing history.
+CycleRace keeps the official time.
 """
 
 from __future__ import annotations

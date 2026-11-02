@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import QHBoxLayout, QLabel, QPushButton, QScrollBar, QVBoxL
 from .chip_history import format_chip_time
 from .crossing_time import recorder_crossing_time, workspace_clocks
 from .line_sampling import read_strip_meta
+from .review_marker_style import CURSOR_COLOR, LEGEND, marker_style
 
 
 STRIP_ROWS = 100                    # rows kept of each sampled line; drawn one to one
@@ -406,7 +407,9 @@ class RaceStripView(QWidget):
         self.setFixedHeight(self.STRIP_TOP + STRIP_ROWS + self.AXIS_HEIGHT)
         self.setMinimumWidth(200)
         self.pieces = []
-        self.chips = []                         # (chip ms, bib, confirmed)
+        self.chips = []                         # (chip ms, bib, processing source)
+        self.line_positions = {}                # (chip ms, bib) -> bound crossing chip ms
+        self.selected_chip = None              # (chip ms, bib), not bib alone (multiple laps)
         self.cursor = None
         self.px_per_s = DEFAULT_ZOOM
         self.view_ms = None
@@ -416,7 +419,7 @@ class RaceStripView(QWidget):
         self._press = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
-        self.setToolTip("全程过线图：横向是时间。号码是芯片参考，并非已认出画面中的人。"
+        self.setToolTip("全程过线图：横向是时间。灰蓝/绿色同号线来自已有绑定，待核号码只作芯片时间参考；不识别号码。"
                         "单击跳转；点过图后 ←/→ 移动，+/− 缩放，Home/End 到首尾。"
                         "滚轮移动，Ctrl+滚轮缩放；回到视频后 ←/→ 仍逐帧。灰色为无过线图，不代表无人。")
 
@@ -444,6 +447,16 @@ class RaceStripView(QWidget):
         if chips != self.chips:
             self.chips = chips
             self._settle()
+
+    def set_line_positions(self, positions):
+        """Place bound labels at video crossings, keeping chip records untouched."""
+        self.line_positions = dict(positions)
+        self.update()
+
+    def set_selected_chip(self, chip):
+        if chip != self.selected_chip:
+            self.selected_chip = chip
+            self.update()
 
     def set_cursor(self, chip_ms):
         self.cursor = None if chip_ms is None else int(chip_ms)
@@ -548,37 +561,46 @@ class RaceStripView(QWidget):
         if self.message:
             painter.setPen(QColor("#667085"))
             painter.drawText(8, self.STRIP_TOP + 16, self.message)
+        # Paint the playback cursor below bindings: at the exact bound frame
+        # it must not turn an automatic/manual correspondence line purple.
+        if self.cursor is not None:
+            x = self.x_of(self.cursor)
+            if 0 <= x < self.width():
+                painter.setPen(QPen(QColor(CURSOR_COLOR), 2))
+                painter.drawLine(x, self.STRIP_TOP - 4, x, bottom + 2)
+                painter.drawLine(x - 4, bottom + 2, x + 4, bottom + 2)
         # Bibs in three staggered rows; a label takes the first row it fits in.
         ends = [-1e9] * len(self.LABEL_ROWS)
         metrics = painter.fontMetrics()
         for stamp, bib, done in self.chips:
-            x = self.x_of(stamp)
+            x = self.x_of(self.line_positions.get((stamp, bib), stamp))
             if x is None or not -40 <= x <= self.width() + 40:
                 continue
-            painter.setPen(QColor("#ba2525"))
-            painter.drawLine(x, self.STRIP_TOP - 6, x, self.STRIP_TOP)
-            label = bib or "?"
-            width = metrics.horizontalAdvance(label) + (8 if done else 0)
+            color, dashed = marker_style(automatic=done == AUTO_LABELLED, manual=bool(done))
+            selected = (stamp, bib) == self.selected_chip
+            # Selection adds weight and a halo, never another business colour.
+            painter.setPen(QPen(QColor("#ffffff"), 8 if selected else 4))
+            painter.drawLine(x, self.STRIP_TOP - 4, x, bottom)
+            painter.setPen(QPen(QColor(color), 4 if selected else 2, Qt.DashLine if dashed else Qt.SolidLine))
+            painter.drawLine(x, self.STRIP_TOP - 4, x, bottom)
+            label = (bib or "?") + (" 待核" if not done else "")
+            width = metrics.horizontalAdvance(label) + 8
             left = max(0, min(x - width // 2, self.width() - width))
             row = next((i for i, end in enumerate(ends) if left > end + 3), None)
             if row is not None:
                 baseline = self.LABEL_ROWS[row]
-                if done:
-                    # Confirmed: a solid green badge, readable at a glance; grey-blue
-                    # when only the system has paired it (自动对上, not a confirmation).
-                    painter.fillRect(left, baseline - metrics.ascent(), width, metrics.height(),
-                                     QColor("#5b7a99" if done == AUTO_LABELLED else "#16a34a"))
-                    painter.setPen(QColor("#ffffff"))
-                    painter.drawText(left + 4, baseline, label)
-                else:
-                    painter.setPen(QColor("#374151"))
-                    painter.drawText(left, baseline, label)
+                painter.fillRect(left, baseline - metrics.ascent(), width, metrics.height(), QColor(color))
+                if selected:
+                    painter.setPen(QPen(QColor("#111827"), 2))
+                    painter.drawRect(left, baseline - metrics.ascent(), width, metrics.height())
+                painter.setPen(QColor("#ffffff"))
+                font = painter.font()
+                font.setBold(selected)
+                painter.setFont(font)
+                painter.drawText(left + 4, baseline, label)
+                font.setBold(False)
+                painter.setFont(font)
                 ends[row] = left + width
-        if self.cursor is not None:
-            x = self.x_of(self.cursor)
-            if 0 <= x < self.width():
-                painter.setPen(QPen(QColor("#b400cc"), 2))
-                painter.drawLine(x, self.STRIP_TOP - 4, x, bottom + 2)
         self._paint_axis(painter, bottom)
 
     def _paint_axis(self, painter, bottom):
@@ -665,6 +687,14 @@ class RaceStripPanel(QWidget):
         self.view = RaceStripView(self)
         self.scroll = QScrollBar(Qt.Horizontal, self)
         self.scroll.setFocusPolicy(Qt.NoFocus)
+        self.legend = QLabel(LEGEND, self)
+        self.legend.setWordWrap(True)
+        self.legend.setStyleSheet("color:#374151;font-size:11px;")
+        self.view.setToolTip(self.view.toolTip() + "\n" + LEGEND + "\n"
+                             "加粗并带边框的号码是左表当前选中记录；灰色状态为已排除。"
+                             "上方时间线和下方同号标签表示已有对应；待核芯片只有时间参考，不强贴到人。"
+                             "视频标记只在绑定帧附近显示，不跟踪移动；灰色图像缺口不代表无人。")
+        self.legend.hide()  # Keep the source legend in hover help, not a permanent extra row.
         column.addWidget(self.view)
         column.addWidget(self.scroll)
         layout.addLayout(column, 1)

@@ -38,11 +38,45 @@ def test_a_rider_whose_last_passage_is_short_of_the_target_is_a_hint_not_a_judge
 def test_a_full_wave_is_paired_in_order_of_crossing_and_chip_time():
     match = match_wave(
         chips=[("c2", 5_000), ("c1", 4_000)],
-        crossings=[("p2", 5_400), ("p1", 4_100)],
+        crossings=[("p2", 5_250), ("p1", 4_100)],
         clock_ok=True,
     )
     assert match.reasons == ()
     assert match.pairs == (("c1", "p1"), ("c2", "p2"))
+
+
+def test_a_wave_with_equal_counts_but_offset_times_is_left_to_hand():
+    # The old sorted zip would pair these; 500 ms and 700 ms are too far for
+    # the time-ordered pairing, which would rather drop both sides.
+    match = match_wave(
+        chips=[("c1", 4_000), ("c2", 5_000)],
+        crossings=[("p1", 4_500), ("p2", 5_700)],
+        clock_ok=True,
+    )
+    assert match.pairs == ()
+    assert any("对不上" in reason for reason in match.reasons)
+
+
+def test_a_double_chip_that_hides_a_missed_read_is_left_to_hand():
+    # Three people and three chips again, but one rider has two chips read and
+    # another was missed: the order no longer lines up, so nothing is labelled.
+    match = match_wave(
+        chips=[("a1", 1_020), ("a2", 1_180), ("b", 2_020)],
+        crossings=[("p1", 1_000), ("p2", 2_000), ("p3", 3_000)],
+        clock_ok=True,
+    )
+    assert match.pairs == ()
+    assert any("对不上" in reason for reason in match.reasons)
+
+
+def test_the_time_difference_has_to_survive_the_pairing_before_a_wave_is_labelled():
+    # 350 ms still beats skipping both sides; 400 ms does not, and 650 ms is
+    # inside the 700 ms window but is still refused.
+    assert match_wave([("c", 4_000)], [("p", 4_350)], clock_ok=True).pairs == (("c", "p"),)
+    for offset in (400, 650):
+        match = match_wave([("c", 4_000)], [("p", 4_000 + offset)], clock_ok=True)
+        assert match.pairs == (), offset
+        assert any("对不上" in reason for reason in match.reasons), offset
 
 
 def test_any_one_failed_condition_leaves_the_whole_wave_to_hand():

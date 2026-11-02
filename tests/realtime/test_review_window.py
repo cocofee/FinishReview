@@ -680,7 +680,7 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert overlays[0][0] == pytest.approx(0.55)
         assert overlays[0][1] == pytest.approx(0.62)
         assert overlays[0][2] == "21"
-        assert overlays[0][5] is True and overlays[0][6] is False
+        assert overlays[0][5] is False and overlays[0][6] is False  # compact view renders a tag and ring
         assert pane.video_view._history_markers[0][2] == "21"
 
         assert panel.confirm_arrival_button.isHidden()
@@ -702,7 +702,7 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         assert pane._worker is worker
         assert pane._current_frame_index == 50
         assert panel.table.item(panel.table.currentRow(), 3).text() == "待定"
-        assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#b42318"
+        assert panel.table.item(panel.table.currentRow(), 3).foreground().color().name() == "#9a3412"
         window._problem_count_clicked(0.55, 0.62, pane)
         assert sum(row.decision is not None for row in panel._arrival_rows) == 1
         # 22 and 23 arrive within 2 s of 21: one wave, counted on this same picture,

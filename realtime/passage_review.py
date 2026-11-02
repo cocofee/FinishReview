@@ -63,6 +63,7 @@ from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
 from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
 from .camera_judgments import CameraJudgment
 from .clock_sync import CLOCK_MODEL_FILENAME, MANUAL_ANCHOR_TOLERANCE_MS, ClockModelStore
+from .review_marker_style import marker_style
 from .race_filmstrip import RaceFilmstripFrame, recording_sources
 from .external_clip_import import EXTERNAL_CLOCK_SOURCE
 from .passage_evidence import (
@@ -1288,7 +1289,8 @@ class EvidenceImageView(QGraphicsView):
             x = x_normalized * self._source_width
             y = y_normalized * self._source_height
             # Grey-blue and dashed: paired by the system (自动对上), nobody has counted them yet.
-            color = QColor("#8fb3d9" if auto else "#1bbf83" if confirmed else "#c0372b")
+            stroke_color, dashed = marker_style(automatic=auto, manual=confirmed)
+            color = QColor(stroke_color)
             if ghost:
                 # Counted on a nearby frame: faded where they were, so they are not clicked twice.
                 color.setAlpha(150)
@@ -1299,7 +1301,7 @@ class EvidenceImageView(QGraphicsView):
                 continue
             pen = QPen(color, 2)
             pen.setCosmetic(True)
-            if (not confirmed and not simple) or ghost or auto:
+            if dashed or ghost:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
             painter.drawLine(int(x), 0, int(x), self._source_height)
@@ -1307,6 +1309,7 @@ class EvidenceImageView(QGraphicsView):
                 continue
             margin = 6.0 / scale
             size = 18.0
+            label = label if confirmed or auto else f"{label} 待核"
             tag_width = max(52.0, 18.0 + len(label) * size) / scale
             tag_height = 30.0 / scale
             # Beside the ring, not on the rider.
@@ -1321,7 +1324,7 @@ class EvidenceImageView(QGraphicsView):
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(tag_rect, 2.0 / scale, 2.0 / scale)
-            painter.setPen(QColor("#07120e" if confirmed else "#231703"))
+            painter.setPen(QColor("#ffffff"))
             font = QFont(self.font())
             font.setPixelSize(max(1, int(round(size / scale))))
             font.setBold(True)
@@ -2428,7 +2431,12 @@ class PassageEvidencePane(QFrame):
         adjacent_frame = self.timeline.property("initial_adjacent_frame")
         self.timeline.setProperty("initial_adjacent_frame", None)
         if adjacent_frame is not None:
+            # EOF handoff may already have requested forward play. The deferred
+            # FPS-aware seek pauses for positioning, not to cancel that request.
+            resume_playing = self._playing
             self.seek_adjacent_frame(*adjacent_frame)
+            if resume_playing:
+                self.set_playing(True)
         elif initial_frame is not None and hasattr(self._worker, "seek_frame"):
             self._worker.seek_frame(int(initial_frame))
         else:

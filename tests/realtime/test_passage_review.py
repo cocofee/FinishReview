@@ -6934,6 +6934,20 @@ def test_seam_seek_waits_for_new_fps_and_excludes_old_frame(
     assert pane.timeline.property("initial_adjacent_frame") is None
 
 
+@pytest.mark.parametrize("resume", [False, True])
+def test_deferred_seam_metadata_preserves_requested_play_state(qapp, boundary_review, resume):
+    dialog, _first, _second, _image = boundary_review()
+    pane = dialog.regular_pane
+    worker = pane._worker
+    worker.seek_frame = lambda _frame: None
+    pane._fps = 0
+    pane.seek_adjacent_frame(-40, 1)
+    pane.set_playing(resume)
+    worker.metadata_ready.emit(2500, 20, 1280, 720, 50)
+    assert pane.is_playing is resume
+    assert pane.timeline.property("initial_adjacent_frame") is None
+
+
 @pytest.mark.parametrize("inflated_count", [False, True])
 @pytest.mark.parametrize("next_fps,overlap_ms,first_index", [(25, 0, 0), (50, 100, 4)])
 @pytest.mark.parametrize("selected", [True, False])

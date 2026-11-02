@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .crossing_pairing import pair_crossings
+
 FINAL = "final"
 INTERMEDIATE = "intermediate"
 OVER = "over"  # more laps than the group's target: 圈数异常, only a hint
@@ -78,6 +80,14 @@ def match_wave(
 
     CHIPS: (key, chip time ms) of the wave's final-lap chips.
     CROSSINGS: (key, time ms) of the people detected crossing on the picture.
+
+    The chips and crossings go through the same time-ordered pairing as the
+    chip/video matching (crossing_pairing.pair_crossings): every pair must be
+    unique, keep the order and beat skipping both sides on time.  Equal counts
+    alone are not enough: if one chip and one person are offset enough for the
+    pairing to prefer dropping them (including some double-chip/missed-read
+    cancellations), the incomplete pairing leaves the whole wave to hand.
+    Time agreement does not prove identity or rule out every cancellation.
     """
     reasons = []
     if not chips:
@@ -99,5 +109,10 @@ def match_wave(
         reasons.append(f"相邻过线不到 {min_gap_ms} 毫秒，顺序可能对错")
     if reasons:
         return WaveMatch(pairs=(), reasons=tuple(reasons))
-    chip_order = sorted(chips, key=lambda chip: chip[1])
-    return WaveMatch(pairs=tuple((chip[0], crossing[0]) for chip, crossing in zip(chip_order, ordered)), reasons=())
+    pairing = pair_crossings(
+        [key for key, _time in crossings], [time for _key, time in crossings],
+        [key for key, _time in chips], [time for _key, time in chips],
+    )
+    if len(pairing.matched) != len(chips) or pairing.video_only or pairing.chip_only:
+        return WaveMatch(pairs=(), reasons=("芯片与过线时间对不上，可能有个别错位",))
+    return WaveMatch(pairs=tuple((chip, crossing) for crossing, chip, _residual in pairing.matched), reasons=())

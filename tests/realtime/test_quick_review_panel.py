@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import QApplication, QLabel
 from realtime.problem_items import (
     CATEGORY_VIDEO, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
 )
-from realtime.quick_review_panel import WAVE_REACH_MS, QuickReviewPanel
+from realtime.quick_review_panel import QuickReviewPanel
 from realtime.chip_history import format_chip_time
 from realtime.arrival_review import candidate_binding
 from tests.realtime.test_arrival_review import event, FRAME, SCOPE
@@ -355,7 +355,7 @@ def test_manual_confirmation_replaces_candidate_row_and_keeps_explicit_category(
 def test_non_rider_category_is_explicit_and_preserved_after_refresh(panel):
     panel._classify("not_rider")
     panel.refresh()
-    assert all(panel.table.item(i, 3).foreground().color().name() == "#1d4ed8" for i in range(panel.table.rowCount()))
+    assert all(panel.table.item(i, 3).foreground().color().name() == "#4b5563" for i in range(panel.table.rowCount()))
     assert all(panel.table.item(i, 3).text() == "已排除" for i in range(panel.table.rowCount()))
     assert all(panel.table.item(i, 0).text() == "" for i in range(panel.table.rowCount()))
     assert all(target.is_active for target in panel.events)
@@ -467,7 +467,7 @@ def test_undo_takes_back_selected_210_after_later_confirmations_and_restart(pane
     assert restored._selected_arrival().bib == "210"
     assert restored._selected_arrival().decision is None
     assert restored.table.item(row(restored, "210"), 3).text() == "待定"
-    assert restored.table.item(row(restored, "210"), 3).foreground().color().name() == "#b42318"
+    assert restored.table.item(row(restored, "210"), 3).foreground().color().name() == "#9a3412"
     assert restored.table.item(row(restored, "210"), 0).text() == original_number
     assert {entry.bib: entry.decision["id"] for entry in restored._arrival_rows
             if entry.decision} == other_ids
@@ -679,9 +679,10 @@ def test_every_click_saves_and_the_unseen_part_only_shows_never_blocks(wave_pane
     for x, offset in ((.2, 100), (.4, 500), (.6, 1000)):
         count_on_picture(wave_panel, x, offset)
     assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
-    look_through(wave_panel, -500, 1000)
-    assert "秒没看" in wave_panel.confirmation_status.text()  # 76 + 0.5 s is still unseen
-    look_through(wave_panel, 1000, 1400)
+    wave_panel._arrival_drafts["seen"] = {}
+    look_through(wave_panel, 0, 300)
+    assert "秒没看" in wave_panel.confirmation_status.text()  # the last chip itself is still unseen
+    look_through(wave_panel, 700, 1400)
     assert "已核" in wave_panel.confirmation_status.text()
     assert wave_panel.table.item(row(wave_panel, "61"), 0).foreground().color().name() == "#126044"
 
@@ -817,19 +818,19 @@ def test_every_way_into_a_row_lands_on_its_wave_s_first_rider_not_the_chip_time(
     asked, jumps = strip_landing
     first, lone = T0, T0 + 10_000
     wave_panel._arrival_clicked(row(wave_panel, "5"))
-    assert jumps[-1] == {"camera_index": 1, "position_ms": lone - 607, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": lone - 107, "reference_only": True}
     wave_panel._arrival_clicked(row(wave_panel, "76"))  # any rider of the wave: it starts at its first
-    assert asked[-1] == first and jumps[-1]["position_ms"] == first - 607
+    assert asked[-1] == first and jumps[-1]["position_ms"] == first - 107
     for enter in (lambda index: wave_panel.table.cellDoubleClicked.emit(index, 0),
                   lambda index: wave_panel.select_item(wave_panel._arrival_rows[index].item.item_id)):
         wave_panel._arrival_clicked(row(wave_panel, "5"))
         enter(row(wave_panel, "20"))
-        assert jumps[-1]["position_ms"] == first - 607
+        assert jumps[-1]["position_ms"] == first - 107
     wave_panel._arrival_clicked(row(wave_panel, "76"))
     QTest.keyClick(wave_panel.table, Qt.Key_Down)
-    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == lone - 607
+    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == lone - 107
     QTest.keyClick(wave_panel.table, Qt.Key_Up)
-    assert wave_panel._selected_arrival().bib == "76" and jumps[-1]["position_ms"] == first - 607
+    assert wave_panel._selected_arrival().bib == "76" and jumps[-1]["position_ms"] == first - 107
 
 
 def test_inside_the_shown_wave_the_picture_stays_and_the_window_does_not_reopen_it(wave_panel, strip_landing):
@@ -847,7 +848,7 @@ def test_inside_the_shown_wave_the_picture_stays_and_the_window_does_not_reopen_
     wave_panel._arrival_clicked(row(wave_panel, "76"))  # on the wave's own picture too
     assert len(jumps) == count
     assert wave_panel.open_wave_start()  # 回到团首: the first rider, from anywhere in the wave
-    assert jumps[-1]["position_ms"] == T0 - 607
+    assert jumps[-1]["position_ms"] == T0 - 107
 
 
 def test_after_a_wave_and_a_decided_row_the_next_click_still_lands(wave_panel, strip_landing, monkeypatch):
@@ -859,12 +860,12 @@ def test_after_a_wave_and_a_decided_row_the_next_click_still_lands(wave_panel, s
     look_through(wave_panel, -600, 1500)
     QTest.keyClick(wave_panel, Qt.Key_Return)
     # Confirming goes on to the next wave at its first rider.
-    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == T0 + 10_000 - 607
+    assert wave_panel._selected_arrival().bib == "5" and jumps[-1]["position_ms"] == T0 + 10_000 - 107
     wave_panel._arrival_clicked(row(wave_panel, "20"))  # a decided row: the frame it was decided on
     assert jumps[-1]["recorder_ms"] == T0 + 500 and not jumps[-1].get("reference_only")
     monkeypatch.setattr(module, "first_crossing", lambda pieces, cache, chip_ms: None)
     wave_panel._arrival_clicked(row(wave_panel, "5"))  # the strip cannot tell: the chip time
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 10_000 - 500, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 10_000, "reference_only": True}
 
 
 def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monkeypatch, tmp_path):
@@ -878,32 +879,32 @@ def test_a_row_opened_before_the_strip_is_read_lands_once_it_is(wave_panel, monk
     assert not jumps  # nothing to land on yet: the window opens the chip time meanwhile
     strip = wave_panel.race_strip
     strip._apply((strip._token, ([strip_piece(tmp_path)], {})))
-    assert [jump[0]["position_ms"] for jump in jumps] == [T0 - 543]
+    assert [jump[0]["position_ms"] for jump in jumps] == [T0 - 43]
     strip._apply((strip._token, ([strip_piece(tmp_path)], {})))  # a later rescan does not move it again
     assert len(jumps) == 1
 
 
-def test_a_crossing_without_a_chip_opens_a_quarter_second_before_it(wave_panel, strip_landing):
-    """现代五项：从前 2 秒（10-29）、0.5 秒（10-30）看起人都还在远处；从前 0.25 秒看起。"""
+def test_a_crossing_without_a_chip_opens_150ms_before_it(wave_panel, strip_landing):
+    """恢复最后现场调整：无芯片行只留0.15秒浏览余量。"""
     _asked, jumps = strip_landing
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=400, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_750, "reference_only": True}
+    assert jumps[-1] == {"camera_index": 1, "position_ms": T0 + 19_850, "reference_only": True}
 
 
-def test_without_an_aligned_strip_a_crossing_opens_a_quarter_second_back_from_its_own_frame(wave_panel):
-    """现代五项 10-29：没有芯片，过线图对不上芯片时间，仍从前 0.25 秒开始看（可能在上一段录像里）。"""
+def test_without_an_aligned_strip_a_crossing_opens_150ms_back_from_its_own_frame(wave_panel):
+    """没有校时过线图时仍使用0.15秒余量，允许目标落在上一段。"""
     jumps = []
     wave_panel.jump_requested.connect(jumps.append)
     lone = wave_panel.add_manual_problem(dict(FRAME, frame_index=40, position_ms=2000, recorder_ms=T0 + 20_000),
                                          recorder_ms=T0 + 20_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.item.item_id == lone.item_id))
-    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1750,
+    assert jumps[-1] == {"camera_index": 1, "segment_id": "seg", "video_path": "a.mkv", "position_ms": 1850,
                          "frame_index": None, "reference_only": True}
-    wave_panel.add_manual_problem(dict(FRAME, frame_index=4, position_ms=200, recorder_ms=T0 + 30_000),
+    wave_panel.add_manual_problem(dict(FRAME, frame_index=2, position_ms=100, recorder_ms=T0 + 30_000),
                                   recorder_ms=T0 + 30_000)
     wave_panel._arrival_clicked(next(i for i, entry in enumerate(wave_panel._arrival_rows)
                                      if entry.time_ms == T0 + 30_000))
@@ -1602,20 +1603,15 @@ def test_a_wave_with_a_different_number_of_people_or_a_blocked_view_is_left_to_h
     assert wave_panel.race_strip.view.chips[0][2] is False
 
 
-def test_enter_counts_the_paired_people_as_if_clicked_once_the_wave_is_looked_through(wave_panel, monkeypatch):
+def test_enter_accepts_the_paired_evidence_without_padding_or_claiming_manual_count(wave_panel, monkeypatch):
     people = auto_people(wave_panel, monkeypatch, (100, 500, 1000))
     wave_panel._arrival_clicked(row(wave_panel, "61"))
-    wave_panel._enter_key()
-    assert "没看" in wave_panel.hint.text() and not any(entry.decision for entry in wave_panel._arrival_rows)
-    look_through(wave_panel, -200, 1100)
-    wave_panel._arrival_clicked(row(wave_panel, "61"))
-    wave_panel._enter_key()
-    assert "没看" in wave_panel.hint.text() and not any(entry.decision for entry in wave_panel._arrival_rows)
-    look_through(wave_panel, -WAVE_REACH_MS, 1400 + WAVE_REACH_MS)
-    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel._arrival_drafts["seen"] = {}
     wave_panel._enter_key()
     assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
-    assert states(wave_panel)["61"] == "已点"  # counted, never 已确认
+    assert states(wave_panel)["61"] == "已接受对应"
+    assert "没看" not in wave_panel.hint.text()
+    assert "人工点数 0" in wave_panel.hint.text()
     decision = next(entry.decision for entry in wave_panel._arrival_rows if entry.bib == "20")
     assert (decision["frame"]["marker_x_normalized"], decision["frame"]["marker_y_normalized"]) == (
         round(people[1].x, 4), round(people[1].y, 4))
