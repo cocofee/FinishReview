@@ -3345,7 +3345,9 @@ class FinishReviewWindow(PassageReviewSurface):
             self.problem_panel.set_browsing(reference)
             target = f"第 {index + 1} 帧" if index is not None else f"片内 {position / 1000:.2f} 秒"
             self._active_playback_pane().set_reference_only(reference)
-            if reference:
+            if frame.get("auto_pair"):
+                self.problem_panel.hint.setText("已定位自动对应的过线原帧；灰蓝号码为系统对应，不算人工点数或裁判确认。")
+            elif reference:
                 date_note = "；芯片日期与接收日期不同，按接收日期查找，正式时间未改" if frame.get("date_aligned") else ""
                 self.problem_panel.hint.setText(
                     f"参考录像 · {target}：尚未校时/匹配，不代表已确认过线{date_note}。请逐帧找到压线帧，左键点人。"

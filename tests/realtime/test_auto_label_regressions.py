@@ -218,22 +218,18 @@ def test_wave_plan_orders_sessions_by_aligned_time(wave_panel, monkeypatch):
     assert saved(wave_panel) == {"61": 5000, "20": 4000, "76": 3000}
 
 
-def test_auto_status_and_enter_use_exact_same_view_interval(wave_panel, monkeypatch):
-    from tests.realtime.test_quick_review_panel import T0
-
+def test_auto_status_and_acceptance_do_not_require_a_view_interval(wave_panel, monkeypatch):
     auto_people(wave_panel, monkeypatch, (100, 500, 1000))
     wave_panel._arrival_clicked(row(wave_panel, "61"))
-    wave_panel._arrival_drafts["seen"] = {"1": [[T0 - 500, T0 + 1400]]}
+    wave_panel._arrival_drafts["seen"] = {}
     wave_panel._sync_arrival_confirmation()
-    assert "没看" in wave_panel.confirmation_status.text()
-    wave_panel._enter_key()
-    assert saved(wave_panel) == {}
-    assert "没看" in wave_panel.hint.text()
-    wave_panel._arrival_drafts["seen"] = {"1": [[T0 - 700, T0 + 1600]]}
-    wave_panel._sync_arrival_confirmation()
-    assert "已看完" in wave_panel.confirmation_status.text()
+    assert "回车接受对应" in wave_panel.confirmation_status.text()
+    assert "没看" not in wave_panel.confirmation_status.text()
+    assert "已看完" not in wave_panel.confirmation_status.text()
     wave_panel._enter_key()
     assert len(saved(wave_panel)) == 3
+    assert set(states(wave_panel).values()) == {"已接受对应", "待定"}
+    assert wave_panel._arrival_drafts["seen"] == {}
 
 
 def test_auto_duplicate_is_rejected_before_creating_candidate(wave_panel, monkeypatch):
