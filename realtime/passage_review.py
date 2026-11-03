@@ -6624,6 +6624,7 @@ class PassageReviewSurface(QDialog):
             self._select_event(
                 event_id,
                 preserve_current_frame=preserve_current_frame,
+                include_historical=True,
             )
 
     @staticmethod
@@ -6778,17 +6779,22 @@ class PassageReviewSurface(QDialog):
         *,
         preserve_current_frame: Optional[PassageEvidencePane] = None,
         locate_target: bool = False,
+        include_historical: bool = False,
     ) -> None:
         self._video_candidate_anchor_time_ms = None
         if preserve_current_frame is None and self._batch_mode and not locate_target:
             active_pane = self._active_playback_pane()
             if getattr(active_pane, "_current_frame_index", -1) >= 0:
                 preserve_current_frame = active_pane
-        self.selection_controller.select(
-            event_id,
-            preserve_current_frame=preserve_current_frame,
-            locate_target=locate_target,
-        )
+        self._include_historical_filmstrip_on_selection = bool(include_historical)
+        try:
+            self.selection_controller.select(
+                event_id,
+                preserve_current_frame=preserve_current_frame,
+                locate_target=locate_target,
+            )
+        finally:
+            self._include_historical_filmstrip_on_selection = False
 
     def _apply_selection_plan(
         self,
@@ -6799,6 +6805,8 @@ class PassageReviewSurface(QDialog):
         event = plan.event
         lookup = plan.lookup
         regular_locations = plan.regular_locations
+        if getattr(self, "_include_historical_filmstrip_on_selection", False):
+            self.video_filmstrip.full_race.ensure_time_visible(event.timeline_timestamp_ms)
         regular = plan.regular_summary
         high_speed = plan.high_speed
         reuse_continuous_media = plan.reuse_continuous_media

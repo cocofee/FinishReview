@@ -7,7 +7,8 @@ from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication, QLabel
 
 from realtime.problem_items import (
-    CATEGORY_VIDEO, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
+    CATEGORY_VIDEO, KIND_LINE_ACTIVITY, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING,
+    STATUS_WAITING, ProblemItem,
 )
 from realtime.quick_review_panel import QuickReviewPanel
 from realtime.chip_history import format_chip_time
@@ -103,6 +104,69 @@ def test_unverified_video_never_becomes_an_arrival_even_from_old_cache(panel, ki
     assert panel._arrival_exports() == ([], [], 0)
     panel.show_unverified_action.setChecked(False)
     assert panel.table.rowCount() == 0
+
+
+def test_unverified_line_changes_are_one_display_group_but_keep_all_source_items(panel):
+    items = []
+    for index, offset in enumerate((0, 600, 1_800)):
+        frame = dict(FRAME, frame_index=5 + index, position_ms=250 + offset,
+                     recorder_ms=FRAME["recorder_ms"] + offset)
+        items.append(ProblemItem(f"empty-{index}", KIND_LINE_ACTIVITY, CATEGORY_VIDEO,
+                                 "终点线发生变化，但没有确认目标穿越",
+                                 evidence={"frame": frame, "recorder_ms": frame["recorder_ms"],
+                                           "crossing_check": {"state": "unverified",
+                                                               "reason": "insufficient_track"}}))
+    panel.events = []
+    panel.items = items
+    panel._render()
+    assert panel.table.rowCount() == 0
+    assert "待核画面 1" in panel.quick_title.text()
+    assert "3 段" in panel.show_unverified_action.text()
+
+    panel.show_unverified_action.setChecked(True)
+    assert panel.table.rowCount() == 1
+    pending = panel._arrival_rows[0]
+    assert len(pending.fragments) == 2
+    assert menu_labels(panel, 0) == ["不是运动员"]
+    assert panel.table.item(0, 3).text() == "画面待核·3段"
+    assert panel.items == items
+
+
+def test_unverified_line_change_can_be_excluded_with_one_and_undone_with_four(panel):
+    frame = dict(FRAME, recorder_ms=FRAME["recorder_ms"] + 2_000)
+    item = ProblemItem("empty-one", KIND_LINE_ACTIVITY, CATEGORY_VIDEO,
+                       "终点线发生变化，但没有确认目标穿越",
+                       evidence={"frame": frame, "recorder_ms": frame["recorder_ms"],
+                                 "crossing_check": {"state": "unverified",
+                                                     "reason": "insufficient_track"}})
+    panel.events = []
+    panel.items = [item]
+    panel._render()
+    panel.show_unverified_action.setChecked(True)
+    panel.table.setFocus()
+    QTest.keyClick(panel.table, Qt.Key_1)
+    assert panel._arrival_store.latest(SCOPE, "candidate:" + item.item_id)["action"] == "not_rider"
+    assert panel.table.item(0, 3).text() == "已排除"
+    QTest.keyClick(panel.table, Qt.Key_4)
+    assert panel._arrival_store.latest(SCOPE, "candidate:" + item.item_id) is None
+    assert panel.table.item(0, 3).text() == "画面待核"
+
+
+def test_waiting_unverified_picture_can_still_be_excluded_with_one(panel):
+    item = ProblemItem(
+        "waiting-empty", KIND_LINE_ACTIVITY, CATEGORY_VIDEO,
+        "画面变化，未确认穿越", status=STATUS_WAITING,
+        evidence={"frame": dict(FRAME), "crossing_check": {"state": "unverified"}},
+    )
+    panel.events = []
+    panel.items = [item]
+    panel._render()
+    panel.show_unverified_action.setChecked(True)
+    assert "待核画面 1" in panel.queue_text()
+    panel.table.setFocus()
+    QTest.keyClick(panel.table, Qt.Key_1)
+    assert panel._arrival_store.latest(SCOPE, "candidate:" + item.item_id)["action"] == "not_rider"
+    assert panel.table.item(0, 3).text() == "已排除"
 
 
 def test_verified_crossing_and_manual_count_still_appear_without_chips(panel):

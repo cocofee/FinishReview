@@ -61,6 +61,23 @@ def test_new_recording_scope_hides_history_but_allows_explicit_browsing(qapp, tm
         panel.close()
 
 
+def test_historical_selection_switches_to_all_recordings(qapp, tmp_path, manual_worker):
+    old = source(tmp_path / "history.mkv", 10000, 1000)
+    live = source(tmp_path / "current.ts", 100000, 2000)
+    panel = RaceFilmstripPanel()
+    try:
+        panel.set_recording_start(99000)
+        panel.set_sources((old, live))
+        assert panel.scope_combo.currentData() == "current"
+        assert panel.index.sources == (live,)
+        assert panel.ensure_time_visible(10000)
+        assert panel.scope_combo.currentData() == "all"
+        assert panel.index.sources == (old, live)
+        assert not panel.ensure_time_visible(100500)
+    finally:
+        panel.close()
+
+
 def test_recording_scope_survives_archive_handover_and_clear(qapp, tmp_path, manual_worker):
     live = source(tmp_path / "live.ts", 100000, 2000, priority=2)
     archive = source(tmp_path / "archive.mkv", 100000, 5000)

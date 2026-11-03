@@ -268,6 +268,27 @@ def test_dialog_cancel_does_not_save_and_save_uses_selected_session(qapp, sealed
     reopened.reject()
 
 
+def test_dialog_persists_the_explicit_target_sport_for_this_event(qapp, sealed):
+    root, _source, _segments = sealed
+    dialog = SamplingSettingsDialog(root)
+    pump(qapp, lambda: dialog.worker is None)
+    assert dialog.sport.currentData() == "cycling"
+    token_before = settings_token(root)
+    dialog.sport.setCurrentIndex(dialog.sport.findData("running"))
+    dialog._save()
+
+    payload = json.loads((root / CONFIG_PATH).read_text(encoding="utf-8"))
+    assert payload["target_sport"] == "running"
+    assert config_from_workspace(root).target_sport == "running"
+    assert settings_token(root) != token_before
+
+    reopened = SamplingSettingsDialog(root)
+    pump(qapp, lambda: reopened.worker is None)
+    assert reopened.sport.currentData() == "running"
+    assert "认人" in reopened.windowTitle()
+    reopened.reject()
+
+
 def test_saved_line_replaces_only_affected_sampling_cache(sealed):
     root, source, segments = sealed
     config = AnalysisConfig(workspace=root, race_id="race", stage_id="stage")

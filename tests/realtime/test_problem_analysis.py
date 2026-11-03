@@ -923,6 +923,33 @@ def test_verified_non_bicycle_targets_cannot_be_auto_paired_to_chips(synthetic_r
     assert result["pairing"]["auto_paired"] == 0
 
 
+def test_running_policy_treats_a_verified_person_as_the_target(synthetic_race, tmp_path, monkeypatch):
+    from realtime.target_crossing import TargetCrossingCheck
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first)
+    workspace = AnalysisWorkspace(root)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
+        c.key: TargetCrossingCheck("confirmed", "anchor_crossed_line", "pedestrian", .91) for c in crossings
+    })
+
+    running = analyse_camera(
+        replace(config, model_path=model, target_sport="running"), workspace, 1, strips,
+    )
+
+    assert running["target_sport"] == "running"
+    assert running["target_policy"]["name"] == "running"
+    assert running.get("calibration") is not None
+    assert running["pairing"]["auto_paired"] > 0
+    assert running["auto_passed"]
+    assert all(item.evidence.get("target_sport") == "running"
+               for item in running["items"] if item.evidence.get("bike"))
+    assert all(item["frame"]["line_config"] for item in running["auto_passed"])
+
+
 @pytest.mark.parametrize("calibrated", [False, True])
 def test_empty_target_frames_keep_noise_as_evidence_not_crossings(synthetic_race, tmp_path, monkeypatch, calibrated):
     """Line noise with no target in three frames must never pair chips or create arrival times."""

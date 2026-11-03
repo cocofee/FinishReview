@@ -66,11 +66,17 @@ def check_target_tracks(
     *,
     frame_size: tuple[int, int],
     margin_px: float = 4.0,
+    preferred_label: str = "",
 ) -> TargetCrossingCheck:
     """Associate same-class boxes and require the same anchor on both sides.
 
     Ambiguous associations, clipped boxes and missing temporal context fail
     closed. A track touching the line without a side change is not confirmed.
+
+    ``preferred_label`` picks the target-sport class when two tracked classes
+    cross together.  Empty keeps the historical choice, which prefers a
+    bicycle/vehicle over a person.  Running passes ``pedestrian`` so an
+    accompanying bicycle cannot hide the person who actually crossed.
     """
     points = np.asarray(line_points, dtype=float)
     observed = tuple(float(stamp) for stamp, _ in observations)
@@ -139,7 +145,19 @@ def check_target_tracks(
             break
     if confirmed:
         # A bicycle and its rider may both be tracked; they are not two events.
-        label, score, vehicle, direction = max(confirmed, key=lambda item: (item[0] != "pedestrian", item[1]))
+        # The sport policy decides which class is the target; without a
+        # preference the historical bicycle/vehicle-first choice is kept.
+        def rank(item):
+            label, score = item[0], item[1]
+            if preferred_label == "pedestrian":
+                # Running treats bicycles and vehicles as non-targets.  When an
+                # escort vehicle and its rider cross together, the vehicle must
+                # win the ambiguity instead of the person's box absorbing a chip.
+                return (label != "pedestrian", label == "vehicle", score)
+            return (label == preferred_label if preferred_label else False,
+                    label != "pedestrian", score)
+
+        label, score, vehicle, direction = max(confirmed, key=rank)
         return TargetCrossingCheck("confirmed", "anchor_crossed_line", label, score, vehicle, direction, observed)
     if clipped:
         reason = "clipped_target"
