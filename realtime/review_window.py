@@ -2576,6 +2576,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
         self.problem_panel.delete_requested.connect(self._delete_problem_record)
+        self.problem_panel.calibration_requested.connect(self._calibrate_crossing_frame)
         self.problem_panel.summary_changed.connect(lambda _text: self._refresh_crossing_cards())
         self._normal_crossing_cards = {}
         self._opened_normal_crossing = ""
@@ -2587,7 +2588,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.crossing_cards.item_selected.connect(self._select_crossing_card)
         self.preview_panel.layout().addWidget(self.crossing_cards)
         # 过线记录已经是左边那张表，横排卡片是同一批数据的第二面：收起来，
-        # 只留下这一行的两个工具（查找原录像 / 以当前帧校时）。
+        # 只留下查找原录像；校时在判读工具条最前面。
         self.crossing_cards.list.hide()
         self.crossing_cards.title.hide()
         self.recording_rail_button = QPushButton("查找原录像", self.crossing_cards)
@@ -2595,10 +2596,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recording_rail_button.toggled.connect(self._set_recording_rail_visible)
         self.crossing_cards.toolbar.addWidget(self.recording_rail_button)
         self._creating_manual_crossing = False
-        self.calibrate_crossing_button = QPushButton("以当前帧校时", self.crossing_cards)
-        self.calibrate_crossing_button.setToolTip("先找到一位身份明确的选手压线原帧，再选择其有效芯片记录建立校时")
-        self.calibrate_crossing_button.clicked.connect(self._calibrate_crossing_frame)
-        self.crossing_cards.toolbar.addWidget(self.calibrate_crossing_button)
+        # 校时 lives on the judging toolbar (QuickReviewPanel.calibrate_button), not down here.
         self.group_start_button = QPushButton("回到团首", self)
         self.group_start_button.clicked.connect(self._open_group_start)
         self.evidence_panes[0].controls_layout.addWidget(self.group_start_button)
@@ -3168,7 +3166,7 @@ class FinishReviewWindow(PassageReviewSurface):
         pane = self._active_playback_pane()
         frame = self._frame_for_problem_count(pane)
         if frame is None:
-            self.problem_panel.hint.setText("先从原录像打开首位身份明确的选手压线画面。")
+            self.problem_panel.hint.setText("先在左表选这位选手的芯片记录，把画面停在他压线的那一帧，再点「先校时」。")
             self.recording_rail_button.setChecked(True)
             return
         from .analysis_workspace import AnalysisWorkspace

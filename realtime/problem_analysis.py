@@ -694,7 +694,7 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
             checks[crossing.key] = TargetCrossingCheck("unverified", "missing_context")
             continue  # A later sealed neighbour can complete this window.
         reader = None
-        observations = []
+        observations, seen = [], []
         try:
             if detector is None:
                 detector = YoloxDetector(config.model_path, config.model_input)
@@ -714,7 +714,9 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
                                  item.start_ms, position, x0, y0, size, width, height)
                 if runtime is not None and detection_key in runtime.detections:
                     runtime.detections.move_to_end(detection_key)
-                    observations.append(runtime.detections[detection_key])
+                    *cached, raw_count = runtime.detections[detection_key]
+                    observations.append(tuple(cached))
+                    seen.append(raw_count)
                     continue
                 if runtime is not None:
                     reader = runtime.reader(path, config.decode_threads)
@@ -733,12 +735,13 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
                 boxes = [replace(d, x=d.x + x0, y=d.y + y0) for d in detections
                          if d.x > 2 and d.y > 2 and d.x + d.w < size - 3 and d.y + d.h < size - 3]
                 observations.append((item.start_ms + pts, boxes))
+                seen.append(len(detections))  # before the crop-edge filter: nothing at all means nobody
                 if runtime is not None:
-                    runtime.detections[detection_key] = observations[-1]
+                    runtime.detections[detection_key] = (*observations[-1], seen[-1])
                     while len(runtime.detections) > 256:
                         runtime.detections.popitem(last=False)
             check = check_target_tracks(observations, crossing.segment_points, frame_size=(width, height),
-                                        preferred_label=policy.verification_preference)
+                                        preferred_label=policy.verification_preference, seen=seen)
         except Exception as error:
             logger.warning("crossing verification unavailable for %s: %s", crossing.key, error)
             check = TargetCrossingCheck("unverified", "model_failed")

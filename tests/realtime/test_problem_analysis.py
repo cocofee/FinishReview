@@ -961,9 +961,11 @@ def test_empty_target_frames_keep_noise_as_evidence_not_crossings(synthetic_race
         workspace = AnalysisWorkspace(root)
     model = tmp_path / "test.onnx"
     model.write_bytes(b"test")
+    # What the model could not follow is evidence to review; a context where it
+    # saw nothing at all is nobody (test_target_crossing.py), not evidence.
     empty = check_target_tracks([(0, []), (600, []), (1200, [])], [(160, 0), (160, 240)],
-                                frame_size=(320, 240))
-    assert empty.state == "unverified"  # No detections is not proof that a rider crossed.
+                                frame_size=(320, 240), seen=[1, 0, 0])
+    assert empty.state == "unverified"  # Cut by the crop edge: not nothing.
     monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
         c.key: empty for c in crossings
     })
@@ -1120,3 +1122,56 @@ def test_a_recording_without_a_line_names_its_hours_and_the_fix():
     assert item.evidence["ranges"] == [[START, START + 120_000], [START + 301_000, START + 360_000]]
     assert item.detail.startswith("录像 10:00:00–10:02:00、10:05:01–10:06:00 没有终点线")
     assert "未检测，不能算核清" in item.detail and "「终点线 / 模型」" in item.detail
+
+
+@pytest.mark.parametrize("edge_box,state,reason", [
+    (False, "not_crossed", "no_target"),
+    (True, "unverified", "insufficient_track"),
+])
+def test_crossing_gate_calls_an_empty_line_nobody_but_keeps_anything_it_saw(
+        tmp_path, monkeypatch, edge_box, state, reason):
+    from types import SimpleNamespace
+    from realtime.problem_rules import CrossingRecord
+    from realtime.bike_check import Detection
+
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    video = tmp_path / "part0.ts"
+    video.write_bytes(b"sealed")
+    files = [problem_analysis._FileStrip(
+        tmp_path / "part0.npz", {"video_path": str(video), "session_id": "session", "line_digest": "line"},
+        0, np.arange(0, 4000, 40), SimpleNamespace(width=320, height=240))]
+    crossing = CrossingRecord(1, "session", "segment", str(video), 1960, 49, 1960, 0, 0, 1,
+                              contact=(110, 100), segment_points=((0, 100), (300, 100)))
+
+    class Reader:
+        def __init__(self, path, threads):
+            self.path = path
+
+        def frames_at(self, positions):
+            return [(np.zeros((240, 320, 3), np.uint8), positions[0])]
+
+        def close(self):
+            pass
+
+    class Detector:
+        def __init__(self, *args):
+            self.i = 0
+
+        def detect(self, frame):
+            self.i += 1
+            # Touching the crop edge: dropped before tracking, but the model did see it.
+            return [Detection(0, .91, 0, 40, 30, 60)] if edge_box and self.i == 2 else []
+
+    monkeypatch.setattr(problem_analysis, "FrameReader", Reader)
+    monkeypatch.setattr(problem_analysis, "YoloxDetector", Detector)
+    runtime = problem_analysis._VerificationRuntime()
+    config = AnalysisConfig(tmp_path, model_path=model)
+    try:
+        for _ in range(2):  # the second pass reads the decoded detections back from the runtime
+            checks = problem_analysis._verify_crossing_candidates(
+                config, 1, files, [crossing], progress=lambda *a: None, checkpoint=None, runtime=runtime)
+            assert (checks[crossing.key].state, checks[crossing.key].reason) == (state, reason)
+            assert not problem_analysis._unchecked_line_items([crossing], checks, 1) or state == "unverified"
+    finally:
+        runtime.close()

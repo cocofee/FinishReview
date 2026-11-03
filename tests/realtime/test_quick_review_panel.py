@@ -1765,3 +1765,27 @@ def test_four_takes_the_pairing_back_for_good_and_leaves_the_wave_to_hand(wave_p
     wave_panel._render()
     assert wave_panel._auto_labels == {}  # not paired again on the next redraw
     assert not any(entry.decision for entry in wave_panel._arrival_rows)
+
+
+def test_calibration_is_a_front_button_that_turns_red_until_the_recording_is_calibrated(panel, tmp_path):
+    from realtime.passage_evidence import VideoClockCalibrationStore
+
+    spy = QSignalSpy(panel.calibration_requested)
+    button = panel.calibrate_button
+    # The first button on the judging toolbar (after the status text), not hidden under the picture.
+    bar = panel.quick_toolbar.layout().itemAt(0).layout()
+    assert bar.indexOf(button) == bar.indexOf(panel.status_widget) + 1
+    assert bar.indexOf(button) < bar.indexOf(panel.row_action_buttons[Qt.Key_1])
+    panel.refresh_calibration_state()
+    assert button.text() == "先校时" and "c2410c" in button.styleSheet()
+    assert "没校时" in button.toolTip()
+    QTest.mouseClick(button, Qt.LeftButton)
+    assert len(spy) == 1
+
+    VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl").record(
+        camera_index=1, session_key="camera_01|camera_01_20261103_125112_396991", offset_ms=3248,
+        anchor_event_id="one", anchor_bib="321", calibrated_at_ms=1)
+    panel.refresh_calibration_state()
+    assert button.text() == "已校时" and "c2410c" not in button.styleSheet()
+    QTest.mouseClick(button, Qt.LeftButton)  # still there to redo it
+    assert len(spy) == 2
