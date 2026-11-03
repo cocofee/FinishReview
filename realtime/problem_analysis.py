@@ -44,9 +44,7 @@ from .batch_review import (BATCH_IDENTITY_FILENAME, aggregate_batches, identity_
 from .bike_check import (
     DECISION_DISPUTED,
     DECISION_KEEP,
-    LABEL_TEXT,
     LABEL_PEDESTRIAN,
-    LABEL_UNCHECKED,
     LABEL_VEHICLE,
     BikeVerdict,
     CropPlan,
@@ -100,6 +98,7 @@ from .problem_items import (
 )
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
+from .target_sport import CYCLING, DEFAULT_SPORT, POLICY_VERSION, normalize_sport, policy_for
 
 
 logger = logging.getLogger("FinishReview.ProblemAnalysis")
@@ -118,6 +117,7 @@ class AnalysisConfig:
     decode_threads: int = DEFAULT_DECODE_THREADS
     model_path: Optional[Path] = None
     model_input: int = 640
+    target_sport: str = DEFAULT_SPORT
     crop_modes: Mapping[int, str] = field(default_factory=dict)
     race_id: str = ""
     stage_id: str = ""
@@ -133,7 +133,6 @@ class AnalysisConfig:
 
     def resolved_output(self) -> Path:
         return Path(self.output_dir) if self.output_dir else Path(self.workspace) / OUTPUT_DIRNAME
-
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -522,14 +521,17 @@ def _chip_locator(files: list[_FileStrip], version: int):
     return locate
 
 
-def bike_cache_key(model_key, plan, crossing):
+def bike_cache_key(model_key, plan, crossing, target_sport: str = DEFAULT_SPORT):
     try:
         stat = Path(crossing.video_path).stat()
         video_stamp = [stat.st_size, stat.st_mtime_ns]
     except OSError:
         video_stamp = None
     geometry = hashlib.sha256(json.dumps([crossing.segment_points, video_stamp], sort_keys=True).encode()).hexdigest()
-    return f"{model_key}|{plan.mode}|{plan.offsets_ms}|{crossing.key}|{geometry}"
+    # A verdict produced under one sport policy must never be reused by the
+    # other: the same box is a target for running and a non-target for cycling.
+    return (f"{normalize_sport(target_sport)}|{POLICY_VERSION}|{model_key}|"
+            f"{plan.mode}|{plan.offsets_ms}|{crossing.key}|{geometry}")
 
 
 def _bike_verdicts(
@@ -543,6 +545,7 @@ def _bike_verdicts(
 ) -> dict[str, BikeVerdict]:
     if not config.model_path:
         return {}
+    policy = policy_for(config.target_sport)
     cache_path = config.resolved_output() / f"bike_camera{camera}.json"
     model_key = model_fingerprint(config.model_path, config.model_input)
     cache: dict = {}
@@ -561,7 +564,7 @@ def _bike_verdicts(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         for index, crossing in enumerate(ordered):
-            key = bike_cache_key(model_key, plan, crossing)
+            key = bike_cache_key(model_key, plan, crossing, config.target_sport)
             # Legacy filename-only caches are intentionally not trusted.
             entry = cache.get(key)
             if entry is not None:
@@ -569,8 +572,11 @@ def _bike_verdicts(
                     name: tuple(value) if name == "details" else value
                     for name, value in entry.items()
                 })
-                if verdict.label in (LABEL_PEDESTRIAN, LABEL_VEHICLE) and verdict.details:
-                    # Re-decide from the cached per-frame scores (rules may change).
+                if (not policy.is_target(verdict.label)
+                        and verdict.label in (LABEL_PEDESTRIAN, LABEL_VEHICLE)
+                        and verdict.details):
+                    # Re-decide a cached non-target from its per-frame scores
+                    # (rules may change).  A running target stays as cached.
                     verdict = decide_verdict(
                         verdict.label, verdict.score, verdict.details,
                         edge_cut=bool(entry.get("edge_cut", "人被画面边缘切掉" in verdict.reason)),
@@ -580,7 +586,7 @@ def _bike_verdicts(
                 continue
             if detector is None:
                 detector = YoloxDetector(config.model_path, config.model_input)
-            progress("认车", index, len(crossings))
+            progress(policy.check_name, index, len(crossings))
             if reader is None or str(reader.path) != str(Path(crossing.video_path)):
                 if reader is not None:
                     reader.close()
@@ -593,6 +599,7 @@ def _bike_verdicts(
             verdict = classify_frames(
                 detector, frames, crossing.segment_points, plan,
                 crowded=crowded(crossing.recorder_ms),
+                target_label=policy.target_label,
             )
             verdicts[crossing.key] = verdict
             cache[key] = {
@@ -645,6 +652,7 @@ def _verification_sources(files, crossing):
 
 def _verify_crossing_candidates(config, camera, files, crossings, *, progress, checkpoint, runtime=None):
     """Run the target gate only in short windows triggered by line changes."""
+    policy = policy_for(config.target_sport)
     cache_path = config.resolved_output() / f"target_crossings_camera{camera}.json"
     try:
         cache = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -673,7 +681,9 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
                 stamp = None
             signature.append([str(path), position, stamp, item.meta.get("geometry_digest"),
                               item.meta.get("line_digest"), item.meta.get("excluded_ranges", [])])
-        key = hashlib.sha256(json.dumps([VERIFICATION_VERSION, model_key, crossing.key, crossing.segment_points,
+        key = hashlib.sha256(json.dumps([VERIFICATION_VERSION, POLICY_VERSION,
+                                        policy.name, policy.verification_preference,
+                                        model_key, crossing.key, crossing.segment_points,
                                         signature], sort_keys=True).encode()).hexdigest()
         saved = cache.get(key)
         if saved is not None:
@@ -727,7 +737,8 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
                     runtime.detections[detection_key] = observations[-1]
                     while len(runtime.detections) > 256:
                         runtime.detections.popitem(last=False)
-            check = check_target_tracks(observations, crossing.segment_points, frame_size=(width, height))
+            check = check_target_tracks(observations, crossing.segment_points, frame_size=(width, height),
+                                        preferred_label=policy.verification_preference)
         except Exception as error:
             logger.warning("crossing verification unavailable for %s: %s", crossing.key, error)
             check = TargetCrossingCheck("unverified", "model_failed")
@@ -794,6 +805,7 @@ def _uncalibrated_video_items(
     these candidates in recorder time and mark pairing as pending.
     """
 
+    policy = policy_for(config.target_sport)
     candidates = list(crossings)
 
     def crowded(recorder_ms: int) -> bool:
@@ -814,10 +826,12 @@ def _uncalibrated_video_items(
             "segment_points": [list(point) for point in crossing.segment_points],
             "recorder_ms": int(crossing.recorder_ms),
             "row": int(crossing.row),
+            "target_sport": policy.name,
             "calibration_pending": True,
         }
         if verdict is not None:
-            detail += f"；模型判断 {LABEL_TEXT.get(verdict.label, verdict.label)} ({float(verdict.score):.2f})"
+            detail += (f"；模型判断 {policy.label_text(verdict.label)} "
+                       f"({float(verdict.score):.2f})")
             if verdict.vehicle:
                 detail += f"（{verdict.vehicle}）"
             if verdict.decision == DECISION_DISPUTED:
@@ -984,6 +998,7 @@ def analyse_camera(
     """
 
     output_dir = config.resolved_output()
+    policy = policy_for(config.target_sport)
     reads = workspace.reads if reads is None else reads
     files = _load_file_strips(strip_paths, runtime)
     detection_started = time.perf_counter()
@@ -1001,27 +1016,20 @@ def analyse_camera(
         crossing_checks = _verify_crossing_candidates(
             config, camera, files, line_candidates, progress=progress, checkpoint=checkpoint, runtime=runtime,
         )
-        # A line change the tracker cannot follow (bunch, shadow, occlusion) is
-        # still evidence that somebody crossed.  Dropping those candidates made
-        # the whole main bunch unpaired and left hundreds of "line activity"
-        # rows with no answer; only a clearly absent target is discarded.
-        crossings = [c for c in line_candidates
-                     if crossing_checks[c.key].state != "not_crossed"
-                     and crossing_checks[c.key].reason != "model_failed"]
+        # Pixel changes without a verified target trajectory are not crossings.
+        # Keep ambiguous/occluded candidates separately as line_activity evidence;
+        # they must not calibrate the clock, absorb chips or create arrival times.
+        crossings = [c for c in line_candidates if crossing_checks[c.key].state == "confirmed"]
         verified_verdicts = {}
         periods = merge_obstructions(obstructions)
         for crossing in crossings:
             check = crossing_checks[crossing.key]
             crowded = crossing.in_obstruction or any(a - 5_000 <= crossing.recorder_ms <= b + 5_000 for a, b in periods)
-            if check.state == "confirmed":
-                reason = ("遮挡时段，目标跨线已验证，仍需人工确认" if crowded
-                          else "目标轨迹跨线已验证；不自动判定选手身份")
-                decision = DECISION_DISPUTED if crowded or check.label != "bicycle" else DECISION_KEEP
-            else:
-                reason = "目标轨迹不足，按芯片时间参与配对，仍需人工确认"
-                decision = DECISION_DISPUTED
+            reason = ("遮挡时段，目标跨线已验证，仍需人工确认" if crowded
+                      else "目标轨迹跨线已验证；不自动判定选手身份")
+            decision = DECISION_DISPUTED if crowded or not policy.is_target(check.label) else DECISION_KEEP
             verified_verdicts[crossing.key] = BikeVerdict(
-                check.label if check.state == "confirmed" else LABEL_UNCHECKED,
+                check.label,
                 check.score, decision, reason,
                 len(check.observed_ms), vehicle=check.vehicle,
             )
@@ -1031,24 +1039,23 @@ def analyse_camera(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"crossings_camera{camera}.json").write_text(json.dumps(
         {"schema_version": 1, "camera_index": camera,
-         # Group counting needs every line change the camera saw; an
-         # "unverified" track is still a person-sized crossing.  Only a target
-         # the model positively ruled out is dropped from this list.
+         "target_sport": policy.name,
+         # Raw changes remain in line_events; automatic counting uses only
+         # verified crossings when a target model is configured.
          "crossings": [entry for entry in raw if not crossing_checks
-                       or (entry["crossing_check"]["state"] != "not_crossed"
-                           and entry["crossing_check"].get("reason") != "model_failed")],
+                       or entry["crossing_check"]["state"] == "confirmed"],
          "line_events": raw,
          "coverage": [list(item) for item in coverage],
          "obstructions": [[item.start_ms, item.end_ms] for item in obstructions]},
         ensure_ascii=False,
     ), encoding="utf-8")
 
-    # A confirmed non-bicycle target (pedestrian, vehicle) must never absorb a
-    # chip.  An unverified candidate, on the other hand, is exactly the rider
-    # the model lost track of, so it stays eligible for time pairing.
+    # A confirmed non-target (pedestrian, bicycle, or vehicle, depending on the
+    # selected sport) must never absorb a chip. Unverified line changes have
+    # already been separated from crossings.
     pairing_crossings = [c for c in crossings if verified_verdicts is None
                          or crossing_checks[c.key].state != "confirmed"
-                         or verified_verdicts[c.key].label == "bicycle"]
+                         or policy.is_target(verified_verdicts[c.key].label)]
     calibration = calibrate_evidence_clock(
         [ClockCrossing(item.recorder_ms, item.session_id) for item in pairing_crossings],
         reads,
@@ -1064,6 +1071,8 @@ def analyse_camera(
     warnings = [*calibration.warnings, *choice.warnings]
     result: dict = {
         "camera_index": camera,
+        "target_sport": policy.name,
+        "target_policy": policy.payload(),
         "stage_seconds": {"line_detection": round(detection_seconds, 3),
                           "crossing_verification": round(time.perf_counter() - verification_started, 3)},
         "files": len(files),
@@ -1081,7 +1090,9 @@ def analyse_camera(
         "items": [],
         "auto_passed": [],
         "bike_status": {"state": "not_configured" if not config.model_path else "waiting_calibration",
-                        "message": "认车未配置，降噪未启用" if not config.model_path else "认车等待校时及候选",
+                        "message": (f"{policy.check_name}未配置，降噪未启用" if not config.model_path
+                                    else f"{policy.check_name}等待校时及候选"),
+                        "target_sport": policy.name,
                         "crop_mode": config.crop_modes.get(camera, "up")},
     }
     if any(check.reason == "model_failed" for check in crossing_checks.values()):
@@ -1139,11 +1150,10 @@ def analyse_camera(
                 )
                 result["bike_status"].update(
                     state="failed",
-                    message=f"认车加载/推理失败，候选保留：{error}",
+                    message=f"{policy.check_name}加载/推理失败，候选保留：{error}",
                 )
-            # Candidates already rendered from ``crossings`` must not appear
-            # again as a second "line activity" row; only a candidate excluded
-            # from pairing (e.g. the model failed on it) remains here.
+            # Confirmed crossings and unverified line evidence are disjoint;
+            # keeping the latter never claims that somebody crossed.
             paired_keys = {item.key for item in crossings}
             result["items"] = video_items + _unchecked_line_items(
                 [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera,
@@ -1157,7 +1167,7 @@ def analyse_camera(
                 result["bike_status"].update(
                     state="enabled" if verdicts else "waiting_crossing" if line_candidates else "no_candidates",
                     message=(
-                        "认车已运行；等待第一名校时后进行芯片配对"
+                        f"{policy.check_name}已运行；等待第一名校时后进行芯片配对"
                         if verdicts else "尚无确认穿越的目标；线变化与遮挡不计过线"
                     ),
                     model_digest=model_fingerprint(config.model_path, config.model_input),
@@ -1249,7 +1259,7 @@ def analyse_camera(
             # ``pairing.video_only``; adding them again would double-count.
             video_only += [c for c in crossings if c.session_id == session
                            and crossing_checks[c.key].state == "confirmed"
-                           and verified_verdicts[c.key].label != "bicycle"]
+                           and not policy.is_target(verified_verdicts[c.key].label)]
         chip_only += pairing.chip_only
     uncalibrated_sessions = sorted({
         name for _start, _end, name in coverage
@@ -1344,24 +1354,31 @@ def analyse_camera(
         )
         if config.model_path and result["bike_status"]["state"] != "failed":
             result["bike_status"].update(state="enabled" if to_check else "no_candidates",
-                                         message="认车已启用（含有效缓存）" if to_check else "已配置；本轮无待认车候选",
+                                         message=(f"{policy.check_name}已启用（含有效缓存）" if to_check
+                                                  else f"已配置；本轮无待{policy.check_name}候选"),
                                          model_digest=model_fingerprint(config.model_path, config.model_input))
     except Exception as error:  # A model/candidate failure must never erase the unclassified crossings.
         logger.warning("bike check unavailable: %s", error)
         verdicts = {}
-        result["bike_status"].update(state="failed", message=f"认车加载/推理失败，候选保留：{error}")
+        result["bike_status"].update(state="failed", message=f"{policy.check_name}加载/推理失败，候选保留：{error}")
     if config.check_paired_bikes and verdicts:
         labels = [verdicts[item[0].key].label for item in matched if item[0].key in verdicts]
-        result["paired_bicycle_share"] = round(sum(label == "bicycle" for label in labels) / max(1, len(labels)), 4)
-        result["paired_not_bicycle"] = [
+        share = round(sum(policy.is_target(label) for label in labels) / max(1, len(labels)), 4)
+        not_target = [
             (item[1].bib, format_chip_time(item[1].chip_ms), verdicts[item[0].key].label)
-            for item in matched if item[0].key in verdicts and verdicts[item[0].key].label != "bicycle"
+            for item in matched if item[0].key in verdicts and not policy.is_target(verdicts[item[0].key].label)
         ]
+        result["paired_target_share"] = share
+        result["paired_not_target"] = not_target
+        if policy.name == CYCLING:
+            # Keep the historical cycling output names for existing readers.
+            result["paired_bicycle_share"] = share
+            result["paired_not_bicycle"] = not_target
     outcome = build_video_items(
         camera_index=camera, model=model, matched=matched, video_only=video_only,
         chip_only=chip_only, no_video=no_video, obstructions=obstructions, verdicts=verdicts,
         manual_entries=manual_entries, chip_locator=_chip_locator(files, model.version),
-        expected_ms=expected_ms,
+        expected_ms=expected_ms, target_sport=policy.name,
         race_start_ms=(
             model.to_recorder(min(read.chip_ms for read in pairing_reads)) - PRE_RACE_MARGIN_MS
             if pairing_reads else None
@@ -1372,16 +1389,19 @@ def analyse_camera(
     result["fragments"] = outcome.fragments
     result["near_crossings"] = outcome.near_crossings
     result["matched"] = [[read.bib, read.chip_ms, round(residual, 1)] for _crossing, read, residual in matched]
-    # Once calibrated, an unverified crossing is paired or listed as a
-    # video-only rider; only a candidate excluded from pairing (model failure)
-    # still needs its own "line changed, not verified" row.
+    # Unverified line evidence stays available for manual review, but never
+    # participates in pairing or becomes a video-only rider.
     paired_keys = {item.key for item in crossings}
     result["items"] = list(outcome.items) + _unchecked_line_items(
         [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera, model,
     )
     result["auto_passed"] = outcome.auto_passed
     recognition = result["bike_status"]
-    evidence_signature = hashlib.sha256(json.dumps([line_signature, recognition], sort_keys=True).encode()).hexdigest()
+    # Sport policy is part of the evidence identity: an old conclusion made
+    # under cycling must never be accepted after switching to running.
+    evidence_signature = hashlib.sha256(json.dumps(
+        [line_signature, recognition, policy.payload()], sort_keys=True,
+    ).encode()).hexdigest()
     by_segment = {item.meta.get("segment_id"): dict(item.meta, geometry_path=str(item.path.parent / item.meta["geometry_file"])
                                                   if item.meta.get("geometry_file") else "") for item in files}
 
@@ -1392,6 +1412,11 @@ def analyse_camera(
                     geometry_path=meta.get("geometry_path", ""),
                     snap_offset_px=meta.get("snap_offset_px", 0))
 
+    for item in result["items"]:
+        frame = item.evidence.get("frame") or {}
+        key = f"{camera}|{frame.get('video_path')}|{frame.get('frame_index')}|{item.evidence.get('row')}"
+        if key in crossing_checks:
+            item.evidence["crossing_check"] = asdict(crossing_checks[key])
     result["items"] = [replace(item, evidence=dict(item.evidence, analysis_signature=evidence_signature,
                         **({"frame": evidence_frame(item.evidence["frame"])} if item.evidence.get("frame") else {})))
                        for item in result["items"]]
@@ -1462,7 +1487,8 @@ ANALYSIS_CONFIG_FILENAME = "analysis_config.json"
 def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
     """Settings for a GUI-started run: ``finish_problems/analysis_config.json``.
 
-    Keys (all optional): ``model_path``, ``model_input``, ``crop_modes``
+    Keys (all optional): ``model_path``, ``model_input``, ``target_sport``
+    (``cycling`` default or ``running``), ``crop_modes``
     (camera -> mode), ``finish_lines`` (list like ``finish_lines.json``),
     ``cameras``, ``min_available_mb`` (default 1536 MB). Results go to
     ``finish_problems/``; calibration versions to
@@ -1480,6 +1506,7 @@ def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
         cameras=tuple(int(value) for value in settings.get("cameras", ())),
         model_path=resolved_model_path(root, settings),
         model_input=int(settings.get("model_input", 640)),
+        target_sport=normalize_sport(settings.get("target_sport")),
         crop_modes={int(key): str(value) for key, value in (settings.get("crop_modes") or {}).items()},
         clock_model_path=root / CLOCK_MODEL_FILENAME,
         min_available_mb=int(settings.get("min_available_mb", MIN_AVAILABLE_MEMORY_MB)),
@@ -1843,6 +1870,7 @@ def write_problem_list(
         "race_id": workspace.race_id,
         "stage_id": workspace.stage_id,
         "race_date": workspace.race_date,
+        "target_sport": normalize_sport(config.target_sport),
         "cameras": cameras,
         "summary": dict(summarize_items(items, auto_passed, unverifiable),
                         candidates_closed=len(closed_candidates)),

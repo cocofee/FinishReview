@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+from dataclasses import replace
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable
@@ -43,6 +44,7 @@ from realtime.stream_recorder import (
     sanitize_recording_message,
     split_rtsp_credentials,
 )
+from realtime.target_sport import SPORTS, normalize_sport
 
 
 logger = logging.getLogger("FinishReview.Entry")
@@ -80,6 +82,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analyze-problems", metavar="EVENT_DIR", help=argparse.SUPPRESS)
     parser.add_argument("--live-problems", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--finish-live-problems", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--target-sport", choices=SPORTS,
+                        help="离线问题分析的目标运动：cycling（默认）或 running；覆盖本次赛事配置")
     parser.add_argument("--check-live-chips", metavar="EVENT_DIR", help=argparse.SUPPRESS)
     parser.add_argument("--chip-race-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--chip-stage-id", default="", help=argparse.SUPPRESS)
@@ -87,11 +91,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: bool = False) -> int:
+def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: bool = False,
+                         target_sport: str | None = None) -> int:
     """Headless offline problem-list run, started by the console in its own process."""
 
     import json as _json
 
+    from realtime.analysis_settings import settings_token
     from realtime.problem_analysis import config_from_workspace, run_offline_analysis
 
     def emit(payload: dict) -> None:
@@ -109,6 +115,13 @@ def run_problem_analysis(event_dir: str, *, live: bool = False, finish_live: boo
         emit({"stage": stage, "done": done, "total": total})
 
     config = config_from_workspace(event_dir)
+    if target_sport:
+        sport = normalize_sport(target_sport)
+        config = replace(
+            config,
+            target_sport=sport,
+            settings_token=settings_token(Path(event_dir), sport),
+        )
     if live or finish_live:
         config.live = True
     if finish_live:
@@ -679,7 +692,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if getattr(args, "analyze_problems", None):
         return run_problem_analysis(args.analyze_problems, live=args.live_problems,
-                                    finish_live=args.finish_live_problems)
+                                    finish_live=args.finish_live_problems,
+                                    target_sport=getattr(args, "target_sport", None))
     source_override = requested_source(args, parser)
     runtime_root = application_dir(module_file=__file__)
     requested_output_dir = (

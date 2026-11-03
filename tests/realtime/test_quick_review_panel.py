@@ -7,7 +7,8 @@ from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication, QLabel
 
 from realtime.problem_items import (
-    CATEGORY_VIDEO, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem,
+    CATEGORY_VIDEO, KIND_LINE_ACTIVITY, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING,
+    STATUS_WAITING, ProblemItem,
 )
 from realtime.quick_review_panel import QuickReviewPanel
 from realtime.chip_history import format_chip_time
@@ -71,6 +72,136 @@ def test_one_table_no_model_descriptions_and_one_is_not_counter(panel):
     assert "这个键不用了" in panel.hint.text()
     for i in range(panel.table.rowCount()):
         assert "自行车" not in " ".join(panel.table.item(i, j).text() for j in range(4))
+
+
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("kind", [KIND_NO_CHIP_CROSSING, "line_activity", "obstruction", "standing"])
+@pytest.mark.parametrize("check", [None, {"state": "unverified", "reason": "insufficient_track"},
+                                   {"state": "unverified", "reason": "missing_context"},
+                                   {"state": "unverified", "reason": "model_failed"}])
+def test_unverified_video_never_becomes_an_arrival_even_from_old_cache(panel, kind, check, stale):
+    evidence = {"frame": dict(FRAME), "recorder_ms": FRAME["recorder_ms"], "configuration_stale": stale}
+    if check is not None:
+        evidence["crossing_check"] = check
+    item = ProblemItem("empty-line", kind, CATEGORY_VIDEO, "画面变化，未确认穿越", evidence=evidence)
+    panel.events = []
+    panel.items = [item]
+    panel._render()
+    assert panel.table.rowCount() == 0
+    assert "到达 0" in panel.quick_title.text()
+    assert "待核画面 1" in panel.quick_title.text()
+    assert "尚未确认目标穿越" in panel.queue_text() and "漏读" not in panel.queue_text()
+    assert panel.items == [item]  # No deletion or rewrite of evidence.
+
+    panel.attention_button.setChecked(True)
+    panel.show_unverified_action.setChecked(True)
+    assert not panel.table.isRowHidden(0)
+    assert panel.table.rowCount() == 1
+    assert panel.table.item(0, 2).text() == "—"
+    assert panel.table.item(0, 3).text() == "画面待核"
+    assert "到达 0" in panel.quick_title.text()
+    assert not panel._auto_labels
+    assert panel._arrival_exports() == ([], [], 0)
+    panel.show_unverified_action.setChecked(False)
+    assert panel.table.rowCount() == 0
+
+
+def test_unverified_line_changes_are_one_display_group_but_keep_all_source_items(panel):
+    items = []
+    for index, offset in enumerate((0, 600, 1_800)):
+        frame = dict(FRAME, frame_index=5 + index, position_ms=250 + offset,
+                     recorder_ms=FRAME["recorder_ms"] + offset)
+        items.append(ProblemItem(f"empty-{index}", KIND_LINE_ACTIVITY, CATEGORY_VIDEO,
+                                 "终点线发生变化，但没有确认目标穿越",
+                                 evidence={"frame": frame, "recorder_ms": frame["recorder_ms"],
+                                           "crossing_check": {"state": "unverified",
+                                                               "reason": "insufficient_track"}}))
+    panel.events = []
+    panel.items = items
+    panel._render()
+    assert panel.table.rowCount() == 0
+    assert "待核画面 1" in panel.quick_title.text()
+    assert "3 段" in panel.show_unverified_action.text()
+
+    panel.show_unverified_action.setChecked(True)
+    assert panel.table.rowCount() == 1
+    pending = panel._arrival_rows[0]
+    assert len(pending.fragments) == 2
+    assert menu_labels(panel, 0) == ["不是运动员"]
+    assert panel.table.item(0, 3).text() == "画面待核·3段"
+    assert panel.items == items
+
+
+def test_unverified_line_change_can_be_excluded_with_one_and_undone_with_four(panel):
+    frame = dict(FRAME, recorder_ms=FRAME["recorder_ms"] + 2_000)
+    item = ProblemItem("empty-one", KIND_LINE_ACTIVITY, CATEGORY_VIDEO,
+                       "终点线发生变化，但没有确认目标穿越",
+                       evidence={"frame": frame, "recorder_ms": frame["recorder_ms"],
+                                 "crossing_check": {"state": "unverified",
+                                                     "reason": "insufficient_track"}})
+    panel.events = []
+    panel.items = [item]
+    panel._render()
+    panel.show_unverified_action.setChecked(True)
+    panel.table.setFocus()
+    QTest.keyClick(panel.table, Qt.Key_1)
+    assert panel._arrival_store.latest(SCOPE, "candidate:" + item.item_id)["action"] == "not_rider"
+    assert panel.table.item(0, 3).text() == "已排除"
+    QTest.keyClick(panel.table, Qt.Key_4)
+    assert panel._arrival_store.latest(SCOPE, "candidate:" + item.item_id) is None
+    assert panel.table.item(0, 3).text() == "画面待核"
+
+
+def test_waiting_unverified_picture_can_still_be_excluded_with_one(panel):
+    item = ProblemItem(
+        "waiting-empty", KIND_LINE_ACTIVITY, CATEGORY_VIDEO,
+        "画面变化，未确认穿越", status=STATUS_WAITING,
+        evidence={"frame": dict(FRAME), "crossing_check": {"state": "unverified"}},
+    )
+    panel.events = []
+    panel.items = [item]
+    panel._render()
+    panel.show_unverified_action.setChecked(True)
+    assert "待核画面 1" in panel.queue_text()
+    panel.table.setFocus()
+    QTest.keyClick(panel.table, Qt.Key_1)
+    assert panel._arrival_store.latest(SCOPE, "candidate:" + item.item_id)["action"] == "not_rider"
+    assert panel.table.item(0, 3).text() == "已排除"
+
+
+def test_verified_crossing_and_manual_count_still_appear_without_chips(panel):
+    panel.events = []
+    evidence = {"frame": dict(FRAME), "recorder_ms": FRAME["recorder_ms"],
+                "crossing_check": {"state": "confirmed", "reason": "anchor_crossed_line"}}
+    item = ProblemItem("verified", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "", evidence=evidence)
+    panel.items = [item]
+    panel._render()
+    assert panel.table.rowCount() == 1 and "到达 1" in panel.quick_title.text()
+    assert panel.table.item(0, 2).text() == format_chip_time(FRAME["recorder_ms"])
+
+    evidence["crossing_check"] = {"state": "unverified", "reason": "insufficient_track"}
+    panel._render()
+    assert panel.table.rowCount() == 0
+    panel._marks[item.item_id] = [dict(x=.5, y=.5, recorder_ms=FRAME["recorder_ms"], frame=dict(FRAME))]
+    panel._render()
+    assert panel.table.rowCount() == 1 and "到达 1" in panel.quick_title.text()
+
+
+def test_first_lap_chip_reads_are_visible_before_anyone_reaches_five_laps(panel):
+    from realtime.race_metadata import RaceGroupMetadata, RaceMetadata
+
+    metadata = RaceMetadata(race_id=SCOPE[0], stage_id=SCOPE[1], revision=1, emitted_at_ms=0,
+                            groups=(RaceGroupMetadata("g", "女子A组", 5),))
+    panel.set_metadata_provider(lambda: metadata)
+    panel.items = []
+    panel.events = [replace(event(str(i), f"lap1-{i}", FRAME["recorder_ms"] + i * 1000), lap=1)
+                    for i in range(1, 16)]
+    panel._render()
+    assert panel.table.rowCount() == 15
+    assert not panel.table.isColumnHidden(5)
+    assert {panel.table.item(i, 5).text() for i in range(15)} == {"1/5"}
+    assert "到达 15" in panel.quick_title.text()
+    assert "不列" not in panel.quick_title.toolTip()
 
 
 def test_finish_line_has_one_visible_entry(panel):
@@ -978,7 +1109,8 @@ def fragment_panel(qapp, tmp_path):
                          chip_time_ms=T0 + offset,
                          evidence={"frame": dict(FRAME, recorder_ms=T0 + offset, position_ms=250 + offset,
                                                  frame_index=5 + offset // 50),
-                                   "recorder_ms": T0 + offset}).to_payload()
+                                   "recorder_ms": T0 + offset,
+                                   "crossing_check": {"state": "confirmed", "reason": "anchor_crossed_line"}}).to_payload()
              for offset in PIECES]
     (directory / "problem_list.json").write_text(json.dumps({"race_id": SCOPE[0], "stage_id": SCOPE[1],
                                                             "items": items}), encoding="utf-8")
@@ -1484,8 +1616,8 @@ def three_laps(panel):
     panel.set_metadata_provider(lambda: metadata)
 
 
-def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel):
-    """Multi-lap review: a rider's laps before the last are not rows (only the last lap is judged)."""
+def test_every_lap_is_listed_with_k_of_n_beside_its_chip(wave_panel):
+    """Each passage remains a row; target laps are display metadata only."""
     from dataclasses import replace as _replace
     three_laps(wave_panel)
     wave_panel.events = [
@@ -1497,12 +1629,14 @@ def test_intermediate_laps_are_not_listed_and_the_title_says_how_many(wave_panel
     wave_panel._quick_render_signature = None
     wave_panel._render()
     bibs = [wave_panel.table.item(index, 1).text() for index in range(wave_panel.table.rowCount())]
-    assert bibs.count("16") == 1
-    assert "中间圈 2 条不列" in wave_panel.quick_title.toolTip()
+    assert bibs == ["16", "16", "16", "5"]
+    assert [wave_panel.table.item(i, 5).text() for i in range(4)] == ["1/3", "2/3", "3/3", ""]
+    assert "到达 4" in wave_panel.quick_title.text()
+    assert "不列" not in wave_panel.quick_title.toolTip()
 
 
-def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(wave_panel):
-    """16 passes on lap 2 of 3 inside the bunch finishing: the wave is the finishers' chips only."""
+def test_all_laps_join_the_same_arrival_wave_by_chip_time(wave_panel):
+    """A lap-2 rider alongside lap-3 riders is still a visible, countable passage."""
     from dataclasses import replace as _replace
     three_laps(wave_panel)
     wave_panel.events = [
@@ -1513,7 +1647,7 @@ def test_an_intermediate_lap_does_not_join_the_wave_of_others_on_their_last_lap(
     wave_panel._quick_render_signature = None
     wave_panel._render()
     waves = [[row.bib for row in wave] for wave in wave_panel._waves]
-    assert waves == [["61", "20"]]
+    assert waves == [["61", "16", "20"]]
 
 
 def test_laps_show_as_k_of_n_and_a_rider_short_of_laps_is_only_a_hint_once_someone_finished(wave_panel):
@@ -1529,8 +1663,9 @@ def test_laps_show_as_k_of_n_and_a_rider_short_of_laps_is_only_a_hint_once_someo
     wave_panel._quick_render_signature = None
     wave_panel._render()
     assert not wave_panel.table.isColumnHidden(5)
-    row = next(i for i in range(wave_panel.table.rowCount()) if wave_panel.table.item(i, 1).text() == "61")
-    assert wave_panel.table.item(row, 5).text() == "3/3"
+    laps_shown = [wave_panel.table.item(i, 5).text() for i in range(wave_panel.table.rowCount())
+                  if wave_panel.table.item(i, 1).text() == "61"]
+    assert laps_shown == ["1/3", "2/3", "3/3"]
     assert "圈数不足 1 人" in wave_panel.quick_title.text()
     assert "16 号" in wave_panel.quick_title.toolTip()
 
@@ -1539,15 +1674,16 @@ def test_the_lap_column_stays_hidden_without_target_laps(wave_panel):
     assert wave_panel.table.isColumnHidden(5)
 
 
-def test_the_crossing_of_an_intermediate_lap_is_not_listed_with_its_bib(panel):
-    """10-30 relay: a crossing bound to a lap-1 chip showed as a 待定 row of its own once the chip was hidden."""
+def test_a_crossing_bound_to_an_intermediate_lap_keeps_its_chip_bib(panel):
+    """Do not hide either the early-lap chip or its bound crossing."""
     from dataclasses import replace as _replace
     three_laps(panel)
     panel.events = [_replace(panel.events[0], lap=1), _replace(panel.events[1], lap=3)]
     panel._quick_render_signature = None
     panel._render()
-    assert [entry.bib for entry in panel._arrival_rows] == ["258"]
-    assert "中间圈 1 条不列" in panel.quick_title.toolTip()
+    assert [entry.bib for entry in panel._arrival_rows] == ["321", "258"]
+    assert [panel.table.item(i, 5).text() for i in range(2)] == ["1/3", "3/3"]
+    assert "不列" not in panel.quick_title.toolTip()
 
 
 def test_target_laps_of_another_race_are_not_used(wave_panel):

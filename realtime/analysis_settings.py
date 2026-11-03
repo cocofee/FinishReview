@@ -9,6 +9,8 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
+from .target_sport import normalize_sport
+
 
 CONFIG_PATH = Path("finish_problems/analysis_config.json")
 CROP_MODES = ("up", "side-right", "side-left")
@@ -45,8 +47,16 @@ def resolved_model_path(root: Path, settings: dict) -> Path | None:
     return path if path.is_absolute() else Path(root) / path
 
 
-def settings_token(root: Path) -> str:
+def settings_token(root: Path, target_sport: str | None = None) -> str:
+    """Hash the sampling settings together with the effective target sport.
+
+    The sport is part of the policy that produced the result, so changing it
+    must invalidate old conclusions.  ``target_sport`` is only needed for an
+    explicit command-line override; the GUI reads it from the file.
+    """
+
     settings = read_settings(root)
+    sport = normalize_sport(target_sport if target_sport is not None else settings.get("target_sport"))
     if not settings:
         return ""
     model = resolved_model_path(root, settings)
@@ -57,7 +67,7 @@ def settings_token(root: Path) -> str:
             stamp = [str(model), stat.st_size, stat.st_mtime_ns]
         except OSError:
             stamp = [str(model), "missing"]
-    return hashlib.sha256(json.dumps([settings, stamp], sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([settings, stamp, sport], sort_keys=True).encode()).hexdigest()
 
 
 def model_fingerprint(path: Path, input_size: int) -> str:
@@ -126,8 +136,10 @@ class AnalysisSettingsStore:
         self.payload = read_settings(root)
 
     def save(self, *, race_id: str, stage_id: str, segment, line: dict,
-             model_path: str, crop_mode: str, effective_from_ms: int | None = None) -> dict:
+             model_path: str, crop_mode: str, effective_from_ms: int | None = None,
+             target_sport: str | None = None) -> dict:
         points = normalized_points(line)
+        sport = normalize_sport(target_sport) if target_sport is not None else None
         # An empty race_id is the pre-race case: the line is tied to the
         # recording session now and picks up the race scope when it arrives.
         if not segment.session_id or crop_mode not in CROP_MODES:
@@ -162,6 +174,10 @@ class AnalysisSettingsStore:
                              points=points, snap=bool(line.get("snap", False))))
         payload["finish_lines"] = defaults
         payload["model_path"] = model_path.strip()
+        if sport is not None:
+            # Isolated with this event workspace; an old file without the key
+            # keeps the historical cycling behaviour.
+            payload["target_sport"] = sport
         payload.setdefault("crop_modes", {})[str(segment.camera_index)] = crop_mode
         payload["settings_revision"] = int(payload.get("settings_revision", 0)) + 1
         # Existing camera filters must not silently disable a newly configured camera.

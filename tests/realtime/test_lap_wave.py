@@ -115,7 +115,7 @@ def test_two_people_closer_than_the_gap_may_have_swapped_so_none_is_labelled():
     assert any("顺序可能对错" in reason for reason in match.reasons)
 
 
-def test_a_wave_without_final_lap_chips_is_not_labelled():
+def test_a_wave_without_chip_records_is_not_labelled():
     match = match_wave(chips=[], crossings=[], clock_ok=True)
     assert match.pairs == ()
-    assert match.reasons == ("本波没有最后一圈的芯片",)
+    assert match.reasons == ("本波没有芯片记录",)

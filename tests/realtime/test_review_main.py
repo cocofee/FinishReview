@@ -77,6 +77,37 @@ def test_problem_worker_progress_is_ascii_json(monkeypatch, capsys):
     assert messages[1] == {"stage": "skipped", "message": "可用内存只有 1000 MB，少于 1536 MB"}
 
 
+def test_problem_worker_applies_an_explicit_target_sport_override(monkeypatch, tmp_path):
+    from realtime import problem_analysis
+    from realtime.problem_analysis import AnalysisConfig
+
+    captured = {}
+    monkeypatch.setattr(problem_analysis, "config_from_workspace",
+                        lambda path: AnalysisConfig(workspace=Path(path)))
+    def run(config, progress):
+        captured["sport"] = config.target_sport
+        captured["token"] = config.settings_token
+        return {"summary": {}}
+    monkeypatch.setattr(problem_analysis, "run_offline_analysis", run)
+    (tmp_path / "finish_problems").mkdir()
+    (tmp_path / "finish_problems" / "analysis_config.json").write_text(
+        json.dumps({"settings_revision": 1}), encoding="utf-8",
+    )
+
+    assert review_main.run_problem_analysis(str(tmp_path), target_sport="running") == 0
+
+    assert captured["sport"] == "running"
+    assert captured["token"]
+
+
+def test_parser_accepts_the_target_sport_for_offline_analysis():
+    parser = build_argument_parser()
+    args = parser.parse_args(["--analyze-problems", "event", "--target-sport", "running"])
+    assert args.target_sport == "running"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--target-sport", "swimming"])
+
+
 def test_main_shows_real_window_before_entering_event_loop(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     captured_windows = []

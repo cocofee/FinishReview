@@ -43,6 +43,7 @@ from .analysis_settings import read_settings, settings_token
 from .batch_review import (BATCH_IDENTITY_FILENAME, BatchDecisionStore, aggregate_batches, identity_chain,
                            previous_items, save_identity)
 from .problem_analysis import OUTPUT_DIRNAME, PROBLEM_LIST_FILENAME
+from .target_sport import normalize_sport
 from .problem_items import (
     ACTION_CHANGE,
     ACTION_CONFIRM_CROSSING,
@@ -272,7 +273,7 @@ class ProblemListPanel(QFrame):
         self.clear_data_button = QPushButton("清空数据", self.header)
         self.clear_data_button.setToolTip(
             "赛前试芯片、试画面后重新开始：删除本场的通过记录、判读和试录画面；"
-            "终点线、认车模型和摄像头设置保留"
+            "终点线、目标识别模型和摄像头设置保留"
         )
         self.clear_data_button.clicked.connect(self.clear_data_requested.emit)
         controls.addWidget(self.clear_data_button)
@@ -718,7 +719,17 @@ class ProblemListPanel(QFrame):
                 self.hint.setText(f"问题清单读取失败：{error}")
                 return
         try:
-            token = settings_token(self.workspace_dir)
+            # A headless run may intentionally use --target-sport without
+            # rewriting the workspace config. Validate that result against the
+            # effective sport recorded in its own payload, so the GUI does not
+            # discard a valid override immediately after analysis.
+            result_sport = None
+            result_path = paths[0]
+            if result_path.is_file():
+                result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(result_payload, dict) and result_payload.get("target_sport"):
+                    result_sport = normalize_sport(result_payload["target_sport"])
+            token = settings_token(self.workspace_dir, result_sport)
             enforce_settings = bool(read_settings(self.workspace_dir).get("settings_revision"))
         except (OSError, ValueError) as error:
             token, enforce_settings = "invalid", True
@@ -797,12 +808,12 @@ class ProblemListPanel(QFrame):
                       and item.category == CATEGORY_VIDEO and item.kind != KIND_MANUAL_REVIEW
                       and item.evidence.get("operator_settings_token", "") != token else item for item in self.items]
         if (self.payload or {}).get("settings_stale"):
-            self.items = [replace(item, status=STATUS_WAITING, status_note="取样线或认车配置已变更，等待重新分析。",
+            self.items = [replace(item, status=STATUS_WAITING, status_note="取样线或目标识别配置已变更，等待重新分析。",
                                   evidence=dict(item.evidence, configuration_stale=True))
                           if item.category == CATEGORY_VIDEO and item.kind != KIND_MANUAL_REVIEW else item for item in self.items]
             self.stage_health["取样"] = "配置已变更，等待重新取样"
             self.stage_health["校时"] = "配置已变更，等待重新校时"
-            self.stage_detail = "配置已变更：旧视频结论不可提交，等待重新取样、校时与认车；芯片自检继续。"
+            self.stage_detail = "配置已变更：旧视频结论不可提交，等待重新取样、校时与目标识别；芯片自检继续。"
             self._set_coverage_alert({})
         elif token != "invalid":
             cameras = (self.payload or {}).get("cameras", {})
@@ -823,7 +834,7 @@ class ProblemListPanel(QFrame):
                 if value.get("pending_segments"):
                     detail += f"；{value['pending_segments']} 个片段排队中"
                 statuses.append(f"机位 {camera}：{detail}")
-            self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；认车状态待分析。"
+            self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；目标识别状态待分析。"
         # A manual count of several people becomes one independent crossing per
         # mark. Hide its unchanged source so recognising one never settles the rest.
         split = {}
@@ -1184,7 +1195,11 @@ class ProblemListPanel(QFrame):
         detail = item.detail + (f"\n{item.status_note}" if item.status_note else "")
         bike = item.evidence.get("bike")
         if bike:
-            detail += f"\n认车：{bike.get('label')} {bike.get('score')}" + (f"（{bike['reason']}）" if bike.get("reason") else "")
+            from .target_sport import policy_for
+            policy = policy_for(item.evidence.get("target_sport"))
+            detail += (f"\n{policy.check_name}：{policy.label_text(str(bike.get('label', '')))} "
+                       f"{bike.get('score')}"
+                       + (f"（{bike['reason']}）" if bike.get("reason") else ""))
         if item.calibration_version:
             detail += f"\n校时版本 v{item.calibration_version}"
         self.detail.setText(detail)

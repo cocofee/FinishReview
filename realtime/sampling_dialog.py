@@ -18,6 +18,7 @@ from .analysis_workspace import AnalysisWorkspace
 from .chip_history import format_chip_time
 from .line_sampling import LineGeometry
 from .problem_analysis import config_from_workspace, line_for_segment
+from .target_sport import DEFAULT_SPORT, SPORT_CHOICES, policy_for
 
 
 def default_segment_index(segments, race_end_ms) -> int:
@@ -237,6 +238,18 @@ class SamplingSettingsDialog(QDialog):
                                   "只有移动相机或换机位时才需要重画；相机在片段内移动时，请选移动后的首个完整片段。")
         self.apply_scope.setWordWrap(True)
         layout.addWidget(self.apply_scope)
+        sport_row = QHBoxLayout()
+        sport_row.addWidget(QLabel("目标运动"))
+        self.sport = QComboBox()
+        for value, text in SPORT_CHOICES:
+            self.sport.addItem(text, value)
+        index = self.sport.findData(self.config.target_sport)
+        self.sport.setCurrentIndex(index if index >= 0 else 0)
+        sport_row.addWidget(self.sport, 1)
+        self.sport_help = QLabel()
+        self.sport_help.setWordWrap(True)
+        sport_row.addWidget(self.sport_help, 2)
+        layout.addLayout(sport_row)
         model_row = QHBoxLayout()
         self.model_path = QLineEdit(str(self.config.model_path or ""))
         self.model_path.setPlaceholderText("可选本机 YOLOX ONNX 模型；留空保留候选但不降噪")
@@ -256,7 +269,8 @@ class SamplingSettingsDialog(QDialog):
         layout.addWidget(self.model_status)
         self.model_path.textChanged.connect(self._model_changed)
         self.crop.currentTextChanged.connect(self._model_changed)
-        self.notice = QLabel("模型为赛事分析共用；终点线和取景方式按机位保存并作为默认沿用。不会改变录像或正式成绩。")
+        self.sport.currentIndexChanged.connect(self._sport_changed)
+        self.notice = QLabel()
         self.notice.setWordWrap(True)
         layout.addWidget(self.notice)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -264,7 +278,7 @@ class SamplingSettingsDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
         self.segment_combo.currentIndexChanged.connect(self._select)
-        self._model_changed()
+        self._sport_changed()
         if self.segments:
             self.segment_combo.setCurrentIndex(default_segment_index(self.segments, self.race_end_ms()))
             if self.worker is None:
@@ -372,14 +386,34 @@ class SamplingSettingsDialog(QDialog):
         if self._closing:
             super().reject()
 
+    def _selected_sport(self) -> str:
+        return self.sport.currentData() or DEFAULT_SPORT
+
+    def _sport_changed(self, *_args):
+        """Keep titles and model words aligned with the explicit target sport."""
+
+        if getattr(self, "probe", None) is not None:
+            self._stop_probe()
+        policy = policy_for(self._selected_sport())
+        self.setWindowTitle(policy.dialog_title)
+        self.model_path.setPlaceholderText(policy.model_placeholder)
+        self.sport_help.setText(policy.help_text)
+        self.notice.setText(policy.notice)
+        self._model_changed()
+        self._geometry_changed()
+
     def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择本机认车模型", self.model_path.text(), "ONNX (*.onnx)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择本机目标识别模型", self.model_path.text(), "ONNX (*.onnx)")
         if path:
             self.model_path.setText(path)
 
     def _model_changed(self, *_args):
-        self.model_status.setText("模型未配置：降噪未启用，候选会保留，待核可能增多。" if not self.model_path.text().strip()
-                                 else "模型已选择，尚未试运行；路径存在不代表已加载。")
+        policy = policy_for(self._selected_sport())
+        self.model_status.setText(
+            f"{policy.check_name}模型未配置：降噪未启用，候选会保留，待核可能增多。"
+            if not self.model_path.text().strip()
+            else "模型已选择，尚未试运行；路径存在不代表已加载。"
+        )
 
     def _probe(self):
         if self.probe is not None:
@@ -390,12 +424,14 @@ class SamplingSettingsDialog(QDialog):
             self.notice.setText(str(error))
             return
         segment = self.segments[self._selected]
+        policy = policy_for(self._selected_sport())
         model_text = self.model_path.text().strip()
         model = Path(model_text).expanduser() if model_text else None
         if model is not None and not model.is_absolute():
             model = self.root / model
         request = {"model_path": str(model or ""), "model_text": model_text, "input_size": self.config.model_input,
                    "crop_mode": self.crop.currentText(), "video_path": str(segment.path),
+                   "target_sport": policy.name,
                    "position_ms": self.position_ms, "points": [point[:] for point in self.view.points]}
         process = self.probe = QProcess(self)
         args = [] if getattr(sys, "frozen", False) else ["-m", "realtime.review_main"]
@@ -406,22 +442,24 @@ class SamplingSettingsDialog(QDialog):
         process.errorOccurred.connect(lambda error: self._probe_done(process, request, -1)
                                      if error == QProcess.FailedToStart else None)
         self.probe_button.setEnabled(False)
-        self.model_status.setText("低优先级进程试运行中；录像继续。")
+        self.model_status.setText(f"低优先级进程试运行{policy.check_name}中；录像继续。")
         process.start()
 
     def _probe_done(self, process, request, code):
         if process is not self.probe:
             return
         self.probe = None
+        policy = policy_for(request.get("target_sport", self._selected_sport()))
         try:
             if code:
                 raise ValueError(bytes(process.readAllStandardError()).decode("utf-8", errors="replace")[-300:] or "试运行进程失败")
             result = json.loads(bytes(process.readAllStandardOutput()).decode("utf-8"))
             if (request["model_text"] == self.model_path.text().strip() and request["crop_mode"] == self.crop.currentText()
+                    and request["target_sport"] == self._selected_sport()
                     and request["points"] == self.view.points):
                 self.model_status.setText(result["message"])
         except (ValueError, KeyError) as error:
-            self.model_status.setText(f"认车试运行失败：{error}；未排除任何候选。")
+            self.model_status.setText(f"{policy.check_name}试运行失败：{error}；未排除任何候选。")
         finally:
             process.deleteLater()
             self._geometry_changed()
@@ -455,7 +493,8 @@ class SamplingSettingsDialog(QDialog):
             self.store.save(race_id=self.source.race_id, stage_id=self.source.stage_id,
                             segment=segment, line=line,
                             effective_from_ms=self._session_start_ms(segment),
-                            model_path=self.model_path.text(), crop_mode=self.crop.currentText())
+                            model_path=self.model_path.text(), crop_mode=self.crop.currentText(),
+                            target_sport=self._selected_sport())
         except (OSError, ValueError, KeyError) as error:
             self.notice.setText(f"配置未保存：{error}")
             return

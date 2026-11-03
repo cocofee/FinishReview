@@ -96,9 +96,13 @@ def probe_model(request: dict) -> dict:
     from dataclasses import asdict
     from .analysis_settings import CROP_MODES, model_fingerprint
     from .line_sampling import LineGeometry
+    from .target_sport import policy_for
 
+    policy = policy_for(request.get("target_sport"))
     if not request.get("model_path"):
-        return {"state": "not_configured", "message": "模型未配置；降噪未启用，所有候选保留。"}
+        return {"state": "not_configured",
+                "message": f"模型未配置；{policy.check_name}降噪未启用，所有候选保留。",
+                "target_sport": policy.name}
     reader = None
     try:
         mode = request.get("crop_mode", "up")
@@ -115,11 +119,17 @@ def probe_model(request: dict) -> dict:
         height, width = frames[0][0].shape[:2]
         geometry = LineGeometry.from_config({"points": request["points"]}, width, height, samples=20)
         points = list(zip(geometry.xs, geometry.ys))
-        verdict = classify_frames(detector, [frame for frame, _pts in frames], points, plan)
-        return {"state": "enabled", "message": f"模型已加载并完成试运行：{mode}，{verdict.label} / {verdict.score:.2f}；仅验证选定画面，不代表全场准确率。",
+        verdict = classify_frames(detector, [frame for frame, _pts in frames], points, plan,
+                                  target_label=policy.target_label)
+        return {"state": "enabled", "target_sport": policy.name,
+                "message": (f"模型已加载并完成试运行：{mode}，"
+                            f"{policy.label_text(verdict.label)} / {verdict.score:.2f}；"
+                            "仅验证选定画面，不代表全场准确率。"),
                 "model_digest": fingerprint, "verdict": asdict(verdict), "pts_ms": [pts for _frame, pts in frames]}
     except Exception as error:
-        return {"state": "failed", "message": f"模型加载/试运行失败：{error}；降噪未启用，候选保留。"}
+        return {"state": "failed",
+                "message": f"模型加载/试运行失败：{error}；{policy.check_name}降噪未启用，候选保留。",
+                "target_sport": policy.name}
     finally:
         if reader:
             reader.close()
@@ -248,6 +258,34 @@ def _edge_cut(detection: Detection, x0: int, y0: int, size: int, width: int, hei
     return left <= 2 or top <= 2 or right >= width - 3 or bottom >= height - 3
 
 
+def _non_target_verdict(
+    label: str,
+    score: float,
+    support_scores: Sequence[float],
+    *,
+    crowded: bool,
+    details: Sequence[Sequence[float]],
+    edge_cut: bool = False,
+    vehicle: str = "",
+) -> BikeVerdict:
+    """A clear, consistent non-target may not absorb a runner's chip.
+
+    This is only used by the running policy; the cycling decisions stay in
+    ``decide_verdict`` unchanged.
+    """
+
+    reasons = []
+    if score < EXCLUDE_THRESHOLD or any(value < EXCLUDE_THRESHOLD for value in support_scores):
+        reasons.append("把握不高或几帧不一致")
+    if crowded:
+        reasons.append("终点线拥挤时段")
+    return BikeVerdict(
+        label, score, DECISION_DISPUTED if reasons else DECISION_EXCLUDE,
+        "；".join(reasons), len(details), vehicle,
+        tuple(tuple(item) for item in details), edge_cut,
+    )
+
+
 def classify_frames(
     detector: YoloxDetector,
     frames: Sequence[np.ndarray],
@@ -255,8 +293,15 @@ def classify_frames(
     plan: CropPlan,
     *,
     crowded: bool = False,
+    target_label: str = LABEL_BICYCLE,
 ) -> BikeVerdict:
-    """Classify one crossing from 1-3 frames around its line contact."""
+    """Classify one crossing from 1-3 frames around its line contact.
+
+    ``target_label`` selects the explicit target-sport policy.  The default
+    keeps the historical bicycle decision path; ``pedestrian`` is used only
+    for running, where a clear person is the target and a clear bicycle or
+    vehicle is a non-target.  Neither path identifies the athlete.
+    """
 
     if not frames:
         return BikeVerdict(LABEL_NO_FRAME, 0.0, DECISION_KEEP, "没有可用画面", 0)
@@ -304,6 +349,33 @@ def classify_frames(
     person = max(item[1] for item in per_frame)
     vehicle = max((item[2] for item in per_frame if item[2] is not None), key=lambda d: d.score, default=None)
     details = tuple((round(b, 3), round(p, 3), round(v.score, 3) if v else 0.0) for b, p, v in per_frame)
+    if target_label == LABEL_PEDESTRIAN:
+        # Running treats a vehicle and its rider as a non-target crossing.  Check
+        # the vehicle first so the rider's person box cannot absorb a nearby chip.
+        if vehicle is not None:
+            return decide_verdict(
+                LABEL_VEHICLE, vehicle.score, details, edge_cut=edge_cut, crowded=crowded,
+                vehicle=VEHICLES.get(vehicle.cls, ""),
+            )
+        if person > 0:
+            reasons = []
+            if person < EXCLUDE_THRESHOLD:
+                reasons.append("把握不高")
+            if crowded:
+                reasons.append("终点线拥挤时段")
+            if edge_cut:
+                reasons.append("人被画面边缘切掉")
+            return BikeVerdict(
+                LABEL_PEDESTRIAN, person,
+                DECISION_DISPUTED if reasons else DECISION_KEEP,
+                "；".join(reasons), len(per_frame), details=details, edge_cut=edge_cut,
+            )
+        if bike > 0:
+            return _non_target_verdict(
+                LABEL_BICYCLE, bike, [item[0] for item in per_frame],
+                crowded=crowded, details=details, edge_cut=edge_cut,
+            )
+        return BikeVerdict(LABEL_NOTHING, 0.0, DECISION_KEEP, "", len(per_frame), details=details)
     if bike > 0 and (vehicle is None or vehicle.score <= bike or vehicle.cls != MOTORCYCLE):
         return BikeVerdict(LABEL_BICYCLE, bike, DECISION_KEEP, "", len(per_frame), details=details)
     if vehicle is not None:

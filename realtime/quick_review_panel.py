@@ -23,9 +23,10 @@ from .arrival_review import (
 from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, uncovered_intervals
 from .chip_history import format_chip_time
 from .crossing_time import item_crossing_time, recorder_crossing_time, workspace_clocks
-from .lap_wave import INTERMEDIATE, Passage, lap_role, short_riders
+from .lap_wave import Passage, short_riders
 from .problem_items import (
-    CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING, STATUS_EXCLUDED,
+    CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING,
+    STATUS_EXCLUDED,
     STATUS_WAITING, ProblemItem, stable_item_id,
 )
 from .problem_panel import ProblemListPanel
@@ -82,6 +83,9 @@ BIB_CHIP_REACH_MS = 5000
 # 疑似漏读 row and a 待定 card at 11:28:57.101).  It stays a row, shown as
 # 已点附近: it may be someone else nobody counted (review 10-29, 疑点保留).
 COUNTED_REACH_MS = 500
+# Display-only buckets of uncertain line motion, anchored on the first change.
+# Never a person count or a chained group; source files and manual rulings stay separate.
+UNVERIFIED_SPAN_MS = 2_000
 NEAR_COUNTED_TEXT = ("已点附近：这一刻 0.5 秒内已点过人，多半就是那个人。看一眼：是同一个人按 1 排除；"
                      "是没点到的人就在画面上补点，或按 3 补录号码。")
 # People counted up to about three frames before the frame shown are drawn as a
@@ -178,6 +182,9 @@ class QuickReviewPanel(ProblemListPanel):
         # settled for the timing system (补录, 多余芯片).
         self._attention_only = False
         self._show_excluded = False
+        self._show_unverified = False
+        self._unverified_items = frozenset()
+        self._unverified_groups = 0
         # True while a row is opened whose picture the panel itself places (or
         # keeps): the window must not reopen the item's stored frame over it.
         self.holds_picture = False
@@ -192,11 +199,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._earlier = {}
         self._metadata_provider = lambda: None  # CycleRace's race metadata: the groups' target laps
         self._target_laps = {}  # group id -> target laps of this race (CycleRace's metadata), when sent
-        self._intermediate_laps = 0  # chip reads of laps before the last, not listed
-        self._unknown_lap_groups = ()  # laps exist but CycleRace did not supply the target
-        self._intermediate_ids = frozenset()  # their event ids: a crossing bound to one is not listed either
         self._short_bibs = ()  # riders whose last read is short of the target, once the group has a finisher
-        self._intermediate_moments = ()  # chip times of those intermediate reads: lapped riders on the line
         # 自动对上 (auto_label): chip row key -> the person the analysis saw cross
         # for it, on waves nobody has counted yet.  Shown only, never saved.
         self._auto_labels = {}
@@ -294,6 +297,9 @@ class QuickReviewPanel(ProblemListPanel):
         self.show_excluded_action = menu.addAction("显示已排除")
         self.show_excluded_action.setCheckable(True)
         self.show_excluded_action.toggled.connect(self._set_show_excluded)
+        self.show_unverified_action = menu.addAction("显示待核画面（不计到达）")
+        self.show_unverified_action.setCheckable(True)
+        self.show_unverified_action.toggled.connect(self._set_show_unverified)
         menu.addSeparator()
         menu.addAction("分析录像", self._toggle_analysis)
         menu.addAction("导出给计时系统（补录 / 建议删除）", self.export)
@@ -401,11 +407,7 @@ class QuickReviewPanel(ProblemListPanel):
         return bool(entry and entry["action"] == "held" and entry.get("reason") == LOCAL_CHIP_EXCLUSION)
 
     def _events(self):
-        """This race's chip reads, without the laps before a rider's last (多圈赛只判最后一圈).
-
-        A lap is known as intermediate only when CycleRace's race metadata
-        carries the group's target laps; without them every read is listed, as before.
-        """
+        """Every chip passage of this race; lap k/N is a label, never a visibility filter."""
         events = tuple(self._events_provider())
         scopes = {(event.race_id, event.stage_id) for event in events}
         self._arrival_scope = self._scope if self._scope[0] else next(iter(scopes)) if len(scopes) == 1 else self._scope
@@ -414,17 +416,8 @@ class QuickReviewPanel(ProblemListPanel):
         self._target_laps = ({group.group_id: group.target_laps for group in metadata.groups}
                              if metadata is not None and (metadata.race_id, metadata.stage_id) == self._arrival_scope
                              else {})
-        self._unknown_lap_groups = tuple(sorted({event.group_id for event in scoped
-                                                 if event.is_active and event.lap > 1
-                                                 and not self._target_laps.get(event.group_id, 0)}))
-        listed = [event for event in scoped
-                  if lap_role(event.lap, self._target_laps.get(event.group_id, 0)) != INTERMEDIATE]
-        self._intermediate_laps = len(scoped) - len(listed)
-        self._intermediate_ids = frozenset(event.event_id for event in scoped) - {event.event_id for event in listed}
         self._short_bibs = self._short_of_laps([event for event in scoped if not self._locally_excluded(event)])
-        self._intermediate_moments = tuple(sorted(int(event.timeline_timestamp_ms) for event in scoped
-                                                  if event.event_id in self._intermediate_ids and event.is_active))
-        return {event.event_id: event for event in listed}
+        return {event.event_id: event for event in scoped}
 
     def _short_of_laps(self, events):
         """Bibs whose last read is short of the group's target laps, in groups someone has finished.
@@ -481,9 +474,8 @@ class QuickReviewPanel(ProblemListPanel):
                                        recorder_ms=raw_recorder_ms,
                                        reference=crossing is None or crossing.source in ("expected", "chip")))
             for event_id, bib in pairs:
-                # The crossing of an intermediate lap goes with its chip read: not
-                # a row of its own (10-30 relay: 27 of them showed as 待定).
-                if not event_id or event_id in represented or event_id in self._intermediate_ids:
+                # Every lap keeps its chip row, without duplicating the bound picture.
+                if not event_id or event_id in represented:
                     continue
                 represented.add(event_id)
                 event = events.get(event_id)
@@ -550,6 +542,10 @@ class QuickReviewPanel(ProblemListPanel):
         assigned = Counter(row.decision["candidate_id"] for row in rows if row.decision)
         counting = set(self._wave_candidates().values())
         moments = self._counted_moments(counting)
+        self._unverified_items = frozenset(row.item.item_id for row in rows
+                                          if row.event is None and self._unverified_picture(row.item))
+        rows = self._fold_unverified(rows, assigned, counting)
+        self._unverified_groups = sum(self._row_state(row) == "画面待核" for row in rows)
         rows = [row for row in rows if row.event is not None or self._candidate_shown(row.item, assigned, counting)]
         self._near_counted_items = frozenset(row.item.item_id for row in rows
                                        if row.event is None and self._near_counted_moment(row.item, assigned, moments))
@@ -592,18 +588,54 @@ class QuickReviewPanel(ProblemListPanel):
             kept.append(row)
         return kept
 
+    def _fold_unverified(self, rows, assigned, counting):
+        """Display-only buckets of uncertain motion, never a merged person count.
+
+        Anchor on the first change, never chain. Keep each source item and its
+        binding. Do not span a chip/confirmed person, recording source, model
+        result, stale state or an independently saved manual ruling.
+        """
+        folded, leads = set(), {}
+        for row in sorted(rows, key=lambda row: (row.time_ms if row.time_ms is not None else 2**62, row.key)):
+            item = row.item
+            category = self._category(item) or {}
+            check = item.evidence.get("crossing_check") or {}
+            is_unverified = self._unverified_picture(item)
+            if row.event is not None or not is_unverified:
+                leads.clear()  # A chip or known person separates review clips.
+                continue
+            frame = item.evidence.get("frame") or {}
+            if (row.time_ms is None or row.mark is not None or row.decision is not None or row.entered
+                    or item.item_id in counting or assigned[item.item_id] or self._marks.get(item.item_id)
+                    or not frame.get("video_path") or not frame.get("segment_id")):
+                leads.clear()
+                continue
+            state = (int(frame.get("camera_index") or 1), frame.get("session_id"), frame.get("video_path"),
+                     item.calibration_version, item.evidence.get("analysis_signature"),
+                     bool(item.evidence.get("configuration_stale")), bool(item.evidence.get("superseded")),
+                     item.status == STATUS_WAITING, check.get("reason"), category.get("action"))
+            lead = leads.get(state)
+            if lead is not None and row.time_ms - lead.time_ms <= UNVERIFIED_SPAN_MS:
+                lead.fragments += (row,)
+                folded.add(row.key)
+            else:
+                leads[state] = row
+        return [row for row in rows if row.key not in folded]
+
     def _fold_fragments(self, rows, assigned):
         """Pieces of one passage without a chip, within a second of the first, share its row.
 
         Display only: every piece keeps its own record, and a ruling on the row
-        is saved on each.  Only untouched pieces of a no-chip crossing fold, and
+        is saved on each. Only untouched pieces of a no-chip crossing fold, and
         only with pieces in the same state, so nothing judged or counted hides.
         """
         def foldable(row):
             item = row.item
             return (row.event is None and row.mark is None and row.decision is None and row.time_ms is not None
                     and item.kind == KIND_NO_CHIP_CROSSING and not item.evidence.get("wave_parent")
-                    and not self._marks.get(item.item_id) and not assigned[item.item_id])
+                    and ((item.evidence.get("crossing_check") or {}).get("state") == "confirmed"
+                         or (self._category(item) or {}).get("action") == "bicycle")
+                    and not self._marks.get(item.item_id) and not row.fragments and not assigned[item.item_id])
         folded, leads = set(), {}
         for row in sorted((row for row in rows if foldable(row)), key=lambda row: (row.time_ms, row.key)):
             state = (self._row_state(row), (self._category(row.item) or {}).get("action"),
@@ -689,6 +721,21 @@ class QuickReviewPanel(ProblemListPanel):
         elif read == EARLIER_BATCH:
             self._earlier_timer.start()
 
+    def _unverified_picture(self, item):
+        """Line motion is evidence to inspect, not a person or an arrival.
+
+        Also handles cached pre-fix no-chip items. Manual counts and explicit
+        operator classifications remain usable even if the model lost the track.
+        """
+        if item.kind == KIND_MANUAL_REVIEW:
+            return False
+        if rider_count(self._marks.get(item.item_id, ())):
+            return False
+        category = self._category(item)
+        if category and category["action"] in ("bicycle", "not_rider"):
+            return False
+        return (item.evidence.get("crossing_check") or {}).get("state") != "confirmed"
+
     def _candidate_shown(self, item, assigned, counting):
         """A picture is a row while it shows someone who is not yet a chip's crossing.
 
@@ -698,6 +745,8 @@ class QuickReviewPanel(ProblemListPanel):
         they stand on it; undoing the wave takes them back into it.
         """
         if item.item_id in counting:
+            return False
+        if self._unverified_picture(item) and not self._show_unverified:
             return False
         marks = self._marks.get(item.item_id, ())
         if item.evidence.get("wave_parent"):
@@ -779,7 +828,7 @@ class QuickReviewPanel(ProblemListPanel):
         """自动对上: pair each uncounted wave's chips with the people the analysis saw cross for it.
 
         Only where every condition of auto_label.label_wave holds: as many
-        people as chips, timed, apart enough, nobody on another lap and no 可能多人
+        people as chips, timed, apart enough, and no 可能多人
         or 已点附近 close by.  Any doubt leaves the whole wave to hand.  Nothing
         is saved until Enter explicitly accepts the bound evidence; its automatic
         origin remains distinct from manual clicks. 4 withdraws the proposal.
@@ -807,7 +856,6 @@ class QuickReviewPanel(ProblemListPanel):
             near = [row for row in loose if start <= row.time_ms <= end]
             match = label_wave(
                 [(row.key, stamp) for row, stamp in zip(wave, stamps)], people, clock_ok=True,
-                short_rider_count=sum(start <= moment <= end for moment in self._intermediate_moments),
                 maybe_several=any(self._earlier_arrival(row, read=False) is not None for row in near),
                 near_counted=any(row.item.item_id in self._near_counted_items for row in near))
             if match.reasons:
@@ -993,6 +1041,8 @@ class QuickReviewPanel(ProblemListPanel):
     def _row_state(self, row):
         if row.event is not None and not row.event.is_active:
             return "已排除"
+        if row.event is None and self._unverified_picture(row.item):
+            return "画面待核"
         if row.stale:
             return "待定"
         if row.decision:
@@ -1003,14 +1053,16 @@ class QuickReviewPanel(ProblemListPanel):
             return "已点" if (row.decision.get("frame") or {}).get("marker_x_normalized") is not None else "已确认"
         if row.note:
             return row.note
+        category = self._category(row.item)
+        if category and category["action"] == "not_rider":
+            return "已排除"
         if (row.item.status == STATUS_WAITING or row.item.evidence.get("configuration_stale")
                 or row.item.evidence.get("superseded")):
             return "待定"
-        category = self._category(row.item)
         if category and category["action"] == "bicycle" and (row.item.evidence.get("wave_parent")
                                                              or category.get("no_chip")):
             return "补录" if row.entered else "疑似漏读"
-        return "已排除" if category and category["action"] == "not_rider" else "待定"
+        return "待定"
 
     @staticmethod
     def _row_group(row):
@@ -1046,6 +1098,12 @@ class QuickReviewPanel(ProblemListPanel):
             self.hint.setText("先在左表选中要删除的芯片记录")
             return
         self.delete_requested.emit(row.event.event_id)
+
+    def queue_text(self):
+        if self._unverified_items and not any(row.event is not None or not self._unverified_picture(row.item)
+                                              for row in self._arrival_rows):
+            return f"尚未确认目标穿越 · 待核画面 {self._unverified_groups} 组（{len(self._unverified_items)} 段，不计到达）"
+        return super().queue_text()
 
     def _row_category(self, row):
         if row.note == "已排除":
@@ -1114,7 +1172,7 @@ class QuickReviewPanel(ProblemListPanel):
         signature = (self._arrival_scope, self._selected_key, tuple(sorted(counted.items())), self._attention_only,
                      self._show_excluded,
                      busy, self._near_counted_items, tuple(sorted(self._target_laps.items())),
-                     self._intermediate_laps, self._short_bibs,
+                     self._show_unverified, self._unverified_items, self._short_bibs,
                      tuple(sorted((index, reasons) for index, reasons in self._auto_reasons.items())),
                      tuple(sorted((key, person.key) for key, person in self._auto_labels.items())),
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._row_state(row), self._row_category(row),
@@ -1135,10 +1193,10 @@ class QuickReviewPanel(ProblemListPanel):
                 carried.setdefault(row.carrier, []).append(row.bib)
         several_groups = len({group for group in groups if group}) > 1
         self.table.setColumnHidden(4, not several_groups)
-        self.table.setColumnHidden(5, not any(row.event is not None and self._target_laps.get(row.event.group_id, 0) > 1
-                                              for row in rows))
-        # Room for a name like 男子山地精英组 beside the state.
-        self.table.setMinimumWidth(450 if several_groups else 340)
+        show_laps = any(row.event is not None and self._target_laps.get(row.event.group_id, 0) > 1 for row in rows)
+        self.table.setColumnHidden(5, not show_laps)
+        # Keep the lap label visible without horizontal scrolling on laptop screens.
+        self.table.setMinimumWidth((450 if several_groups else 340) + (50 if show_laps else 0))
         for widget in (self.table, self.table_column):
             widget.setMaximumWidth(540 if several_groups else 440)
         self.table.blockSignals(True)
@@ -1151,7 +1209,7 @@ class QuickReviewPanel(ProblemListPanel):
             # A chip row shows its chip time, so the column reads in the table's
             # order; the frame its rider was clicked on is in the tooltip.
             moment = int(row.event.timeline_timestamp_ms) if row.event is not None else row.time_ms
-            time = format_chip_time(moment) if moment is not None else "—"
+            time = format_chip_time(moment) if moment is not None and state != "画面待核" else "—"
             category = self._row_category(row)
             number = ""
             if row.event is not None:
@@ -1183,6 +1241,7 @@ class QuickReviewPanel(ProblemListPanel):
                                               "已接受对应": ("#3b5b7a", "#e6edf5"),
                                               "已排除": ("#4b5563", "#f1f3f5"),
                                               "待定": ("#9a3412", "#ffedd5"),
+                                              "画面待核": ("#4b5563", "#f1f3f5"),
                                               "多出": ("#9a3412", "#ffedd5"),
                                               "疑似漏读": ("#9a3412", "#ffedd5"),
                                               "疑似双芯片": ("#9a3412", "#ffedd5"),
@@ -1246,6 +1305,11 @@ class QuickReviewPanel(ProblemListPanel):
                     tooltip = (f"判读时间（校时后）：{format_chip_time(row.time_ms)}\n"
                                + (f"录像原时刻：{format_chip_time(row.recorder_ms)}\n"
                                   if row.recorder_ms is not None else "") + tooltip)
+                if state == "画面待核":
+                    tooltip = ("仅检测到画面变化，尚未确认目标穿越；不计到达，不生成过线时间。\n"
+                               + (f"录像变化时刻：{format_chip_time(row.recorder_ms)}\n"
+                                  if row.recorder_ms is not None else "")
+                               + "点击回看；确实有人时在原帧点人，疑点和原始证据均保留。")
                 cell.setToolTip(tooltip)
                 self.table.setItem(index, column, cell)
             if row.key == self._selected_key or any(piece.key == self._selected_key for piece in row.fragments):
@@ -1265,22 +1329,29 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.blockSignals(False)
         confirmed = sum(row.decision is not None for row in rows)
         excluded_count = sum(self._row_state(row) == "已排除" for row in rows)
-        self.quick_title.setText(f"到达 {len(rows) - excluded_count} · 已对上 {confirmed}"
+        unverified_count = sum(self._row_state(row) == "画面待核" for row in rows)
+        arrivals = len(rows) - excluded_count - unverified_count
+        self.quick_title.setText(f"到达 {arrivals} · 已对上 {confirmed}"
                                  + (f" · 圈数不足 {len(self._short_bibs)} 人" if self._short_bibs else ""))
-        details = [f"到达记录 {len(rows)} · 人工已点 / 确认 {confirmed} · 自动对上 {len(self._auto_labels)}",
+        details = [f"到达记录 {arrivals} · 人工已点 / 确认 {confirmed} · 自动对上 {len(self._auto_labels)}",
                    "灰蓝虚线：自动对应，非人工确认；绿色实线：人工已点 / 确认"]
         if excluded_count:
             details.append(f"已排除 {excluded_count} 条（仅隐藏显示，更多 → 显示已排除）")
-        if self._intermediate_laps:
-            details.append(f"中间圈 {self._intermediate_laps} 条不列")
+        if self._target_laps:
+            details.append("显示全部圈次；圈数 k/N 仅作提示，不隐藏芯片记录")
+        if self._unverified_items:
+            details.append(f"待核画面 {self._unverified_groups} 组、{len(self._unverified_items)} 段不计到达；更多 → 显示待核画面")
         if self._short_bibs:
             details.append("圈数不足（只提示，不判定；可能未完赛或漏读一圈）：" + "、".join(self._short_bibs) + " 号")
         self.quick_title.setToolTip("\n".join(details))
         unknown_laps = any(row.event is not None and row.event.is_active and self._row_state(row) != "已排除"
                            and self._target_laps.get(row.event.group_id, 0) <= 0 for row in rows)
         self.lap_status.setText("圈数未知 · 显示全部圈次" if unknown_laps else "")
-        self.lap_status.setToolTip("未收到当前组别的有效目标圈数，不能只列最后一圈；请检查 CycleRace 赛事同步。"
+        self.lap_status.setToolTip("未收到当前组别的有效目标圈数；所有圈次仍正常显示，请检查 CycleRace 赛事同步。"
                                    if unknown_laps else "")
+        count = self._unverified_groups
+        self.show_unverified_action.setText(f"显示待核画面（{count} 组/{len(self._unverified_items)} 段，不计到达）")
+        self.quick_title.setText(self.quick_title.text() + (f" · 待核画面 {count}组" if count else ""))
         self.refresh_status_visibility()
         self.summary.setText(self.quick_title.text())
         self.summary_changed.emit(self.quick_title.text())
@@ -1381,7 +1452,7 @@ class QuickReviewPanel(ProblemListPanel):
         file starts: the window opens the archive or the piece that holds it.
         """
         if (not self._quick_ready or row.event is not None or row.time_ms is None
-                or self._row_state(row) != "待定"):
+                or self._row_state(row) not in ("待定", "画面待核")):
             return None
         own = row.item.evidence.get("frame") or {}
         camera = int(own.get("camera_index") or 1)
@@ -1524,7 +1595,8 @@ class QuickReviewPanel(ProblemListPanel):
         if row.note == "已排除":
             self.hint.setText("本机已排除 · 原始记录保留 · 不导出 · 4 撤销")
             return
-        text = {"疑似漏读": "疑似漏读：核对原帧上的号码，按 3 补录号码（导出到补录清单）；不是运动员按 1。",
+        text = {"画面待核": "仅有画面变化，不计到达：看完整段后按 1 排除，4 撤销；确实有人就在原帧点人。",
+                "疑似漏读": "疑似漏读：核对原帧上的号码，按 3 补录号码（导出到补录清单）；不是运动员按 1。",
                 "补录": f"补录 {row.bib} 号：按 3 改号码，4 撤回。",
                 "疑似双芯片": f"{row.bib} 号这一波看完了却没对上人：漏点了就在画面上补点；"
                               "是别人带的第二个芯片，就按 2 填携带人。",
@@ -1623,6 +1695,8 @@ class QuickReviewPanel(ProblemListPanel):
                     ("撤回疑似漏读", lambda: self._take_back_miss(key))]
         if state == "已排除":
             return [("撤销排除", lambda: self._undo_key("candidate:" + row.item.item_id))]
+        if state == "画面待核":
+            return [("不是运动员", lambda: self._candidate_not_rider(key))] if self._excludable(row) else []
         if self._excludable(row):
             actions = [("补录号码…", lambda: self._record_candidate(key)),
                        ("不是运动员", lambda: self._candidate_not_rider(key))]
@@ -1679,7 +1753,7 @@ class QuickReviewPanel(ProblemListPanel):
     def _record_candidate(self, key):
         """补录号码 on a crossing without a chip: listed 疑似漏读, then its bib is asked."""
         row = self._row_by_key(key)
-        if row is None or not self._excludable(row):
+        if row is None or not self._excludable(row) or self._row_state(row) == "画面待核":
             return
         self._candidate_no_chip(row)
         row = self._row_by_key(key)
@@ -2256,11 +2330,13 @@ class QuickReviewPanel(ProblemListPanel):
             return
         self._step(1)
 
-    def _usable(self, item=None):
+    def _usable(self, item=None, *, action=""):
         item = item or self._candidate_item()
         if item is None or self._arrival_store is None:
             return False
-        if item.status == STATUS_WAITING or item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
+        waiting_exclusion = action == "not_rider" and self._unverified_picture(item)
+        if ((item.status == STATUS_WAITING and not waiting_exclusion)
+                or item.evidence.get("configuration_stale") or item.evidence.get("superseded")):
             self.hint.setText("证据已变化，等待重新分析后再确认。")
             return False
         return True
@@ -2325,7 +2401,7 @@ class QuickReviewPanel(ProblemListPanel):
         if action != "held" and row is None:
             self.candidate_preparing.emit()
         item = row.item if row is not None else self._candidate_item()
-        if not self._usable(item):
+        if not self._usable(item, action=action):
             return
         frame = self._row_frame(row) if row is not None else self._frame_provider()
         # A classification belongs to the candidate currently on screen.  Do not
@@ -2385,11 +2461,14 @@ class QuickReviewPanel(ProblemListPanel):
         return True
 
     def _excludable(self, row):
-        """An undecided picture without a chip that 3 may exclude."""
+        """Whether an undecided picture without a chip can be excluded with 1."""
         item = row.item
-        return (row.event is None and row.mark is None and not row.decision and row.time_ms is not None
-                and self._row_state(row) == "待定" and bool(item.evidence.get("frame"))
-                and item.status != STATUS_WAITING and not item.evidence.get("configuration_stale")
+        state = self._row_state(row)
+        status_allows = state == "画面待核" or item.status != STATUS_WAITING
+        time_allows = state == "画面待核" or row.time_ms is not None
+        return (row.event is None and row.mark is None and not row.decision
+                and time_allows and state in ("待定", "画面待核") and bool(item.evidence.get("frame"))
+                and status_allows and not item.evidence.get("configuration_stale")
                 and not item.evidence.get("superseded")
                 and not any(other.decision and other.decision.get("candidate_id") == item.item_id
                             for other in self._arrival_rows))
@@ -3400,7 +3479,7 @@ class QuickReviewPanel(ProblemListPanel):
         wave = self._wave_of.get(row.key) if row.event is not None else None
         if wave is not None and wave in outdated:
             return "芯片有变化"  # saved before a chip came in: Enter on the wave saves it in chip order
-        if (state in ("疑似漏读", "多出", "疑似双芯片") or row.stale
+        if (state in ("疑似漏读", "多出", "疑似双芯片", "画面待核") or row.stale
                 or state == "待定" and (row.event is None or wave in counted)):
             return state
         return None
@@ -3444,6 +3523,13 @@ class QuickReviewPanel(ProblemListPanel):
         if self._render() is not False and self.table.isRowHidden(self.table.currentRow()):
             self._select_next_visible(self.table.currentRow())
         self._last_saved_key = saved  # Toggling display never consumes the immediate undo.
+
+    def _set_show_unverified(self, on):
+        self._show_unverified = bool(on)
+        saved = self._last_saved_key
+        self._quick_render_signature = None
+        self._render()
+        self._last_saved_key = saved
 
     def _set_attention_only(self, on):
         self._attention_only = bool(on)

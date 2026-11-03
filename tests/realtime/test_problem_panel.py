@@ -9,6 +9,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
+from realtime.analysis_settings import CONFIG_PATH, settings_token
 from realtime.batch_review import aggregate_batches, read_snapshots
 from realtime.chip_checks import chip_check_items
 from realtime.chip_history import ChipRead
@@ -54,6 +55,24 @@ def _write_list(root, items, auto_passed, cameras=None):
     if cameras is not None:
         payload["cameras"] = cameras
     (directory / "problem_list.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def test_panel_accepts_cli_target_sport_result_token(qapp, tmp_path):
+    config_path = tmp_path / CONFIG_PATH
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"settings_revision": 1, "target_sport": "cycling"}), encoding="utf-8")
+    _write_list(tmp_path, [], [])
+    problem_path = tmp_path / "finish_problems" / "problem_list.json"
+    payload = json.loads(problem_path.read_text(encoding="utf-8"))
+    payload.update(target_sport="running", settings_token=settings_token(tmp_path, "running"))
+    problem_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(tmp_path)
+        assert not panel.payload.get("settings_stale")
+    finally:
+        panel.close()
 
 
 def _items(two_chip_bibs=("020", "023")):

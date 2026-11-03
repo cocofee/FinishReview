@@ -1,10 +1,10 @@
-"""Which passage of a multi-lap race is the one to look at, and when a wave can be labelled by itself.
+"""Lap-count hints and conservative chip-to-person matching for an arrival wave.
 
-Only a rider's last lap counts (多圈赛只判最后一圈).  A wave is the chips
-of one bunch on that last lap; its people are matched to its chips in order
-only when every check holds, else the whole wave is looked at by hand
-(整波有任一条件不满足，整波退回手动).  Nothing here decides a result: the
-labels are a shortcut for the operator, and CycleRace keeps the official time.
+Every lap remains visible. Lap roles describe progress only, never which
+passages are hidden. A wave's people are matched to its chips in order only
+when every check holds; otherwise the whole wave is looked at by hand.
+Nothing here decides a result: labels are a shortcut for the operator,
+and CycleRace keeps the official time.
 """
 
 from __future__ import annotations
@@ -76,9 +76,9 @@ def match_wave(
     obstructed: bool = False,
     min_gap_ms: int = MIN_GAP_MS,
 ) -> WaveMatch:
-    """Pair the final-lap chips of a wave with the people on its picture, in order, or say why not.
+    """Pair all passage chips of a wave with the people on its picture, or say why not.
 
-    CHIPS: (key, chip time ms) of the wave's final-lap chips.
+    CHIPS: (key, chip time ms) of every passage in the wave.
     CROSSINGS: (key, time ms) of the people detected crossing on the picture.
 
     The chips and crossings go through the same time-ordered pairing as the
@@ -91,7 +91,7 @@ def match_wave(
     """
     reasons = []
     if not chips:
-        reasons.append("本波没有最后一圈的芯片")
+        reasons.append("本波没有芯片记录")
     if not clock_ok:
         reasons.append("录像未校时")
     if len(crossings) != len(chips):

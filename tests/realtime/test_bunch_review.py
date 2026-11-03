@@ -124,7 +124,9 @@ def _detections(root, camera, crossings):
     directory = root / 'finish_problems'
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f'crossings_camera{camera}.json').write_text(
-        json.dumps({'schema_version': 1, 'camera_index': camera, 'crossings': crossings}), encoding='utf-8')
+        json.dumps({'schema_version': 1, 'camera_index': camera, 'crossings': [
+            dict(entry, crossing_check=entry.get('crossing_check', {'state': 'confirmed'}))
+            if isinstance(entry, dict) else entry for entry in crossings]}), encoding='utf-8')
 
 
 def test_the_group_keeps_only_the_people_detected_inside_it(synthetic_bunch):

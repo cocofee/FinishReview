@@ -785,12 +785,14 @@ def test_obstructed_line_events_need_verified_crossings_before_entering_the_queu
 
     assert result["analyzed_through_ms"] > START
     assert result["calibration_pending"] and not result["auto_passed"]
-    assert result["crossings"] == (0 if state == "not_crossed" else len(CROSSINGS_S))
-    if state in ("confirmed", "unverified"):
-        # Both are real line changes awaiting a clock; an unverified track is
-        # kept once as a crossing candidate, not duplicated as line_activity.
+    assert result["crossings"] == (len(CROSSINGS_S) if state == "confirmed" else 0)
+    if state == "confirmed":
         assert all(i.status == "disputed" and i.kind == KIND_NO_CHIP_CROSSING for i in result["items"])
         assert len(result["items"]) == len(CROSSINGS_S)
+    elif state == "unverified":
+        assert all(i.kind == "line_activity" for i in result["items"])
+        assert len(result["items"]) == len(CROSSINGS_S)
+        assert "first_rider_candidate" not in result
     else:
         assert result["items"] == []
     saved = json.loads((config.resolved_output() / "crossings_camera1.json").read_text(encoding="utf-8"))
@@ -919,6 +921,64 @@ def test_verified_non_bicycle_targets_cannot_be_auto_paired_to_chips(synthetic_r
     assert result["calibration"]["source"] == "manual_anchor"
     assert not result["auto_passed"] and not result["late_pair_frames"]
     assert result["pairing"]["auto_paired"] == 0
+
+
+def test_running_policy_treats_a_verified_person_as_the_target(synthetic_race, tmp_path, monkeypatch):
+    from realtime.target_crossing import TargetCrossingCheck
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    first = workspace.reads[0]
+    _record_first_rider(root, first)
+    workspace = AnalysisWorkspace(root)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
+        c.key: TargetCrossingCheck("confirmed", "anchor_crossed_line", "pedestrian", .91) for c in crossings
+    })
+
+    running = analyse_camera(
+        replace(config, model_path=model, target_sport="running"), workspace, 1, strips,
+    )
+
+    assert running["target_sport"] == "running"
+    assert running["target_policy"]["name"] == "running"
+    assert running.get("calibration") is not None
+    assert running["pairing"]["auto_paired"] > 0
+    assert running["auto_passed"]
+    assert all(item.evidence.get("target_sport") == "running"
+               for item in running["items"] if item.evidence.get("bike"))
+    assert all(item["frame"]["line_config"] for item in running["auto_passed"])
+
+
+@pytest.mark.parametrize("calibrated", [False, True])
+def test_empty_target_frames_keep_noise_as_evidence_not_crossings(synthetic_race, tmp_path, monkeypatch, calibrated):
+    """Line noise with no target in three frames must never pair chips or create arrival times."""
+    from realtime.target_crossing import check_target_tracks
+
+    root, workspace, config, strips = _isolated_race(tmp_path, synthetic_race)
+    if calibrated:
+        _record_first_rider(root, workspace.reads[0])
+        workspace = AnalysisWorkspace(root)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    empty = check_target_tracks([(0, []), (600, []), (1200, [])], [(160, 0), (160, 240)],
+                                frame_size=(320, 240))
+    assert empty.state == "unverified"  # No detections is not proof that a rider crossed.
+    monkeypatch.setattr(problem_analysis, "_verify_crossing_candidates", lambda _c, _n, _f, crossings, **kw: {
+        c.key: empty for c in crossings
+    })
+    result = analyse_camera(replace(config, model_path=model), workspace, 1, strips)
+    assert result["line_candidates"] == len(CROSSINGS_S)
+    assert result["crossings"] == 0
+    assert not result["auto_passed"]
+    assert not any(item.kind == KIND_NO_CHIP_CROSSING for item in result["items"])
+    assert len([i for i in result["items"] if i.kind == "line_activity"]) == len(CROSSINGS_S)
+    assert "first_rider_candidate" not in result
+    if calibrated:
+        assert result["pairing"]["auto_paired"] == 0
+    saved = json.loads((config.resolved_output() / "crossings_camera1.json").read_text(encoding="utf-8"))
+    assert saved["crossings"] == []
+    assert len(saved["line_events"]) == len(CROSSINGS_S)
 
 
 def test_scanned_empty_video_advances_without_chips_or_clock_calibration(synthetic_race, tmp_path, monkeypatch):

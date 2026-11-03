@@ -740,6 +740,21 @@ class RaceFilmstripPanel(QWidget):
             self.scope_combo.setItemText(0, f"本次录像 · {format_time(int(timestamp_ms), date=True)[:14]}")
         self._scope_changed()
 
+    def ensure_time_visible(self, timestamp_ms) -> bool:
+        """Include historical media when an explicit selection points before a new recording."""
+        if (
+            timestamp_ms is None
+            or self._recording_start_ms is None
+            or self.scope_combo.currentData() != "current"
+            or int(timestamp_ms) >= int(self._recording_start_ms)
+        ):
+            return False
+        index = self.scope_combo.findData("all")
+        if index < 0:
+            return False
+        self.scope_combo.setCurrentIndex(index)
+        return True
+
     def _scope_changed(self):
         self._cancel_decode()
         self._pending = None

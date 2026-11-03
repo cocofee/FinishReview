@@ -9,7 +9,8 @@ Rules, in order:
    evidence. Anything else becomes one "附近可能另有过线" item per chip, never
    a silent drop and never a task per fragment (plan step 5);
 3. repeated activity at the same spot within 90 s becomes one "standing" item;
-4. remaining bicycle-like crossings are "crossing without chip";
+4. remaining target-like crossings are "crossing without chip" (the target
+   class comes from the explicit sport policy; cycling is the default);
 5. chips within 1 s of a group's first chip are one group, never chained on to
    the next rider. A pair of chips on one crossing, with the line in view and
    fewer than six riders within 3 s, is "two chips, one crossing"; every other
@@ -34,7 +35,6 @@ from .bike_check import (
     DECISION_DISPUTED,
     DECISION_EXCLUDE,
     LABEL_BICYCLE,
-    LABEL_TEXT,
     LABEL_UNCHECKED,
     BikeVerdict,
 )
@@ -59,6 +59,7 @@ from .problem_items import (
     ProblemItem,
     stable_item_id,
 )
+from .target_sport import DEFAULT_SPORT, TargetSportPolicy, policy_for
 
 
 DUPLICATE_MS = 800
@@ -227,7 +228,8 @@ def _nearest_expected(
     return best
 
 
-def _crossing_evidence(crossing: CrossingRecord, version: int, verdict: Optional[BikeVerdict] = None) -> dict:
+def _crossing_evidence(crossing: CrossingRecord, version: int, verdict: Optional[BikeVerdict] = None,
+                       policy: Optional[TargetSportPolicy] = None) -> dict:
     evidence = {
         "frame": crossing.frame_payload(version),
         "contact": list(crossing.contact),
@@ -235,6 +237,8 @@ def _crossing_evidence(crossing: CrossingRecord, version: int, verdict: Optional
         "recorder_ms": crossing.recorder_ms,
         "row": crossing.row,
     }
+    if policy is not None:
+        evidence["target_sport"] = policy.name
     if verdict is not None:
         evidence["bike"] = {
             "label": verdict.label, "score": round(verdict.score, 3), "decision": verdict.decision,
@@ -257,9 +261,11 @@ def build_video_items(
     chip_locator=None,
     expected_ms: Optional[Mapping[str, int]] = None,
     race_start_ms: Optional[int] = None,
+    target_sport: str = DEFAULT_SPORT,
 ) -> RuleOutcome:
     """Apply the merge rules; ``chip_locator(read)`` pins a chip to a frame."""
 
+    policy = policy_for(target_sport)
     version = int(model.version)
     outcome = RuleOutcome()
     expected = {
@@ -302,9 +308,9 @@ def build_video_items(
     read_of: dict[str, ChipRead] = {read.read_id: read for read in [*chip_only, *(item[1] for item in matched)]}
     expected_values = sorted(expected.values())
     for crossing, verdict in sorted(candidates, key=lambda item: item[0].recorder_ms):
-        if verdict is not None and verdict.label in ("pedestrian", "vehicle"):
+        if verdict is not None and policy.is_non_target(verdict.label):
             rest.append((crossing, verdict))
-            continue  # A nearby chip cannot turn a non-bicycle target into a rider.
+            continue  # A nearby chip cannot turn a non-target into an athlete.
         late = [
             read for read in chip_only
             if read.read_id not in resolved and (
@@ -367,7 +373,7 @@ def build_video_items(
                     f"反复出现 {len(members)} 次活动，可能有人停留"
                 ),
                 chip_time_ms=chip_time, status=STATUS_OPEN, priority=40,
-                evidence=dict(_crossing_evidence(first, version), count=len(members)),
+                evidence=dict(_crossing_evidence(first, version, policy=policy), count=len(members)),
                 calibration_version=version,
             ))
             continue
@@ -382,12 +388,12 @@ def build_video_items(
         else:
             clusters.append([member])
     for cluster in clusters:
-        crossing, verdict = min(cluster, key=_evidence_rank)
+        crossing, verdict = min(cluster, key=lambda item: _evidence_rank(item, policy))
         chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
         label = verdict.label if verdict is not None else LABEL_UNCHECKED
         status, note = STATUS_OPEN, ""
         if verdict is not None and verdict.decision == DECISION_DISPUTED:
-            status, note = STATUS_DISPUTED, f"有争议：{LABEL_TEXT.get(label, label)}，{verdict.reason}"
+            status, note = STATUS_DISPUTED, f"有争议：{policy.label_text(label)}，{verdict.reason}"
         elif verdict is not None and verdict.decision != DECISION_EXCLUDE and crowded(crossing.recorder_ms):
             note = "终点线拥挤时段"
         manual = [
@@ -397,7 +403,7 @@ def build_video_items(
         if manual:
             status = STATUS_CLOSED_UPSTREAM
             note = "CycleRace 已补录 " + "、".join(_chip_text(read) for read in manual)
-        evidence = _crossing_evidence(crossing, version, verdict)
+        evidence = _crossing_evidence(crossing, version, verdict, policy)
         # Group size is not read from chips: a stretch with several crossings and
         # fewer chips is kept visible even when no chip is missing entirely.
         dense_start = crossing.recorder_ms - DENSE_WINDOW_MS
@@ -412,7 +418,7 @@ def build_video_items(
             item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
             kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
             detail=(
-                f"{format_chip_time(chip_time)} 有人过线，附近没有芯片读数（认车：{LABEL_TEXT.get(label, label)}）"
+                f"{format_chip_time(chip_time)} 有人过线，附近没有芯片读数（{policy.check_name}：{policy.label_text(label)}）"
                 + (f"；同一时刻线上另有 {len(cluster) - 1} 处变化" if len(cluster) > 1 else "")
                 + (f"；前后 2 秒内共 {dense_video} 处过线、附近只有 {dense_chips} 条芯片，请一并核对"
                    if dense else "")
@@ -434,13 +440,13 @@ def build_video_items(
         else:
             near_groups.append([entry])
     for group in near_groups:
-        best = min(group, key=lambda value: _evidence_rank((value.crossing, value.verdict)))
+        best = min(group, key=lambda value: _evidence_rank((value.crossing, value.verdict), policy))
         crossing, verdict, read = best.crossing, best.verdict, best.read
         chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
         label = verdict.label if verdict is not None else LABEL_UNCHECKED
         status, note = STATUS_OPEN, ""
         if verdict is not None and verdict.decision == DECISION_DISPUTED:
-            status, note = STATUS_DISPUTED, f"有争议：{LABEL_TEXT.get(label, label)}，{verdict.reason}"
+            status, note = STATUS_DISPUTED, f"有争议：{policy.label_text(label)}，{verdict.reason}"
         elif crowded(crossing.recorder_ms):
             note = "终点线拥挤时段"
         manual = [
@@ -463,19 +469,20 @@ def build_video_items(
         outcome.near_crossings.append({
             "bib": read.bib, "event_id": read.event_id, "gap_ms": int(best.gap_ms),
             "recorder_ms": int(crossing.recorder_ms), "members": len(group), "bike": members[0]["bike"],
+            "target_sport": policy.name,
         })
         outcome.items.append(ProblemItem(
             item_id=stable_item_id(KIND_NEAR_CROSSING, camera_index, read.read_id, crossing.key),
             kind=KIND_NEAR_CROSSING, category=CATEGORY_VIDEO,
             detail=(
                 f"{format_chip_time(chip_time)} 线上另有一处变化，距芯片 {_chip_text(read)} 的过线 "
-                f"{best.gap_ms:+d} ms（认车：{LABEL_TEXT.get(label, label)}）；"
+                f"{best.gap_ms:+d} ms（{policy.check_name}：{policy.label_text(label)}）；"
                 "可能另有一位漏读选手，也可能只是同一人的后轮或影子，请按原帧判断"
                 + (f"；同一芯片附近另有 {len(group) - 1} 处变化，见证据" if len(group) > 1 else "")
             ),
             chip_time_ms=chip_time, status=status, status_note=note, priority=15,
             evidence=dict(
-                _crossing_evidence(crossing, version, verdict),
+                _crossing_evidence(crossing, version, verdict, policy),
                 near_read={"bib": read.bib, "event_id": read.event_id, "chip_ms": read.chip_ms,
                            "expected_recorder_ms": int(expected[read.read_id])},
                 gap_ms=int(best.gap_ms), members=members,
@@ -527,7 +534,7 @@ def build_video_items(
             chip_time_ms=read.chip_ms, bibs=(read.bib, partner.bib),
             event_ids=(read.event_id, partner.event_id),
             status=status, status_note=note, priority=20,
-            evidence=dict(_crossing_evidence(crossing, version), chip_count=2, video_count=1,
+            evidence=dict(_crossing_evidence(crossing, version, policy=policy), chip_count=2, video_count=1,
                           span_ms=abs(read.chip_ms - partner.chip_ms)),
             calibration_version=version,
         ))
@@ -552,7 +559,7 @@ def build_video_items(
                     chip_time_ms=read.chip_ms, bibs=(read.bib, partner.bib),
                     event_ids=(read.event_id, partner.event_id),
                     status=status, status_note=note, priority=20,
-                    evidence=_crossing_evidence(crossing, version),
+                    evidence=_crossing_evidence(crossing, version, policy=policy),
                     calibration_version=version,
                 ))
                 continue
@@ -583,11 +590,11 @@ def build_video_items(
         outcome.items.append(ProblemItem(
             item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera_index, crossing.key),
             kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
-            detail=f"{format_chip_time(chip_time)} 线上活动，认车为{LABEL_TEXT.get(verdict.label, verdict.label)}"
+            detail=f"{format_chip_time(chip_time)} 线上活动，{policy.check_name}为{policy.label_text(verdict.label)}"
                    + (f"（{verdict.vehicle}）" if verdict.vehicle else ""),
             chip_time_ms=chip_time, status=STATUS_OPEN,
             status_note="待人工确认",
-            priority=90, evidence=_crossing_evidence(crossing, version, verdict),
+            priority=90, evidence=_crossing_evidence(crossing, version, verdict, policy),
             calibration_version=version,
         ))
 
@@ -598,7 +605,7 @@ def build_video_items(
             kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
             detail=f"{format_chip_time(chip_time)} 首位选手到达前的线上活动",
             chip_time_ms=chip_time, status=STATUS_EXCLUDED, status_note="已排除：赛前活动",
-            priority=95, evidence=_crossing_evidence(crossing, version),
+            priority=95, evidence=_crossing_evidence(crossing, version, policy=policy),
             calibration_version=version,
         ))
 
@@ -715,9 +722,11 @@ def _group_members(items, bunches, crowds, expected) -> list[ProblemItem]:
     return result
 
 
-def _evidence_rank(member: tuple[CrossingRecord, Optional[BikeVerdict]]) -> tuple[int, float, int]:
+def _evidence_rank(member: tuple[CrossingRecord, Optional[BikeVerdict]],
+                   policy: Optional[TargetSportPolicy] = None) -> tuple[int, float, int]:
     crossing, verdict = member
-    if verdict is not None and verdict.label == LABEL_BICYCLE:
+    target_label = policy.target_label if policy is not None else LABEL_BICYCLE
+    if verdict is not None and verdict.label == target_label:
         rank = 0
     elif verdict is None or verdict.decision != DECISION_DISPUTED:
         rank = 1
