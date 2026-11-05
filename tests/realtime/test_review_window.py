@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -2357,6 +2358,80 @@ def test_returning_to_the_field_needs_no_timing_data_and_starts_recording(qapp, 
     finally:
         window.stop_recording()
         window.close()
+
+
+def test_returning_to_a_race_cyclerace_sent_yesterday_asks_before_making_its_folder(
+        qapp, tmp_path, monkeypatch):
+    """11-05: 「返回当前赛事」 made a folder for the previous evening's 接力测试赛."""
+    root = tmp_path / "events"
+    _archived_field_event(root)
+    old = RaceMetadata(race_id="race-relay-test", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                       race_name="接力测试赛", stage_name="接力赛段")
+    inbox = RaceMetadataStore(root / ".finishreview" / "cyclerace_metadata_inbox.json")
+    inbox.store(old)
+    yesterday = (datetime.now() - timedelta(days=1)).timestamp()
+    os.utime(inbox.snapshot_path, (yesterday, yesterday))
+    window = _window(root)
+    asked = []
+    answer = QMessageBox.Cancel
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda _parent, _title, message, *_args: asked.append(message) or answer)
+    try:
+        assert window._receiver_metadata_store.current().race_id == "race-relay-test"
+        assert not window._return_to_live_event()
+        assert "接力测试赛" in asked[-1] and "不是今天" in asked[-1]
+        assert window._workspace_mode == "archive"
+        assert not (root / "接力测试赛").exists()
+
+        answer = QMessageBox.Yes
+        assert window._return_to_live_event()
+        assert window._workspace_mode == "live"
+        assert window._current_metadata().race_id == "race-relay-test"
+        assert window.output_dir.parent.name == "接力测试赛"
+    finally:
+        window.close()
+
+
+def test_returning_to_a_race_sent_today_enters_without_asking(qapp, tmp_path, monkeypatch):
+    root = tmp_path / "events"
+    _archived_field_event(root)
+    RaceMetadataStore(root / ".finishreview" / "cyclerace_metadata_inbox.json").store(
+        RaceMetadata(race_id="race-today", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                     race_name="今日赛", stage_name="终点"))
+    window = _window(root)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: pytest.fail("今天发来的赛事不应询问"))
+    try:
+        assert window._return_to_live_event()
+        assert window._current_metadata().race_id == "race-today"
+    finally:
+        window.close()
+
+
+def test_saved_event_picker_shows_competition_and_race_folders(qapp, tmp_path):
+    long_name = "甘肃省第六届“红色之路长征赛”自行车业余联赛古浪站暨“丝路要塞·红色古浪”环“八步沙”自行车赛"
+    for path, race_id, race_name, stage in (
+        (tmp_path / "现代五项" / "2026-11-04 女子激光跑决赛", "race-w", "2026年全国现代五项冠军赛总决赛", "女子激光跑决赛"),
+        (tmp_path / "现代五项" / "2026-11-04 男子激光跑决赛", "race-m", "2026年全国现代五项冠军赛总决赛", "男子激光跑决赛"),
+        (tmp_path / "古浪", "race-g", long_name, long_name),
+    ):
+        RaceMetadataStore(path / "cyclerace_race_metadata.json").store(
+            RaceMetadata(race_id=race_id, stage_id="stage-1", revision=1, emitted_at_ms=1,
+                         race_name=race_name, stage_name=stage))
+    dialog = review_window_module.EventWorkspacePickerDialog(
+        review_window_module.discover_event_workspaces(tmp_path))
+    try:
+        rows = {(dialog.table.item(row, 0).text(), dialog.table.item(row, 1).text())
+                for row in range(dialog.table.rowCount())}
+        assert rows == {("现代五项", "2026-11-04 女子激光跑决赛"), ("现代五项", "2026-11-04 男子激光跑决赛"),
+                        (long_name, long_name)}
+        # The long name cannot squeeze the competition column to nothing.
+        assert dialog.table.horizontalHeader().sectionSize(0) >= 200
+        assert dialog.table.horizontalHeader().sectionResizeMode(1) == QHeaderView.Stretch
+        dialog.search_edit.setText("现代五项")
+        qapp.processEvents()
+        assert sum(not dialog.table.isRowHidden(row) for row in range(dialog.table.rowCount())) == 2
+    finally:
+        dialog.close()
 
 
 def test_returning_to_the_field_without_any_race_uses_an_isolated_folder(qapp, tmp_path):

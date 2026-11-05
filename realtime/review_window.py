@@ -1624,10 +1624,43 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_runtime_status()
         return True
 
+    def _may_enter_received_race(self, metadata: RaceMetadata) -> bool:
+        """A race CycleRace sent on an earlier day gets no new folder without the operator's word.
+
+        11-05: 「返回当前赛事」 made a folder for the previous evening's 接力测试赛.
+        A race that already has its folder, or that CycleRace sent today, enters as before.
+        """
+
+        if any(race_id == metadata.race_id for _folder, race_id, _name in _saved_race_folders(self.workspace_root)):
+            return True
+        if (self.workspace_root / "cyclerace_race_metadata.json").is_file() and (
+                _saved_race_id(self.workspace_root) == metadata.race_id):
+            return True
+        try:
+            sent = datetime.fromtimestamp(self._receiver_metadata_store.snapshot_path.stat().st_mtime,
+                                          BEIJING_TIMEZONE)
+        except OSError:
+            return True
+        today = datetime.now(BEIJING_TIMEZONE).date()
+        if sent.date() >= today:
+            return True
+        name = metadata.race_name or metadata.race_id
+        stage = f"「{metadata.stage_name}」" if metadata.stage_name else ""
+        answer = QMessageBox.question(
+            self, "返回当前赛事",
+            "\n\n".join((
+                f"CycleRace 最后发来的是 {sent:%m-%d %H:%M} 的「{name}」{stage}，不是今天发来的。",
+                "进入这场会为它新建本场文件夹。今天的比赛请先在 CycleRace 打开，它会重新发来。",
+                "仍要进入这场吗？")),
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        return answer == QMessageBox.Yes
+
     def _return_to_live_event(self) -> bool:
         if self._workspace_mode != "archive":
             return True
         metadata = self._receiver_metadata_store.current()
+        if metadata is not None and not self._may_enter_received_race(metadata):
+            return False
         try:
             if metadata is not None:
                 applied = self._activate_cyclerace_workspace(

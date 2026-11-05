@@ -53,6 +53,8 @@ class EventWorkspaceDescriptor:
     metadata: RaceMetadata
     modified_at_ms: int
     is_root: bool = False
+    # The competition folder a race is filed under (11-05), "" for a flat folder.
+    competition: str = ""
 
     @property
     def race_name(self) -> str:
@@ -121,6 +123,7 @@ def validate_event_workspace(
         metadata=metadata,
         modified_at_ms=_workspace_modified_at_ms(candidate),
         is_root=candidate == root,
+        competition=candidate.parent.name if candidate != root and candidate.parent != root else "",
     )
 
 
