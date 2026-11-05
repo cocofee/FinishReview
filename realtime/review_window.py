@@ -303,7 +303,7 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | No
     race_suffix = _safe_event_folder_name(metadata.race_id, "race")
     # A race already saved stays where it is, under its bare name (folders
     # made before 10-28) or its dated one.
-    dated = re.compile(r"\d{4}-\d{2}-\d{2} " + re.escape(folder_name) + r"(_.*)?")
+    dated = re.compile(r"\d{4}-\d{2}-\d{2} " + re.escape(folder_name) + r"([_ ].*)?")
     try:
         saved = sorted(path for path in root.iterdir() if path.is_dir() and (
             path.name == folder_name or path.name.startswith(f"{folder_name}_") or dated.fullmatch(path.name)))
@@ -316,7 +316,13 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | No
     # date, which can be wrong (特奥 ran 10-28 with a stage dated 09-20).
     day = (today or datetime.now(BEIJING_TIMEZONE).date()).isoformat()
     base = f"{day} {folder_name}"
-    candidates = [root / base, root / f"{base}_{race_suffix}"]
+    candidates = [root / base]
+    # 现代五项 ran two competitions a day under one race name (男子/女子决赛);
+    # the second is told apart by its stage, not by a long CycleRace code.
+    stage_name = _safe_event_folder_name(metadata.stage_name, "") if str(metadata.stage_name or "").strip() else ""
+    if stage_name and stage_name != folder_name:
+        candidates.append(root / f"{base} {stage_name}")
+    candidates.append(root / f"{base}_{race_suffix}")
     candidates.extend(root / f"{base}_{race_suffix}_{index}" for index in range(2, 100))
     for candidate in candidates:
         if not candidate.exists():
@@ -618,6 +624,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._archive_background_passage_count = 0
         self._live_metadata_scope = None
         self._held_race_ids: set[str] = set()
+        # Races whose recording the first chip already started, or the operator stopped.
+        self._auto_recorded_race_ids: set[str] = set()
         # The base review surface starts timers while the production window is
         # still being assembled. Initialise health-check state before that
         # happens so an early clock tick cannot observe half-built state.
@@ -1433,6 +1441,9 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _toggle_recording(self) -> None:
         if self._recording_any_active():
+            race_id = self._race_being_recorded()
+            if race_id:
+                self._auto_recorded_race_ids.add(race_id)
             self.stop_recording()
             return
         if self._workspace_mode == "archive":
@@ -1443,6 +1454,7 @@ class FinishReviewWindow(PassageReviewSurface):
             if not is_supported_review_source(self.source):
                 return
         try:
+            self._enter_race_opened_in_cyclerace()
             self.start_recording()
         except Exception as exc:  # noqa: BLE001 - GUI boundary reports device failures.
             self._runtime_error = sanitize_recording_message(exc)
@@ -4318,6 +4330,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._workspace_mode = "live"
             save_workspace_mode(self.workspace_root, self.output_dir, "live")
             self._archive_background_passage_count = 0
+            self._workspace_notice = ""
         if applied and recording_was_active:
             self._workspace_notice = "已切换新赛事，录像待重新开始"
         return applied
@@ -4392,9 +4405,12 @@ class FinishReviewWindow(PassageReviewSurface):
         )
 
     def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
+        # The first chip starts a forgotten recording once per race; a recording
+        # the operator stopped is not started again by later chips.
         if (
             self._workspace_mode != "live"
             or not event.is_active
+            or event.race_id in self._auto_recorded_race_ids
             or self._camera_auth_retry_blocked()
             or self._recording_any_active()
             or self._is_test_passage(event)
@@ -4411,6 +4427,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 event.event_id,
             )
             return False
+        self._auto_recorded_race_ids.add(event.race_id)
         logger.info(
             "Recording auto-started for live passage %s in group %s",
             event.event_id,
@@ -4418,35 +4435,30 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         return True
 
-    def _auto_start_recording_for_metadata(self, metadata: RaceMetadata) -> bool:
-        if (
-            self._workspace_mode != "live"
-            or self._camera_auth_retry_blocked()
-            or self._recording_any_active()
-            or not any(
-                not _is_test_group_name(group.name)
-                and not _is_test_group_name(group.group_id)
-                for group in metadata.groups
-            )
-        ):
-            return False
-        try:
-            self.start_recording()
-        except Exception as error:  # noqa: BLE001 - metadata handling must survive.
-            self._runtime_error = sanitize_recording_message(error)
-            self._auto_recording_error = self._runtime_error
-            logger.exception(
-                "Failed to auto-start recording for live metadata %s/%s",
-                metadata.race_id,
-                metadata.stage_id,
-            )
-            return False
-        logger.info(
-            "Recording auto-started for live metadata %s/%s",
-            metadata.race_id,
-            metadata.stage_id,
-        )
-        return True
+    def _enter_race_opened_in_cyclerace(self) -> None:
+        """Starting to record is when the race open in CycleRace gets its folder here.
+
+        11-05: every race opened in CycleRace used to get a folder the moment its
+        details arrived, so a morning of tests left dozens behind.
+        """
+        if self._workspace_mode != "live" or self.timing_provider != "cyclerace":
+            return
+        opened = self._receiver_metadata_store.current()
+        if opened is None or self._live_metadata_scope != (opened.race_id, opened.stage_id):
+            return
+        current = self.metadata_store.current() if self.metadata_store is not None else None
+        if current is not None and current.race_id == opened.race_id:
+            return
+        if opened.groups and all(_is_test_group_name(group.name) or _is_test_group_name(group.group_id)
+                                 for group in opened.groups):
+            return
+        self._activate_cyclerace_workspace(opened)
+
+    def _race_being_recorded(self) -> str:
+        current = self._current_metadata()
+        if current is not None:
+            return current.race_id
+        return self._live_metadata_scope[0] if self._live_metadata_scope else ""
 
     def _on_passage_received(self, event: PassageEvent) -> None:
         if self._defer_capture_callback(self._on_passage_received, event):
@@ -4600,6 +4612,14 @@ class FinishReviewWindow(PassageReviewSurface):
         if self._workspace_mode == "archive":
             self._update_runtime_status()
             return
+        current = self.metadata_store.current() if self.metadata_store is not None else None
+        if current is None or current.race_id != metadata.race_id:
+            # Opening a race in CycleRace is not that race starting here: no folder
+            # and no recording until the operator records or its first chip arrives.
+            self._workspace_notice = (f"CycleRace 当前赛事：{metadata.race_name or metadata.race_id}。"
+                                      "点「开始录像」或收到芯片时才建立本场文件夹。")
+            self._update_runtime_status()
+            return
         try:
             self._activate_cyclerace_workspace(metadata)
             self._capture_error = ""
@@ -4608,7 +4628,6 @@ class FinishReviewWindow(PassageReviewSurface):
             logger.exception("Failed to activate CycleRace event workspace")
             self._update_runtime_status()
             return
-        self._auto_start_recording_for_metadata(metadata)
         pending_focus = self._pending_focus
         if pending_focus is not None and (
             pending_focus.race_id != metadata.race_id
