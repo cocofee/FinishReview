@@ -15,7 +15,7 @@ try:
     from .preflight import PreflightJournal
     from .race_metadata import RaceMetadata, RaceMetadataStore
     from .video_timeline import VideoTimelineStore
-    from .workspace_context import EventWorkspaceMetadataStore
+    from .workspace_context import EventWorkspaceMetadataStore, is_event_folder_under
 except ImportError:
     from passage_evidence import (
         HIGH_SPEED_SOURCE,
@@ -26,7 +26,7 @@ except ImportError:
     from preflight import PreflightJournal
     from race_metadata import RaceMetadata, RaceMetadataStore
     from video_timeline import VideoTimelineStore
-    from workspace_context import EventWorkspaceMetadataStore
+    from workspace_context import EventWorkspaceMetadataStore, is_event_folder_under
 
 
 METADATA_FILENAME = "cyclerace_race_metadata.json"
@@ -111,7 +111,7 @@ def validate_event_workspace(
 ) -> EventWorkspaceDescriptor:
     root = Path(workspace_root).expanduser().resolve()
     candidate = Path(path).expanduser().resolve()
-    if candidate != root and candidate.parent != root:
+    if not is_event_folder_under(candidate, root):
         raise EventWorkspaceError("赛事目录不在当前保存根目录中")
     if not candidate.is_dir():
         raise EventWorkspaceError("赛事目录不存在")
@@ -130,11 +130,17 @@ def discover_event_workspaces(
     root = Path(workspace_root).expanduser().resolve()
     candidates = [root]
     try:
-        candidates.extend(
-            path
-            for path in root.iterdir()
-            if path.is_dir() and path.name != ".finishreview"
-        )
+        for path in root.iterdir():
+            if not path.is_dir() or path.name.startswith("."):
+                continue
+            candidates.append(path)
+            # A competition's folder holds one folder per race (11-05).
+            if not (path / METADATA_FILENAME).is_file():
+                try:
+                    candidates.extend(child for child in path.iterdir()
+                                      if child.is_dir() and not child.name.startswith("."))
+                except OSError:
+                    continue
     except OSError as error:
         raise EventWorkspaceError(f"赛事保存根目录无法读取：{error}") from error
 

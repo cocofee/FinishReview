@@ -22,6 +22,7 @@ import numpy as np
 
 from .bike_check import FrameReader
 from .problem_items import ProblemItem
+from .runtime_paths import relocated_video_path
 
 
 logger = logging.getLogger("FinishReview.CrossingCards")
@@ -59,8 +60,7 @@ def _crop_box(width: int, height: int, cx: float, cy: float, size: int) -> tuple
 
 
 def _resolve(video_path: str, workspace_root: Path) -> Path:
-    path = Path(video_path)
-    return path if path.is_absolute() else workspace_root / path
+    return relocated_video_path(video_path, Path(workspace_root))
 
 
 def _item_geometry(item: ProblemItem) -> tuple[Optional[tuple[float, float]], list]:

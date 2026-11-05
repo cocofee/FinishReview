@@ -89,10 +89,11 @@ from .preflight import (
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
 from .workspace_context import (
-    EventWorkspaceMetadataStore, recovered_archive_path, saved_archive_path, saved_live_path, saved_received_path,
-    save_workspace_mode,
+    EventWorkspaceMetadataStore, is_event_folder_under, recovered_archive_path, saved_archive_path, saved_live_path,
+    saved_received_path, save_workspace_mode,
 )
 from .review_export import export_review_summary
+from .runtime_paths import relocated_video_path
 from .review_clip import PassageReviewBindingStore
 from .receiver_controller import ReceiverController
 from .recording_lock import LOCK_FILENAME, FolderInUseError, RecordingFolderLock
@@ -289,6 +290,32 @@ def _saved_race_id(folder: Path) -> str | None:
     return None
 
 
+def _saved_race_folders(root: Path) -> list[tuple[Path, str, str]]:
+    """Race folders in the root and in its competition folders, with their race id and name."""
+
+    found = []
+    try:
+        level_one = sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
+    except OSError:
+        return found
+    for path in level_one:
+        folders = [path]
+        if not (path / "cyclerace_race_metadata.json").is_file() and not (path / "review_event_scope.json").is_file():
+            try:
+                folders = sorted(child for child in path.iterdir() if child.is_dir() and not child.name.startswith("."))
+            except OSError:
+                continue
+        for folder in folders:
+            try:
+                saved = RaceMetadataStore(folder / "cyclerace_race_metadata.json").current()
+            except (OSError, RuntimeError, ValueError):
+                saved = None
+            race_id = saved.race_id if saved is not None else _saved_race_id(folder)
+            if race_id:
+                found.append((folder, race_id, saved.race_name if saved is not None else ""))
+    return found
+
+
 def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | None = None) -> Path:
     root = Path(root).expanduser().resolve()
     try:
@@ -300,30 +327,28 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | No
         # there, so coming back to it must not open an empty folder beside them.
         return root
     folder_name = _safe_event_folder_name(metadata.race_name, metadata.race_id)
-    race_suffix = _safe_event_folder_name(metadata.race_id, "race")
-    # A race already saved stays where it is, under its bare name (folders
-    # made before 10-28) or its dated one.
-    dated = re.compile(r"\d{4}-\d{2}-\d{2} " + re.escape(folder_name) + r"([_ ].*)?")
-    try:
-        saved = sorted(path for path in root.iterdir() if path.is_dir() and (
-            path.name == folder_name or path.name.startswith(f"{folder_name}_") or dated.fullmatch(path.name)))
-    except OSError:
-        saved = []
-    for candidate in saved:
-        if _saved_race_id(candidate) == metadata.race_id:
+    # A race already saved stays where it is: straight in the root (before
+    # 11-05) or inside its competition's folder.
+    saved = _saved_race_folders(root)
+    for candidate, race_id, _race_name in saved:
+        if race_id == metadata.race_id:
             return candidate
+    # 11-05: one folder per competition, one folder per race in it, so the
+    # 现代五项 days and its 男子/女子, A/B 组 races sit together.  The
+    # competition's folder may have been renamed shorter by hand; a race of
+    # the same name already filed there shows where it is.
+    competition = next((candidate.parent for candidate, _race_id, race_name in saved
+                        if candidate.parent != root and race_name == metadata.race_name), root / folder_name)
     # A new race is filed under the day it first arrived, not CycleRace's stage
     # date, which can be wrong (特奥 ran 10-28 with a stage dated 09-20).
     day = (today or datetime.now(BEIJING_TIMEZONE).date()).isoformat()
-    base = f"{day} {folder_name}"
-    candidates = [root / base]
-    # 现代五项 ran two competitions a day under one race name (男子/女子决赛);
-    # the second is told apart by its stage, not by a long CycleRace code.
     stage_name = _safe_event_folder_name(metadata.stage_name, "") if str(metadata.stage_name or "").strip() else ""
-    if stage_name and stage_name != folder_name:
-        candidates.append(root / f"{base} {stage_name}")
-    candidates.append(root / f"{base}_{race_suffix}")
-    candidates.extend(root / f"{base}_{race_suffix}_{index}" for index in range(2, 100))
+    base = f"{day} {stage_name}" if stage_name and stage_name != folder_name else day
+    if (competition / "cyclerace_race_metadata.json").is_file():
+        # An older race folder already has the competition's name: keep the new race beside it.
+        competition, base = root, f"{day} {folder_name}" + (f" {stage_name}" if base != day else "")
+    candidates = [competition / base]
+    candidates.extend(competition / f"{base}_{index}" for index in range(2, 100))
     for candidate in candidates:
         if not candidate.exists():
             return candidate
@@ -1682,7 +1707,11 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         event_dir = self.output_dir.resolve()
         root = self.workspace_root.resolve()
-        if event_dir != root and event_dir.parent != root:
+        if event_dir == root:
+            # The root also holds every other race's folder; clearing it would take them too.
+            QMessageBox.warning(self, "无法清空数据", "本场数据直接放在保存根目录里，和其他赛事混在一起，未做任何改动。")
+            return
+        if not is_event_folder_under(event_dir, root):
             QMessageBox.warning(self, "无法清空数据", "本场目录不在保存根目录中，未做任何改动。")
             return
         count = len(self.passage_store.events(include_inactive=True))
@@ -3328,9 +3357,8 @@ class FinishReviewWindow(PassageReviewSurface):
         from .video_timeline import PassageVideoLocation
 
         segment = self.timeline_store.get_segment(str(frame.get("segment_id", "")))
-        path = Path(str(frame.get("video_path", "")))
-        if not path.is_absolute():
-            path = self.output_dir / path
+        # Follows the same file into this race folder if the folder was moved (11-05).
+        path = relocated_video_path(str(frame.get("video_path", "")), self.output_dir)
         if segment is None or not path.is_file():
             self.problem_panel.hint.setText("原录像缺失或不在本赛事的录像索引中，未跳转其他录像。")
             return False

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from realtime.passage_receiver import PassageEvent, PassageEventStore
 from realtime.race_metadata import RaceMetadata
 from realtime.video_timeline import VideoTimelineStore
@@ -79,3 +81,17 @@ def test_saved_live_event_restores_explicit_selection(tmp_path):
     assert saved_live_path(tmp_path) == target.resolve()
     save_workspace_mode(tmp_path, target, "archive")
     assert saved_live_path(tmp_path) is None
+
+
+def test_a_race_inside_a_competition_folder_is_remembered_but_deeper_is_not(tmp_path):
+    target = tmp_path / "现代五项" / "2026-11-04 女子激光跑决赛"
+    target.mkdir(parents=True)
+    (target / "cyclerace_race_metadata.json").touch()
+    save_workspace_mode(tmp_path, target, "live")
+    assert saved_live_path(tmp_path) == target.resolve()
+
+    deeper = target / "videos" / "copy"
+    deeper.mkdir(parents=True)
+    with pytest.raises(ValueError):
+        save_workspace_mode(tmp_path, deeper, "live")
+    assert saved_live_path(tmp_path) == target.resolve()

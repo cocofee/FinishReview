@@ -45,9 +45,18 @@ def test_discovers_root_legacy_workspace_and_direct_children(tmp_path):
     RaceMetadataStore(child / "cyclerace_race_metadata.json").store(
         _metadata("race-child", "新赛事")
     )
-    nested = tmp_path / "container" / "nested"
+    # 11-05: a competition folder holds one folder per race.
+    nested = tmp_path / "现代五项" / "2026-11-04 女子决赛"
     RaceMetadataStore(nested / "cyclerace_race_metadata.json").store(
-        _metadata("race-nested", "不应递归发现")
+        _metadata("race-nested", "现代五项")
+    )
+    deeper = tmp_path / "现代五项" / "2026-11-04 女子决赛" / "videos" / "copy"
+    RaceMetadataStore(deeper / "cyclerace_race_metadata.json").store(
+        _metadata("race-deeper", "不应递归发现")
+    )
+    inside_race = child / "finish_problems"
+    RaceMetadataStore(inside_race / "cyclerace_race_metadata.json").store(
+        _metadata("race-inside", "赛事目录里的子目录不是赛事")
     )
     (tmp_path / ".finishreview").mkdir()
 
@@ -56,7 +65,9 @@ def test_discovers_root_legacy_workspace_and_direct_children(tmp_path):
     assert {workspace.metadata.race_id for workspace in workspaces} == {
         "race-root",
         "race-child",
+        "race-nested",
     }
+    assert validate_event_workspace(nested, tmp_path).metadata.race_id == "race-nested"
     assert next(item for item in workspaces if item.is_root).path == tmp_path.resolve()
 
 
