@@ -18,10 +18,11 @@ reads the event workspace and writes into its own output folder.
 from __future__ import annotations
 
 import json
+import os
 import hashlib
 import logging
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -44,6 +45,7 @@ from .batch_review import (BATCH_IDENTITY_FILENAME, aggregate_batches, identity_
 from .bike_check import (
     DECISION_DISPUTED,
     DECISION_KEEP,
+    LABEL_BICYCLE,
     LABEL_PEDESTRIAN,
     LABEL_VEHICLE,
     BikeVerdict,
@@ -96,9 +98,12 @@ from .problem_items import (
     ProblemItem,
     sort_items,
 )
+from .person_follow import follow_path, follow_payload
+from .person_crossing import (configured_direction, extract_people, learn_profile, not_athlete_reason,
+                              people_at_line, person_model_path)
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
-from .target_sport import CYCLING, DEFAULT_SPORT, POLICY_VERSION, normalize_sport, policy_for
+from .target_sport import CYCLING, DEFAULT_SPORT, POLICY_VERSION, RUNNING, normalize_sport, policy_for
 
 
 logger = logging.getLogger("FinishReview.ProblemAnalysis")
@@ -117,8 +122,13 @@ class AnalysisConfig:
     decode_threads: int = DEFAULT_DECODE_THREADS
     model_path: Optional[Path] = None
     model_input: int = 640
+    # Running only: the small model that follows people at the line (see
+    # person_crossing).  Empty: yolox_nano.onnx beside ``model_path``, else that model.
+    person_model_path: Optional[Path] = None
     target_sport: str = DEFAULT_SPORT
     crop_modes: Mapping[int, str] = field(default_factory=dict)
+    # Camera -> sprint arrow: [dx, dy] on the picture, 0 for 不限方向; absent learns it.
+    sprint_arrows: Mapping[int, Any] = field(default_factory=dict)
     race_id: str = ""
     stage_id: str = ""
     clock_model_path: Optional[Path] = None
@@ -235,6 +245,46 @@ def extract_strips(
     return paths
 
 
+def _person_model(config: AnalysisConfig) -> Optional[Path]:
+    """Running with a model: the model that follows people at the line."""
+
+    if normalize_sport(config.target_sport) != RUNNING:
+        return None
+    path = person_model_path(config.model_path, config.person_model_path)
+    return path if path is not None and path.is_file() else None
+
+
+def extract_race_people(
+    config: AnalysisConfig,
+    reads: Iterable[ChipRead],
+    strip_paths: list[Path],
+    *,
+    runtime=None,
+    gates: Optional[dict] = None,
+    progress: ProgressCallback = _noop_progress,
+    checkpoint: Optional[Callable[[], None]] = None,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> int:
+    """Look for people only from shortly before the first chip read onward.
+
+    Hours of warm-up recording before the race are never searched; without any
+    chip read nothing is, since there is no race to compare people with yet.
+    """
+
+    model = _person_model(config)
+    times = [read.chip_ms for read in reads if not read.excluded]
+    if model is None or not times or not strip_paths:
+        return 0
+    start = min(times) - PRE_RACE_MARGIN_MS
+    files = [item for item in _load_file_strips(strip_paths, runtime) if item.end_ms >= start]
+    if not files:
+        return 0
+    from .stream_recorder import find_ffmpeg_executable
+
+    return extract_people(config.resolved_output(), files, model, executable=find_ffmpeg_executable(),
+                          gates=gates, progress=progress, checkpoint=checkpoint, cancelled=cancelled)
+
+
 def default_line_for_camera(config: AnalysisConfig, workspace: AnalysisWorkspace, camera: int):
     line = config.finish_lines.get(camera)
     # The saved line is the camera default for later sessions and stages too:
@@ -310,6 +360,7 @@ class _VerificationRuntime:
         self.detections = OrderedDict()
         self.files = {}
         self.line_detections = {}
+        self.people = {}
 
     def reader(self, path, threads):
         path = Path(path)
@@ -791,6 +842,92 @@ def _unchecked_line_items(crossings, checks, camera, model=None):
     return items
 
 
+PERSON_CHECK_REASON = "人形轨迹跨线；只说明有人过线，不识别身份"
+AFTER_FINISH_MS = 120_000
+# A saved sprint arrow is overruled when this many chip-matched people, and
+# this share of them, run against it: the arrow was saved the wrong way round.
+ARROW_CHECK_MIN = 3
+ARROW_CHECK_SHARE = 0.8
+
+
+def _person_evidence(people, camera: int):
+    """Tracked people as confirmed crossings, in the shapes the rules read."""
+
+    crossings, checks, verdicts, raw = [], {}, {}, []
+    for person in people.crossings:
+        record = person.record
+        label = LABEL_BICYCLE if person.vehicle else LABEL_PEDESTRIAN
+        check = TargetCrossingCheck("confirmed", "person_track", label, person.score, "", person.direction)
+        crossings.append(record)
+        checks[record.key] = check
+        verdicts[record.key] = BikeVerdict(label, person.score, DECISION_KEEP, PERSON_CHECK_REASON, person.points)
+        raw.append({
+            "recorder_ms": record.recorder_ms, "session_id": record.session_id, "frame_index": record.frame_index,
+            "video_path": record.video_path, "row": record.row, "in_obstruction": False,
+            "person": {"direction": person.direction, "proj": person.proj, "height": person.height,
+                       "speed": person.speed, "points": person.points, "vehicle": person.vehicle},
+            "crossing_check": asdict(check),
+        })
+    return crossings, checks, verdicts, raw
+
+
+def _write_follow(output_dir: Path, people, camera: int, bibs: dict) -> None:
+    """Where each crossing person walked, for the number that follows them on the picture."""
+
+    target = follow_path(output_dir, camera)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(follow_payload(people, bibs, camera), ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, target)
+    except OSError as error:  # The picture only loses its moving numbers.
+        logger.warning("person tracks for camera %s not saved: %s", camera, error)
+
+
+def _athlete_leftovers(people, result, matched, video_only, pairing_crossings, reads, *, direction, live):
+    """Crossings no chip claimed, minus the people who are plainly not athletes.
+
+    What paired athletes looked like here (direction, size, speed, lane) is
+    learned per race; a leftover unlike them is a spectator, photographer or
+    official.  Those are counted, not queued.  Anyone athlete-like stays a
+    question: a missed chip must never be filtered away.
+    """
+
+    from .chip_checks import lap_targets
+
+    person_of = people.by_key()
+    profile = learn_profile([person_of[crossing.key] for crossing, _read, _residual in matched
+                             if crossing.key in person_of], direction)
+    reasons: Counter = Counter()
+    dropped = []
+    paired_keys = {crossing.key for crossing in pairing_crossings}
+    for person in people.crossings:
+        if person.record.key not in paired_keys and not person.vehicle:
+            reasons["反方向"] += 1  # held out of pairing by the sprint arrow
+            dropped.append([person.record.recorder_ms, "反方向"])
+    cutoff = None
+    times = [read.chip_ms for read in reads if not read.excluded and read.active_now]
+    targets = lap_targets(reads, ChipCheckContext(race_finished=not live, now_ms=int(time.time() * 1000)))
+    if times and targets and all(target.settled for target in targets.values()):
+        # Multi-lap and every group has run its laps: later line traffic is
+        # the venue emptying, not an athlete without a chip.
+        cutoff = max(times) + AFTER_FINISH_MS
+    kept = []
+    for crossing in video_only:
+        person = person_of.get(crossing.key)
+        reason = not_athlete_reason(person, profile, direction) if person is not None else ""
+        if not reason and cutoff is not None and crossing.recorder_ms > cutoff:
+            reason = "全部完赛之后"
+        if reason:
+            reasons[reason] += 1
+            dropped.append([crossing.recorder_ms, reason])
+        else:
+            kept.append(crossing)
+    result["people"] = dict(people.stats, direction=direction, profile=profile.payload() if profile else None,
+                            not_athletes=dict(reasons), not_athlete_times=dropped[:500])
+    return kept
+
+
 def _uncalibrated_video_items(
     config: AnalysisConfig,
     camera: int,
@@ -1004,6 +1141,14 @@ def analyse_camera(
     policy = policy_for(config.target_sport)
     reads = workspace.reads if reads is None else reads
     files = _load_file_strips(strip_paths, runtime)
+    person_model = _person_model(config)
+    # Running with a model: tracked people are the crossings, and only the
+    # recording the people search has covered counts as seen.
+    people = (people_at_line(output_dir, files, camera, person_model,
+                             cache=runtime.people if runtime is not None else None)
+              if person_model is not None else None)
+    if people is not None:
+        files = people.files
     detection_started = time.perf_counter()
     progress("过线检测", 0, len(files))
     crossings, obstructions, coverage, raw = detect_session_crossings(
@@ -1015,7 +1160,13 @@ def analyse_camera(
     verification_started = time.perf_counter()
     crossing_checks = {}
     verified_verdicts = None
-    if config.model_path:
+    if people is not None:
+        crossings, crossing_checks, verified_verdicts, raw = _person_evidence(people, camera)
+        line_candidates = list(crossings)
+        # The line strip's "blocked" stretches describe pixels, not people; the
+        # tracks already say who crossed in a crowd.
+        obstructions = []
+    elif config.model_path:
         crossing_checks = _verify_crossing_candidates(
             config, camera, files, line_candidates, progress=progress, checkpoint=checkpoint, runtime=runtime,
         )
@@ -1059,11 +1210,30 @@ def analyse_camera(
     pairing_crossings = [c for c in crossings if verified_verdicts is None
                          or crossing_checks[c.key].state != "confirmed"
                          or policy.is_target(verified_verdicts[c.key].label)]
+    direction = None
+    before_arrow = []
+    if people is not None:
+        # The sprint arrow drawn on the finish line: a person walking the other
+        # way never absorbs a chip.  Without an arrow the direction is learned
+        # from the paired athletes after pairing.
+        direction = configured_direction(config.sprint_arrows.get(camera), people.files[-1].geometry)
+        if direction:
+            person_of = people.by_key()
+            before_arrow = pairing_crossings
+            pairing_crossings = [c for c in pairing_crossings if person_of[c.key].direction == direction]
     calibration = calibrate_evidence_clock(
         [ClockCrossing(item.recorder_ms, item.session_id) for item in pairing_crossings],
         reads,
         camera_index=camera,
     )
+    if calibration.model is None and before_arrow:
+        # Nobody running the arrow's way fits the chips: maybe the arrow is
+        # backwards.  Calibrate on everyone; the check after calibration decides.
+        calibration = calibrate_evidence_clock(
+            [ClockCrossing(item.recorder_ms, item.session_id) for item in before_arrow],
+            reads,
+            camera_index=camera,
+        )
     sessions = {session for _start, _end, session in coverage if session}
     anchors, other_recording_anchors, changed_anchors = manual_anchors_for_run(
         workspace, camera, reads, sessions,
@@ -1176,6 +1346,8 @@ def analyse_camera(
                     model_digest=model_fingerprint(config.model_path, config.model_input),
                 )
             result["calibration_pending"] = True
+            if people is not None:
+                _write_follow(output_dir, people, camera, {})
             first = next(iter(pairing_crossings), None)
             if first is not None:
                 result["first_rider_candidate"] = {
@@ -1244,6 +1416,29 @@ def analyse_camera(
         else:
             by_session.setdefault(session, []).append(read)
             expected_ms[read.read_id] = int(model.to_recorder(read.chip_ms, session))
+    if people is not None and direction and before_arrow:
+        # An arrow saved the wrong way round would hold every athlete out of
+        # pairing.  When the people the chips do meet mostly run against it,
+        # the arrow is wrong, not them: ignore it and say so.
+        person_of = people.by_key()
+        ways = Counter()
+        for session in {item[2] for item in coverage}:
+            if served_sessions is not None and session not in served_sessions:
+                continue
+            session_crossings = [item for item in before_arrow if item.session_id == session]
+            session_reads = by_session.get(session, [])
+            trial = pair_crossings(
+                session_crossings, [item.recorder_ms for item in session_crossings],
+                session_reads, [expected_ms[read.read_id] for read in session_reads],
+            )
+            ways.update(person_of[crossing.key].direction for crossing, _read, _residual in trial.matched
+                        if crossing.key in person_of)
+        total = sum(ways.values())
+        if total >= ARROW_CHECK_MIN and ways[-direction] >= ARROW_CHECK_SHARE * total:
+            warnings.append(f"冲刺方向可能设反了：芯片对上的 {total} 人中 {ways[-direction]} 人与黄箭头相反，"
+                            "本次分析不按箭头过滤，请在「终点线 / 模型」里核对冲刺方向")
+            direction = None
+            pairing_crossings = before_arrow
     matched, video_only, chip_only = [], [], []
     for session in {item[2] for item in coverage}:
         if served_sessions is not None and session not in served_sessions:
@@ -1264,6 +1459,10 @@ def analyse_camera(
                            and crossing_checks[c.key].state == "confirmed"
                            and not policy.is_target(verified_verdicts[c.key].label)]
         chip_only += pairing.chip_only
+    if people is not None:
+        _write_follow(output_dir, people, camera, {crossing.key: read.bib for crossing, read, _residual in matched})
+        video_only = _athlete_leftovers(people, result, matched, video_only, pairing_crossings, reads,
+                                        direction=direction, live=config.live)
     uncalibrated_sessions = sorted({
         name for _start, _end, name in coverage
         if name and served_sessions is not None and name not in served_sessions
@@ -1509,8 +1708,10 @@ def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
         cameras=tuple(int(value) for value in settings.get("cameras", ())),
         model_path=resolved_model_path(root, settings),
         model_input=int(settings.get("model_input", 640)),
+        person_model_path=Path(settings["person_model_path"]) if settings.get("person_model_path") else None,
         target_sport=normalize_sport(settings.get("target_sport")),
         crop_modes={int(key): str(value) for key, value in (settings.get("crop_modes") or {}).items()},
+        sprint_arrows={int(key): value for key, value in (settings.get("sprint_arrows") or {}).items()},
         clock_model_path=root / CLOCK_MODEL_FILENAME,
         min_available_mb=int(settings.get("min_available_mb", MIN_AVAILABLE_MEMORY_MB)),
         sampling_profiles=tuple(settings.get("sampling_profiles", ())),
@@ -1644,11 +1845,23 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                     duration_ms += sum(end - start for start, end in uncovered_ranges(
                         segment.start_ms, segment.end_ms, segment.excluded_ranges))
                 sample_started = time.perf_counter()
-                job["ready"].extend(extract_strips(
+                new_paths = extract_strips(
                     config, tuple(batch), line_for_camera(config, workspace, camera) or {}, progress=progress,
                     checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
-                ))
+                )
+                job["ready"].extend(new_paths)
                 sampling_seconds = time.perf_counter() - sample_started
+                if cancelled():
+                    return
+                people_started = time.perf_counter()
+                # The first round also catches up on the race so far; later
+                # rounds only look at the files just sealed.
+                extract_race_people(
+                    config, workspace.reads, list(job["ready"]) if first_round else new_paths, runtime=runtime,
+                    gates=job.setdefault("gates", {}), progress=progress,
+                    checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
+                )
+                people_seconds = time.perf_counter() - people_started
                 if cancelled():
                     return
                 # A stop/settle run may remove the chip delay only once its entire
@@ -1668,6 +1881,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 result["performance"] = dict(
                     new_video_seconds=round(duration_ms / 1000, 3),
                     sampling_seconds=round(sampling_seconds, 3),
+                    people_seconds=round(people_seconds, 3),
                     analysis_seconds=round(time.perf_counter() - analysis_started, 3),
                 )
                 results[camera] = result
@@ -1763,6 +1977,10 @@ def run_offline_analysis(
         summary["cameras"][camera] = {"strips": len(paths)}
         if stage == "strips" or cancelled():
             continue
+        extract_race_people(config, workspace.reads, paths, progress=progress,
+                            checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled)
+        if cancelled():
+            continue
         result = analyse_camera(
             config, workspace, camera, paths, progress=progress,
             checkpoint=lambda: governor.checkpoint(cancelled),
@@ -1826,10 +2044,14 @@ def write_problem_list(
             read = replace(read, chip_ms=int(event.timeline_timestamp_ms), lap=event.lap,
                            group_id=event.group_id, group_name=event.group_name, excluded=group_exclusion(event.group_name))
         current_reads.append(read)
-    items: list[ProblemItem] = list(chip_check_items(current_reads, ChipCheckContext(roster=roster)))
+    # Live: a group is judged for short or extra laps once it has gone quiet,
+    # never against a field still running; the roster check waits for the end.
+    context = (ChipCheckContext(roster=roster, race_finished=False, now_ms=int(time.time() * 1000))
+               if config.live else ChipCheckContext(roster=roster))
+    items: list[ProblemItem] = list(chip_check_items(current_reads, context))
     if config.live:
-        from .problem_items import KIND_NOT_ARRIVED, KIND_LAP_MISSING
-        items = [item for item in items if item.kind not in (KIND_NOT_ARRIVED, KIND_LAP_MISSING)]
+        from .problem_items import KIND_NOT_ARRIVED
+        items = [item for item in items if item.kind != KIND_NOT_ARRIVED]
     auto_passed: list[dict] = []
     unverifiable = 0
     cameras = {}

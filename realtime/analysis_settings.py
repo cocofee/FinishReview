@@ -137,7 +137,7 @@ class AnalysisSettingsStore:
 
     def save(self, *, race_id: str, stage_id: str, segment, line: dict,
              model_path: str, crop_mode: str, effective_from_ms: int | None = None,
-             target_sport: str | None = None) -> dict:
+             target_sport: str | None = None, sprint_arrow=None) -> dict:
         points = normalized_points(line)
         sport = normalize_sport(target_sport) if target_sport is not None else None
         # An empty race_id is the pre-race case: the line is tied to the
@@ -174,6 +174,13 @@ class AnalysisSettingsStore:
                              points=points, snap=bool(line.get("snap", False))))
         payload["finish_lines"] = defaults
         payload["model_path"] = model_path.strip()
+        # Which way the finishers run, per camera: [dx, dy] on the picture, 0 for
+        # 不限方向; no entry means learn it from the athletes the chips matched.
+        arrows = payload.setdefault("sprint_arrows", {})
+        if sprint_arrow is None:
+            arrows.pop(str(camera_index), None)
+        else:
+            arrows[str(camera_index)] = sprint_arrow
         if sport is not None:
             # Isolated with this event workspace; an old file without the key
             # keeps the historical cycling behaviour.

@@ -1,10 +1,10 @@
-"""Presentation-only person tags: small, readable and bound to the original point."""
+"""Presentation-only person tags: compact, readable and bound to the original point."""
 
 import pytest
 from PyQt5.QtCore import QRectF
 from PyQt5.QtGui import QColor, QImage, QPainter, QTransform
 
-from realtime.passage_review import EvidenceImageView
+from realtime.passage_review import PERSON_TAG_FONT_PX, EvidenceImageView
 from tests.realtime.test_quick_review_panel import qapp
 
 
@@ -36,8 +36,8 @@ def test_number_tag_is_screen_sized_and_kept_inside_visible_image(qapp, scale):
                      (visible.right(), visible.bottom()), (100 / scale, 150 / scale)):
             tag = view._person_tag_rect(x, y, "321", scale, visible, occupied)
             assert visible.contains(tag)
-            assert tag.height() * scale == pytest.approx(22)
-            assert 30 <= tag.width() * scale < 60
+            assert tag.height() * scale == pytest.approx(PERSON_TAG_FONT_PX + 10)
+            assert 34 <= tag.width() * scale < 70
             occupied.append(tag)
     finally:
         view.close()

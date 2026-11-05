@@ -8,7 +8,7 @@ from pathlib import Path
 
 import cv2
 from PyQt5.QtCore import QPointF, Qt, QThread, QProcess, pyqtSignal
-from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                             QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QLineEdit,
                             QPushButton, QVBoxLayout)
@@ -18,7 +18,7 @@ from .analysis_workspace import AnalysisWorkspace
 from .chip_history import format_chip_time
 from .line_sampling import LineGeometry
 from .problem_analysis import config_from_workspace, line_for_segment
-from .target_sport import DEFAULT_SPORT, SPORT_CHOICES, policy_for
+from .target_sport import DEFAULT_SPORT, RUNNING, SPORT_CHOICES, policy_for
 
 
 def default_segment_index(segments, race_end_ms) -> int:
@@ -53,6 +53,19 @@ class SamplingLineView(QGraphicsView):
         self.width_px = self.height_px = 0
         self._drag = None
         self._overlays = []
+        self.arrow = None  # (dx, dy) unit vector on the picture, or None
+
+    def line_normal(self, sign=1):
+        """Unit normal of the line's first-to-last chord, on the picture."""
+
+        if len(self.points) < 2 or not self.width_px:
+            return None
+        (ax, ay), (bx, by) = self.points[0], self.points[-1]
+        dx, dy = (bx - ax) * self.width_px, (by - ay) * self.height_px
+        length = (dx * dx + dy * dy) ** 0.5
+        if length < 1:
+            return None
+        return sign * -dy / length, sign * dx / length
 
     def set_frame(self, frame, line=None):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -155,6 +168,22 @@ class SamplingLineView(QGraphicsView):
         for x, y in self.points:
             self._overlays.append(self.scene().addEllipse(x * self.width_px - radius, y * self.height_px - radius,
                                                           2 * radius, 2 * radius, pen))
+        if self.arrow is not None and len(self.points) >= 2:
+            # A thick shaft from the line and a solid head at the far end: the
+            # way the runners cross, readable at a glance.
+            (ax, ay), (bx, by) = self.points[0], self.points[-1]
+            mx, my = (ax + bx) / 2 * self.width_px, (ay + by) / 2 * self.height_px
+            size = 0.2 * min(self.width_px, self.height_px)
+            ux, uy = self.arrow
+            px, py = -uy, ux
+            tip = QPointF(mx + ux * size, my + uy * size)
+            base_x, base_y = mx + ux * size * 0.6, my + uy * size * 0.6
+            arrow_pen = QPen(QColor("#ffcc00"), 6)
+            arrow_pen.setCosmetic(True)
+            self._overlays.append(self.scene().addLine(mx, my, base_x, base_y, arrow_pen))
+            head = QPolygonF([tip, QPointF(base_x + px * size * 0.22, base_y + py * size * 0.22),
+                              QPointF(base_x - px * size * 0.22, base_y - py * size * 0.22)])
+            self._overlays.append(self.scene().addPolygon(head, arrow_pen, QBrush(QColor("#ffcc00"))))
         self.changed.emit()
 
 
@@ -230,6 +259,18 @@ class SamplingSettingsDialog(QDialog):
         self.snap = QCheckBox("自动贴合白线（实际修正位置记录在取样证据中）")
         row.addWidget(self.snap)
         layout.addLayout(row)
+        direction_row = QHBoxLayout()
+        self.direction_label = QLabel("冲刺方向")
+        direction_row.addWidget(self.direction_label)
+        self.direction = QComboBox()
+        for text, value in (("自动判断（按芯片对上的人学习）", "auto"), ("不限方向", "any"),
+                            ("选手按黄箭头跑：箭头朝线的这一侧", "forward"), ("选手按黄箭头跑：箭头朝线的另一侧", "back")):
+            self.direction.addItem(text, value)
+        self.direction.setToolTip("黄色箭头就是选手冲过终点线的方向，看画面选让箭头指对的那一项；"
+                                  "反方向走过线的人不会被当成漏芯片；接力或折返赛选「不限方向」")
+        self.direction.currentIndexChanged.connect(self._direction_changed)
+        direction_row.addWidget(self.direction, 1)
+        layout.addLayout(direction_row)
         self.geometry_label = QLabel()
         layout.addWidget(self.geometry_label)
         self.view.changed.connect(self._geometry_changed)
@@ -333,7 +374,27 @@ class SamplingSettingsDialog(QDialog):
                 return max(times)
         return None
 
+    def _direction_changed(self, *_args):
+        value = self.direction.currentData()
+        self.view.arrow = self.view.line_normal(-1 if value == "back" else 1) if value in ("forward", "back") else None
+        self.view.redraw()
+
+    def sprint_arrow(self):
+        """What to save: ``None`` learn it, ``0`` 不限方向, or the arrow."""
+
+        value = self.direction.currentData()
+        if value == "any":
+            return 0
+        if value in ("forward", "back"):
+            normal = self.view.line_normal(-1 if value == "back" else 1)
+            return [round(normal[0], 4), round(normal[1], 4)] if normal else None
+        return None
+
     def _geometry_changed(self):
+        if getattr(self.view, "arrow", None) is not None and hasattr(self, "direction"):
+            # Following a moved line: the arrow stays on its side of it.
+            value = self.direction.currentData()
+            self.view.arrow = self.view.line_normal(-1 if value == "back" else 1)
         self.geometry_label.setText(f"节点 {len(self.view.points)} · 解码画面 {self.view.width_px} × {self.view.height_px}")
         try:
             normalized_points({"points": self.view.points})
@@ -398,6 +459,10 @@ class SamplingSettingsDialog(QDialog):
         self.setWindowTitle(policy.dialog_title)
         self.model_path.setPlaceholderText(policy.model_placeholder)
         self.sport_help.setText(policy.help_text)
+        # Only the person check (running) reads the sprint direction.
+        running = self._selected_sport() == RUNNING
+        self.direction_label.setVisible(running)
+        self.direction.setVisible(running)
         self.notice.setText(policy.notice)
         self._model_changed()
         self._geometry_changed()
@@ -494,7 +559,7 @@ class SamplingSettingsDialog(QDialog):
                             segment=segment, line=line,
                             effective_from_ms=self._session_start_ms(segment),
                             model_path=self.model_path.text(), crop_mode=self.crop.currentText(),
-                            target_sport=self._selected_sport())
+                            target_sport=self._selected_sport(), sprint_arrow=self.sprint_arrow())
         except (OSError, ValueError, KeyError) as error:
             self.notice.setText(f"配置未保存：{error}")
             return

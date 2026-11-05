@@ -24,10 +24,12 @@ from .problem_items import (
     KIND_DUPLICATE_READ,
     KIND_EARLY_READ,
     KIND_LAP_MISSING,
+    KIND_LAP_OVER,
     KIND_LAP_REGRESS,
     KIND_LAP_REPEAT,
     KIND_LAP_TIME,
     KIND_NOT_ARRIVED,
+    KIND_PAIRED_CHIPS,
     KIND_REPEATED_PASSAGE,
     KIND_SYNC,
     KIND_TEST_CHIP,
@@ -50,8 +52,22 @@ DEFAULT_MAX_SPEED_KMH = 60.0
 EARLY_FRACTION = 0.5
 EARLY_REFERENCE_MIN_READS = 5
 LAP_TIME_LOW = 0.5
-LAP_TIME_HIGH = 2.0
+# A lap read missed in between shows up as one lap of about twice the usual
+# time.  Real 现代五项 laps stay within 0.86-1.39x the group median, so 1.6x
+# still catches a fast athlete's doubled lap (about 1.7x).
+LAP_TIME_HIGH = 1.6
 _FINISHED_STATUSES = {"", "OK"}
+# A group is settled -- every athlete has stopped -- once it has been quiet for
+# this many median laps.  Only then are short or extra laps judged mid-race.
+SETTLE_LAP_FACTOR = 1.5
+# The lap most bibs ended on is the target when only a few bibs went beyond it.
+TARGET_MIN_SHARE = 0.6
+OVER_MAX_FRACTION = 0.15
+# Two bibs together on every lap are one athlete carrying two chips, or two
+# athletes running as a pair: a picture decides.  Seven 现代五项 races had no
+# such pair within 1 s; two laps together happened by chance, three did once.
+PAIR_WINDOW_MS = 1_000
+PAIR_MIN_LAPS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +82,9 @@ class ChipCheckContext:
     statuses: Mapping[str, str] = field(default_factory=dict)
     sync_issues: Sequence[SyncIssue] = ()
     race_finished: bool = True
+    # Wall clock of a live check, so a group that has gone quiet can be judged
+    # before the whole race is declared finished.  ``None`` waits for the end.
+    now_ms: Optional[int] = None
 
     def gun_for(self, group_name: str) -> Optional[int]:
         if group_name in self.gun_starts:
@@ -283,6 +302,70 @@ def _early_items(reads: Sequence[ChipRead], context: ChipCheckContext) -> list[P
     return items
 
 
+@dataclass(frozen=True, slots=True)
+class LapTarget:
+    """How many laps a group is judged against, and whether it can be judged yet."""
+
+    target: int
+    settled: bool
+    # When a group still running would settle if no further read arrived.
+    settle_at_ms: Optional[int] = None
+    # Bibs beyond a target most of the group agrees on: an extra read, not a
+    # standard that would make everyone else a lap short.
+    over_bibs: tuple[str, ...] = ()
+
+
+def _lap_reference(reads: Sequence[ChipRead]) -> dict[str, list[int]]:
+    by_bib: dict[str, list[ChipRead]] = defaultdict(list)
+    for read in reads:
+        by_bib[read.bib].append(read)
+    lap_times: dict[str, list[int]] = defaultdict(list)
+    for bib_reads in by_bib.values():
+        bib_reads = sorted(bib_reads, key=lambda read: read.chip_ms)
+        for previous, current in zip(bib_reads, bib_reads[1:]):
+            if current.lap == previous.lap + 1:
+                lap_times[current.group_name].append(current.chip_ms - previous.chip_ms)
+    return lap_times
+
+
+def lap_targets(reads: Sequence[ChipRead], context: ChipCheckContext = ChipCheckContext()) -> dict[str, LapTarget]:
+    """Per group: the lap count to judge against and whether the group has stopped.
+
+    The target is the lap most bibs ended on when only a few bibs went beyond
+    it; otherwise the highest lap, as before.  One extra read must not make
+    every other athlete look a lap short.
+    """
+
+    active = [read for read in reads if read.lap > 0 and not read.excluded and read.active_now]
+    lap_times = _lap_reference([read for read in reads if read.lap > 0 and not read.excluded])
+    finals: dict[str, dict[str, int]] = defaultdict(dict)
+    last_ms: dict[str, int] = {}
+    for read in active:
+        group = finals[read.group_name]
+        group[read.bib] = max(group.get(read.bib, 0), read.lap)
+        last_ms[read.group_name] = max(last_ms.get(read.group_name, read.chip_ms), read.chip_ms)
+    targets = {}
+    for group_name, bib_laps in finals.items():
+        reference = lap_times.get(group_name, [])
+        median = float(np.median(reference)) if len(reference) >= EARLY_REFERENCE_MIN_READS else None
+        settle_at = int(last_ms[group_name] + SETTLE_LAP_FACTOR * median) if median else None
+        settled = context.race_finished or (
+            context.now_ms is not None and settle_at is not None and context.now_ms >= settle_at)
+        counts: dict[int, int] = defaultdict(int)
+        for lap in bib_laps.values():
+            counts[lap] += 1
+        most = max(counts.values())
+        mode = max(lap for lap, count in counts.items() if count == most)
+        above = tuple(sorted((bib for bib, lap in bib_laps.items() if lap > mode), key=lambda b: (len(b), b)))
+        allowed = max(1, int(OVER_MAX_FRACTION * len(bib_laps)))
+        if len(bib_laps) >= 3 and most >= TARGET_MIN_SHARE * len(bib_laps) and 0 < len(above) <= allowed:
+            target, over = mode, above
+        else:
+            target, over = max(counts), ()
+        targets[group_name] = LapTarget(target, settled, None if settled else settle_at, over)
+    return targets
+
+
 def _lap_items(reads: Sequence[ChipRead], context: ChipCheckContext) -> list[ProblemItem]:
     lapped = [read for read in reads if read.lap > 0 and not read.excluded]
     if not lapped:
@@ -290,18 +373,11 @@ def _lap_items(reads: Sequence[ChipRead], context: ChipCheckContext) -> list[Pro
     by_bib: dict[str, list[ChipRead]] = defaultdict(list)
     for read in lapped:
         by_bib[read.bib].append(read)
-    lap_times: dict[str, list[int]] = defaultdict(list)
-    for bib_reads in by_bib.values():
-        bib_reads.sort(key=lambda read: read.chip_ms)
-        for previous, current in zip(bib_reads, bib_reads[1:]):
-            if current.lap == previous.lap + 1:
-                lap_times[current.group_name].append(current.chip_ms - previous.chip_ms)
-    group_max = defaultdict(int)
-    for read in lapped:
-        if read.active_now:
-            group_max[read.group_name] = max(group_max[read.group_name], read.lap)
+    lap_times = _lap_reference(lapped)
+    targets = lap_targets(reads, context)
     items = []
     for bib, bib_reads in by_bib.items():
+        bib_reads.sort(key=lambda read: read.chip_ms)
         for previous, current in zip(bib_reads, bib_reads[1:]):
             pair = (previous, current)
             status, note = _status(pair, minimum_active=2)
@@ -330,30 +406,99 @@ def _lap_items(reads: Sequence[ChipRead], context: ChipCheckContext) -> list[Pro
                     median = float(np.median(reference))
                     lap_ms = current.chip_ms - previous.chip_ms
                     if lap_ms < LAP_TIME_LOW * median or lap_ms > LAP_TIME_HIGH * median:
+                        hint = (f"，约 {lap_ms / median:.1f} 圈的时间，可能中间漏读一次"
+                                if lap_ms > LAP_TIME_HIGH * median else "")
                         items.append(ProblemItem(
                             item_id=stable_item_id(KIND_LAP_TIME, previous.read_id, current.read_id),
                             kind=KIND_LAP_TIME,
                             detail=(
                                 f"号码 {bib} 第 {current.lap} 圈用时 {lap_ms / 60_000:.1f} 分钟，"
-                                f"组内中位 {median / 60_000:.1f} 分钟"
+                                f"组内中位 {median / 60_000:.1f} 分钟{hint}"
                             ),
                             **common,
                         ))
-        if not context.race_finished:
-            continue
         active = [read for read in bib_reads if read.active_now]
         if not active:
             continue
+        target = targets.get(active[0].group_name)
+        if target is None or not target.settled:
+            continue
         last = max(read.lap for read in active)
+        if bib in target.over_bibs:
+            for read in active:
+                if read.lap <= target.target:
+                    continue
+                before = [other for other in active if other.chip_ms < read.chip_ms]
+                gap = f"，距上一次 {(read.chip_ms - before[-1].chip_ms) / 60_000:.1f} 分钟" if before else ""
+                items.append(ProblemItem(
+                    item_id=stable_item_id(KIND_LAP_OVER, read.read_id),
+                    kind=KIND_LAP_OVER, category=CATEGORY_CHIP,
+                    detail=(f"号码 {bib} 记到第 {read.lap} 圈，同组多数人是 {target.target} 圈；"
+                            f"多出的一次 {_read_text(read)}{gap}。可能跑完后又经过读点或重复读数"),
+                    chip_time_ms=read.chip_ms, bibs=(bib,), event_ids=(read.event_id,),
+                    status=STATUS_OPEN, priority=30,
+                ))
+            continue
         status_text = context.statuses.get(bib, "")
-        if last < group_max[active[0].group_name] and status_text in _FINISHED_STATUSES:
+        if last < target.target and status_text in _FINISHED_STATUSES:
             items.append(ProblemItem(
                 item_id=stable_item_id(KIND_LAP_MISSING, bib, last),
                 kind=KIND_LAP_MISSING, category=CATEGORY_CHIP,
-                detail=f"号码 {bib} 只到第 {last} 圈，同组最多 {group_max[active[0].group_name]} 圈，且没有退赛状态",
+                detail=f"号码 {bib} 只到第 {last} 圈，同组应为 {target.target} 圈，且没有退赛状态",
                 chip_time_ms=active[-1].chip_ms, bibs=(bib,), event_ids=(active[-1].event_id,),
                 status=STATUS_OPEN, priority=35,
             ))
+    return items
+
+
+def _paired_items(reads: Sequence[ChipRead]) -> list[ProblemItem]:
+    """Two bibs that crossed together on every lap, at least ``PAIR_MIN_LAPS`` of them.
+
+    Withdrawn reads still count, so a pair CycleRace already fixed stays visible
+    as closed upstream.  A re-identified read (same event under a new bib) is
+    one passage, never a pair with itself.
+    """
+
+    by_group: dict[str, dict[str, dict[int, ChipRead]]] = defaultdict(lambda: defaultdict(dict))
+    for read in sorted(reads, key=lambda read: (read.active_now, read.revision)):
+        if read.lap > 0 and not read.excluded and read.bib:
+            by_group[read.group_name][read.bib][read.lap] = read
+    items = []
+    for bibs in by_group.values():
+        names = sorted(bibs, key=lambda bib: (len(bib), bib))
+        for index, first in enumerate(names):
+            for second in names[index + 1:]:
+                common = sorted(set(bibs[first]) & set(bibs[second]))
+                if len(common) < PAIR_MIN_LAPS:
+                    continue
+                pairs = [(bibs[first][lap], bibs[second][lap]) for lap in common]
+                if any(a.event_id == b.event_id for a, b in pairs):
+                    continue
+                together = next((index for index, (a, b) in enumerate(pairs)
+                                 if abs(a.chip_ms - b.chip_ms) > PAIR_WINDOW_MS), len(pairs))
+                if together < PAIR_MIN_LAPS:
+                    continue
+                anchor = pairs[:PAIR_MIN_LAPS]
+                members = [read for pair in anchor for read in pair]
+                status, note = _status(members, minimum_active=len(members))
+                widest = max(abs(a.chip_ms - b.chip_ms) for a, b in pairs[:together])
+                if together < len(pairs) and status == STATUS_OPEN:
+                    # Two athletes pacing each other split up at last; one
+                    # athlete's two chips never do.  The row stays, answered.
+                    a, b = pairs[together]
+                    status = STATUS_INFO
+                    note = f"第 {common[together]} 圈相差 {abs(a.chip_ms - b.chip_ms) / 1000:.1f} 秒，已经分开：是两个人"
+                items.append(ProblemItem(
+                    item_id=stable_item_id(KIND_PAIRED_CHIPS, first, second),
+                    kind=KIND_PAIRED_CHIPS, category=CATEGORY_CHIP,
+                    detail=(f"号码 {first} 和 {second} 连续 {together} 圈都一起过线（最大相差 {widest / 1000:.2f} 秒）："
+                            "可能是一人带两个芯片，也可能是两人结伴跑，看原帧是 1 人还是 2 人"),
+                    chip_time_ms=anchor[0][0].chip_ms, bibs=(first, second),
+                    # The first laps bind the decision; later laps must not reopen it.
+                    event_ids=tuple(read.event_id for read in members),
+                    status=status, status_note=note, priority=20,
+                    evidence={"laps": common, "lap_times": [[a.chip_ms, b.chip_ms] for a, b in pairs]},
+                ))
     return items
 
 
@@ -400,6 +545,14 @@ def _sync_items(issues: Sequence[SyncIssue], race_date_ms: int = 0) -> list[Prob
     return items
 
 
+def next_recheck_ms(reads: Sequence[ChipRead], context: ChipCheckContext) -> Optional[int]:
+    """When a live check must run again even if no new read arrives: a group settles."""
+
+    pending = [target.settle_at_ms for target in lap_targets(reads, context).values()
+               if not target.settled and target.settle_at_ms is not None]
+    return min(pending) if pending else None
+
+
 def chip_check_items(
     reads: Sequence[ChipRead],
     context: ChipCheckContext = ChipCheckContext(),
@@ -417,6 +570,7 @@ def chip_check_items(
     items += _batch_items(reads, context.roster)
     items += _early_items(reads, context)
     items += _lap_items(reads, context)
+    items += _paired_items(reads)
     items += _not_arrived_items(reads, context)
     items += _sync_items(context.sync_issues, race_date_ms)
     return tuple(sort_items(items))
@@ -425,5 +579,8 @@ def chip_check_items(
 __all__ = [
     "ChipCheckContext",
     "DUPLICATE_WINDOW_MS",
+    "LapTarget",
     "chip_check_items",
+    "lap_targets",
+    "next_recheck_ms",
 ]

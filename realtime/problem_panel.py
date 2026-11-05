@@ -180,6 +180,8 @@ class ProblemListPanel(QFrame):
         self._chip_process: Optional[QProcess] = None
         self._chip_generation = 0
         self._chip_signature = None
+        # A group that goes quiet is judged without a new read: check again then.
+        self._chip_recheck_at: Optional[int] = None
         self._chip_retry_after = 0.0
         self.chip_status = "芯片自检等待记录"
         self._chip_timer = QTimer(self)
@@ -2420,6 +2422,7 @@ class ProblemListPanel(QFrame):
         self._chip_timer.stop()
         self._chip_generation += 1
         self._chip_signature = None
+        self._chip_recheck_at = None
         self._chip_retry_after = 0.0
         self.chip_status = "芯片自检等待记录"
         self.stage_health["接收"] = self.chip_status
@@ -2457,7 +2460,9 @@ class ProblemListPanel(QFrame):
             cached = (self.payload or {}).get("chip_checks")
             if cached:
                 self._chip_signature = cached.get("input_signature")
-        if signature != self._chip_signature and not self._chip_timer.isActive():
+        due = self._chip_recheck_at is not None and time.time() * 1000 >= self._chip_recheck_at
+        if (signature != self._chip_signature or due) and not self._chip_timer.isActive():
+            self._chip_recheck_at = None
             self.chip_status = "芯片自检等待更新（上一结果保留）"
             self.stage_health["接收"] = self.chip_status
             self._chip_timer.start()
@@ -2505,6 +2510,7 @@ class ProblemListPanel(QFrame):
             temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             temporary.replace(path)
             self._chip_signature = payload["input_signature"]
+            self._chip_recheck_at = payload.get("recheck_at_ms")
             self.refresh()
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.chip_status = f"芯片自检失败，保留上一结果：{error}"

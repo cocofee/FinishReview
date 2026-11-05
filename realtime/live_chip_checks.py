@@ -6,11 +6,13 @@ recording journals, or operator decisions. The panel merges both snapshots.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 
 from .analysis_workspace import AnalysisWorkspace
-from .chip_checks import ChipCheckContext, chip_check_items
+from .chip_checks import ChipCheckContext, chip_check_items, next_recheck_ms
 from .chip_history import group_exclusion
 from .batch_review import aggregate_batches, previous_items, read_snapshots, unambiguous_auto_passed
 from .problem_items import CATEGORY_CHIP, KIND_NOT_ARRIVED, ProblemItem, sort_items
@@ -34,7 +36,7 @@ def input_signature(root: Path) -> list:
     return signature
 
 
-def live_chip_payload(root: Path, *, race_id: str = "", stage_id: str = "") -> dict:
+def live_chip_payload(root: Path, *, race_id: str = "", stage_id: str = "", now_ms: Optional[int] = None) -> dict:
     root = Path(root)
     signature = input_signature(root)
     workspace = AnalysisWorkspace(root, race_id=race_id, stage_id=stage_id)
@@ -43,7 +45,9 @@ def live_chip_payload(root: Path, *, race_id: str = "", stage_id: str = "") -> d
     if metadata is not None and (metadata.race_id, metadata.stage_id) == (workspace.race_id, workspace.stage_id):
         roster = {athlete.bib: metadata.group_label(athlete.group_id)
                   for athlete in metadata.athletes if athlete.bib}
-    context = ChipCheckContext(roster=roster, race_finished=False)
+    # A group that has gone quiet is judged now, not when the race is closed.
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    context = ChipCheckContext(roster=roster, race_finished=False, now_ms=now_ms)
     reads = []
     for read in workspace.reads:
         event = workspace.latest_event(read.event_id)
@@ -64,6 +68,9 @@ def live_chip_payload(root: Path, *, race_id: str = "", stage_id: str = "") -> d
     return {
         "schema_version": 1, "race_id": workspace.race_id, "stage_id": workspace.stage_id,
         "input_signature": signature,
+        # Lap totals of a group still running are judged once it settles, which
+        # needs no new read: the panel runs the check again at this time.
+        "recheck_at_ms": next_recheck_ms(reads, context),
         # Duplicate transport deliveries can be acknowledged without a journal
         # append. The journal is not a raw reader-message counter.
         "counts": {"raw_messages": None, "journal_messages": len(scoped_history),

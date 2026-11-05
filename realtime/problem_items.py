@@ -36,6 +36,10 @@ KIND_LAP_REPEAT = "lap_repeat"
 KIND_LAP_REGRESS = "lap_regress"
 KIND_LAP_TIME = "lap_time"
 KIND_LAP_MISSING = "lap_missing"
+# More laps than most of the group: an extra read, judged once the group settles.
+KIND_LAP_OVER = "lap_over"
+# Two bibs together on every lap: one athlete with two chips, or a pair.
+KIND_PAIRED_CHIPS = "paired_chips"
 KIND_NOT_ARRIVED = "not_arrived"
 KIND_SYNC = "sync"
 # Video problems (plan 7.3, first part).
@@ -100,6 +104,7 @@ KIND_TYPES = {
     KIND_BATCH_READS: TYPE_MULTI_CHIP,
     KIND_TEST_CHIP: TYPE_MULTI_CHIP,
     KIND_UNKNOWN_BIB: TYPE_MULTI_CHIP,
+    KIND_PAIRED_CHIPS: TYPE_MULTI_CHIP,
     KIND_BUNCH: TYPE_BUNCH,
     KIND_OBSTRUCTION: TYPE_BUNCH,
     KIND_LINE_ACTIVITY: TYPE_EVIDENCE,
@@ -114,6 +119,7 @@ KIND_TYPES = {
     KIND_LAP_REGRESS: TYPE_RECORD,
     KIND_LAP_TIME: TYPE_RECORD,
     KIND_LAP_MISSING: TYPE_RECORD,
+    KIND_LAP_OVER: TYPE_RECORD,
     KIND_NOT_ARRIVED: TYPE_RECORD,
     KIND_SYNC: TYPE_RECORD,
     # 芯片与画面自己对上的正常单人：是竞赛记录的一部分，不是谁的疑点，
@@ -145,6 +151,8 @@ KIND_TITLES = {
     KIND_LAP_REGRESS: "圈号倒退",
     KIND_LAP_TIME: "单圈用时异常",
     KIND_LAP_MISSING: "末圈缺读",
+    KIND_LAP_OVER: "圈数多于同组",
+    KIND_PAIRED_CHIPS: "两个号每圈同时过线",
     KIND_NOT_ARRIVED: "应到未到",
     KIND_SYNC: "两边记录不一致",
     KIND_NO_CHIP_CROSSING: "有人过线，没有芯片",
@@ -241,6 +249,10 @@ KIND_ACTIONS = {
     KIND_LAP_REGRESS: (ACTION_CHANGE, ACTION_KEEP),
     KIND_LAP_TIME: (ACTION_CHANGE, ACTION_KEEP),
     KIND_LAP_MISSING: (ACTION_CHECKED,),
+    KIND_LAP_OVER: (ACTION_DELETE_CHIP, ACTION_CHANGE, ACTION_KEEP),
+    # Every lap carries both bibs, so no single record is the one to delete:
+    # the operator says what the frame shows and settles it in CycleRace.
+    KIND_PAIRED_CHIPS: (ACTION_SIDE_BY_SIDE, ACTION_SYNCED, ACTION_CHECKED),
     KIND_NOT_ARRIVED: (ACTION_CHECKED,),
     KIND_SYNC: (ACTION_SYNCED, ACTION_CHECKED),
     KIND_NO_CHIP_CROSSING: (ACTION_RECORD_BIB, ACTION_NOT_RIDER, ACTION_RIDE_BACK, ACTION_CONFIRM_CROSSING),
