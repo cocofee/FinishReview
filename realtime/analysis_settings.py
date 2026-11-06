@@ -17,6 +17,8 @@ CROP_MODES = ("up", "side-right", "side-left")
 # A line drawn before the race scope was known may belong to an earlier race
 # of the same folder; it carries over to other sessions for a day only.
 PRE_RACE_LINE_CARRY_MS = 24 * 60 * 60 * 1000
+# ``save(count_line=KEEP)`` leaves a camera's saved count line as it is.
+KEEP = object()
 
 
 def read_settings(root: Path) -> dict:
@@ -137,7 +139,7 @@ class AnalysisSettingsStore:
 
     def save(self, *, race_id: str, stage_id: str, segment, line: dict,
              model_path: str, crop_mode: str, effective_from_ms: int | None = None,
-             target_sport: str | None = None, sprint_arrow=None) -> dict:
+             target_sport: str | None = None, sprint_arrow=None, count_line=KEEP) -> dict:
         points = normalized_points(line)
         sport = normalize_sport(target_sport) if target_sport is not None else None
         # An empty race_id is the pre-race case: the line is tied to the
@@ -181,6 +183,14 @@ class AnalysisSettingsStore:
             arrows.pop(str(camera_index), None)
         else:
             arrows[str(camera_index)] = sprint_arrow
+        if count_line is not KEEP:
+            # Cycling: where riders are counted before the finish, per camera,
+            # [[x, y], [x, y]] in 0..1 of the picture; ``None`` removes it.
+            lines = payload.setdefault("count_lines", {})
+            if count_line is None:
+                lines.pop(str(camera_index), None)
+            else:
+                lines[str(camera_index)] = [[round(float(x), 6), round(float(y), 6)] for x, y in count_line]
         if sport is not None:
             # Isolated with this event workspace; an old file without the key
             # keeps the historical cycling behaviour.

@@ -13,12 +13,13 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QF
                             QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QLineEdit,
                             QPushButton, QVBoxLayout)
 
-from .analysis_settings import AnalysisSettingsStore, CROP_MODES, normalized_points
+from .analysis_settings import KEEP, AnalysisSettingsStore, CROP_MODES, normalized_points
 from .analysis_workspace import AnalysisWorkspace
 from .chip_history import format_chip_time
 from .line_sampling import LineGeometry
 from .problem_analysis import config_from_workspace, line_for_segment
-from .target_sport import DEFAULT_SPORT, RUNNING, SPORT_CHOICES, policy_for
+from .rider_counting import valid_count_line
+from .target_sport import CYCLING, DEFAULT_SPORT, RUNNING, SPORT_CHOICES, policy_for
 
 
 def default_segment_index(segments, race_end_ms) -> int:
@@ -54,6 +55,15 @@ class SamplingLineView(QGraphicsView):
         self._drag = None
         self._overlays = []
         self.arrow = None  # (dx, dy) unit vector on the picture, or None
+        # Cycling: a straight count line before the finish, edited instead of
+        # the finish line while ``editing_count`` is set.
+        self.count_points = []
+        self.editing_count = False
+
+    def edited(self):
+        """The line the mouse is editing."""
+
+        return self.count_points if self.editing_count else self.points
 
     def line_normal(self, sign=1):
         """Unit normal of the line's first-to-last chord, on the picture."""
@@ -67,7 +77,7 @@ class SamplingLineView(QGraphicsView):
             return None
         return sign * -dy / length, sign * dx / length
 
-    def set_frame(self, frame, line=None):
+    def set_frame(self, frame, line=None, count=None):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
         image = QImage(rgb.data, width, height, rgb.strides[0], QImage.Format_RGB888).copy()
@@ -77,6 +87,7 @@ class SamplingLineView(QGraphicsView):
         self.scene().setSceneRect(0, 0, width, height)
         self.width_px, self.height_px = width, height
         self.points = normalized_points(line) if line and line.get("points") != [] else []
+        self.count_points = [[float(x), float(y)] for x, y in (count or [])][:2]
         self.history = []
         self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
         self.redraw()
@@ -93,20 +104,23 @@ class SamplingLineView(QGraphicsView):
         return [point.x() / self.width_px, point.y() / self.height_px]
 
     def remember(self):
-        self.history.append([p[:] for p in self.points])
+        self.history.append(([p[:] for p in self.points], [p[:] for p in self.count_points]))
 
     def undo(self):
         if self.history:
-            self.points = self.history.pop()
+            self.points, self.count_points = self.history.pop()
             self.redraw()
 
     def clear_points(self):
         self.remember()
-        self.points = []
+        if self.editing_count:
+            self.count_points = []
+        else:
+            self.points = []
         self.redraw()
 
     def nearest(self, position):
-        for i, (x, y) in enumerate(self.points):
+        for i, (x, y) in enumerate(self.edited()):
             pixel = self.mapFromScene(QPointF(x * self.width_px, y * self.height_px))
             if (pixel - position).manhattanLength() <= 16:
                 return i
@@ -120,10 +134,20 @@ class SamplingLineView(QGraphicsView):
         if event.button() == Qt.RightButton:
             if nearest is not None:
                 self.remember()
-                self.points.pop(nearest)
+                self.edited().pop(nearest)
                 self.redraw()
             return
         if event.button() != Qt.LeftButton:
+            return
+        if self.editing_count:
+            # A straight line of two points: drag them, or clear to redraw.
+            if nearest is not None:
+                self.remember()
+                self._drag = nearest
+            elif len(self.count_points) < 2:
+                self.remember()
+                self.count_points.append(point)
+                self.redraw()
             return
         self.remember()
         if nearest is not None:
@@ -145,13 +169,13 @@ class SamplingLineView(QGraphicsView):
     def mouseMoveEvent(self, event):
         point = self.normalized_at(event.pos())
         if self._drag is not None and point is not None:
-            self.points[self._drag] = point
+            self.edited()[self._drag] = point
             self.redraw()
 
     def mouseReleaseEvent(self, event):
         point = self.normalized_at(event.pos())
         if self._drag is not None and point is not None:
-            self.points[self._drag] = point
+            self.edited()[self._drag] = point
             self.redraw()
         self._drag = None
 
@@ -184,6 +208,15 @@ class SamplingLineView(QGraphicsView):
             head = QPolygonF([tip, QPointF(base_x + px * size * 0.22, base_y + py * size * 0.22),
                               QPointF(base_x - px * size * 0.22, base_y - py * size * 0.22)])
             self._overlays.append(self.scene().addPolygon(head, arrow_pen, QBrush(QColor("#ffcc00"))))
+        if self.count_points:
+            count_pen = QPen(QColor("#ff8c00"), 3, Qt.DashLine)
+            count_pen.setCosmetic(True)
+            for a, b in zip(self.count_points, self.count_points[1:]):
+                self._overlays.append(self.scene().addLine(a[0] * self.width_px, a[1] * self.height_px,
+                                                          b[0] * self.width_px, b[1] * self.height_px, count_pen))
+            for x, y in self.count_points:
+                self._overlays.append(self.scene().addEllipse(x * self.width_px - radius, y * self.height_px - radius,
+                                                              2 * radius, 2 * radius, count_pen))
         self.changed.emit()
 
 
@@ -271,6 +304,20 @@ class SamplingSettingsDialog(QDialog):
         self.direction.currentIndexChanged.connect(self._direction_changed)
         direction_row.addWidget(self.direction, 1)
         layout.addLayout(direction_row)
+        count_row = QHBoxLayout()
+        self.count_label = QLabel("正在画")
+        count_row.addWidget(self.count_label)
+        self.drawing = QComboBox()
+        self.drawing.addItem("终点线（绿）", "finish")
+        self.drawing.addItem("计数线（橙，自行车可选）", "count")
+        self.drawing.setToolTip("计数线画在终点线前、车手还分得开的路面上，两点横跨整条车道；"
+                                "车手从这条线骑向终点线时数一个人。不画就按原来的认车方法。")
+        self.drawing.currentIndexChanged.connect(self._drawing_changed)
+        count_row.addWidget(self.drawing, 1)
+        self.count_help = QLabel("计数线：终点线前车手还没挤在一起、也没被画面切掉的地方")
+        self.count_help.setWordWrap(True)
+        count_row.addWidget(self.count_help, 2)
+        layout.addLayout(count_row)
         self.geometry_label = QLabel()
         layout.addWidget(self.geometry_label)
         self.view.changed.connect(self._geometry_changed)
@@ -379,6 +426,24 @@ class SamplingSettingsDialog(QDialog):
         self.view.arrow = self.view.line_normal(-1 if value == "back" else 1) if value in ("forward", "back") else None
         self.view.redraw()
 
+    def _drawing_changed(self, *_args):
+        self.view.editing_count = self.drawing.currentData() == "count" and self._selected_sport() == CYCLING
+        self.view._drag = None
+        self._geometry_changed()
+
+    def count_line(self):
+        """What to save: the count line, ``None`` to remove it, ``KEEP`` for running."""
+
+        if self._selected_sport() != CYCLING:
+            return KEEP
+        points = [point[:] for point in self.view.count_points]
+        if not points:
+            return None
+        problem = valid_count_line(points, self.view.points)
+        if problem:
+            raise ValueError(problem)
+        return points
+
     def sprint_arrow(self):
         """What to save: ``None`` learn it, ``0`` 不限方向, or the arrow."""
 
@@ -395,7 +460,11 @@ class SamplingSettingsDialog(QDialog):
             # Following a moved line: the arrow stays on its side of it.
             value = self.direction.currentData()
             self.view.arrow = self.view.line_normal(-1 if value == "back" else 1)
-        self.geometry_label.setText(f"节点 {len(self.view.points)} · 解码画面 {self.view.width_px} × {self.view.height_px}")
+        count = len(self.view.count_points)
+        count_text = ("" if not hasattr(self, "sport") or self._selected_sport() != CYCLING
+                      else " · 计数线 " + ("已画" if count == 2 else "画了 1 个点，还差 1 个" if count else "未画"))
+        self.geometry_label.setText(f"节点 {len(self.view.points)}{count_text} · "
+                                    f"解码画面 {self.view.width_px} × {self.view.height_px}")
         try:
             normalized_points({"points": self.view.points})
             valid = self._frame_ready
@@ -407,7 +476,8 @@ class SamplingSettingsDialog(QDialog):
 
     def _select(self, index):
         if self._selected is not None:
-            self._drafts[self._selected] = {"points": [p[:] for p in self.view.points], "snap": self.snap.isChecked()}
+            self._drafts[self._selected] = {"points": [p[:] for p in self.view.points], "snap": self.snap.isChecked(),
+                                            "count": [p[:] for p in self.view.count_points]}
         self._selected = index
         self._frame_ready = False
         self._stop_probe()
@@ -428,9 +498,11 @@ class SamplingSettingsDialog(QDialog):
         self.position_ms = pts
         self._frame_ready = True
         segment = self.segments[self._selected]
-        line = self._drafts.get(self._selected) or line_for_segment(self.config, self.source, segment)
+        draft = self._drafts.get(self._selected)
+        line = draft or line_for_segment(self.config, self.source, segment)
+        count = draft.get("count") if draft else self.config.count_lines.get(segment.camera_index)
         try:
-            self.view.set_frame(frame, line)
+            self.view.set_frame(frame, line, count if isinstance(count, list) else None)
         except (ValueError, KeyError, TypeError) as error:
             self.view.set_frame(frame)
             self.notice.setText(f"原取样线无效，请重新画线：{error}")
@@ -463,6 +535,12 @@ class SamplingSettingsDialog(QDialog):
         running = self._selected_sport() == RUNNING
         self.direction_label.setVisible(running)
         self.direction.setVisible(running)
+        # Only cycling counts riders at a count line.
+        cycling = self._selected_sport() == CYCLING
+        self.count_label.setVisible(cycling)
+        self.drawing.setVisible(cycling)
+        self.count_help.setVisible(cycling)
+        self._drawing_changed()
         self.notice.setText(policy.notice)
         self._model_changed()
         self._geometry_changed()
@@ -559,7 +637,8 @@ class SamplingSettingsDialog(QDialog):
                             segment=segment, line=line,
                             effective_from_ms=self._session_start_ms(segment),
                             model_path=self.model_path.text(), crop_mode=self.crop.currentText(),
-                            target_sport=self._selected_sport(), sprint_arrow=self.sprint_arrow())
+                            target_sport=self._selected_sport(), sprint_arrow=self.sprint_arrow(),
+                            count_line=self.count_line())
         except (OSError, ValueError, KeyError) as error:
             self.notice.setText(f"配置未保存：{error}")
             return

@@ -545,6 +545,37 @@ def _proj_range(geometry) -> tuple[float, float]:
     return (EDGE_PROJ_LOW if at_edge(a) else PROJ_LOW), (EDGE_PROJ_HIGH if at_edge(b) else PROJ_HIGH)
 
 
+def _line_record(camera_index: int, item, when: float, frame_index: int, row: int, rows) -> CrossingRecord:
+    """A person's crossing as a line record: the original frame, and where on the line."""
+
+    geometry = item.geometry
+    return CrossingRecord(
+        camera_index=camera_index, session_id=str(item.meta.get("session_id", "")),
+        segment_id=str(item.meta.get("segment_id", "")), video_path=str(item.meta.get("video_path", "")),
+        recorder_ms=int(round(when)), frame_index=int(frame_index),
+        position_ms=int(round(float(item.pts[frame_index]))), row=row, r0=rows[0], r1=rows[1],
+        contact=geometry.point(row),
+        segment_points=tuple(geometry.point(int(r)) for r in np.linspace(rows[0], rows[1], 9).round()),
+    )
+
+
+def _free_record(make: Callable[[int], CrossingRecord], row: int, samples: int,
+                 used_keys: set[str]) -> Optional[CrossingRecord]:
+    """The record at ``row``, else the nearest free row up the line, then down it.
+
+    People crossing in one frame can land on one row.  Walking only up and
+    then bouncing between the last two rows never ended once both were taken
+    (three people in one frame at the end of the line); this walks up first,
+    as before, then down.  ``None`` only when every row of that frame is taken.
+    """
+
+    for at in (*range(row, samples), *range(row - 1, -1, -1)):
+        record = make(at)
+        if record.key not in used_keys:
+            return record
+    return None
+
+
 def _track_crossings(track, files, camera_index: int, used_keys: set[str]) -> list[PersonCrossing]:
     """Every crossing of one track.
 
@@ -592,17 +623,11 @@ def _track_crossings(track, files, camera_index: int, used_keys: set[str]) -> li
             box = track[index][3]
             rows = sorted(int(np.clip(round(_projection(corner, a, b) * (samples - 1)), 0, samples - 1))
                           for corner in ((box[0], box[1] + box[3]), (box[0] + box[2], box[1] + box[3])))
-            record = None
-            while record is None or record.key in used_keys:
-                record = CrossingRecord(
-                    camera_index=camera_index, session_id=str(item.meta.get("session_id", "")),
-                    segment_id=str(item.meta.get("segment_id", "")), video_path=str(item.meta.get("video_path", "")),
-                    recorder_ms=int(round(when)), frame_index=int(frame_index),
-                    position_ms=int(round(float(item.pts[frame_index]))), row=row, r0=rows[0], r1=rows[1],
-                    contact=geometry.point(row),
-                    segment_points=tuple(geometry.point(int(r)) for r in np.linspace(rows[0], rows[1], 9).round()),
-                )
-                row = min(samples - 1, row + 1) if row < samples - 1 else max(0, row - 1)
+            record = _free_record(
+                lambda at: _line_record(camera_index, item, when, frame_index, at, rows), row, samples, used_keys)
+            if record is None:
+                logger.warning("no free row left for a crossing in frame %s of %s", frame_index, item.path.name)
+                continue
             used_keys.add(record.key)
             found.append(PersonCrossing(
                 record=record, direction=1 if value > 0 else -1, proj=round(float(proj), 3),
@@ -687,10 +712,14 @@ def learn_profile(matched: Sequence[PersonCrossing], direction: Optional[int]) -
 
 
 def not_athlete_reason(crossing: PersonCrossing, profile: Optional[AthleteProfile],
-                       direction: Optional[int] = None) -> str:
-    """Why a crossing nobody's chip claimed is not an athlete; empty when it may be one."""
+                       direction: Optional[int] = None, *, riders: bool = False) -> str:
+    """Why a crossing nobody's chip claimed is not an athlete; empty when it may be one.
 
-    if crossing.vehicle:
+    ``riders``: the crossings are cycling riders (rider_counting), so riding is
+    what an athlete does, not a reason to leave them out.
+    """
+
+    if crossing.vehicle and not riders:
         return "骑车或车辆"
     wanted = profile.direction if profile is not None else (direction or 0)
     if wanted and crossing.direction != wanted:

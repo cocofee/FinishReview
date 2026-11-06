@@ -573,3 +573,51 @@ def test_line_can_be_drawn_before_any_race_event(qapp, tmp_path):
     segment = workspace.archive_segments(for_configuration=True)[0]
     config = replace(config_from_workspace(tmp_path), race_id="race-new", stage_id="stage")
     assert line_for_segment(config, workspace, segment)["points"] == [[.1, .2], [.8, .7]]
+
+
+def test_count_line_is_drawn_apart_from_the_finish_line_and_stays_straight(qapp):
+    view = SamplingLineView()
+    view.resize(800, 600)
+    view.show()
+    view.set_frame(np.zeros((180, 320, 3), np.uint8), {"points": POINTS}, [[.8, .2]])
+    qapp.processEvents()
+    view.editing_count = True
+    for x, y in ((290, 90), (300, 120)):
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=view.mapFromScene(QPointF(x, y)))
+    assert view.points == POINTS
+    assert len(view.count_points) == 2
+    assert view.count_points[1] == pytest.approx([290 / 320, 90 / 180], abs=.01)
+    view.undo()
+    assert len(view.count_points) == 1
+    view.clear_points()
+    assert view.count_points == [] and view.points == POINTS
+    view.close()
+
+
+def test_dialog_saves_a_cycling_count_line_and_running_keeps_it(qapp, sealed):
+    root, _source, _segments = sealed
+    dialog = SamplingSettingsDialog(root)
+    pump(qapp, lambda: dialog.worker is None)
+    assert dialog.sport.currentData() == "cycling" and not dialog.drawing.isHidden()
+    dialog.view.count_points = [[.1, .6], [.9, .3]]  # across the finish line
+    dialog._save()
+    assert not (root / CONFIG_PATH).exists()
+    assert "相交" in dialog.notice.text()
+    dialog.view.count_points = [[.8, .2], [.9, .5]]
+    dialog._save()
+    assert config_from_workspace(root).count_lines == {1: [[.8, .2], [.9, .5]]}
+
+    reopened = SamplingSettingsDialog(root)
+    pump(qapp, lambda: reopened.worker is None)
+    assert reopened.view.count_points == [[.8, .2], [.9, .5]]
+    reopened.sport.setCurrentIndex(reopened.sport.findData("running"))
+    assert reopened.drawing.isHidden()
+    reopened._save()
+    assert config_from_workspace(root).count_lines == {1: [[.8, .2], [.9, .5]]}
+
+    cleared = SamplingSettingsDialog(root)
+    pump(qapp, lambda: cleared.worker is None)
+    cleared.sport.setCurrentIndex(cleared.sport.findData("cycling"))
+    cleared.view.count_points = []
+    cleared._save()
+    assert config_from_workspace(root).count_lines == {}

@@ -101,6 +101,7 @@ from .problem_items import (
 from .person_follow import follow_path, follow_payload
 from .person_crossing import (configured_direction, extract_people, learn_profile, not_athlete_reason,
                               people_at_line, person_model_path)
+from .rider_counting import count_line_problem, extract_riders, riders_at_line
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
 from .target_sport import CYCLING, DEFAULT_SPORT, POLICY_VERSION, RUNNING, normalize_sport, policy_for
@@ -129,6 +130,9 @@ class AnalysisConfig:
     crop_modes: Mapping[int, str] = field(default_factory=dict)
     # Camera -> sprint arrow: [dx, dy] on the picture, 0 for 不限方向; absent learns it.
     sprint_arrows: Mapping[int, Any] = field(default_factory=dict)
+    # Cycling only: camera -> count line [[x, y], [x, y]] (0..1 of the picture)
+    # drawn before the finish where riders are still apart (rider_counting).
+    count_lines: Mapping[int, Any] = field(default_factory=dict)
     race_id: str = ""
     stage_id: str = ""
     clock_model_path: Optional[Path] = None
@@ -254,11 +258,24 @@ def _person_model(config: AnalysisConfig) -> Optional[Path]:
     return path if path is not None and path.is_file() else None
 
 
+def _rider_setup(config: AnalysisConfig, camera: Optional[int]):
+    """Cycling with a model and a count line drawn for this camera: (model, count line)."""
+
+    if camera is None or normalize_sport(config.target_sport) != CYCLING:
+        return None
+    points = config.count_lines.get(int(camera))
+    if not isinstance(points, (list, tuple)) or len(points) != 2:
+        return None
+    path = person_model_path(config.model_path, config.person_model_path)
+    return (path, points) if path is not None and path.is_file() else None
+
+
 def extract_race_people(
     config: AnalysisConfig,
     reads: Iterable[ChipRead],
     strip_paths: list[Path],
     *,
+    camera: Optional[int] = None,
     runtime=None,
     gates: Optional[dict] = None,
     progress: ProgressCallback = _noop_progress,
@@ -271,7 +288,8 @@ def extract_race_people(
     chip read nothing is, since there is no race to compare people with yet.
     """
 
-    model = _person_model(config)
+    rider = _rider_setup(config, camera)
+    model = rider[0] if rider is not None else _person_model(config)
     times = [read.chip_ms for read in reads if not read.excluded]
     if model is None or not times or not strip_paths:
         return 0
@@ -279,8 +297,16 @@ def extract_race_people(
     files = [item for item in _load_file_strips(strip_paths, runtime) if item.end_ms >= start]
     if not files:
         return 0
+    if rider is not None and count_line_problem(files, rider[1]):
+        # The count line no longer fits a finish line: the cycling check of
+        # the line strip runs instead, and needs no people.
+        return 0
     from .stream_recorder import find_ffmpeg_executable
 
+    if rider is not None:
+        return extract_riders(config.resolved_output(), files, model, rider[1],
+                              executable=find_ffmpeg_executable(), gates=gates, progress=progress,
+                              checkpoint=checkpoint, cancelled=cancelled)
     return extract_people(config.resolved_output(), files, model, executable=find_ffmpeg_executable(),
                           gates=gates, progress=progress, checkpoint=checkpoint, cancelled=cancelled)
 
@@ -884,7 +910,8 @@ def _write_follow(output_dir: Path, people, camera: int, bibs: dict) -> None:
         logger.warning("person tracks for camera %s not saved: %s", camera, error)
 
 
-def _athlete_leftovers(people, result, matched, video_only, pairing_crossings, reads, *, direction, live):
+def _athlete_leftovers(people, result, matched, video_only, pairing_crossings, reads, *, direction, live,
+                       riders=False):
     """Crossings no chip claimed, minus the people who are plainly not athletes.
 
     What paired athletes looked like here (direction, size, speed, lane) is
@@ -915,7 +942,7 @@ def _athlete_leftovers(people, result, matched, video_only, pairing_crossings, r
     kept = []
     for crossing in video_only:
         person = person_of.get(crossing.key)
-        reason = not_athlete_reason(person, profile, direction) if person is not None else ""
+        reason = not_athlete_reason(person, profile, direction, riders=riders) if person is not None else ""
         if not reason and cutoff is not None and crossing.recorder_ms > cutoff:
             reason = "全部完赛之后"
         if reason:
@@ -1142,11 +1169,25 @@ def analyse_camera(
     reads = workspace.reads if reads is None else reads
     files = _load_file_strips(strip_paths, runtime)
     person_model = _person_model(config)
-    # Running with a model: tracked people are the crossings, and only the
-    # recording the people search has covered counts as seen.
-    people = (people_at_line(output_dir, files, camera, person_model,
-                             cache=runtime.people if runtime is not None else None)
-              if person_model is not None else None)
+    rider = _rider_setup(config, camera)
+    # A count line across a recording's finish line, or one riders cross the
+    # wrong way, counts nobody right: the line strip's cycling check runs
+    # instead and the operator is told to redraw it.
+    count_line_note = count_line_problem(files, rider[1]) if rider is not None else ""
+    if count_line_note:
+        rider = None
+    # Running with a model, or cycling with a count line: tracked people are
+    # the crossings, and only the recording the search has covered counts as seen.
+    if rider is not None:
+        people = riders_at_line(output_dir, files, camera, rider[0], rider[1],
+                                cache=runtime.people if runtime is not None else None)
+        if people is not None and people.stats.get("count_line_problem"):
+            count_line_note = people.stats["count_line_problem"]
+            people, rider = None, None
+    else:
+        people = (people_at_line(output_dir, files, camera, person_model,
+                                 cache=runtime.people if runtime is not None else None)
+                  if person_model is not None else None)
     if people is not None:
         files = people.files
     detection_started = time.perf_counter()
@@ -1242,6 +1283,8 @@ def analyse_camera(
         calibration.model, anchors, camera_index=camera, sessions=sessions,
     )
     warnings = [*calibration.warnings, *choice.warnings]
+    if count_line_note:
+        warnings.append(f"{count_line_note}；本次按原来的认车方法分析")
     result: dict = {
         "camera_index": camera,
         "target_sport": policy.name,
@@ -1462,7 +1505,7 @@ def analyse_camera(
     if people is not None:
         _write_follow(output_dir, people, camera, {crossing.key: read.bib for crossing, read, _residual in matched})
         video_only = _athlete_leftovers(people, result, matched, video_only, pairing_crossings, reads,
-                                        direction=direction, live=config.live)
+                                        direction=direction, live=config.live, riders=rider is not None)
     uncalibrated_sessions = sorted({
         name for _start, _end, name in coverage
         if name and served_sessions is not None and name not in served_sessions
@@ -1712,6 +1755,7 @@ def config_from_workspace(workspace_dir: str | Path) -> AnalysisConfig:
         target_sport=normalize_sport(settings.get("target_sport")),
         crop_modes={int(key): str(value) for key, value in (settings.get("crop_modes") or {}).items()},
         sprint_arrows={int(key): value for key, value in (settings.get("sprint_arrows") or {}).items()},
+        count_lines={int(key): value for key, value in (settings.get("count_lines") or {}).items()},
         clock_model_path=root / CLOCK_MODEL_FILENAME,
         min_available_mb=int(settings.get("min_available_mb", MIN_AVAILABLE_MEMORY_MB)),
         sampling_profiles=tuple(settings.get("sampling_profiles", ())),
@@ -1857,7 +1901,8 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 # The first round also catches up on the race so far; later
                 # rounds only look at the files just sealed.
                 extract_race_people(
-                    config, workspace.reads, list(job["ready"]) if first_round else new_paths, runtime=runtime,
+                    config, workspace.reads, list(job["ready"]) if first_round else new_paths, camera=camera,
+                    runtime=runtime,
                     gates=job.setdefault("gates", {}), progress=progress,
                     checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
                 )
@@ -1977,7 +2022,7 @@ def run_offline_analysis(
         summary["cameras"][camera] = {"strips": len(paths)}
         if stage == "strips" or cancelled():
             continue
-        extract_race_people(config, workspace.reads, paths, progress=progress,
+        extract_race_people(config, workspace.reads, paths, camera=camera, progress=progress,
                             checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled)
         if cancelled():
             continue
