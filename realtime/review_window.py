@@ -89,10 +89,11 @@ from .preflight import (
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
 from .race_metadata import RaceMetadata, RaceMetadataStore
 from .workspace_context import (
-    EventWorkspaceMetadataStore, recovered_archive_path, saved_archive_path, saved_live_path, saved_received_path,
-    save_workspace_mode,
+    EventWorkspaceMetadataStore, is_event_folder_under, recovered_archive_path, saved_archive_path, saved_live_path,
+    saved_received_path, save_workspace_mode,
 )
 from .review_export import export_review_summary
+from .runtime_paths import relocated_video_path
 from .review_clip import PassageReviewBindingStore
 from .receiver_controller import ReceiverController
 from .recording_lock import LOCK_FILENAME, FolderInUseError, RecordingFolderLock
@@ -289,6 +290,32 @@ def _saved_race_id(folder: Path) -> str | None:
     return None
 
 
+def _saved_race_folders(root: Path) -> list[tuple[Path, str, str]]:
+    """Race folders in the root and in its competition folders, with their race id and name."""
+
+    found = []
+    try:
+        level_one = sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
+    except OSError:
+        return found
+    for path in level_one:
+        folders = [path]
+        if not (path / "cyclerace_race_metadata.json").is_file() and not (path / "review_event_scope.json").is_file():
+            try:
+                folders = sorted(child for child in path.iterdir() if child.is_dir() and not child.name.startswith("."))
+            except OSError:
+                continue
+        for folder in folders:
+            try:
+                saved = RaceMetadataStore(folder / "cyclerace_race_metadata.json").current()
+            except (OSError, RuntimeError, ValueError):
+                saved = None
+            race_id = saved.race_id if saved is not None else _saved_race_id(folder)
+            if race_id:
+                found.append((folder, race_id, saved.race_name if saved is not None else ""))
+    return found
+
+
 def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | None = None) -> Path:
     root = Path(root).expanduser().resolve()
     try:
@@ -300,24 +327,28 @@ def _event_workspace_dir(root: Path, metadata: RaceMetadata, *, today: date | No
         # there, so coming back to it must not open an empty folder beside them.
         return root
     folder_name = _safe_event_folder_name(metadata.race_name, metadata.race_id)
-    race_suffix = _safe_event_folder_name(metadata.race_id, "race")
-    # A race already saved stays where it is, under its bare name (folders
-    # made before 10-28) or its dated one.
-    dated = re.compile(r"\d{4}-\d{2}-\d{2} " + re.escape(folder_name) + r"(_.*)?")
-    try:
-        saved = sorted(path for path in root.iterdir() if path.is_dir() and (
-            path.name == folder_name or path.name.startswith(f"{folder_name}_") or dated.fullmatch(path.name)))
-    except OSError:
-        saved = []
-    for candidate in saved:
-        if _saved_race_id(candidate) == metadata.race_id:
+    # A race already saved stays where it is: straight in the root (before
+    # 11-05) or inside its competition's folder.
+    saved = _saved_race_folders(root)
+    for candidate, race_id, _race_name in saved:
+        if race_id == metadata.race_id:
             return candidate
+    # 11-05: one folder per competition, one folder per race in it, so the
+    # 现代五项 days and its 男子/女子, A/B 组 races sit together.  The
+    # competition's folder may have been renamed shorter by hand; a race of
+    # the same name already filed there shows where it is.
+    competition = next((candidate.parent for candidate, _race_id, race_name in saved
+                        if candidate.parent != root and race_name == metadata.race_name), root / folder_name)
     # A new race is filed under the day it first arrived, not CycleRace's stage
     # date, which can be wrong (特奥 ran 10-28 with a stage dated 09-20).
     day = (today or datetime.now(BEIJING_TIMEZONE).date()).isoformat()
-    base = f"{day} {folder_name}"
-    candidates = [root / base, root / f"{base}_{race_suffix}"]
-    candidates.extend(root / f"{base}_{race_suffix}_{index}" for index in range(2, 100))
+    stage_name = _safe_event_folder_name(metadata.stage_name, "") if str(metadata.stage_name or "").strip() else ""
+    base = f"{day} {stage_name}" if stage_name and stage_name != folder_name else day
+    if (competition / "cyclerace_race_metadata.json").is_file():
+        # An older race folder already has the competition's name: keep the new race beside it.
+        competition, base = root, f"{day} {folder_name}" + (f" {stage_name}" if base != day else "")
+    candidates = [competition / base]
+    candidates.extend(competition / f"{base}_{index}" for index in range(2, 100))
     for candidate in candidates:
         if not candidate.exists():
             return candidate
@@ -618,6 +649,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._archive_background_passage_count = 0
         self._live_metadata_scope = None
         self._held_race_ids: set[str] = set()
+        # Races whose recording the first chip already started, or the operator stopped.
+        self._auto_recorded_race_ids: set[str] = set()
         # The base review surface starts timers while the production window is
         # still being assembled. Initialise health-check state before that
         # happens so an early clock tick cannot observe half-built state.
@@ -1433,6 +1466,9 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _toggle_recording(self) -> None:
         if self._recording_any_active():
+            race_id = self._race_being_recorded()
+            if race_id:
+                self._auto_recorded_race_ids.add(race_id)
             self.stop_recording()
             return
         if self._workspace_mode == "archive":
@@ -1443,6 +1479,7 @@ class FinishReviewWindow(PassageReviewSurface):
             if not is_supported_review_source(self.source):
                 return
         try:
+            self._enter_race_opened_in_cyclerace()
             self.start_recording()
         except Exception as exc:  # noqa: BLE001 - GUI boundary reports device failures.
             self._runtime_error = sanitize_recording_message(exc)
@@ -1587,10 +1624,43 @@ class FinishReviewWindow(PassageReviewSurface):
         self._update_runtime_status()
         return True
 
+    def _may_enter_received_race(self, metadata: RaceMetadata) -> bool:
+        """A race CycleRace sent on an earlier day gets no new folder without the operator's word.
+
+        11-05: 「返回当前赛事」 made a folder for the previous evening's 接力测试赛.
+        A race that already has its folder, or that CycleRace sent today, enters as before.
+        """
+
+        if any(race_id == metadata.race_id for _folder, race_id, _name in _saved_race_folders(self.workspace_root)):
+            return True
+        if (self.workspace_root / "cyclerace_race_metadata.json").is_file() and (
+                _saved_race_id(self.workspace_root) == metadata.race_id):
+            return True
+        try:
+            sent = datetime.fromtimestamp(self._receiver_metadata_store.snapshot_path.stat().st_mtime,
+                                          BEIJING_TIMEZONE)
+        except OSError:
+            return True
+        today = datetime.now(BEIJING_TIMEZONE).date()
+        if sent.date() >= today:
+            return True
+        name = metadata.race_name or metadata.race_id
+        stage = f"「{metadata.stage_name}」" if metadata.stage_name else ""
+        answer = QMessageBox.question(
+            self, "返回当前赛事",
+            "\n\n".join((
+                f"CycleRace 最后发来的是 {sent:%m-%d %H:%M} 的「{name}」{stage}，不是今天发来的。",
+                "进入这场会为它新建本场文件夹。今天的比赛请先在 CycleRace 打开，它会重新发来。",
+                "仍要进入这场吗？")),
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        return answer == QMessageBox.Yes
+
     def _return_to_live_event(self) -> bool:
         if self._workspace_mode != "archive":
             return True
         metadata = self._receiver_metadata_store.current()
+        if metadata is not None and not self._may_enter_received_race(metadata):
+            return False
         try:
             if metadata is not None:
                 applied = self._activate_cyclerace_workspace(
@@ -1670,7 +1740,11 @@ class FinishReviewWindow(PassageReviewSurface):
             return
         event_dir = self.output_dir.resolve()
         root = self.workspace_root.resolve()
-        if event_dir != root and event_dir.parent != root:
+        if event_dir == root:
+            # The root also holds every other race's folder; clearing it would take them too.
+            QMessageBox.warning(self, "无法清空数据", "本场数据直接放在保存根目录里，和其他赛事混在一起，未做任何改动。")
+            return
+        if not is_event_folder_under(event_dir, root):
             QMessageBox.warning(self, "无法清空数据", "本场目录不在保存根目录中，未做任何改动。")
             return
         count = len(self.passage_store.events(include_inactive=True))
@@ -2576,6 +2650,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
         self.problem_panel.delete_requested.connect(self._delete_problem_record)
+        self.problem_panel.calibration_requested.connect(self._calibrate_crossing_frame)
         self.problem_panel.summary_changed.connect(lambda _text: self._refresh_crossing_cards())
         self._normal_crossing_cards = {}
         self._opened_normal_crossing = ""
@@ -2587,7 +2662,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.crossing_cards.item_selected.connect(self._select_crossing_card)
         self.preview_panel.layout().addWidget(self.crossing_cards)
         # 过线记录已经是左边那张表，横排卡片是同一批数据的第二面：收起来，
-        # 只留下这一行的两个工具（查找原录像 / 以当前帧校时）。
+        # 只留下查找原录像；校时在判读工具条最前面。
         self.crossing_cards.list.hide()
         self.crossing_cards.title.hide()
         self.recording_rail_button = QPushButton("查找原录像", self.crossing_cards)
@@ -2595,10 +2670,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recording_rail_button.toggled.connect(self._set_recording_rail_visible)
         self.crossing_cards.toolbar.addWidget(self.recording_rail_button)
         self._creating_manual_crossing = False
-        self.calibrate_crossing_button = QPushButton("以当前帧校时", self.crossing_cards)
-        self.calibrate_crossing_button.setToolTip("先找到一位身份明确的选手压线原帧，再选择其有效芯片记录建立校时")
-        self.calibrate_crossing_button.clicked.connect(self._calibrate_crossing_frame)
-        self.crossing_cards.toolbar.addWidget(self.calibrate_crossing_button)
+        # 校时 lives on the judging toolbar (QuickReviewPanel.calibrate_button), not down here.
         self.group_start_button = QPushButton("回到团首", self)
         self.group_start_button.clicked.connect(self._open_group_start)
         self.evidence_panes[0].controls_layout.addWidget(self.group_start_button)
@@ -3168,7 +3240,7 @@ class FinishReviewWindow(PassageReviewSurface):
         pane = self._active_playback_pane()
         frame = self._frame_for_problem_count(pane)
         if frame is None:
-            self.problem_panel.hint.setText("先从原录像打开首位身份明确的选手压线画面。")
+            self.problem_panel.hint.setText("先在左表选这位选手的芯片记录，把画面停在他压线的那一帧，再点「先校时」。")
             self.recording_rail_button.setChecked(True)
             return
         from .analysis_workspace import AnalysisWorkspace
@@ -3318,9 +3390,8 @@ class FinishReviewWindow(PassageReviewSurface):
         from .video_timeline import PassageVideoLocation
 
         segment = self.timeline_store.get_segment(str(frame.get("segment_id", "")))
-        path = Path(str(frame.get("video_path", "")))
-        if not path.is_absolute():
-            path = self.output_dir / path
+        # Follows the same file into this race folder if the folder was moved (11-05).
+        path = relocated_video_path(str(frame.get("video_path", "")), self.output_dir)
         if segment is None or not path.is_file():
             self.problem_panel.hint.setText("原录像缺失或不在本赛事的录像索引中，未跳转其他录像。")
             return False
@@ -4320,6 +4391,7 @@ class FinishReviewWindow(PassageReviewSurface):
             self._workspace_mode = "live"
             save_workspace_mode(self.workspace_root, self.output_dir, "live")
             self._archive_background_passage_count = 0
+            self._workspace_notice = ""
         if applied and recording_was_active:
             self._workspace_notice = "已切换新赛事，录像待重新开始"
         return applied
@@ -4394,9 +4466,12 @@ class FinishReviewWindow(PassageReviewSurface):
         )
 
     def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
+        # The first chip starts a forgotten recording once per race; a recording
+        # the operator stopped is not started again by later chips.
         if (
             self._workspace_mode != "live"
             or not event.is_active
+            or event.race_id in self._auto_recorded_race_ids
             or self._camera_auth_retry_blocked()
             or self._recording_any_active()
             or self._is_test_passage(event)
@@ -4413,6 +4488,7 @@ class FinishReviewWindow(PassageReviewSurface):
                 event.event_id,
             )
             return False
+        self._auto_recorded_race_ids.add(event.race_id)
         logger.info(
             "Recording auto-started for live passage %s in group %s",
             event.event_id,
@@ -4420,35 +4496,30 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         return True
 
-    def _auto_start_recording_for_metadata(self, metadata: RaceMetadata) -> bool:
-        if (
-            self._workspace_mode != "live"
-            or self._camera_auth_retry_blocked()
-            or self._recording_any_active()
-            or not any(
-                not _is_test_group_name(group.name)
-                and not _is_test_group_name(group.group_id)
-                for group in metadata.groups
-            )
-        ):
-            return False
-        try:
-            self.start_recording()
-        except Exception as error:  # noqa: BLE001 - metadata handling must survive.
-            self._runtime_error = sanitize_recording_message(error)
-            self._auto_recording_error = self._runtime_error
-            logger.exception(
-                "Failed to auto-start recording for live metadata %s/%s",
-                metadata.race_id,
-                metadata.stage_id,
-            )
-            return False
-        logger.info(
-            "Recording auto-started for live metadata %s/%s",
-            metadata.race_id,
-            metadata.stage_id,
-        )
-        return True
+    def _enter_race_opened_in_cyclerace(self) -> None:
+        """Starting to record is when the race open in CycleRace gets its folder here.
+
+        11-05: every race opened in CycleRace used to get a folder the moment its
+        details arrived, so a morning of tests left dozens behind.
+        """
+        if self._workspace_mode != "live" or self.timing_provider != "cyclerace":
+            return
+        opened = self._receiver_metadata_store.current()
+        if opened is None or self._live_metadata_scope != (opened.race_id, opened.stage_id):
+            return
+        current = self.metadata_store.current() if self.metadata_store is not None else None
+        if current is not None and current.race_id == opened.race_id:
+            return
+        if opened.groups and all(_is_test_group_name(group.name) or _is_test_group_name(group.group_id)
+                                 for group in opened.groups):
+            return
+        self._activate_cyclerace_workspace(opened)
+
+    def _race_being_recorded(self) -> str:
+        current = self._current_metadata()
+        if current is not None:
+            return current.race_id
+        return self._live_metadata_scope[0] if self._live_metadata_scope else ""
 
     def _on_passage_received(self, event: PassageEvent) -> None:
         if self._defer_capture_callback(self._on_passage_received, event):
@@ -4602,6 +4673,14 @@ class FinishReviewWindow(PassageReviewSurface):
         if self._workspace_mode == "archive":
             self._update_runtime_status()
             return
+        current = self.metadata_store.current() if self.metadata_store is not None else None
+        if current is None or current.race_id != metadata.race_id:
+            # Opening a race in CycleRace is not that race starting here: no folder
+            # and no recording until the operator records or its first chip arrives.
+            self._workspace_notice = (f"CycleRace 当前赛事：{metadata.race_name or metadata.race_id}。"
+                                      "点「开始录像」或收到芯片时才建立本场文件夹。")
+            self._update_runtime_status()
+            return
         try:
             self._activate_cyclerace_workspace(metadata)
             self._capture_error = ""
@@ -4610,7 +4689,6 @@ class FinishReviewWindow(PassageReviewSurface):
             logger.exception("Failed to activate CycleRace event workspace")
             self._update_runtime_status()
             return
-        self._auto_start_recording_for_metadata(metadata)
         pending_focus = self._pending_focus
         if pending_focus is not None and (
             pending_focus.race_id != metadata.race_id

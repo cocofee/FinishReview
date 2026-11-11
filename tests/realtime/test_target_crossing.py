@@ -86,3 +86,33 @@ def test_stationary_background_does_not_discard_an_incomplete_target():
         LINE, frame_size=(320, 240),
     )
     assert result.state == "unverified" and result.reason == "insufficient_track"
+
+
+EMPTY = [(0, []), (600, []), (1200, [])]
+
+
+def test_a_full_context_where_the_model_saw_nothing_is_nobody_not_a_picture_to_review():
+    result = check_target_tracks(EMPTY, LINE, frame_size=(320, 240), seen=[0, 0, 0])
+    assert (result.state, result.reason) == ("not_crossed", "no_target")
+
+
+def test_anything_the_model_saw_keeps_the_candidate_for_review():
+    # A box cut by the crop edge or too weak to track is still something there.
+    for seen in ([0, 1, 0], [2, 0, 0], [0, 0, 1]):
+        result = check_target_tracks(EMPTY, LINE, frame_size=(320, 240), seen=seen)
+        assert result.state == "unverified" and result.reason == "insufficient_track"
+    weak = replace(box(100), score=.25)
+    result = check_target_tracks([(0, []), (600, [weak]), (1200, [])], LINE, frame_size=(320, 240),
+                                 seen=[0, 1, 0])
+    assert result.state == "unverified"
+
+
+def test_nothing_seen_never_covers_for_a_missing_or_broken_context():
+    assert check_target_tracks(EMPTY[:2], LINE, frame_size=(320, 240), seen=[0, 0]).reason == "missing_context"
+    gap = [(0, []), (600, []), (1600, [])]
+    assert check_target_tracks(gap, LINE, frame_size=(320, 240), seen=[0, 0, 0]).reason == "discontinuous_context"
+
+
+def test_callers_that_cannot_count_keep_the_old_answer():
+    assert check_target_tracks(EMPTY, LINE, frame_size=(320, 240)).reason == "insufficient_track"
+    assert check_target_tracks(EMPTY, LINE, frame_size=(320, 240), seen=[0, 0]).reason == "insufficient_track"

@@ -75,6 +75,8 @@ from .passage_evidence import (
     VideoClockCalibrationStore,
 )
 from .passage_receiver import PassageEvent, PassageEventStore
+from .person_follow import FOLLOW_AFTER_MS, FOLLOW_BEFORE_MS, FollowTracks, follow_path
+from .person_follow import OUTPUT_DIRNAME as FOLLOW_OUTPUT_DIRNAME
 from .passage_batch import (
     DEFAULT_REVIEW_GAP_MS,
     DEFAULT_SUBWAVE_GAP_MS,
@@ -428,6 +430,10 @@ def review_status_text(
     high_speed: Optional[PassageVideoLocation],
 ) -> str:
     return combined_review_status(regular, high_speed)
+
+
+# Screen size of the number beside a person on the picture.
+PERSON_TAG_FONT_PX = 20
 
 
 class EvidenceImageView(QGraphicsView):
@@ -1217,11 +1223,11 @@ class EvidenceImageView(QGraphicsView):
     def _person_tag_rect(self, x, y, label, scale, visible, occupied):
         """Place a small screen-sized tag near its point, inside the visible image."""
         font = QFont(self.font())
-        font.setPixelSize(14)
+        font.setPixelSize(PERSON_TAG_FONT_PX)
         font.setBold(True)
-        width = min(max(24, QFontMetrics(font).horizontalAdvance(label) + 12) / scale, visible.width())
-        height = min(22 / scale, visible.height())
-        gap = 10 / scale
+        width = min(max(34, QFontMetrics(font).horizontalAdvance(label) + 16) / scale, visible.width())
+        height = min((PERSON_TAG_FONT_PX + 10) / scale, visible.height())
+        gap = 12 / scale
         candidates = []
         for dx, dy in ((gap, -height - gap), (-width - gap, -height - gap),
                        (gap, gap), (-width - gap, gap), (gap, -2 * height - gap)):
@@ -1237,8 +1243,8 @@ class EvidenceImageView(QGraphicsView):
         """A point and number label, not a timing line or a tracking box."""
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        radius = (4 if ghost else 5) / scale
-        pen = QPen(color, 1.5)
+        radius = (5 if ghost else 7) / scale
+        pen = QPen(color, 2.5)
         pen.setCosmetic(True)
         if dashed or ghost:
             pen.setStyle(Qt.DashLine)
@@ -1254,10 +1260,11 @@ class EvidenceImageView(QGraphicsView):
             length = (delta.x() ** 2 + delta.y() ** 2) ** .5
             if length > radius:
                 painter.drawLine(QPointF(x, y) + delta * (radius / length), end)
+            # The tag's border carries the marker colour: green counted, grey-blue paired by chip.
             painter.setBrush(QColor(20, 27, 35, 225))
             painter.drawRoundedRect(tag, 4 / scale, 4 / scale)
             font = QFont(self.font())
-            font.setPixelSize(max(1, round(14 / scale)))
+            font.setPixelSize(max(1, round(PERSON_TAG_FONT_PX / scale)))
             font.setBold(True)
             painter.setFont(font)
             painter.setPen(QColor("#ffffff"))
@@ -3139,6 +3146,8 @@ class PassageReviewSurface(QDialog):
         self.continuous_marker_store = continuous_marker_store or ContinuousMarkerStore(
             passage_store.journal_path.with_name("continuous_markers.jsonl")
         )
+        # Saved runner paths per camera, for numbers that walk with their runner.
+        self._follow_cache: dict[Path, FollowTracks] = {}
         self.calibration_store = calibration_store or VideoClockCalibrationStore(
             passage_store.journal_path.with_name("video_clock_calibrations.jsonl")
         )
@@ -7829,11 +7838,26 @@ class PassageReviewSurface(QDialog):
             self._toggle_maximized_pane(pane)
         pane.video_view.setFocus(Qt.ShortcutFocusReason)
 
+    def _follow_tracks(self, camera_index: int) -> FollowTracks:
+        output_dir = Path(self.passage_store.journal_path).parent / FOLLOW_OUTPUT_DIRNAME
+        path = follow_path(output_dir, camera_index)
+        tracks = self._follow_cache.get(path)
+        if tracks is None:
+            tracks = self._follow_cache[path] = FollowTracks(path)
+        return tracks.refresh()
+
     def _continuous_marker_overlays(
         self,
         pane: PassageEvidencePane,
-    ) -> tuple[tuple[float, float, str, bool, bool], ...]:
-        """Return nearby confirmed camera-1 markers on the continuous timeline."""
+    ) -> tuple[tuple, ...]:
+        """Confirmed camera-1 markers nearby, each carried along with its runner.
+
+        A mark is put on a runner at the line; where the analysis saw that
+        runner, the number walks with them from a little before the crossing to
+        a little after.  Runners the chips paired automatically carry their
+        number too, in the grey-blue 自动对上 style: a pairing, not a count.
+        Without a seen runner a mark stays where it was put, on its own frame.
+        """
 
         location = pane.location
         if (
@@ -7853,15 +7877,27 @@ class PassageReviewSurface(QDialog):
             + int(pane._current_position_ms)
         )
         tolerance_ms = max(200, int(pane.frame_duration_ms()) * 3)
-        overlays: list[tuple[float, float, str, bool, bool]] = []
+        follow = self._follow_tracks(int(pane.camera_index))
+        nearby = follow.around(current_recorder_time_ms)
+        followed: set[int] = set()
+        marked_bibs: set[str] = set()
+        overlays: list[tuple] = []
+
+        def place(mark_ms: int, x: float, y: float, label: str, *, own: bool = False) -> None:
+            # ``own``: the selected runner, whose ring the pane draws on its frame.
+            track = follow.owner(nearby, mark_ms, x, y) if nearby else None
+            if track is not None:
+                followed.add(id(track))
+                here = (track.at(current_recorder_time_ms)
+                        if track.near(current_recorder_time_ms, mark_ms) else None)
+                if here is not None and not (own and pane._association_is_visible(pane.association)):
+                    overlays.append((here[0], here[1], label, True, pane.is_auyat_rgb, True, False, False))
+                return
+            if not own and abs(mark_ms - current_recorder_time_ms) <= tolerance_ms:
+                overlays.append((x, y, label, True, pane.is_auyat_rgb))
+
         for association in self._current_associations():
-            if (
-                association.confirmed_source != REGULAR_SOURCE
-                or (
-                    association.passage_event_id == self._selected_event_id
-                    and pane.association is not None
-                )
-            ):
+            if association.confirmed_source != REGULAR_SOURCE:
                 continue
             event = self.passage_store.get(association.passage_event_id)
             segment = self.timeline_store.get_segment(association.segment_id)
@@ -7887,18 +7923,14 @@ class PassageReviewSurface(QDialog):
                 event_recorder_time_ms = int(event.timeline_timestamp_ms) + int(
                     offset_ms
                 )
-            if abs(event_recorder_time_ms - current_recorder_time_ms) > tolerance_ms:
+            if abs(event_recorder_time_ms - current_recorder_time_ms) > FOLLOW_BEFORE_MS + FOLLOW_AFTER_MS:
                 continue
             label = event.bib.strip() or association.bib.strip() or "未知"
-            overlays.append(
-                (
-                    float(association.marker_x_normalized),
-                    float(association.marker_y_normalized),
-                    label,
-                    True,
-                    pane.is_auyat_rgb,
-                )
-            )
+            marked_bibs.add(label)
+            place(event_recorder_time_ms, float(association.marker_x_normalized),
+                  float(association.marker_y_normalized), label,
+                  own=(association.passage_event_id == self._selected_event_id
+                       and pane.association is not None))
         # Unknown/待补录 markers live on their own continuous timeline and
         # must remain visible independently of the selected roster identity.
         for marker in self.continuous_marker_store.markers():
@@ -7908,17 +7940,19 @@ class PassageReviewSurface(QDialog):
             if segment is None or segment.media_started_at_ms is None:
                 continue
             marker_recorder_time_ms = int(segment.media_started_at_ms) + int(marker.position_ms)
-            if abs(marker_recorder_time_ms - current_recorder_time_ms) > tolerance_ms:
+            if abs(marker_recorder_time_ms - current_recorder_time_ms) > FOLLOW_BEFORE_MS + FOLLOW_AFTER_MS:
                 continue
-            overlays.append(
-                (
-                    float(marker.marker_x_normalized),
-                    float(marker.marker_y_normalized),
-                    marker.label,
-                    True,
-                    pane.is_auyat_rgb,
-                )
-            )
+            place(marker_recorder_time_ms, float(marker.marker_x_normalized),
+                  float(marker.marker_y_normalized), marker.label)
+        # Runners the chips paired by themselves: their number, not yet counted.
+        for track in nearby:
+            if id(track) in followed or not track.bib or track.bib in marked_bibs:
+                continue
+            if not track.near(current_recorder_time_ms, track.crossing_ms):
+                continue
+            here = track.at(current_recorder_time_ms)
+            if here is not None:
+                overlays.append((here[0], here[1], track.bib, False, pane.is_auyat_rgb, True, False, True))
         return tuple(overlays)
 
     def _on_preview_frame_ready(

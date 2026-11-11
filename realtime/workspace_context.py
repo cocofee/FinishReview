@@ -47,6 +47,16 @@ def saved_received_path(root):
     return _saved_path(root, "live_received")
 
 
+def is_event_folder_under(path, root) -> bool:
+    """A race folder is the root itself, a folder in it, or one inside its competition's folder.
+
+    11-05: races of one competition (现代五项: 男子/女子, A/B 组, each day) are kept
+    together as ``<root>/<competition>/<date> <stage>`` instead of crowding the root.
+    """
+    root, path = Path(root).resolve(), Path(path).resolve()
+    return path == root or path.parent == root or path.parent.parent == root
+
+
 def saved_live_path(root):
     """An explicit return to the field also works before timing data arrives."""
     return _saved_path(root, "live") or _saved_path(root, "live_ready", require_event=False)
@@ -59,7 +69,7 @@ def _saved_path(root, mode, *, require_event=True):
     if value.get("mode") != mode or not isinstance(relative, str):
         return None
     candidate = (root / relative).resolve()
-    if ((candidate == root or candidate.parent == root) and candidate.is_dir()
+    if (is_event_folder_under(candidate, root) and candidate.is_dir()
             and (not require_event or any((candidate / name).is_file() for name in
                     ("cyclerace_passage_events.jsonl", "cyclerace_race_metadata.json")))):
         return candidate
@@ -81,7 +91,7 @@ def recovered_archive_path(root):
 
 def save_workspace_mode(root, path, mode):
     root, path = Path(root).resolve(), Path(path).resolve()
-    if path != root and path.parent != root:
+    if not is_event_folder_under(path, root):
         raise ValueError("赛事目录不在当前保存根目录中")
     _write_object(root / ".finishreview" / ARCHIVE_FILENAME, {
         "schema_version": 1,

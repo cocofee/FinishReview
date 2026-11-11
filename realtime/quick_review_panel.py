@@ -22,7 +22,7 @@ from .arrival_review import (
 )
 from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, uncovered_intervals
 from .chip_history import format_chip_time
-from .crossing_time import item_crossing_time, recorder_crossing_time, workspace_clocks
+from .crossing_time import item_crossing_time, manual_clock_offsets, recorder_crossing_time, workspace_clocks
 from .lap_wave import Passage, short_riders
 from .problem_items import (
     CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING,
@@ -152,6 +152,8 @@ class QuickReviewPanel(ProblemListPanel):
     sampling_preparing = pyqtSignal()
     # A chip record the operator wants gone (spare chip, misread); the window asks why.
     delete_requested = pyqtSignal(str)
+    # 校时: the window learns the video offset from the current frame and a chip record.
+    calibration_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         self._quick_ready = False
@@ -270,6 +272,13 @@ class QuickReviewPanel(ProblemListPanel):
         bar.addWidget(self.status_widget, 1)
         self.quick_title = QLabel("到达记录", column)
         column_layout.insertWidget(0, self.quick_title)
+        # 校时 is the first thing done at every recording: until it is done every
+        # chip mark sits seconds away from its rider (11-03: 3.2 s).  It used to
+        # hide under the picture, behind 查找原录像.
+        self.calibrate_button = QPushButton("先校时", self.quick_toolbar)
+        self.calibrate_button.clicked.connect(self.calibration_requested.emit)
+        bar.addWidget(self.calibrate_button)
+        self._calibration_needed = None
         self.row_action_buttons = {}
         for key, label in ((Qt.Key_1, "1 非运动员"), (Qt.Key_2, "2 双芯片"), (Qt.Key_3, "3 补录")):
             button = QPushButton(label, self.quick_toolbar)
@@ -1117,6 +1126,7 @@ class QuickReviewPanel(ProblemListPanel):
     def _render(self):
         if not self._quick_ready:
             return False
+        self.refresh_calibration_state()
         try:
             self._ensure_store()
             rows = self._build_rows()
@@ -1471,6 +1481,7 @@ class QuickReviewPanel(ProblemListPanel):
     def _strip_ready(self):
         """The strip was still being read when the row was opened (at start): land it now."""
         key, self._landing_pending = self._landing_pending, None
+        self.refresh_calibration_state()
         self._earlier_timer.start()  # 可能多人 of the crossings, read off the strip
         row = self._selected_arrival()
         if key is not None and row is not None and row.key == key:
@@ -2271,6 +2282,39 @@ class QuickReviewPanel(ProblemListPanel):
         for label in labels:
             label.setVisible(bool(label.text()))
         self.status_widget.setVisible(any(label.text() for label in labels))
+
+    def refresh_calibration_state(self):
+        """Red 先校时 until the latest recording has a clock; 已校时 after (still clickable to redo).
+
+        The latest strip piece is the current recording: an earlier, short
+        session left uncalibrated only keeps its grey on the strip.  Without a
+        strip yet, any saved first-rider offset or fitted clock counts.
+        """
+        pieces = self.race_strip.view.pieces
+        if pieces:
+            latest = max(pieces, key=lambda piece: (piece.start_ms, piece.archive))
+            needed = not latest.aligned
+            offset = latest.offset_ms if latest.aligned else None
+        else:
+            workspace = self.workspace_dir
+            needed = workspace is None or not (manual_clock_offsets(workspace) or workspace_clocks(workspace))
+            offset = None
+        if needed == self._calibration_needed and offset == getattr(self, "_calibration_offset", None):
+            return
+        self._calibration_needed, self._calibration_offset = needed, offset
+        steps = ("每次开始录像后第一步：在左表选一条芯片记录，把画面停在这位选手压线的那一帧，"
+                 "点这里并确认是哪位选手。不改芯片时间，只让芯片标记对上画面。")
+        if needed:
+            self.calibrate_button.setText("先校时")
+            self.calibrate_button.setStyleSheet(
+                "QPushButton{color:white; background:#c2410c; font-weight:700; padding:2px 10px;"
+                " border:1px solid #9a3412; border-radius:3px;}")
+            self.calibrate_button.setToolTip("本次录像还没校时：芯片标记和画面可能差几秒。\n" + steps)
+        else:
+            self.calibrate_button.setText("已校时")
+            self.calibrate_button.setStyleSheet("color:#17675b; font-weight:600;")
+            detail = f"当前录像比芯片晚 {offset / 1000:+.1f} 秒，已扣除。" if offset is not None else "本次录像已校时。"
+            self.calibrate_button.setToolTip(detail + "\n需要重校时：" + steps)
 
     def set_finish_line_status(self, configured):
         self.finish_line_status.setText("" if configured else "未设终点线")

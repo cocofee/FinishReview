@@ -1,6 +1,10 @@
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
+import pytest
 
 from realtime.analysis_resources import CpuMonitor, ResourceGovernor
 from realtime.bike_check import (
@@ -528,3 +532,25 @@ def test_a_stretch_with_more_crossings_than_chips_is_still_visible_without_chips
         assert (window["start_ms"], window["end_ms"]) == (item.evidence["recorder_ms"] - 2_000,
                                                           item.evidence["recorder_ms"] + 2_000)
     assert all("前后 2 秒内共 3 处过线、附近只有 0 条芯片" in item.detail for item in items)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process settings")
+def test_lowering_priority_really_lowers_it_and_switches_windows_slowdown_off():
+    """In a child process, so the test run itself keeps its priority."""
+
+    code = (
+        "import ctypes\n"
+        "from realtime.analysis_resources import lower_process_priority\n"
+        "k = ctypes.WinDLL('kernel32'); k.GetCurrentProcess.restype = ctypes.c_void_p\n"
+        "k.GetPriorityClass.argtypes = [ctypes.c_void_p]; k.GetPriorityClass.restype = ctypes.c_ulong\n"
+        "k.GetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]\n"
+        "class S(ctypes.Structure): _fields_ = [('v', ctypes.c_ulong), ('c', ctypes.c_ulong), ('s', ctypes.c_ulong)]\n"
+        "ok = lower_process_priority(); s = S(1, 0, 0)\n"
+        "k.GetProcessInformation(k.GetCurrentProcess(), 4, ctypes.byref(s), ctypes.sizeof(s))\n"
+        "print(ok, hex(k.GetPriorityClass(k.GetCurrentProcess())), s.c & 1, s.s & 1)\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                          cwd=Path(__file__).resolve().parents[2])
+
+    # lowered, below-normal priority class, execution-speed throttling under our control and off
+    assert done.stdout.split() == ["True", "0x4000", "1", "0"], done.stdout + done.stderr

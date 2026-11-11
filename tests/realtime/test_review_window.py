@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -1514,6 +1515,12 @@ def test_problem_item_opens_its_original_frame_in_its_own_camera(qapp, tmp_path,
         window._open_problem_frame(dict(frame, video_path=str(tmp_path / "missing.mkv")))
         assert len(opened) == 1
         assert "原录像缺失" in window.problem_panel.hint.text()
+        # A race folder moved after the frame was saved still opens the same file.
+        moved = tmp_path / "videos" / "camera_02.mkv"
+        moved.parent.mkdir()
+        moved.write_bytes(b"video")
+        window._open_problem_frame(dict(frame, video_path=r"D:\录像\race\旧目录\videos\camera_02.mkv"))
+        assert opened[-1] == (moved, 1850, 37, 2)
     finally:
         window.close()
 
@@ -1934,21 +1941,26 @@ def test_cyclerace_metadata_creates_named_event_workspace(qapp, tmp_path):
     receiver.deliver_metadata(metadata)
     qapp.processEvents()
 
+    # 11-05: opening a race in CycleRace makes no folder; its first chip does.
     today = datetime.now(review_window_module.BEIJING_TIMEZONE).date().isoformat()
-    event_dir = root / f"{today} 2026 城市公路自行车赛"
+    event_dir = root / "2026 城市公路自行车赛" / f"{today} 终点"
+    assert window.output_dir == root.resolve()
+    assert not event_dir.exists()
+    assert metadata.race_name in window._workspace_notice
+
+    event = _event(race_id=metadata.race_id, event_id="race-2026-passage-15")
+    receiver.deliver(event)
+    qapp.processEvents()
+
     assert window.workspace_root == root.resolve()
     assert window.output_dir == event_dir.resolve()
     assert window.metadata_store.current() == metadata
+    assert "开始录像" not in window._workspace_notice
     assert window.event_name_label.text() == metadata.race_name
     assert window._receiver_passage_store.journal_path.parent == (
         root / review_window_module.CYCLERACE_INBOX_DIRNAME
     ).resolve()
     assert receiver.stopped
-
-    active_receiver = _FakeReceiver.instances[-1]
-    event = _event(race_id=metadata.race_id, event_id="race-2026-passage-15")
-    active_receiver.deliver(event)
-    qapp.processEvents()
 
     stored_event = window.passage_store.get(event.event_id)
     assert stored_event is not None
@@ -2022,32 +2034,45 @@ def test_cyclerace_workspace_merge_carries_inactive_tombstone(qapp, tmp_path):
 
 def test_same_named_cyclerace_events_do_not_share_workspace(qapp, tmp_path):
     root = tmp_path / "events"
-    occupied = root / "城市赛"
-    RaceMetadataStore(occupied / "cyclerace_race_metadata.json").store(
-        RaceMetadata(
-            race_id="race-old",
-            stage_id="stage-1",
-            revision=1,
-            emitted_at_ms=1,
-            race_name="城市赛",
-            stage_name="终点",
-        )
-    )
-    metadata = RaceMetadata(
-        race_id="race-new",
-        stage_id="stage-1",
-        revision=1,
-        emitted_at_ms=2,
-        race_name="城市赛",
-        stage_name="终点",
-    )
-
+    metadata = RaceMetadata(race_id="race-new", stage_id="stage-1", revision=1, emitted_at_ms=2,
+                            race_name="城市赛", stage_name="终点")
     day = date(2026, 10, 28)
 
-    assert review_window_module._event_workspace_dir(root, metadata, today=day) == (root / "2026-10-28 城市赛").resolve()
-    (root / "2026-10-28 城市赛" / "videos").mkdir(parents=True)
     assert review_window_module._event_workspace_dir(root, metadata, today=day) == (
-        root / "2026-10-28 城市赛_race-new").resolve()
+        root / "城市赛" / "2026-10-28 终点").resolve()
+    (root / "城市赛" / "2026-10-28 终点" / "videos").mkdir(parents=True)
+    assert review_window_module._event_workspace_dir(root, metadata, today=day) == (
+        root / "城市赛" / "2026-10-28 终点_2").resolve()
+
+
+def test_races_of_one_competition_share_its_folder(qapp, tmp_path):
+    """11-05: 现代五项 left ten folders in the root; its races now sit in one competition folder."""
+    root = tmp_path / "events"
+    women = RaceMetadata(race_id="race-women", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                         race_name="全国现代五项总决赛", stage_name="女子激光跑决赛")
+    men = replace(women, race_id="race-men", stage_name="男子激光跑决赛")
+    day = date(2026, 11, 4)
+
+    women_dir = review_window_module._event_workspace_dir(root, women, today=day)
+    assert women_dir == (root / "全国现代五项总决赛" / "2026-11-04 女子激光跑决赛").resolve()
+    RaceMetadataStore(women_dir / "cyclerace_race_metadata.json").store(women)
+    assert review_window_module._event_workspace_dir(root, men, today=day) == (
+        root / "全国现代五项总决赛" / "2026-11-04 男子激光跑决赛").resolve()
+    # Coming back to a race on another day finds it where it was filed.
+    assert review_window_module._event_workspace_dir(root, women, today=date(2026, 11, 5)) == women_dir
+
+    # The competition folder renamed shorter by hand still collects its new races.
+    (root / "全国现代五项总决赛").rename(root / "现代五项")
+    later = replace(women, race_id="race-relay", stage_name="混合接力")
+    assert review_window_module._event_workspace_dir(root, later, today=date(2026, 11, 6)) == (
+        root / "现代五项" / "2026-11-06 混合接力").resolve()
+
+    # A race of that name filed flat in the root before 11-05 stays apart from new ones.
+    RaceMetadataStore(root / "城市赛" / "cyclerace_race_metadata.json").store(
+        replace(women, race_id="race-flat", race_name="城市赛", stage_name="终点"))
+    assert review_window_module._event_workspace_dir(
+        root, replace(women, race_id="race-city", race_name="城市赛", stage_name="终点"), today=day) == (
+        root / "2026-11-04 城市赛 终点").resolve()
 
 
 def test_a_saved_race_is_found_under_its_old_or_dated_folder_on_any_day(qapp, tmp_path):
@@ -2064,7 +2089,7 @@ def test_a_saved_race_is_found_under_its_old_or_dated_folder_on_any_day(qapp, tm
         root / "2026-10-28 城市赛").resolve()
     fresh = replace(old, race_id="race-fresh")
     assert review_window_module._event_workspace_dir(root, fresh, today=later) == (
-        root / "2026-10-30 城市赛").resolve()
+        root / "城市赛" / "2026-10-30").resolve()
 
 
 def test_a_race_kept_in_the_root_itself_is_its_own_workspace(qapp, tmp_path):
@@ -2076,7 +2101,7 @@ def test_a_race_kept_in_the_root_itself_is_its_own_workspace(qapp, tmp_path):
     assert review_window_module._event_workspace_dir(root, metadata) == root.resolve()
     other = replace(metadata, race_id="race-other", race_name="特奥")
     assert review_window_module._event_workspace_dir(root, other, today=date(2026, 10, 28)) == (
-        root / "2026-10-28 特奥").resolve()
+        root / "特奥" / "2026-10-28 终点").resolve()
 
 
 def test_switching_cyclerace_event_exports_previous_review_summary(qapp, tmp_path):
@@ -2177,7 +2202,9 @@ def test_opening_saved_event_isolates_live_data_and_returns_to_current_event(
     )
     initial_receiver.deliver_metadata(live_metadata)
     qapp.processEvents()
+    window._enter_race_opened_in_cyclerace()
     live_dir = window.output_dir
+    assert live_dir != root.resolve()
     receiver = window._receiver
     assert receiver is not None and receiver.is_running
 
@@ -2333,6 +2360,80 @@ def test_returning_to_the_field_needs_no_timing_data_and_starts_recording(qapp, 
         window.close()
 
 
+def test_returning_to_a_race_cyclerace_sent_yesterday_asks_before_making_its_folder(
+        qapp, tmp_path, monkeypatch):
+    """11-05: 「返回当前赛事」 made a folder for the previous evening's 接力测试赛."""
+    root = tmp_path / "events"
+    _archived_field_event(root)
+    old = RaceMetadata(race_id="race-relay-test", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                       race_name="接力测试赛", stage_name="接力赛段")
+    inbox = RaceMetadataStore(root / ".finishreview" / "cyclerace_metadata_inbox.json")
+    inbox.store(old)
+    yesterday = (datetime.now() - timedelta(days=1)).timestamp()
+    os.utime(inbox.snapshot_path, (yesterday, yesterday))
+    window = _window(root)
+    asked = []
+    answer = QMessageBox.Cancel
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda _parent, _title, message, *_args: asked.append(message) or answer)
+    try:
+        assert window._receiver_metadata_store.current().race_id == "race-relay-test"
+        assert not window._return_to_live_event()
+        assert "接力测试赛" in asked[-1] and "不是今天" in asked[-1]
+        assert window._workspace_mode == "archive"
+        assert not (root / "接力测试赛").exists()
+
+        answer = QMessageBox.Yes
+        assert window._return_to_live_event()
+        assert window._workspace_mode == "live"
+        assert window._current_metadata().race_id == "race-relay-test"
+        assert window.output_dir.parent.name == "接力测试赛"
+    finally:
+        window.close()
+
+
+def test_returning_to_a_race_sent_today_enters_without_asking(qapp, tmp_path, monkeypatch):
+    root = tmp_path / "events"
+    _archived_field_event(root)
+    RaceMetadataStore(root / ".finishreview" / "cyclerace_metadata_inbox.json").store(
+        RaceMetadata(race_id="race-today", stage_id="stage-1", revision=1, emitted_at_ms=1,
+                     race_name="今日赛", stage_name="终点"))
+    window = _window(root)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: pytest.fail("今天发来的赛事不应询问"))
+    try:
+        assert window._return_to_live_event()
+        assert window._current_metadata().race_id == "race-today"
+    finally:
+        window.close()
+
+
+def test_saved_event_picker_shows_competition_and_race_folders(qapp, tmp_path):
+    long_name = "甘肃省第六届“红色之路长征赛”自行车业余联赛古浪站暨“丝路要塞·红色古浪”环“八步沙”自行车赛"
+    for path, race_id, race_name, stage in (
+        (tmp_path / "现代五项" / "2026-11-04 女子激光跑决赛", "race-w", "2026年全国现代五项冠军赛总决赛", "女子激光跑决赛"),
+        (tmp_path / "现代五项" / "2026-11-04 男子激光跑决赛", "race-m", "2026年全国现代五项冠军赛总决赛", "男子激光跑决赛"),
+        (tmp_path / "古浪", "race-g", long_name, long_name),
+    ):
+        RaceMetadataStore(path / "cyclerace_race_metadata.json").store(
+            RaceMetadata(race_id=race_id, stage_id="stage-1", revision=1, emitted_at_ms=1,
+                         race_name=race_name, stage_name=stage))
+    dialog = review_window_module.EventWorkspacePickerDialog(
+        review_window_module.discover_event_workspaces(tmp_path))
+    try:
+        rows = {(dialog.table.item(row, 0).text(), dialog.table.item(row, 1).text())
+                for row in range(dialog.table.rowCount())}
+        assert rows == {("现代五项", "2026-11-04 女子激光跑决赛"), ("现代五项", "2026-11-04 男子激光跑决赛"),
+                        (long_name, long_name)}
+        # The long name cannot squeeze the competition column to nothing.
+        assert dialog.table.horizontalHeader().sectionSize(0) >= 200
+        assert dialog.table.horizontalHeader().sectionResizeMode(1) == QHeaderView.Stretch
+        dialog.search_edit.setText("现代五项")
+        qapp.processEvents()
+        assert sum(not dialog.table.isRowHidden(row) for row in range(dialog.table.rowCount())) == 2
+    finally:
+        dialog.close()
+
+
 def test_returning_to_the_field_without_any_race_uses_an_isolated_folder(qapp, tmp_path):
     root = tmp_path / "events"
     history = root / "旧赛事"
@@ -2460,6 +2561,28 @@ def test_clearing_race_data_is_blocked_while_recording_or_in_history(qapp, tmp_p
         window._clear_event_data()
         assert warnings[-1][0] == "无法清空数据"
         assert warnings[-1][1].startswith("正在查看历史赛事")
+        assert window.passage_store.get("test-read") is not None
+    finally:
+        window.close()
+
+
+def test_clearing_is_refused_when_the_race_is_the_root_itself(qapp, tmp_path, monkeypatch):
+    """古浪 recorded straight into the root; clearing it would delete every other race folder."""
+    window = _window(tmp_path)
+    other = tmp_path / "现代五项" / "2026-11-04 女子激光跑决赛"
+    (other / "videos").mkdir(parents=True)
+    (other / "videos" / "final.mkv").write_bytes(b"video")
+    window.passage_store.append(_event(event_id="test-read"))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning",
+                        lambda _parent, title, message: warnings.append((title, message)))
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *_args, **_kwargs: pytest.fail("根目录不应开始询问清空"))
+    try:
+        assert window.output_dir == tmp_path.resolve()
+        window._clear_event_data()
+        assert warnings[-1][0] == "无法清空数据" and "未做任何改动" in warnings[-1][1]
+        assert (other / "videos" / "final.mkv").is_file()
         assert window.passage_store.get("test-read") is not None
     finally:
         window.close()
@@ -2691,10 +2814,11 @@ def test_first_live_formal_passage_auto_starts_recording(qapp, tmp_path):
     window.close()
 
 
-def test_live_formal_metadata_starts_recording_before_first_passage(
+def test_race_opened_in_cyclerace_gets_a_folder_only_when_recording_starts(
     qapp,
     tmp_path,
 ):
+    """11-05: every race opened in CycleRace used to get a folder and a recording at once."""
     window = _window(tmp_path)
     window.start_receiver()
 
@@ -2711,9 +2835,37 @@ def test_live_formal_metadata_starts_recording_before_first_passage(
     )
     qapp.processEvents()
 
+    assert window.recorder is None
+    assert window.output_dir == tmp_path.resolve()
+    assert not [path for path in tmp_path.iterdir() if "正式赛事" in path.name]
+
+    window._toggle_recording()
+
     assert window.recorder is not None and window.recorder.is_running
     assert len(_FakeRecorder.instances) == 1
+    assert window.output_dir.parent.name == "正式赛事"
+    assert window.metadata_store.current().race_id == "race-formal"
     assert window.passage_store.events() == ()
+    window.close()
+
+
+def test_a_recording_the_operator_stopped_is_not_restarted_by_chips(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[-1]
+
+    receiver.deliver(_event(event_id="first", sequence=15))
+    qapp.processEvents()
+    assert window.recorder is not None and window.recorder.is_running
+
+    window._toggle_recording()
+    assert not window._recording_any_active()
+
+    receiver.deliver(_event(event_id="second", sequence=16))
+    qapp.processEvents()
+    assert not window._recording_any_active()
+    assert len(_FakeRecorder.instances) == 1
+    assert window.passage_store.get("second") is not None
     window.close()
 
 
@@ -2726,6 +2878,7 @@ def test_another_race_never_cuts_the_running_recording_over(qapp, tmp_path):
         race_id="race-formal", stage_id="stage-1", revision=1, emitted_at_ms=1,
         race_name="正式赛事", stage_name="终点", groups=(RaceGroupMetadata("men-open", "男子公开组"),)))
     qapp.processEvents()
+    window._toggle_recording()
     recorder = window.recorder
     folder = window.output_dir
     assert recorder is not None and recorder.is_running
@@ -3294,6 +3447,8 @@ def test_focus_before_passage_shows_roster_then_auto_selects_passage(
             ),
         )
     )
+    window._enter_race_opened_in_cyclerace()
+    receiver = _FakeReceiver.instances[-1]
     receiver.deliver_focus(
         RaceFocus(
             race_id="race-1",
@@ -4395,7 +4550,7 @@ def test_auth_failure_pauses_retries_without_stopping_passage_intake(qapp, tmp_p
             race_id="race-1", stage_id="stage-1", revision=1, emitted_at_ms=1,
             groups=(RaceGroupMetadata(group_id="men-open", name="男子公开组"),),
         )
-        assert not window._auto_start_recording_for_metadata(metadata)
+        window.receiver.deliver_metadata(metadata)
         assert len(_FakeRecorder.instances) == 1
 
         # An explicit retry after correcting the device is still possible.

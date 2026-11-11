@@ -16,7 +16,9 @@ from .bike_check import BICYCLE, PERSON, VEHICLES, Detection
 
 
 VERIFICATION_OFFSETS_MS = (-600, 0, 600)
-VERIFICATION_VERSION = 2
+# 3: a full, continuous context in which the model saw nothing at all is
+# "nobody there" (not_crossed / no_target), no longer a picture to review.
+VERIFICATION_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ def check_target_tracks(
     frame_size: tuple[int, int],
     margin_px: float = 4.0,
     preferred_label: str = "",
+    seen: Sequence[int] | None = None,
 ) -> TargetCrossingCheck:
     """Associate same-class boxes and require the same anchor on both sides.
 
@@ -77,6 +80,14 @@ def check_target_tracks(
     cross together.  Empty keeps the historical choice, which prefers a
     bicycle/vehicle over a person.  Running passes ``pedestrian`` so an
     accompanying bicycle cannot hide the person who actually crossed.
+
+    ``seen`` holds, per observation, how many boxes the model returned before
+    any filtering: weak ones and ones cut by the crop edge count too.  When the
+    whole continuous context shows nothing at all, the line change was light,
+    shadow or picture noise on an empty line:
+    ``not_crossed``/``no_target``, not a picture to review.  Anything the model
+    saw, however weakly, keeps the old fail-closed answers.  ``None`` (callers
+    that cannot count) keeps the old behaviour.
     """
     points = np.asarray(line_points, dtype=float)
     observed = tuple(float(stamp) for stamp, _ in observations)
@@ -84,6 +95,8 @@ def check_target_tracks(
         return TargetCrossingCheck("unverified", "missing_context", observed_ms=observed)
     if any(right <= left or right - left > 850 for left, right in zip(observed, observed[1:])):
         return TargetCrossingCheck("unverified", "discontinuous_context", observed_ms=observed)
+    if seen is not None and len(seen) == len(observations) and not any(seen):
+        return TargetCrossingCheck("not_crossed", "no_target", observed_ms=observed)
     width, height = frame_size
     tracks: list[list[tuple[float, Detection]]] = []
     ambiguous = False

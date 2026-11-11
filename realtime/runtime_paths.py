@@ -71,6 +71,33 @@ def resolve_output_dir(value: str | os.PathLike[str], *, base_dir: Optional[Path
     return resolve_runtime_path(value, base_dir=base_dir)
 
 
+# Folders of a race that hold its recordings, as written into its records.
+_MEDIA_FOLDERS = ("videos", "review_buffer")
+
+
+def relocated_video_path(value: str | os.PathLike[str], workspace: Path) -> Path:
+    """A saved recording path, followed into ``workspace`` if its race folder was moved.
+
+    Older records keep full paths such as ``D:\\录像\\race\\<race>\\videos\\x.mkv``;
+    after races were filed into one folder per competition (11-05) the same file
+    sits under the race's new folder.  The record itself is left unchanged.
+    """
+
+    path = Path(value)
+    if not path.is_absolute():
+        return Path(workspace) / path
+    if path.is_file():
+        return path
+    parts = path.parts
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].lower() in _MEDIA_FOLDERS:
+            moved = Path(workspace).joinpath(*parts[index:])
+            if moved.is_file():
+                return moved
+            break
+    return path
+
+
 def resolve_source(value: str, *, base_dir: Optional[Path] = None) -> str:
     """Resolve local video files while preserving cameras and network streams."""
     normalized = str(value).strip()

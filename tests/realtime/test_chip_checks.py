@@ -1,4 +1,4 @@
-from realtime.chip_checks import ChipCheckContext, chip_check_items
+from realtime.chip_checks import ChipCheckContext, chip_check_items, lap_targets, next_recheck_ms
 from realtime.chip_history import ChipRead
 from realtime.problem_items import (
     KIND_BATCH_READS,
@@ -7,10 +7,12 @@ from realtime.problem_items import (
     KIND_DUPLICATE_READ,
     KIND_EARLY_READ,
     KIND_LAP_MISSING,
+    KIND_LAP_OVER,
     KIND_LAP_REGRESS,
     KIND_LAP_REPEAT,
     KIND_LAP_TIME,
     KIND_NOT_ARRIVED,
+    KIND_PAIRED_CHIPS,
     KIND_REPEATED_PASSAGE,
     KIND_SYNC,
     KIND_TEST_CHIP,
@@ -165,3 +167,87 @@ def test_sync_issues_become_items_and_items_round_trip():
     assert item.chip_time_ms == 1_788_019_200_000 + 39_490_466
     assert ProblemItem.from_payload(item.to_payload()) == item
     assert item.title == "两边记录不一致"
+
+
+LAP = 10 * MINUTE
+
+
+def _laps(bib, laps, *, offset_ms=0, base=0):
+    return [_read(base + number, bib, GUN + number * LAP + offset_ms, lap=number) for number in range(1, laps + 1)]
+
+
+def _five_lap_field(extra_bib="7"):
+    reads = []
+    for rider in range(1, 11):
+        reads += _laps(str(rider), 5, offset_ms=rider * 20_000, base=rider * 100)
+    # One extra passage after finishing: lap 6 for a single bib.
+    reads.append(_read(9_999, extra_bib, GUN + 5 * LAP + 7 * 20_000 + 4 * MINUTE, lap=6))
+    return reads
+
+
+def test_one_extra_lap_is_lap_over_not_everyone_short():
+    items = chip_check_items(_five_lap_field())
+
+    assert not any(item.kind == KIND_LAP_MISSING for item in items)
+    over, = [item for item in items if item.kind == KIND_LAP_OVER]
+    assert over.bibs == ("7",) and over.event_ids == ("race-stage-1-passage-9999",)
+    assert over.status == STATUS_OPEN and "同组多数人是 5 圈" in over.detail
+    assert lap_targets(_five_lap_field())["女子公路公开组"].over_bibs == ("7",)
+
+
+def test_live_lap_judging_waits_until_the_group_settles():
+    reads = _five_lap_field()
+    last = max(read.chip_ms for read in reads)
+    early = ChipCheckContext(race_finished=False, now_ms=last + LAP)
+    late = ChipCheckContext(race_finished=False, now_ms=last + 2 * LAP)
+
+    assert not any(item.kind in (KIND_LAP_OVER, KIND_LAP_MISSING) for item in chip_check_items(reads, early))
+    assert next_recheck_ms(reads, early) == last + int(1.5 * LAP)
+    assert any(item.kind == KIND_LAP_OVER for item in chip_check_items(reads, late))
+    assert next_recheck_ms(reads, late) is None
+    # Without a clock a live check never settles.
+    assert not any(item.kind == KIND_LAP_OVER
+                   for item in chip_check_items(reads, ChipCheckContext(race_finished=False)))
+
+
+def test_long_lap_hints_a_missed_read():
+    reads = []
+    for rider in range(1, 7):
+        reads += _laps(str(rider), 4, offset_ms=rider * 1_000, base=rider * 100)
+    reads = [read for read in reads if not (read.bib == "3" and read.lap == 2)]
+    reads = [_read(int(read.event_id.rsplit("-", 1)[1]), read.bib, read.chip_ms,
+                   lap=read.lap - 1 if read.bib == "3" and read.lap > 2 else read.lap) for read in reads]
+
+    lap_time = [item for item in chip_check_items(reads) if item.kind == KIND_LAP_TIME and item.bibs == ("3",)]
+
+    assert lap_time and "可能中间漏读一次" in lap_time[0].detail
+
+
+def test_paired_chips_open_split_and_voided():
+    together = _laps("5", 5, base=100) + _laps("8", 5, offset_ms=300, base=200) + _laps("9", 5, offset_ms=90_000, base=300)
+
+    pair, = [item for item in chip_check_items(together) if item.kind == KIND_PAIRED_CHIPS]
+    assert pair.bibs == ("5", "8") and pair.status == STATUS_OPEN and len(pair.event_ids) == 6
+
+    split = [read if not (read.bib == "8" and read.lap >= 4) else
+             _read(int(read.event_id.rsplit("-", 1)[1]), "8", read.chip_ms + 5_000, lap=read.lap)
+             for read in together]
+    pair, = [item for item in chip_check_items(split) if item.kind == KIND_PAIRED_CHIPS]
+    assert pair.status == STATUS_INFO and "已经分开" in pair.status_note
+
+    voided = [read if not (read.bib == "8" and read.lap == 1) else
+              _read(201, "8", read.chip_ms, lap=1, active=False) for read in together]
+    pair, = [item for item in chip_check_items(voided) if item.kind == KIND_PAIRED_CHIPS]
+    assert pair.status == STATUS_CLOSED_UPSTREAM
+
+    # Two laps together is pacing, not a pair.
+    short = _laps("5", 2, base=100) + _laps("8", 2, offset_ms=300, base=200)
+    assert not any(item.kind == KIND_PAIRED_CHIPS for item in chip_check_items(short))
+
+
+def test_reidentified_read_is_not_a_pair_with_itself():
+    reads = _laps("5", 4, base=100)
+    renamed = [_read(100 + number, "6", read.chip_ms, lap=number, revision=2)
+               for number, read in enumerate(reads, start=1)]
+
+    assert not any(item.kind == KIND_PAIRED_CHIPS for item in chip_check_items(reads + renamed))

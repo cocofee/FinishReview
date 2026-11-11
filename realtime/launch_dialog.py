@@ -249,7 +249,7 @@ class EventWorkspacePickerDialog(QDialog):
         layout.addWidget(self.search_edit)
 
         self.table = QTableWidget(len(self._workspaces), 4, self)
-        self.table.setHorizontalHeaderLabels(("赛事名称", "赛段", "最后更新", "状态"))
+        self.table.setHorizontalHeaderLabels(("比赛", "日期 项目", "最后更新", "状态"))
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -257,8 +257,13 @@ class EventWorkspacePickerDialog(QDialog):
         self.table.itemSelectionChanged.connect(self._update_selection)
         self.table.cellDoubleClicked.connect(self._open_selected_row)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # A long race name (古浪's runs to 40 characters) must not squeeze the
+        # other column to nothing: both share the width and long names are cut.
+        self.table.setTextElideMode(Qt.ElideRight)
+        self.table.setWordWrap(False)
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.resizeSection(0, 260)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         selected_row = -1
@@ -268,8 +273,8 @@ class EventWorkspacePickerDialog(QDialog):
             ).strftime("%Y-%m-%d %H:%M") if workspace.modified_at_ms else "--"
             is_current = current_path is not None and workspace.path == current_path
             values = (
-                workspace.race_name,
-                workspace.stage_name,
+                workspace.competition or workspace.race_name,
+                workspace.path.name if workspace.competition else workspace.stage_name,
                 modified,
                 "当前打开" if is_current else "已保存",
             )
@@ -277,7 +282,8 @@ class EventWorkspacePickerDialog(QDialog):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.UserRole, str(workspace.path))
-                    item.setToolTip(str(workspace.path))
+                if column in {0, 1}:
+                    item.setToolTip("\n".join((workspace.race_name, workspace.stage_name, str(workspace.path))))
                 if column in {2, 3}:
                     item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(row, column, item)
@@ -323,7 +329,7 @@ class EventWorkspacePickerDialog(QDialog):
         first_visible = -1
         for row, workspace in enumerate(self._workspaces):
             searchable = " ".join(
-                (workspace.race_name, workspace.stage_name, workspace.path.name)
+                (workspace.race_name, workspace.stage_name, workspace.path.name, workspace.competition)
             ).casefold()
             hidden = bool(query and query not in searchable)
             self.table.setRowHidden(row, hidden)
