@@ -1,6 +1,6 @@
 # FinishReview 系统详细说明
 
-> 适用版本：v0.25.9（代码位于 `realtime` 包，入口 `python -m realtime.review_main`）。
+> 适用版本：v0.25.10（代码位于 `realtime` 包，入口 `python -m realtime.review_main`）。
 > 本文按“现场怎么用 → 数据怎么流 → 每层怎么实现 → 文件放在哪 → 哪些事不做”的顺序说明。
 
 ## 0. 一句话定位
