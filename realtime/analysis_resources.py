@@ -27,12 +27,27 @@ _POWER_THROTTLING_EXECUTION_SPEED = 0x1
 
 
 def lower_process_priority(*, idle: bool = False) -> bool:
-    """Lower this process's CPU priority and enable efficiency mode if possible."""
+    """Lower this process's CPU priority, and tell Windows not to slow it down on top of that.
+
+    The low priority is what gives way: the timing software and the recorder
+    get the processor first.  Windows' efficiency mode is switched off rather
+    than on.  Left to itself, Windows moves a windowless process to the small
+    cores at reduced speed after about three seconds, and everything in it
+    runs 3-4 times slower (i5-13500H, 2026-11-11: one YOLOX-nano look 134 ms
+    instead of 400-520 ms), so a 35 minute race took 98 minutes to analyse and
+    a missed chip was reported an hour late.
+    """
 
     lowered = False
     if sys.platform == "win32":
         try:
-            kernel32 = ctypes.windll.kernel32
+            # Declared types: left to ctypes' defaults, the process handle is cut
+            # to 32 bits on 64-bit Python and Windows refuses it (error 6), so
+            # neither the priority nor the power setting was ever applied.
+            kernel32 = ctypes.WinDLL("kernel32")
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            kernel32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
             handle = kernel32.GetCurrentProcess()
             priority = IDLE_PRIORITY_CLASS if idle else BELOW_NORMAL_PRIORITY_CLASS
             lowered = bool(kernel32.SetPriorityClass(handle, priority))
@@ -44,10 +59,11 @@ def lower_process_priority(*, idle: bool = False) -> bool:
                     ("StateMask", ctypes.c_ulong),
                 ]
 
+            # ControlMask names the setting, StateMask 0 switches it off.
             state = _PowerThrottling(
                 _POWER_THROTTLING_CURRENT_VERSION,
                 _POWER_THROTTLING_EXECUTION_SPEED,
-                _POWER_THROTTLING_EXECUTION_SPEED,
+                0,
             )
             kernel32.SetProcessInformation(
                 handle, _PROCESS_POWER_THROTTLING, ctypes.byref(state), ctypes.sizeof(state),

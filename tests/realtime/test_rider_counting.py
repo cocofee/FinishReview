@@ -352,3 +352,38 @@ def test_one_slow_passer_by_before_the_race_does_not_time_the_first_riders(rider
     assert people.stats["finish_timing"] == {"seen_at_finish": 1, "race_delay": 0, "velocity": 2, "count_line": 0}
     riders = sorted(c.record.recorder_ms for c in people.crossings)[1:]
     assert all(abs(ms - (START + value * 1000)) <= 100 for ms, value in zip(riders, CROSSINGS_S[:2]))
+
+
+_GATE_META = {"model": "abc", "roi": [0, 0, 320, 240], "band": [10, 10, 200, 200], "count_line": [[150.0, 36.0], [150.0, 204.0]]}
+
+
+def _left_gate():
+    return _RiderGate(background=np.arange(12, dtype=np.float32).reshape(3, 4), last_motion_ms=9_900.0,
+                      near_until_ms=10_800.0, last_look_ms=9_960.0,
+                      recent=[(9_880.0, [[1.0, 2.0, 3.0, 4.0]]), (9_960.0, [])])
+
+
+def test_the_next_process_takes_up_the_gate_where_the_last_one_left_it(tmp_path):
+    path = rider_counting._gate_path(tmp_path, tmp_path / "strips" / "camera_01" / "piece_0001.npz", "session")
+    rider_counting._save_gate(path, _left_gate(), 10_000.0, _GATE_META)
+
+    gate = rider_counting._load_gate(path, 10_000.0, _GATE_META)
+
+    left = _left_gate()
+    assert np.array_equal(gate.background, left.background)
+    assert (gate.last_motion_ms, gate.near_until_ms, gate.last_look_ms) == (9_900.0, 10_800.0, 9_960.0)
+    assert gate.recent == [(9_880.0, [[1.0, 2.0, 3.0, 4.0]]), (9_960.0, [])]
+    assert not list(path.parent.glob("*.json"))  # never mistaken for a rider record
+
+
+def test_a_gate_left_elsewhere_or_long_ago_is_not_taken_up(tmp_path):
+    path = tmp_path / "riders" / "camera_01" / "session.gate.npz"
+    rider_counting._save_gate(path, _left_gate(), 10_000.0, _GATE_META)
+
+    assert rider_counting._load_gate(path, 10_000.0 + rider_counting.GATE_CARRY_MS + 1, _GATE_META) is None  # a gap in the recording
+    assert rider_counting._load_gate(path, 9_000.0, _GATE_META) is None                                       # an earlier file redone
+    assert rider_counting._load_gate(path, 10_000.0, dict(_GATE_META, count_line=[[160.0, 36.0], [160.0, 204.0]])) is None
+    assert rider_counting._load_gate(path, 10_000.0, dict(_GATE_META, model="other")) is None
+    assert rider_counting._load_gate(tmp_path / "missing.gate.npz", 10_000.0, _GATE_META) is None
+    path.write_bytes(b"not a gate")
+    assert rider_counting._load_gate(path, 10_000.0, _GATE_META) is None

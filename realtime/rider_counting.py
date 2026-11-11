@@ -238,6 +238,56 @@ class _RiderGate:
     recent: list = field(default_factory=list)
 
 
+# The live console starts a new analysis process every few seconds.  A gate
+# left behind by the last one is taken up again when the next file follows
+# within this long; without it each process needed 250-700 ms of looks before
+# it could tell a rider was coming, and riders at the count line just then
+# were not counted (Tongxin, busiest five minutes as 2.5 s pieces: 34 riders
+# counted with a process per round, 36 in one process).
+GATE_CARRY_MS = 1000
+
+
+def _gate_path(output_dir: Path, strip_path: Path, session: str) -> Path:
+    return Path(output_dir) / "riders" / Path(strip_path).parent.name / f"{session or 'session'}.gate.npz"
+
+
+def _save_gate(path: Path, gate: _RiderGate, until_ms: float, meta: dict) -> None:
+    """Leave the gate for the next process; a failure only costs that process its warm start."""
+
+    if gate.background is None:
+        return
+    state = {"version": RIDER_VERSION, "model": meta["model"], "roi": meta["roi"], "band": meta["band"],
+             "count_line": meta["count_line"], "until_ms": float(until_ms),
+             "last_motion_ms": gate.last_motion_ms, "near_until_ms": gate.near_until_ms,
+             "last_look_ms": gate.last_look_ms,
+             "recent": [[stamp, [list(map(float, box)) for box in riders]] for stamp, riders in gate.recent]}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        with open(temporary, "wb") as handle:
+            np.savez(handle, background=gate.background, state=np.array(json.dumps(state)))
+        temporary.replace(path)
+    except OSError as error:
+        logger.warning("rider gate not saved: %s", error)
+
+
+def _load_gate(path: Path, start_ms: float, meta: dict) -> Optional[_RiderGate]:
+    """The gate another process left, if it ended where this file begins and looked at the same road."""
+
+    try:
+        with np.load(path, allow_pickle=False) as saved:
+            background = np.asarray(saved["background"], np.float32)
+            state = json.loads(str(saved["state"]))
+        same = all(state[key] == meta[key] for key in ("model", "roi", "band", "count_line"))
+        if state["version"] != RIDER_VERSION or not same or not 0 <= start_ms - state["until_ms"] <= GATE_CARRY_MS:
+            return None
+        return _RiderGate(background=background, last_motion_ms=float(state["last_motion_ms"]),
+                          near_until_ms=float(state["near_until_ms"]), last_look_ms=float(state["last_look_ms"]),
+                          recent=[(float(stamp), riders) for stamp, riders in state["recent"]])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _wake_area(finish, count, width: int, height: int):
     """The road a rider wakes the detector on: along the count line as far as it counts, up and down the road."""
 
@@ -387,8 +437,9 @@ def extract_riders(output_dir: Path, files: Sequence, model: Path, count_points,
         progress("数车手", index, len(files))
         session = str(item.meta.get("session_id", ""))
         gate = gates.get(("rider", session))
+        saved_gate = _gate_path(output_dir, item.path, session)
         if not isinstance(gate, _RiderGate):
-            gate = gates[("rider", session)] = _RiderGate()
+            gate = gates[("rider", session)] = _load_gate(saved_gate, float(item.start_ms), meta) or _RiderGate()
         wake = _wake_area(finish, count, int(item.geometry.width), int(item.geometry.height))
         try:
             payload = detect_file_riders(
@@ -404,6 +455,7 @@ def extract_riders(output_dir: Path, files: Sequence, model: Path, count_points,
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(dict(payload, meta=meta), separators=(",", ":")), encoding="utf-8")
         temporary.replace(target)
+        _save_gate(saved_gate, gate, float(item.end_ms), meta)
         logger.info("riders %s: %s", item.path.name, payload["stats"])
         done += 1
     progress("数车手", len(files), len(files))
