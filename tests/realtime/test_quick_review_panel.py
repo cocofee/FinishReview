@@ -1789,3 +1789,196 @@ def test_calibration_is_a_front_button_that_turns_red_until_the_recording_is_cal
     assert button.text() == "已校时" and "c2410c" not in button.styleSheet()
     QTest.mouseClick(button, Qt.LeftButton)  # still there to redo it
     assert len(spy) == 2
+
+
+def run_signals(panel):
+    runs = []
+    panel.run_requested.connect(runs.append)
+    return runs
+
+
+def test_a_click_plays_on_to_the_next_chip_and_stops_there(wave_panel, qapp):
+    """11-11：点一个人，录像自己走到下一位停住；不用再按 Shift+方向键找帧。"""
+
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert runs == [True] and wave_panel._run_to == T0 + 400 and not wave_panel._run_tail
+    assert "自动走到下一位" in wave_panel.hint.text()
+
+    look_through(wave_panel, 100, 200, 100)
+    assert runs == [True]  # not there yet
+    look_through(wave_panel, 300, 400, 40)
+    qapp.processEvents()
+    assert runs == [True, False] and wave_panel._run_to is None
+    assert "20 号" in wave_panel.hint.text()
+    assert wave_panel._selected_arrival().bib == "61"  # nothing was counted or moved on by the run
+
+
+def test_someone_due_on_this_picture_keeps_it_where_it_is(wave_panel, qapp):
+    wave_panel.events[1] = event("20", "b", T0 + 100)  # side by side with 61
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert runs == [] and wave_panel._run_to is None
+
+
+def test_a_key_a_row_or_a_click_holds_the_run(wave_panel, qapp):
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert wave_panel.stop_run() and runs == [True, False]
+    assert not wave_panel.stop_run() and runs == [True, False]
+
+    count_on_picture(wave_panel, .4, 400)  # the next person, clicked while it would play
+    qapp.processEvents()
+    assert runs == [True, False, True] and wave_panel._run_to == T0 + 900
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
+    assert runs[-1] is False and wave_panel._run_to is None
+
+
+def test_a_wave_counted_even_is_played_past_its_tail_and_then_opens_the_next(wave_panel, qapp):
+    """人数对上、看到本波末尾后 1 秒（防尾部有没芯片的人）才自己到下一处；对不上就停着。"""
+
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    for x, offset in ((.2, 0), (.4, 400), (.6, 900)):
+        look_through(wave_panel, max(0, offset - 400), offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    assert wave_panel._run_to == T0 + 900 + 1000 and wave_panel._run_tail
+    assert wave_panel._selected_arrival().bib == "76"  # not before the tail is seen
+    look_through(wave_panel, 1000, 1900, 100)
+    qapp.processEvents()
+    assert runs[-1] is False
+    assert wave_panel._selected_arrival().bib == "5"
+    assert "对上" in wave_panel.hint.text()
+
+
+def test_a_wave_that_does_not_count_even_stays_at_its_tail(wave_panel, qapp):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    for x, offset in ((.2, 0), (.4, 400), (.6, 900)):
+        look_through(wave_panel, max(0, offset - 400), offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    look_through(wave_panel, 1000, 1400, 100)
+    count_on_picture(wave_panel, .8, 1400)  # a fourth person at the back: no chip
+    qapp.processEvents()
+    look_through(wave_panel, 1500, 1900, 100)
+    qapp.processEvents()
+    assert wave_panel._selected_arrival().bib != "5"
+    assert "多 1 人" in wave_panel.confirmation_status.text()
+    assert "看到末尾" in wave_panel.hint.text()
+
+
+def test_in_a_tight_wave_seen_late_on_the_picture_the_run_never_skips_the_next_rider(wave_panel, qapp):
+    """11-11 现场：一波人很密、画面上压线比芯片晚半秒时，录像一口气放过了整波，没法点。"""
+
+    wave_panel.events[:3] = [event("61", "a", T0), event("20", "b", T0 + 100), event("76", "c", T0 + 200)]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 500)  # 61 crosses half a second after its chip
+    qapp.processEvents()
+    assert runs == [] and wave_panel._run_to is None  # 20 is due right here: it stays
+    assert "下一位 20 号" in wave_panel.hint.text()
+    count_on_picture(wave_panel, .4, 650)
+    qapp.processEvents()
+    assert runs == [] and wave_panel._run_to is None
+
+
+def test_a_run_aims_at_the_next_chip_shifted_by_how_late_this_wave_is_seen(wave_panel, qapp):
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 500)  # chips at 0, 400, 900: seen 500 ms late
+    qapp.processEvents()
+    assert runs == [True] and wave_panel._run_to == T0 + 900
+
+
+
+def test_space_on_a_wave_nobody_is_clicked_on_yet_plays_to_the_first_chip_and_stops(wave_panel, qapp):
+    """11-12 古浪：大集团里按空格录像一口气放完，来不及一个个点；空格也要走到下一位停住。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, -600, -600)
+    runs = run_signals(wave_panel)
+    assert wave_panel.play_on()
+    assert runs == [True] and wave_panel._run_to == T0 and not wave_panel._run_tail
+    assert "已点 0/3 人" in wave_panel.hint.text() and "走到下一位" in wave_panel.hint.text()
+    look_through(wave_panel, -400, 0, 40)
+    qapp.processEvents()
+    assert runs == [True, False] and wave_panel._run_to is None
+    assert "61 号" in wave_panel.hint.text()
+    assert not any(entry.decision for entry in wave_panel._arrival_rows)  # Space counts nobody
+
+
+def test_space_with_the_next_rider_due_here_but_not_at_the_line_moves_a_little(wave_panel, qapp):
+    wave_panel.events[:3] = [event("61", "a", T0), event("20", "b", T0 + 100), event("76", "c", T0 + 200)]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 500)
+    qapp.processEvents()
+    assert runs == [] and "按空格往前走一点" in wave_panel.hint.text()  # 20 is due right here
+    look_through(wave_panel, 500, 500)
+    assert wave_panel.play_on()
+    assert runs == [True] and wave_panel._run_to == T0 + 500 + 300 and not wave_panel._run_tail
+    look_through(wave_panel, 540, 800, 40)
+    qapp.processEvents()
+    assert runs == [True, False] and wave_panel._run_to is None
+
+
+def test_space_past_the_wave_or_with_no_wave_plays_as_always(wave_panel, qapp):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 900 + 1000, 900 + 1000)
+    runs = run_signals(wave_panel)
+    assert not wave_panel.play_on() and runs == []
+    wave_panel._shown_ms = None  # no picture shown yet
+    assert not wave_panel.play_on() and runs == []
+
+def test_every_run_or_hold_says_how_many_are_counted_and_who_was_just_clicked(wave_panel, qapp):
+    """11-11：录像自己往前走后，刚点的圈就看不到了，提示里要说清点到第几个、刚点的是谁。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert "已点 1/3 人（刚点的记为 61 号）" in wave_panel.hint.text()
+    look_through(wave_panel, 100, 400, 40)
+    qapp.processEvents()
+    assert "已点 1/3 人" in wave_panel.hint.text() and "20 号" in wave_panel.hint.text()
+
+
+
+def test_the_running_count_above_the_video_says_how_many_passed_and_the_last_bib(wave_panel, qapp):
+    """11-12：视频上方中间写“已过 N 人 · X 号”，和计时软件的累计人数直接对。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    first = count_on_picture(wave_panel, .2, 0)
+    count_on_picture(wave_panel, .4, 400)
+    qapp.processEvents()
+    assert wave_panel.passed_count_text(dict(first, recorder_ms=T0 - 1)) == "已过 0 人"
+    assert wave_panel.passed_count_text(first) == "已过 1 人 · 61 号"
+    assert wave_panel.passed_count_text(dict(first, recorder_ms=T0 + 600)) == "已过 2 人 · 20 号"
+    assert wave_panel.passed_count_text(dict(first, recorder_ms=T0 + 600, camera_index=2)) == "已过 0 人"
+
+
+def test_a_crossing_the_machine_thinks_is_staff_is_listed_with_its_reason(panel):
+    """11-12：机器觉得不像选手的过线照样列出，选中时说明理由，由操作员判断。"""
+    panel.events = []
+    evidence = {"frame": dict(FRAME), "recorder_ms": FRAME["recorder_ms"], "unlike_athlete": "站着或慢走",
+                "crossing_check": {"state": "confirmed", "reason": "person_track"}}
+    panel.items = [ProblemItem("staff?", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "", evidence=evidence)]
+    panel._render()
+    assert panel.table.rowCount() == 1
+    row = panel._arrival_rows[0]
+    assert "机器看着不像选手（站着或慢走），由你判断" in panel._unlike_athlete(row)
+    panel._show_row_hint(row)
+    assert panel.hint.text().startswith("机器看着不像选手（站着或慢走）")
+    assert "机器看着不像选手" in panel.table.item(0, 3).toolTip()

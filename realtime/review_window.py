@@ -2552,6 +2552,8 @@ class FinishReviewWindow(PassageReviewSurface):
         # In the workbench the picture already fills the room; F enlarges nothing.
         for pane in self.evidence_panes:
             pane._maximize_shortcut.setEnabled(not expanded)
+            if not expanded and hasattr(pane, "set_passed_count"):
+                pane.set_passed_count("")
         self.setMinimumHeight(700 if expanded else 760)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
@@ -2648,6 +2650,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.marks_changed.connect(self._problem_marks_changed)
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
+        self.problem_panel.run_requested.connect(self._run_problem_playback)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
         self.problem_panel.delete_requested.connect(self._delete_problem_record)
         self.problem_panel.calibration_requested.connect(self._calibrate_crossing_frame)
@@ -2943,6 +2946,31 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_crossing_cards()
         self.problem_panel.setFocus()
 
+    def _run_problem_playback(self, playing) -> None:
+        """The arrival list plays the recording on to the next person, or holds it: what Space does."""
+
+        pane = self._active_playback_pane()
+        if pane is not None and bool(playing) != bool(pane.is_playing):
+            self._toggle_pane(pane)
+
+    def _toggle_active_pane(self) -> None:
+        """Space.  On the arrival list's wave it plays on to the next person and stops (11-12).
+
+        古浪 big bunch: Space played the recording straight on and everyone went
+        past before one could be clicked.  A run playing is held; plain playing
+        is paused; with no wave on screen Space plays as it always did.
+        """
+
+        panel = getattr(self, "problem_panel", None)
+        if getattr(self, "_problem_workbench_active", False) and getattr(panel, "quick_review", False):
+            pane = self._active_playback_pane()
+            if pane is not None and pane.is_playing:
+                if panel.stop_run():
+                    return
+            elif pane is not None and panel.play_on():
+                return
+        PassageReviewSurface._toggle_active_pane(self)
+
     def _quick_review_mark_arrival(self, frame, x_normalized, y_normalized, pane) -> None:
         """Use the operator's picture click as the bicycle cue, not a final ruling."""
 
@@ -3016,6 +3044,32 @@ class FinishReviewWindow(PassageReviewSurface):
         pane = self._problem_pane()
         if pane is not None:
             pane.video_view.set_history_markers(self._continuous_marker_overlays(pane))
+            self._show_problem_count_badge(pane)
+
+    def _followed_mark_overlays(self, pane, image):
+        """11-12: a counted person's tag rides along with them for about a second."""
+        if pane is not self._problem_pane() or not hasattr(self.problem_panel, "follow_marks"):
+            return ()
+        from .mark_follow import MarkFollower
+        follower = getattr(self, "_mark_follower", None)
+        if follower is None:
+            follower = self._mark_follower = MarkFollower()
+        try:
+            followed = follower.update(self._frame_for_problem_count(pane), image, self.problem_panel.follow_marks())
+        except Exception:  # a display aid: never let it stop the recording
+            follower.reset()
+            return ()
+        return tuple((x, y, label, True, False, False, False, False) for x, y, label in followed)
+
+    def _show_problem_count_badge(self, pane) -> None:
+        """已过 N 人 · X 号 above the picture, read against the timing software."""
+        text = ""
+        if (getattr(self, "_problem_workbench_active", False) and pane is self._problem_pane()
+                and getattr(self.problem_panel, "quick_review", False)
+                and hasattr(self.problem_panel, "passed_count_text")):
+            text = self.problem_panel.passed_count_text(self._frame_for_problem_count(pane))
+        if hasattr(pane, "set_passed_count"):
+            pane.set_passed_count(text)
 
     def _continuous_marker_overlays(self, pane):
         """The counted people ride along with the crossing markers of the same frame."""
@@ -3147,7 +3201,9 @@ class FinishReviewWindow(PassageReviewSurface):
         if getattr(self.problem_panel, "quick_review", False):
             # The red "待补录" identity guide is not the camera's finish line.
             pane.video_view.clear_marker()
-            pane.video_view.set_history_markers(self._problem_count_overlays(pane))
+            pane.video_view.set_history_markers(self._problem_count_overlays(pane)
+                                                + self._followed_mark_overlays(pane, image))
+            self._show_problem_count_badge(pane)
             self.problem_panel._sync_arrival_confirmation()
         if pane is not self._active_playback_pane():
             return

@@ -5933,3 +5933,81 @@ def test_a_row_opens_in_its_sealed_archive_on_the_same_picture(qapp, tmp_path):
         assert opened is location and position == 500
     finally:
         window.close()
+
+
+def test_the_arrival_list_s_run_plays_and_holds_the_active_pane_like_space():
+    """11-11：点人后录像自己走到下一位——面板只发「放 / 停」，窗口按空格的同一条路去做。"""
+
+    class Pane:
+        is_playing = False
+
+    class Window:
+        def __init__(self):
+            self.pane, self.toggled = Pane(), 0
+
+        def _active_playback_pane(self):
+            return self.pane
+
+        def _toggle_pane(self, pane):
+            self.toggled += 1
+            pane.is_playing = not pane.is_playing
+
+    window = Window()
+    run = review_window_module.FinishReviewWindow._run_problem_playback
+    run(window, True)
+    run(window, True)  # already playing: Space is not pressed a second time
+    assert window.toggled == 1 and window.pane.is_playing
+    run(window, False)
+    run(window, False)
+    assert window.toggled == 2 and not window.pane.is_playing
+    window.pane = None
+    run(window, True)  # no recording open: nothing to play
+
+
+def test_space_on_the_arrival_list_plays_a_wave_on_to_the_next_person():
+    """11-12 古浪：大集团里空格一口气放完；工作台上空格改成走到下一位停住，放着时空格停。"""
+
+    class Pane:
+        is_playing = False
+
+    class Panel:
+        quick_review = True
+
+        def __init__(self):
+            self.calls, self.answer = [], True
+
+        def stop_run(self):
+            self.calls.append("stop")
+            return self.answer
+
+        def play_on(self):
+            self.calls.append("play_on")
+            return self.answer
+
+    class Window:
+        def __init__(self):
+            self.pane, self.problem_panel, self.toggled = Pane(), Panel(), 0
+            self._problem_workbench_active = True
+
+        def _active_playback_pane(self):
+            return self.pane
+
+        def _toggle_pane(self, pane):
+            self.toggled += 1
+
+    space = review_window_module.FinishReviewWindow._toggle_active_pane
+    window = Window()
+    space(window)
+    assert window.problem_panel.calls == ["play_on"] and window.toggled == 0
+    window.pane.is_playing = True
+    space(window)  # the run playing: Space holds it
+    assert window.problem_panel.calls[-1] == "stop" and window.toggled == 0
+    window.problem_panel.answer = False
+    space(window)  # playing plainly: Space pauses as always
+    assert window.toggled == 1
+    window.pane.is_playing = False
+    space(window)  # nothing of a wave left: Space plays as always
+    assert window.problem_panel.calls[-1] == "play_on" and window.toggled == 2
+    window._problem_workbench_active = False
+    space(window)  # not on the arrival list: the panel is not asked
+    assert window.toggled == 3 and len(window.problem_panel.calls) == 4

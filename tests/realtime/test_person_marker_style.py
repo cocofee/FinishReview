@@ -37,7 +37,8 @@ def test_number_tag_is_screen_sized_and_kept_inside_visible_image(qapp, scale):
             tag = view._person_tag_rect(x, y, "321", scale, visible, occupied)
             assert visible.contains(tag)
             assert tag.height() * scale == pytest.approx(PERSON_TAG_FONT_PX + 10)
-            assert 34 <= tag.width() * scale < 70
+            # 30 px bold digits (11-12): a three-digit tag is about 106 px wide on screen.
+            assert 34 <= tag.width() * scale < 120
             occupied.append(tag)
     finally:
         view.close()
@@ -63,7 +64,7 @@ def test_workbench_markers_do_not_draw_long_lines_or_change_identity(qapp, dot):
         before = view._history_markers
         image = painted(view)
         assert image.pixelColor(320, 80) == QColor("#606060")
-        assert image.pixelColor(325, 240) != QColor("#606060")  # small ring at saved point
+        assert image.pixelColor(330, 240) != QColor("#606060")  # ring (radius 10) at saved point
         assert view._history_markers == before
         view.set_marker(.5, .5, "19", confirmed=True)
         image = painted(view)

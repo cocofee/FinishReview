@@ -7212,3 +7212,11 @@ def test_surface_workbench_compact_mode_controls_multi_camera_maximize(
             assert pane.fit_btn.text() == "适应"
     finally:
         dialog.close()
+
+
+def test_the_running_count_box_sits_in_the_header_and_hides_when_empty(qapp):
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE)
+    pane.set_passed_count("已过 45 人 · 5 号")
+    assert pane.passed_label.text() == "已过 45 人 · 5 号" and not pane.passed_label.isHidden()
+    pane.set_passed_count("")
+    assert pane.passed_label.isHidden()

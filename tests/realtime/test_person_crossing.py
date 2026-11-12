@@ -94,7 +94,8 @@ def test_every_athlete_pairs_and_nothing_is_queued(person_race):
     assert result["people"]["profile"]["samples"] == len(CROSSINGS_S)
 
 
-def test_spectators_are_counted_not_queued_and_a_chipless_runner_is_asked(person_race):
+def test_people_unlike_athletes_are_still_asked_with_the_machine_s_reason(person_race):
+    """11-12：机器看着像工作人员的人也列出来，由操作员判断，机器不能自己去掉（可能漏掉运动员）。"""
     _root, workspace, config, strips, model = person_race
     walkers = ATHLETES + [
         (9.0, -200.0, HEIGHT_PX),   # running the wrong way
@@ -106,9 +107,11 @@ def test_spectators_are_counted_not_queued_and_a_chipless_runner_is_asked(person
     result = analyse_camera(config, workspace, 1, strips)
 
     assert result["people"]["not_athletes"] == {"反方向": 1, "站着或慢走": 1}
-    missing, = [item for item in result["items"] if item.pending]
-    assert missing.kind == KIND_NO_CHIP_CROSSING
-    assert abs(missing.evidence["recorder_ms"] - (START + 48_000)) <= 100
+    asked = sorted((item for item in result["items"] if item.pending and item.kind == KIND_NO_CHIP_CROSSING),
+                   key=lambda item: item.evidence["recorder_ms"])
+    assert [round((item.evidence["recorder_ms"] - START) / 1000) for item in asked] == [9, 22, 48]
+    assert [item.evidence.get("unlike_athlete") for item in asked] == ["反方向", "站着或慢走", None]
+    assert "机器看着不像选手（站着或慢走），是不是由你判断" in asked[1].detail
 
 
 def _with_extra_chip(root, config, strips, chip_ms, bib, number):

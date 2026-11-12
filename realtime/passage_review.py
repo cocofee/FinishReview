@@ -433,7 +433,10 @@ def review_status_text(
 
 
 # Screen size of the number beside a person on the picture.
-PERSON_TAG_FONT_PX = 20
+PERSON_TAG_FONT_PX = 30  # 11-12: 20 px was too small to read at a glance
+# The tag sits this far to the right of the click, level with it, off the
+# person's body (operator, 11-12); left or above when that place is taken.
+PERSON_TAG_LIFT_PX = 60
 
 
 class EvidenceImageView(QGraphicsView):
@@ -1227,10 +1230,10 @@ class EvidenceImageView(QGraphicsView):
         font.setBold(True)
         width = min(max(34, QFontMetrics(font).horizontalAdvance(label) + 16) / scale, visible.width())
         height = min((PERSON_TAG_FONT_PX + 10) / scale, visible.height())
-        gap = 12 / scale
+        gap, lift = 12 / scale, PERSON_TAG_LIFT_PX / scale
         candidates = []
-        for dx, dy in ((gap, -height - gap), (-width - gap, -height - gap),
-                       (gap, gap), (-width - gap, gap), (gap, -2 * height - gap)):
+        for dx, dy in ((lift, -height / 2), (-width - lift, -height / 2), (gap, -height - lift),
+                       (-width - gap, -height - lift), (gap, gap), (-width - gap, gap)):
             left = max(visible.left(), min(x + dx, visible.right() - width))
             top = max(visible.top(), min(y + dy, visible.bottom() - height))
             candidate = QRectF(left, top, width, height)
@@ -1243,7 +1246,7 @@ class EvidenceImageView(QGraphicsView):
         """A point and number label, not a timing line or a tracking box."""
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        radius = (5 if ghost else 7) / scale
+        radius = (7 if ghost else 10) / scale
         pen = QPen(color, 2.5)
         pen.setCosmetic(True)
         if dashed or ghost:
@@ -1566,6 +1569,21 @@ class PassageEvidencePane(QFrame):
         )
         self.frame_indicator_label.setMinimumHeight(30)
         self.frame_indicator_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        # 11-12: 已过 N 人 · X 号 in the middle above the picture, read against the
+        # timing software's own running count (the operator's words).
+        self.passed_label = QLabel("")
+        self.passed_label.setObjectName("evidencePassedCount")
+        self.passed_label.setAlignment(Qt.AlignCenter)
+        self.passed_label.setStyleSheet(
+            "QLabel#evidencePassedCount {"
+            " background: #0b2b1f; color: #ffffff;"
+            " border: 2px solid #1bbf83; border-radius: 3px;"
+            " padding: 2px 18px; font-size: 18pt; font-weight: 800;"
+            "}"
+        )
+        self.passed_label.setMinimumHeight(40)
+        self.passed_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.passed_label.hide()
         self.camera_combo = QComboBox(self)
         self.camera_combo.setMinimumWidth(88)
         self.camera_combo.setToolTip("切换普通录像机位")
@@ -1581,6 +1599,8 @@ class PassageEvidencePane(QFrame):
         header.addWidget(self.active_badge)
         header.addWidget(self.frame_indicator_label)
         header.addWidget(self.camera_combo)
+        header.addStretch()
+        header.addWidget(self.passed_label)
         header.addStretch()
         header.addWidget(self.quality_label)
         header.addWidget(self.status_label)
@@ -1714,6 +1734,13 @@ class PassageEvidencePane(QFrame):
             self._frame_step_shortcuts.append(shortcut)
         self._set_transport_enabled(False)
 
+
+    def set_passed_count(self, text: str) -> None:
+        """已过 N 人 · X 号 in the middle of the header; empty hides it."""
+        value = str(text or "").strip()
+        if value != self.passed_label.text():
+            self.passed_label.setText(value)
+        self.passed_label.setVisible(bool(value))
     def set_active_judging(self, active: bool) -> None:
         active = bool(active)
         if self.property("activeJudging") == active:

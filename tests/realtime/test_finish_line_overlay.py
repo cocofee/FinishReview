@@ -35,3 +35,4 @@ def test_finish_line_is_painted_at_source_coordinates_after_zoom_and_hd():
     center = view.mapFromScene(QPointF(320, 240))
     assert view.viewport().grab().toImage().pixelColor(center).green() == 0
     view.close()
+
