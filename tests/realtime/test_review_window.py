@@ -2823,16 +2823,38 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert receiver.stopped
 
 
-def test_first_live_formal_passage_auto_starts_recording(qapp, tmp_path):
+def test_a_chip_read_while_not_recording_reminds_in_red_and_starts_nothing(qapp, tmp_path):
+    """11-14：赛前反复测芯片，每测一次就自动录一段、多一个文件夹。改成红色提醒，不自动录。"""
     window = _window(tmp_path)
     window.start_receiver()
 
     _FakeReceiver.instances[-1].deliver(_event())
     qapp.processEvents()
 
+    assert window.recorder is None and not _FakeRecorder.instances
+    assert window.passage_store.get("race-1-stage-1-passage-15") is not None   # the chip itself is kept
+    assert not window.recording_reminder.isHidden()
+
+    window._toggle_recording()                      # the operator starts it: the reminder goes
+    qapp.processEvents()
     assert window.recorder is not None and window.recorder.is_running
-    assert len(_FakeRecorder.instances) == 1
-    assert window.passage_store.get("race-1-stage-1-passage-15") is not None
+    window._update_runtime_status()
+    assert window.recording_reminder.isHidden()
+    window.close()
+
+
+def test_a_click_on_the_reminder_puts_it_away_for_this_race(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+    _FakeReceiver.instances[-1].deliver(_event())
+    qapp.processEvents()
+    assert not window.recording_reminder.isHidden()
+
+    window.recording_reminder.click()
+    assert window.recording_reminder.isHidden()
+    _FakeReceiver.instances[-1].deliver(_event(event_id="race-1-stage-1-passage-16"))
+    qapp.processEvents()
+    assert window.recording_reminder.isHidden() and window.recorder is None
     window.close()
 
 
@@ -2878,6 +2900,7 @@ def test_a_recording_the_operator_stopped_is_not_restarted_by_chips(qapp, tmp_pa
 
     receiver.deliver(_event(event_id="first", sequence=15))
     qapp.processEvents()
+    window._toggle_recording()                 # the operator starts it (11-14: chips start nothing)
     assert window.recorder is not None and window.recorder.is_running
 
     window._toggle_recording()
@@ -2887,6 +2910,7 @@ def test_a_recording_the_operator_stopped_is_not_restarted_by_chips(qapp, tmp_pa
     qapp.processEvents()
     assert not window._recording_any_active()
     assert len(_FakeRecorder.instances) == 1
+    assert window.recording_reminder.isHidden()   # stopped on purpose: not nagged about it either
     assert window.passage_store.get("second") is not None
     window.close()
 
@@ -3002,7 +3026,7 @@ def test_live_test_group_id_without_metadata_does_not_auto_start_recording(
     window.close()
 
 
-def test_first_formal_passage_after_test_group_starts_only_one_recorder(
+def test_a_test_group_chip_is_not_reminded_about_and_the_first_formal_one_is(
     qapp,
     tmp_path,
 ):
@@ -3026,13 +3050,15 @@ def test_first_formal_passage_after_test_group_starts_only_one_recorder(
     qapp.processEvents()
     assert window.recorder is None
 
+    assert window.recording_reminder.isHidden()
+
     receiver.deliver(_event(event_id="formal-first", sequence=16))
     qapp.processEvents()
-    assert window.recorder is not None and window.recorder.is_running
+    assert window.recorder is None and not window.recording_reminder.isHidden()
 
     receiver.deliver(_event(event_id="formal-second", sequence=17))
     qapp.processEvents()
-    assert len(_FakeRecorder.instances) == 1
+    assert not _FakeRecorder.instances and not window.recording_reminder.isHidden()
     window.close()
 
 
@@ -3048,39 +3074,6 @@ def test_historical_passage_does_not_auto_start_recording(qapp, tmp_path):
 
     assert window.recorder is None
     assert window.table.rowCount() == 1
-    window.close()
-
-
-def test_auto_recording_failure_does_not_drop_live_passage(qapp, tmp_path):
-    class _FailRecorder(_FakeRecorder):
-        def start(self):
-            raise RuntimeError("camera unavailable")
-
-    _FailRecorder.instances.clear()
-    _FakeReceiver.instances.clear()
-    window = FinishReviewWindow(
-        "rtsp://camera/live",
-        tmp_path,
-        passage_host="127.0.0.1",
-        passage_port=18765,
-        passage_batch_interval_ms=0,
-        recorder_factory=_FailRecorder,
-        receiver_factory=_FakeReceiver,
-    )
-    window.start_receiver()
-
-    _FakeReceiver.instances[-1].deliver(_event())
-    qapp.processEvents()
-
-    assert window.recorder is None
-    assert window.passage_store.get("race-1-stage-1-passage-15") is not None
-    assert window.table.rowCount() == 1
-    assert window._runtime_error == "camera unavailable"
-    assert window.camera_status_label.text() == "录像设备: 自动启动失败"
-    assert window.camera_status_label.toolTip() == "camera unavailable"
-    # A device that is in trouble is exactly what the strip exists for.
-    assert not window.camera_status_label.isHidden()
-    assert not window.runtime_status_strip.isHidden()
     window.close()
 
 

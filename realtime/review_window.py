@@ -651,6 +651,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._held_race_ids: set[str] = set()
         # Races whose recording the first chip already started, or the operator stopped.
         self._auto_recorded_race_ids: set[str] = set()
+        self._recording_reminder_race = ""
+        self._last_chip_race_id = ""
         # The base review surface starts timers while the production window is
         # still being assembled. Initialise health-check state before that
         # happens so an early clock tick cannot observe half-built state.
@@ -1466,9 +1468,12 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _toggle_recording(self) -> None:
         if self._recording_any_active():
-            race_id = self._race_being_recorded()
-            if race_id:
-                self._auto_recorded_race_ids.add(race_id)
+            # Stopped on purpose: no reminder for this race again.  The race the
+            # chips name counts too; without race details here the folder's own
+            # id is empty and the stop used to be forgotten.
+            for race_id in (self._race_being_recorded(), self._last_chip_race_id):
+                if race_id:
+                    self._auto_recorded_race_ids.add(race_id)
             self.stop_recording()
             return
         if self._workspace_mode == "archive":
@@ -2446,6 +2451,15 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.problem_list_button.setStyleSheet(tool_button_style)
+        self.recording_reminder = QPushButton("有芯片读数，还没录像 ▶", panel)
+        self.recording_reminder.setObjectName("finishRecordingReminder")
+        self.recording_reminder.setToolTip("正式比赛请点右边「开始录像」。只是测芯片就不用管；点这条提示本场不再提醒。")
+        self.recording_reminder.setStyleSheet(
+            "QPushButton { background: #b42318; color: #ffffff; border: none; border-radius: 4px;"
+            " padding: 2px 10px; font-size: 10pt; font-weight: 700; }")
+        self.recording_reminder.clicked.connect(self._dismiss_recording_reminder)
+        self.recording_reminder.hide()
+        top_layout.addWidget(self.recording_reminder)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.setMinimumWidth(88)
@@ -2620,11 +2634,19 @@ class FinishReviewWindow(PassageReviewSurface):
         self.product_title_label.setVisible(not compact)
         menu = getattr(getattr(self.problem_panel, "more_button", None), "menu", lambda: None)()
         if menu is not None and not getattr(self, "_header_actions", None):
+            menu.addAction("清理旧赛事文件夹…", self._clean_old_folders)
             menu.addSeparator()
             self._header_actions = [menu.addAction("重新检查连接（刷新）", self.recheck_button.click),
                                     menu.addAction("设备与赛事设置", self.settings_button.click)]
         for action in getattr(self, "_header_actions", None) or ():
             action.setVisible(compact)
+
+    def _clean_old_folders(self) -> None:
+        """Folders left by earlier tests: the operator ticks which go (see workspace_cleanup)."""
+        from .workspace_cleanup import clean_old_folders
+        done = clean_old_folders(self, self.workspace_root, self.output_dir)
+        if done:
+            self.problem_panel.hint.setText(done)
 
     def _uses_popup_judging(self):
         return not getattr(self, "_problem_workbench_active", False) and super()._uses_popup_judging()
@@ -4610,8 +4632,16 @@ class FinishReviewWindow(PassageReviewSurface):
         )
 
     def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
-        # The first chip starts a forgotten recording once per race; a recording
-        # the operator stopped is not started again by later chips.
+        """A chip read while nothing records: say so in red, start nothing.
+
+        11-14: the first chip of a race used to start the recording.  Before a
+        race the chips are tested again and again, and every test left a
+        recording and a folder behind ("它就会自动连接录像…非常麻烦").  The
+        reminder beside 开始录像 stays for a race that really was forgotten; a
+        click on it puts it away for this race, as stopping a recording does.
+        """
+        if event.is_active and not self._is_test_passage(event):
+            self._last_chip_race_id = event.race_id
         if (
             self._workspace_mode != "live"
             or not event.is_active
@@ -4622,23 +4652,26 @@ class FinishReviewWindow(PassageReviewSurface):
             or not self._is_live_passage(event)
         ):
             return False
-        try:
-            self.start_recording()
-        except Exception as error:  # noqa: BLE001 - passage storage must survive.
-            self._runtime_error = sanitize_recording_message(error)
-            self._auto_recording_error = self._runtime_error
-            logger.exception(
-                "Failed to auto-start recording for live passage %s",
-                event.event_id,
-            )
-            return False
-        self._auto_recorded_race_ids.add(event.race_id)
-        logger.info(
-            "Recording auto-started for live passage %s in group %s",
-            event.event_id,
-            event.group_id,
-        )
-        return True
+        if self._recording_reminder_race != event.race_id:
+            self._recording_reminder_race = event.race_id
+            logger.info("Chip read %s while not recording: reminder shown", event.event_id)
+        self._sync_recording_reminder()
+        return False
+
+    def _sync_recording_reminder(self) -> None:
+        label = getattr(self, "recording_reminder", None)
+        if label is None:
+            return
+        race = self._recording_reminder_race
+        if race and (self._recording_any_active() or race in self._auto_recorded_race_ids
+                     or self._workspace_mode != "live"):
+            race = self._recording_reminder_race = ""
+        label.setVisible(bool(race))
+
+    def _dismiss_recording_reminder(self) -> None:
+        if self._recording_reminder_race:
+            self._auto_recorded_race_ids.add(self._recording_reminder_race)
+        self._sync_recording_reminder()
 
     def _enter_race_opened_in_cyclerace(self) -> None:
         """Starting to record is when the race open in CycleRace gets its folder here.
@@ -5396,6 +5429,7 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         self._update_event_header()
         self._update_operator_controls()
+        self._sync_recording_reminder()
 
     def set_finish_line_roi(
         self,
