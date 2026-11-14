@@ -2075,3 +2075,44 @@ def test_a_crossing_the_machine_thinks_is_staff_is_listed_with_its_reason(panel)
     panel._show_row_hint(row)
     assert panel.hint.text().startswith("机器看着不像选手（站着或慢走）")
     assert "机器看着不像选手" in panel.table.item(0, 3).toolTip()
+
+
+def test_the_cells_above_the_picture_fill_in_arrival_order_as_people_are_clicked(wave_panel, qapp):
+    """11-14：大集团里看不出点了几个、点了谁。画面上方全场一人一格、从左到右，点一个人填一格，多点的人是红格。"""
+
+    from realtime.wave_slots import DONE, EXTRA, NEXT, TODO
+
+    def cells():
+        wave_panel.refresh_slots("已过 0 人")
+        return [(slot.label, slot.state, slot.current) for slot in wave_panel.wave_slots.slots()]
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    assert cells() == [("61", NEXT, True), ("20", TODO, True), ("76", TODO, True), ("5", TODO, False)]
+    assert wave_panel.wave_slots.summary() == "已过 0 人　本波 0/3"
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert cells() == [("61", DONE, True), ("20", NEXT, True), ("76", TODO, True), ("5", TODO, False)]
+    for x, offset in ((.4, 400), (.6, 900), (.8, 1400)):
+        look_through(wave_panel, offset - 400, offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    # The person beyond the last chip sits where they crossed, before 5, not at the end.
+    assert cells() == [("61", DONE, True), ("20", DONE, True), ("76", DONE, True), ("多 1", EXTRA, True),
+                       ("5", TODO, False)]
+    assert wave_panel.wave_slots.summary() == "已过 0 人　本波 4/3 多 1 人"
+
+    # A filled cell goes back to the frame that person was clicked on; nothing is counted or undone.
+    jumps = []
+    wave_panel.jump_requested.connect(jumps.append)
+    marks = len(wave_panel.current_marks())
+    second = wave_panel.wave_slots.slots()[1]
+    wave_panel.wave_slots.mark_clicked.emit(second.mark)
+    assert len(jumps) == 1 and jumps[0]["reference_only"] and jumps[0]["recorder_ms"] == T0 + 400
+    assert len(wave_panel.current_marks()) == marks and wave_panel._selected_arrival().bib == "20"
+
+    # On to someone crossing alone: the cells stay, the bunch before stays green.
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
+    states = cells()
+    assert [cell[:2] for cell in states[:3]] == [("61", DONE), ("20", DONE), ("76", DONE)]
+    assert states[-1] == ("5", NEXT, True) and not any(cell[2] for cell in states[:-1])

@@ -30,6 +30,7 @@ from .problem_items import (
     STATUS_WAITING, ProblemItem, stable_item_id,
 )
 from .problem_panel import ProblemListPanel
+from .wave_slots import DONE, ELSEWHERE, EXTRA, NEXT, NO_CHIP, TODO, Slot, WaveSlotRow
 from .problem_resolutions import _frame_text, _passage_number, export_lists
 from .race_strip import (AUTO_LABELLED, RaceStripPanel, earlier_arrival, first_crossing, frame_at,
                          line_arrivals)
@@ -180,7 +181,6 @@ class QuickReviewPanel(ProblemListPanel):
     delete_requested = pyqtSignal(str)
     # 校时: the window learns the video offset from the current frame and a chip record.
     calibration_requested = pyqtSignal()
-    # Q: one person crosses on the frame shown; the window records it like a click.
     run_speed = pyqtSignal(float)               # how fast the run plays (RUN_FAST_SPEED)
     # True: play the recording on from the frame shown; False: hold it (see RUN_NEAR_MS).
     run_requested = pyqtSignal(bool)
@@ -380,6 +380,12 @@ class QuickReviewPanel(ProblemListPanel):
         self.race_strip.seek_requested.connect(self._seek_race_strip)
         self.race_strip.ready.connect(self._strip_ready)
         self.layout().insertWidget(1, self.race_strip)
+        # The head count; the window puts it above the picture, in the place of 已过 N 人 (see wave_slots).
+        self.wave_slots = WaveSlotRow(self)
+        self.wave_slots.mark_clicked.connect(self._slot_clicked)
+        self._slot_thumbs = {}
+        self._slot_cache = None
+        self.layout().insertWidget(2, self.wave_slots)
         self._quick_ready = True
         QApplication.instance().installEventFilter(self)
         self._render()
@@ -2359,6 +2365,92 @@ class QuickReviewPanel(ProblemListPanel):
                               "还没到线按空格往前走，← → 一帧一帧。")
         else:
             self.hint.setText("这里机器看到有人过线：是运动员就点，不是就按空格继续。")
+
+    @staticmethod
+    def _thumb_key(mark):
+        return (int(mark["recorder_ms"]), round(float(mark["x"]), 4), round(float(mark["y"]), 4))
+
+    def keep_thumb(self, recorder_ms, x, y, thumb):
+        """The cut of the frame around someone just clicked, for their cell (this run of the program only)."""
+        if thumb is None:
+            return
+        if len(self._slot_thumbs) >= 400:
+            self._slot_thumbs.pop(next(iter(self._slot_thumbs)))
+        self._slot_thumbs[(int(recorder_ms), round(float(x), 4), round(float(y), 4))] = thumb
+
+    def wave_slot_list(self, plan=None):
+        """One cell an arrival, the whole race in table order; the wave on the picture is marked current."""
+        plan = plan or self._run_plan()  # before anyone is clicked on it: its chips alone
+        key = (self._table_builds, id(plan), len(plan.marks) if plan is not None else -1, len(self._arrival_rows))
+        if self._slot_cache is not None and self._slot_cache[0] == key and self._slot_cache[1] is plan:
+            return self._slot_cache[2]
+        holder, chips, following, marks = {}, set(), None, []
+        if plan is not None:
+            chips = {row.key for row in plan.chips}
+            holder = {row.key: i for i, row in plan.assigned}
+            marks = plan.marks
+            for i, mark in enumerate(marks):
+                if i in plan.labels and i not in plan.no_chip and i not in plan.extra and not is_excluded(mark):
+                    row = self._decided_row(mark, plan.item)
+                    if row is not None:
+                        holder.setdefault(row.key, i)
+            following = plan.unmatched[0].key if plan.unmatched else None
+        slots = []
+        for row in self._arrival_rows:
+            state = self._row_state(row)
+            if state in ("已排除", "画面待核") or row.note == "多余芯片":
+                continue
+            if row.event is None:  # somebody without a chip record: 多出 or 疑似漏读
+                index = next((i for i, mark in enumerate(marks) if mark is row.mark), None)
+                thumb = self._thumb_key(row.mark) if row.mark is not None else None
+                if index is not None and index in plan.extra:
+                    slots.append(Slot(plan.labels[index], EXTRA, index, thumb, True))
+                else:
+                    slots.append(Slot(str(row.bib) if row.entered and row.bib else "无芯片", NO_CHIP,
+                                      index, thumb, index is not None))
+            elif row.key in chips:
+                index = holder.get(row.key)
+                if index is not None:
+                    slots.append(Slot(str(row.bib), DONE, index, self._thumb_key(marks[index]), True))
+                elif row.decision is not None and not self._counted_here(row, plan.item):
+                    slots.append(Slot(str(row.bib), ELSEWHERE, None, None, True))
+                else:
+                    slots.append(Slot(str(row.bib), NEXT if row.key == following else TODO, None, None, True))
+            else:
+                saved = (row.decision or {}).get("frame") or {}
+                thumb = None
+                if saved.get("marker_x_normalized") is not None and saved.get("recorder_ms") is not None:
+                    thumb = (int(saved["recorder_ms"]), round(float(saved["marker_x_normalized"]), 4),
+                             round(float(saved["marker_y_normalized"]), 4))
+                slots.append(Slot(str(row.bib), DONE if row.decision else TODO, None, thumb))
+        summary = ""
+        if plan is not None:
+            count = len(plan.chips) - len(plan.extra_chips)
+            summary = f"本波 {plan.people}/{count}" + (f" 多 {len(plan.extra)} 人" if plan.extra else "")
+        self._slot_cache = (key, plan, (slots, summary))
+        return slots, summary
+
+    def refresh_slots(self, passed=""):
+        """PASSED: 已过 N 人 up to the frame shown, said in front of the cells."""
+        if not self._quick_ready:
+            return
+        slots, summary = self.wave_slot_list()
+        self.wave_slots.set_slots(slots, "　".join(part for part in (passed, summary) if part), self._slot_thumbs)
+
+    def _slot_clicked(self, index):
+        """A filled cell: back to the frame that person was clicked on, to look again; nothing is changed."""
+        plan = self._wave_plan()
+        if plan is None or not 0 <= index < len(plan.marks):
+            return
+        frame = plan.marks[index].get("frame") or {}
+        self.stop_run()
+        self.show_counted(index)
+        if frame.get("recorder_ms") is None:
+            self.hint.setText("这个人被点的那一帧没有记下来，回不去。")
+            return
+        self.jump_requested.emit(dict(frame, reference_only=True))
+        self.hint.setText(f"回到点 {plan.labels.get(index, '这个人')} 的那一帧（只看，不改动）；"
+                          "要撤销按 4。")
 
     def _run_count(self, plan):
         """How far the wave is counted, said every time the recording moves or holds (11-11:

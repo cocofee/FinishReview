@@ -2554,6 +2554,11 @@ class FinishReviewWindow(PassageReviewSurface):
             pane._maximize_shortcut.setEnabled(not expanded)
             if not expanded and hasattr(pane, "set_passed_count"):
                 pane.set_passed_count("")
+                if getattr(pane, "_header_strip", None) is not None:
+                    strip = pane._header_strip
+                    pane.set_header_strip(None)
+                    strip.setParent(self.problem_panel)
+                    strip.hide()
         self.setMinimumHeight(700 if expanded else 760)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
@@ -3035,6 +3040,9 @@ class FinishReviewWindow(PassageReviewSurface):
                          and (mark["x"] - x_normalized) ** 2 + (mark["y"] - y_normalized) ** 2 < .02 ** 2), None)
         builds = panel._table_builds
         if existing is None:
+            from .wave_slots import person_thumb
+            panel.keep_thumb(frame["recorder_ms"], round(float(x_normalized), 4), round(float(y_normalized), 4),
+                             person_thumb(pane.video_view._pixmap_item.pixmap(), x_normalized, y_normalized))
             panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
         else:
             panel._editing_mark = existing
@@ -3092,6 +3100,10 @@ class FinishReviewWindow(PassageReviewSurface):
                 and getattr(self.problem_panel, "quick_review", False)
                 and hasattr(self.problem_panel, "passed_count_text")):
             text = self.problem_panel.passed_count_text(self._frame_for_problem_count(pane))
+            if hasattr(self.problem_panel, "refresh_slots") and hasattr(pane, "set_header_strip"):
+                # The cells of who is counted take the place of 已过 N 人 · X 号 (11-14).
+                pane.set_header_strip(self.problem_panel.wave_slots)
+                self.problem_panel.refresh_slots(text.split(" · ")[0])
         if hasattr(pane, "set_passed_count"):
             pane.set_passed_count(text)
 

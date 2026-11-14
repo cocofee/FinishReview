@@ -1610,6 +1610,7 @@ class PassageEvidencePane(QFrame):
         header.addWidget(self.camera_combo)
         header.addStretch()
         header.addWidget(self.passed_label)
+        self._header, self._header_strip = header, None
         header.addStretch()
         header.addWidget(self.quality_label)
         header.addWidget(self.status_label)
@@ -1749,7 +1750,20 @@ class PassageEvidencePane(QFrame):
         value = str(text or "").strip()
         if value != self.passed_label.text():
             self.passed_label.setText(value)
-        self.passed_label.setVisible(bool(value))
+        self.passed_label.setVisible(bool(value) and self._header_strip is None)
+
+    def set_header_strip(self, widget) -> None:
+        """WIDGET takes the middle of the header, in the place of 已过 N 人 (11-14: the cells of
+        who is counted say the same and more, right above the picture); None gives it back."""
+        if widget is self._header_strip:
+            return
+        if self._header_strip is not None:
+            self._header.removeWidget(self._header_strip)
+        self._header_strip = widget
+        if widget is not None:
+            self._header.insertWidget(self._header.indexOf(self.passed_label), widget, 1)
+            self.passed_label.hide()
+
     def set_active_judging(self, active: bool) -> None:
         active = bool(active)
         if self.property("activeJudging") == active:
