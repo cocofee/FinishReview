@@ -2116,3 +2116,64 @@ def test_the_cells_above_the_picture_fill_in_arrival_order_as_people_are_clicked
     states = cells()
     assert [cell[:2] for cell in states[:3]] == [("61", DONE), ("20", DONE), ("76", DONE)]
     assert states[-1] == ("5", NEXT, True) and not any(cell[2] for cell in states[:-1])
+
+
+def test_the_cells_are_not_rebuilt_for_every_frame_shown(wave_panel, qapp):
+    """11-14 审查：一波还没点人时每显示一帧都把全场重算一遍，4 倍快扫正是最吃紧的时候。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel.refresh_slots("已过 0 人")
+    hits = wave_panel.slot_cache_hits
+    for offset in range(0, 500, 50):  # frames going by, nobody clicked yet
+        look_through(wave_panel, offset, offset)
+        wave_panel.refresh_slots("已过 0 人")
+    assert wave_panel.slot_cache_hits == hits + 10
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel.refresh_slots("已过 1 人")  # a click is seen at once
+    assert [slot.state for slot in wave_panel.wave_slots.slots()][:2] == ["done", "next"]
+    hits = wave_panel.slot_cache_hits
+    for _ in range(5):
+        wave_panel.refresh_slots("已过 1 人")
+    assert wave_panel.slot_cache_hits == hits + 5
+
+
+def test_the_person_the_operator_is_on_stands_out_in_the_table_and_the_cells(wave_panel, qapp):
+    """11-14：“我现在点到哪一个人物，好像不能一下看出来”。下一位要点的人：左表标黄加粗、格子标黄；点齐后是刚点的人。"""
+
+    from PyQt5.QtGui import QColor
+
+    def yellow_rows():
+        table = wave_panel.table
+        return [wave_panel._arrival_rows[i].bib for i in range(table.rowCount())
+                if table.item(i, 0) is not None and table.item(i, 0).background().color() == QColor("#ffd84d")]
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel.refresh_slots("已过 0 人")
+    key, words, kind = wave_panel.current_target()
+    assert words == "下一位 61 号" and kind == "next" and yellow_rows() == ["61"]
+    assert [slot.label for slot in wave_panel.wave_slots.slots() if slot.target] == ["61"]
+    assert wave_panel.table.styleSheet() == wave_panel.TARGET_ROW_STYLE   # the selected row is that person
+
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel.refresh_slots("已过 1 人")
+    assert wave_panel.current_target()[1] == "下一位 20 号" and yellow_rows() == ["20"]
+    assert [slot.label for slot in wave_panel.wave_slots.slots() if slot.target] == ["20"]
+
+    for x, offset in ((.4, 400), (.6, 900)):
+        look_through(wave_panel, offset - 400, offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    wave_panel.refresh_slots("已过 3 人")
+    words = wave_panel.current_target()[1]
+    assert words.endswith("已点") or words == "本波点齐"
+    assert wave_panel.current_target()[2] == "done" and yellow_rows() == []   # yellow is only ever the next one
+
+    look_through(wave_panel, 1000, 1400, 100)
+    count_on_picture(wave_panel, .8, 1400)            # one more than the chips
+    qapp.processEvents()
+    wave_panel.refresh_slots("已过 3 人")
+    assert wave_panel.current_target()[1:] == ("多 1 人", "alert") and yellow_rows() == []
+

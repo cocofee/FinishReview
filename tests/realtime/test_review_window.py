@@ -6033,3 +6033,50 @@ def test_space_on_the_arrival_list_plays_a_wave_on_to_the_next_person():
     window._problem_workbench_active = False
     space(window)  # not on the arrival list: the panel is not asked
     assert window.toggled == 3 and len(window.problem_panel.calls) == 4
+
+
+def test_the_workbench_gives_its_height_to_the_picture_and_gives_it_back(qapp, tmp_path):
+    """11-14：画面被高度卡住、两侧黑边。工作台里顶栏压成一行，刷新/设置进「更多」，画面下面不留空带。"""
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        qapp.processEvents()
+        pane, panel = window.regular_pane, window.problem_panel
+        assert window.runtime_header.minimumHeight() == 38
+        assert window.recheck_button.isHidden() and window.settings_button.isHidden()
+        shown = [action.text() for action in panel.more_button.menu().actions() if action.isVisible()]
+        assert "重新检查连接（刷新）" in shown and "设备与赛事设置" in shown
+        assert not window.crossing_cards.isVisibleTo(window)
+        assert pane.controls_layout.indexOf(window.recording_rail_button) >= 0
+        assert window.recording_rail_button.isVisibleTo(window)
+        # With nothing to judge yet the raw recording is offered once; put away, it leaves no band.
+        window.recording_rail_button.setChecked(False)
+        qapp.processEvents()
+        assert not window.preview_panel.isVisibleTo(window)
+        assert pane.controls_layout.indexOf(pane.timeline) >= 0
+
+        window._show_problem_count_badge(pane)
+        assert pane._header.indexOf(panel.wave_slots) >= 0 and window._slot_pane is pane
+        assert pane.title_label.isHidden() and pane.frame_indicator_label.isHidden()
+
+        # 查找原录像 brings the recording rail back, and takes it away again.
+        window.recording_rail_button.setChecked(True)
+        qapp.processEvents()
+        assert window.preview_panel.isVisibleTo(window) and window.video_filmstrip.isVisibleTo(window)
+        window.recording_rail_button.setChecked(False)
+        qapp.processEvents()
+        assert not window.preview_panel.isVisibleTo(window)
+
+        window._set_problem_list_layout(False)
+        qapp.processEvents()
+        assert window.runtime_header.minimumHeight() == 78
+        assert not window.recheck_button.isHidden() and not window.settings_button.isHidden()
+        assert not any(action.isVisible() for action in window._header_actions)
+        assert pane._header.indexOf(panel.wave_slots) < 0 and window._slot_pane is None
+        assert not pane.title_label.isHidden() and not pane.frame_indicator_label.isHidden()
+        assert pane.layout().indexOf(pane.timeline) >= 0
+        assert window.recording_rail_button.isHidden()
+    finally:
+        window.close()

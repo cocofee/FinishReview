@@ -16,9 +16,8 @@ from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt5.QtWidgets import QSizePolicy, QToolTip, QWidget
 
 DONE, NEXT, TODO, EXTRA, NO_CHIP, ELSEWHERE = "done", "next", "todo", "extra", "no_chip", "elsewhere"
-ROW_HEIGHT = 46
+ROW_HEIGHT = 34
 CELL_WIDTH = 46
-THUMB_HEIGHT = 26
 COLOURS = {  # border, fill, text
     DONE: ("#0f766e", "#d5f0ec", "#0b3b37"),
     ELSEWHERE: ("#0f766e", "#eef7f6", "#0b3b37"),
@@ -27,6 +26,8 @@ COLOURS = {  # border, fill, text
     EXTRA: ("#b42318", "#fde4e1", "#b42318"),
     NO_CHIP: ("#9a5b12", "#fbefd9", "#7a4508"),
 }
+TARGET_COLOURS = ("#111827", "#ffd84d", "#111827")  # border, fill, text: the next person to click
+TARGET_DONE_COLOURS = ("#111827", "#2fb872", "#ffffff")  # that person, clicked
 TIPS = {
     DONE: "已点；点这一格回到点他的那一帧",
     ELSEWHERE: "这条芯片已在别处确认，画面上没有他的点",
@@ -42,8 +43,8 @@ class Slot:
     label: str
     state: str
     mark: int | None = None      # index among the wave's counted people, None: nobody clicked
-    thumb_key: tuple | None = None
     current: bool = False        # of the wave on the picture
+    target: bool = False         # the person the operator is on: the next to click, or just clicked
 
 
 class WaveSlotRow(QWidget):
@@ -55,7 +56,6 @@ class WaveSlotRow(QWidget):
         super().__init__(parent)
         self._slots = ()
         self._summary = ""
-        self._thumbs = {}
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMouseTracking(True)
         self.hide()
@@ -72,14 +72,12 @@ class WaveSlotRow(QWidget):
     def summary(self):
         return self._summary
 
-    def set_slots(self, slots, summary="", thumbs=None):
+    def set_slots(self, slots, summary=""):
         """SLOTS in arrival order; an empty list hides the row."""
         slots = tuple(slots)
-        thumbs = thumbs if thumbs is not None else {}
-        shown = tuple(slot.thumb_key in thumbs for slot in slots)
-        if (slots, summary, shown) == (self._slots, self._summary, getattr(self, "_shown", None)):
+        if (slots, summary) == (self._slots, self._summary):
             return
-        self._slots, self._summary, self._thumbs, self._shown = slots, summary, thumbs, shown
+        self._slots, self._summary = slots, summary
         self.setVisible(bool(slots))
         self.update()
 
@@ -88,8 +86,8 @@ class WaveSlotRow(QWidget):
             return 0
         font = QFont(self.font())
         font.setBold(True)
-        font.setPointSize(13)
-        return QFontMetrics(font).horizontalAdvance(self._summary) + 16
+        font.setPointSize(10)
+        return QFontMetrics(font).horizontalAdvance(self._summary) + 10
 
     def focus_index(self):
         """The cell kept in view: the next person of the wave on the picture, else its first cell."""
@@ -146,7 +144,7 @@ class WaveSlotRow(QWidget):
             painter.setPen(QColor("#b42318" if "多" in self._summary else "#0b3b37"))
             font = QFont(self.font())
             font.setBold(True)
-            font.setPointSize(13)
+            font.setPointSize(10)
             painter.setFont(font)
             painter.drawText(QRect(4, 0, self._summary_width(), self.height()),
                              Qt.AlignVCenter | Qt.AlignLeft, self._summary)
@@ -154,42 +152,23 @@ class WaveSlotRow(QWidget):
         painter.setClipRect(area)
         font = QFont(self.font())
         font.setBold(True)
-        font.setPointSize(9)
+        font.setPointSize(10)
         for slot, rect in zip(self._slots, self.cell_rects()):
             if not rect.intersects(area):
                 continue
             border, fill, text = COLOURS[slot.state]
-            pen = QPen(QColor(border), 2 if slot.state == NEXT else 1)
+            if slot.target:  # seen from the corner of the eye while watching the recording
+                border, fill, text = TARGET_DONE_COLOURS if slot.state == DONE else TARGET_COLOURS
+            pen = QPen(QColor(border), 3 if slot.target else 2 if slot.state == NEXT else 1)
             if slot.state == TODO:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
             painter.setBrush(QColor(fill))
             painter.drawRoundedRect(rect, 3, 3)
-            thumb = self._thumbs.get(slot.thumb_key) if slot.thumb_key is not None else None
-            label_rect = rect
-            if thumb is not None and rect.height() >= THUMB_HEIGHT + 14:
-                scaled = thumb.scaled(rect.width() - 4, rect.height() - 15, Qt.KeepAspectRatio,
-                                      Qt.SmoothTransformation)
-                painter.drawPixmap(rect.x() + (rect.width() - scaled.width()) // 2, rect.y() + 2, scaled)
-                label_rect = QRect(rect.x(), rect.bottom() - 13, rect.width(), 14)
+            font.setPointSize(13 if slot.target else 10)
             painter.setFont(font)
             painter.setPen(QColor(text))
-            painter.drawText(label_rect, Qt.AlignCenter, slot.label)
+            painter.drawText(rect, Qt.AlignCenter, slot.label)
             if slot.current:  # the wave on the picture
                 painter.fillRect(QRect(rect.x(), self.height() - 2, rect.width() + 3, 2), QColor("#0b3b37"))
         painter.end()
-
-
-def person_thumb(pixmap, x, y, height=THUMB_HEIGHT * 2):
-    """A small cut of the frame around the person clicked at (X, Y), fractions of the frame.
-
-    The click is on the front wheel or the foot at the line: the person is above it.
-    """
-    if pixmap is None or pixmap.isNull():
-        return None
-    width, full = pixmap.width(), pixmap.height()
-    box = QRect(int((x - .07) * width), int((y - .30) * full), int(.14 * width), int(.36 * full))
-    box = box.intersected(pixmap.rect())
-    if box.width() < 4 or box.height() < 4:
-        return None
-    return pixmap.copy(box).scaledToHeight(height, Qt.SmoothTransformation)

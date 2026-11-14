@@ -1,10 +1,9 @@
 from PyQt5.QtCore import QPoint, Qt
-from PyQt5.QtGui import QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 import pytest
 
-from realtime.wave_slots import DONE, NEXT, TODO, Slot, WaveSlotRow, person_thumb
+from realtime.wave_slots import DONE, NEXT, TODO, Slot, WaveSlotRow
 
 
 @pytest.fixture
@@ -18,7 +17,7 @@ def test_the_row_follows_the_wave_on_screen_and_only_filled_cells_answer_a_click
     assert row.isHidden()
     # 200 arrivals: 120 counted, the wave on the picture is 120..134 with two of it clicked.
     slots = [Slot(str(100 + i), DONE if i < 122 else NEXT if i == 122 else TODO,
-                  i if 120 <= i < 122 else None, None, 120 <= i < 135) for i in range(200)]
+                  i if 120 <= i < 122 else None, 120 <= i < 135) for i in range(200)]
     row.set_slots(slots, "已过 122 人　本波 2/15")
     row.show()
     rects = row.cell_rects()
@@ -40,9 +39,15 @@ def test_the_row_follows_the_wave_on_screen_and_only_filled_cells_answer_a_click
     assert row.isHidden()
 
 
-def test_the_cut_of_a_person_stays_inside_the_frame(qapp):
-    frame = QPixmap(640, 360)
-    frame.fill(Qt.gray)
-    assert person_thumb(frame, .5, .6).height() == 52
-    assert person_thumb(frame, .01, .02) is not None  # at a corner the cut is clipped, not empty
-    assert person_thumb(QPixmap(), .5, .5) is None
+def test_the_cell_of_the_person_the_operator_is_on_is_painted_apart(qapp):
+    from PyQt5.QtGui import QColor
+
+    row = WaveSlotRow()
+    row.resize(900, row.sizeHint().height())
+    row.set_slots([Slot("50", DONE, 0, True), Slot("519", NEXT, None, True, True), Slot("7", TODO, None, True)])
+    row.show()
+    image = row.grab().toImage()
+    rects = row.cell_rects()
+    corner = lambda rect: QColor(image.pixel(rect.left() + 5, rect.top() + 5)).name()  # noqa: E731
+    assert corner(rects[1]) == "#ffd84d" and corner(rects[0]) != "#ffd84d" and corner(rects[2]) != "#ffd84d"
+

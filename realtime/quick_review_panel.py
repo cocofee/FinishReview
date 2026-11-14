@@ -383,8 +383,8 @@ class QuickReviewPanel(ProblemListPanel):
         # The head count; the window puts it above the picture, in the place of 已过 N 人 (see wave_slots).
         self.wave_slots = WaveSlotRow(self)
         self.wave_slots.mark_clicked.connect(self._slot_clicked)
-        self._slot_thumbs = {}
-        self._slot_cache = None
+        self._slot_cache, self.slot_cache_hits = None, 0
+        self._target_row_state, self._target_cells = None, []
         self.layout().insertWidget(2, self.wave_slots)
         self._quick_ready = True
         QApplication.instance().installEventFilter(self)
@@ -2366,24 +2366,79 @@ class QuickReviewPanel(ProblemListPanel):
         else:
             self.hint.setText("这里机器看到有人过线：是运动员就点，不是就按空格继续。")
 
-    @staticmethod
-    def _thumb_key(mark):
-        return (int(mark["recorder_ms"]), round(float(mark["x"]), 4), round(float(mark["y"]), 4))
+    def current_target(self, plan=None):
+        """(row key, words, kind) for the person the operator is on; kind is next, done or alert.
 
-    def keep_thumb(self, recorder_ms, x, y, thumb):
-        """The cut of the frame around someone just clicked, for their cell (this run of the program only)."""
-        if thumb is None:
+        Yellow means one thing only, the next person to click; clicked, it turns
+        green (11-14: "这个黄色是下一个还是…变化有点怪").
+
+        The next click's bib while the wave has chips left; once it is counted
+        even, whoever is selected (just clicked).  11-14: "我现在点到哪一个人物，
+        好像不能一下看出来": it is said on the left, in the cells and on the picture.
+        """
+        plan = plan or self._run_plan()
+        if plan is None:
+            return None, "", "done"
+        if plan.extra:
+            return None, f"多 {len(plan.extra)} 人", "alert"
+        if plan.unmatched:
+            return plan.unmatched[0].key, f"下一位 {plan.unmatched[0].bib} 号", "next"
+        row = self._selected_arrival()
+        chips = {chip.key for chip in plan.chips}
+        if row is not None and row.key in chips and row.bib:
+            return row.key, f"{row.bib} 号 已点", "done"
+        return None, "本波点齐", "done"
+
+    TARGET_ROW_STYLE = "QTableWidget::item:selected {background:#ffd84d; color:#111827;}"
+    DONE_ROW_STYLE = "QTableWidget::item:selected {background:#7fdca4; color:#0b3d2a;}"
+    PLAIN_ROW_STYLE = "QTableWidget::item:selected {background:#d6eeea; color:#123d36;}"
+
+    def _mark_target_row(self, key, kind="next"):
+        """The row of the person the operator is on, bold: yellow to click, green once clicked."""
+        state = (self._table_builds, key, self._selected_key, kind)
+        if state == self._target_row_state:
             return
-        if len(self._slot_thumbs) >= 400:
-            self._slot_thumbs.pop(next(iter(self._slot_thumbs)))
-        self._slot_thumbs[(int(recorder_ms), round(float(x), 4), round(float(y), 4))] = thumb
+        if self._target_row_state is not None and self._target_row_state[0] == self._table_builds:
+            for cell, brush, font, pen in self._target_cells:
+                cell.setBackground(brush)
+                cell.setForeground(pen)
+                cell.setFont(font)
+        self._target_row_state, self._target_cells = state, []
+        index = next((i for i, row in enumerate(self._arrival_rows) if row.key == key), None) if key else None
+        if index is not None:
+            for column in range(self.table.columnCount()):
+                cell = self.table.item(index, column)
+                if cell is None:
+                    continue
+                self._target_cells.append((cell, cell.background(), cell.font(), cell.foreground()))
+                font = cell.font()
+                font.setBold(True)
+                cell.setFont(font)
+                cell.setBackground(QColor("#7fdca4" if kind == "done" else "#ffd84d"))
+        selected = self._selected_arrival()
+        style = ((self.DONE_ROW_STYLE if kind == "done" else self.TARGET_ROW_STYLE)
+                 if key and selected is not None and selected.key == key
+                 else self.PLAIN_ROW_STYLE)
+        if style != self.table.styleSheet():
+            self.table.setStyleSheet(style)
 
     def wave_slot_list(self, plan=None):
         """One cell an arrival, the whole race in table order; the wave on the picture is marked current."""
         plan = plan or self._run_plan()  # before anyone is clicked on it: its chips alone
-        key = (self._table_builds, id(plan), len(plan.marks) if plan is not None else -1, len(self._arrival_rows))
-        if self._slot_cache is not None and self._slot_cache[0] == key and self._slot_cache[1] is plan:
-            return self._slot_cache[2]
+        # Asked for on every frame shown.  Before anyone is clicked on a wave its
+        # plan is made anew each time (_run_plan): the cells are kept by what the
+        # plan is made of, never by the plan object (11-14: 250 rows a frame at 4x).
+        picture = plan.item.item_id if plan is not None and plan.item is not None else None
+        key = (self._table_builds, len(self._arrival_rows), picture,
+               self._plan_cache[0] if picture is not None and self._plan_cache is not None else None,
+               tuple(row.key for row in plan.chips) if plan is not None else None,
+               plan.unmatched[0].key if plan is not None and plan.unmatched else None,
+               plan.people if plan is not None else None)
+        target = self.current_target(plan)[0]
+        key += (target,)
+        if self._slot_cache is not None and self._slot_cache[0] == key:
+            self.slot_cache_hits += 1
+            return self._slot_cache[1]
         holder, chips, following, marks = {}, set(), None, []
         if plan is not None:
             chips = {row.key for row in plan.chips}
@@ -2402,32 +2457,27 @@ class QuickReviewPanel(ProblemListPanel):
                 continue
             if row.event is None:  # somebody without a chip record: 多出 or 疑似漏读
                 index = next((i for i, mark in enumerate(marks) if mark is row.mark), None)
-                thumb = self._thumb_key(row.mark) if row.mark is not None else None
                 if index is not None and index in plan.extra:
-                    slots.append(Slot(plan.labels[index], EXTRA, index, thumb, True))
+                    slots.append(Slot(plan.labels[index], EXTRA, index, True))
                 else:
                     slots.append(Slot(str(row.bib) if row.entered and row.bib else "无芯片", NO_CHIP,
-                                      index, thumb, index is not None))
+                                      index, index is not None))
             elif row.key in chips:
                 index = holder.get(row.key)
                 if index is not None:
-                    slots.append(Slot(str(row.bib), DONE, index, self._thumb_key(marks[index]), True))
+                    slots.append(Slot(str(row.bib), DONE, index, True, row.key == target))
                 elif row.decision is not None and not self._counted_here(row, plan.item):
-                    slots.append(Slot(str(row.bib), ELSEWHERE, None, None, True))
+                    slots.append(Slot(str(row.bib), ELSEWHERE, None, True, row.key == target))
                 else:
-                    slots.append(Slot(str(row.bib), NEXT if row.key == following else TODO, None, None, True))
+                    slots.append(Slot(str(row.bib), NEXT if row.key == following else TODO, None, True,
+                                      row.key == target))
             else:
-                saved = (row.decision or {}).get("frame") or {}
-                thumb = None
-                if saved.get("marker_x_normalized") is not None and saved.get("recorder_ms") is not None:
-                    thumb = (int(saved["recorder_ms"]), round(float(saved["marker_x_normalized"]), 4),
-                             round(float(saved["marker_y_normalized"]), 4))
-                slots.append(Slot(str(row.bib), DONE if row.decision else TODO, None, thumb))
+                slots.append(Slot(str(row.bib), DONE if row.decision else TODO))
         summary = ""
         if plan is not None:
             count = len(plan.chips) - len(plan.extra_chips)
             summary = f"本波 {plan.people}/{count}" + (f" 多 {len(plan.extra)} 人" if plan.extra else "")
-        self._slot_cache = (key, plan, (slots, summary))
+        self._slot_cache = (key, (slots, summary))
         return slots, summary
 
     def refresh_slots(self, passed=""):
@@ -2435,7 +2485,9 @@ class QuickReviewPanel(ProblemListPanel):
         if not self._quick_ready:
             return
         slots, summary = self.wave_slot_list()
-        self.wave_slots.set_slots(slots, "　".join(part for part in (passed, summary) if part), self._slot_thumbs)
+        target = self.current_target()
+        self._mark_target_row(target[0], target[2])
+        self.wave_slots.set_slots(slots, "　".join(part for part in (passed, summary) if part))
 
     def _slot_clicked(self, index):
         """A filled cell: back to the frame that person was clicked on, to look again; nothing is changed."""

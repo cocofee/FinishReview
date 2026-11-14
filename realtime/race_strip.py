@@ -40,6 +40,8 @@ FIGURE_LEVEL = 15                   # colour change on the line that is someone 
 # many of the hundred places differ from the empty line.  古浪 11-14, read-only:
 # 199 of 201 chip crossings had it within a second, a random moment 18 %; the
 # line was like that 8 % of the time, 190 times away from any chip (2.5 a minute).
+FOLLOW_AT = 0.4          # of the strip's width: where the cursor stays while the recording plays
+FOLLOW_STEP_MS = 1000    # a cursor moving on by more than this was a jump, not playing
 ARRIVAL_PLACES = 10
 ARRIVAL_CONTEXT_MS = 20_000         # the empty line is the median of this much on either side
 ARRIVAL_MERGE_MS = 300              # shorter breaks are the same body (wheel, frame, wheel)
@@ -479,6 +481,7 @@ class RaceStripView(QWidget):
         self.message = "正在读取过线图…"
         self.cache = StripCache()
         self._pixmap, self._pixmap_key, self._version = None, None, 0
+        self._pixmap_base, self.strip_renders = None, 0
         self._press = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
@@ -522,9 +525,18 @@ class RaceStripView(QWidget):
             self.update()
 
     def set_cursor(self, chip_ms):
+        before = self.cursor
         self.cursor = None if chip_ms is None else int(chip_ms)
         if self.cursor is not None and self.view_ms is not None:
             span = self.span_ms()
+            # Playing on (a frame or a few later than the last one): past FOLLOW_AT of
+            # the width the strip scrolls under the cursor.  It used to stand still
+            # and jump half a screen every few seconds (11-14: "紫色的线走得不流畅").
+            hold = self.view_ms + span * FOLLOW_AT
+            if (before is not None and 0 < self.cursor - before <= FOLLOW_STEP_MS
+                    and hold < self.cursor <= self.view_ms + span * 0.75):
+                self.set_view(self.view_ms + (self.cursor - max(before, hold)), following=True)
+                return
             if not self.view_ms + span * 0.15 <= self.cursor <= self.view_ms + span * 0.75:
                 self.set_view(self.cursor - span / 2)
                 return
@@ -550,16 +562,18 @@ class RaceStripView(QWidget):
             return
         self.set_view(self.view_ms)
 
-    def set_view(self, view_ms):
+    def set_view(self, view_ms, following=False):
         extent = self.extent()
         if extent is not None:
             view_ms = max(extent[0], min(view_ms, extent[1] - self.span_ms()))
         self.view_ms = float(view_ms)
-        self._compact_label_band()
+        # While it scrolls along the label band only grows: a strip that changed
+        # its height with every bib coming into view would shake the picture under it.
+        self._compact_label_band(grow_only=following)
         self.view_changed.emit()
         self.update()
 
-    def _compact_label_band(self):
+    def _compact_label_band(self, grow_only=False):
         """Reserve only the label rows needed by visible chips, up to three."""
         ends = [-1e9] * len(self.LABEL_ROWS)
         rows = 1
@@ -575,7 +589,7 @@ class RaceStripView(QWidget):
                 ends[row] = left + width
                 rows = max(rows, row + 1)
         top = self.LABEL_ROWS[rows - 1] + 3
-        if top != self.STRIP_TOP:
+        if top != self.STRIP_TOP and not (grow_only and top < self.STRIP_TOP):
             self.STRIP_TOP = top
             self.setFixedHeight(top + STRIP_ROWS + self.AXIS_HEIGHT)
 
@@ -613,14 +627,19 @@ class RaceStripView(QWidget):
             painter.setPen(QColor("#667085"))
             painter.drawText(8, self.STRIP_TOP + 40, self.message or "没有可显示的过线图")
             return
-        key = (self.view_ms, self.px_per_s, self.width(), self._version)
-        if key != self._pixmap_key:
-            image = render_strip(self.pieces, self.cache, self.view_ms, self.ms_per_px, self.width())
+        # Two widths are drawn at once: scrolling along only moves the picture
+        # until the view leaves them (a new one for every frame was the cost).
+        key = (self.px_per_s, self.width(), self._version)
+        base = self._pixmap_base
+        if key != self._pixmap_key or base is None or not base <= self.view_ms <= base + self.span_ms():
+            base = self.view_ms - self.span_ms() * 0.25
+            image = render_strip(self.pieces, self.cache, base, self.ms_per_px, self.width() * 2)
             rgb = np.ascontiguousarray(image[:, :, ::-1])
             self._pixmap = QPixmap.fromImage(
                 QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format_RGB888).copy())
-            self._pixmap_key = key
-        painter.drawPixmap(0, self.STRIP_TOP, self._pixmap)
+            self._pixmap_key, self._pixmap_base = key, base
+            self.strip_renders += 1
+        painter.drawPixmap(-int(round((self.view_ms - base) / self.ms_per_px)), self.STRIP_TOP, self._pixmap)
         if self.message:
             painter.setPen(QColor("#667085"))
             painter.drawText(8, self.STRIP_TOP + 16, self.message)

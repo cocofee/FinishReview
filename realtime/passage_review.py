@@ -554,6 +554,12 @@ class EvidenceImageView(QGraphicsView):
         )
         self._frame_badge.setFixedSize(300, 34)
         self._frame_badge.hide()
+        # 11-14: who the next click is, in the corner of the picture the eyes are on.
+        self._target_badge = QLabel(self.viewport())
+        self._target_badge.setObjectName("evidenceTargetBadge")
+        self._target_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._target_badge.setAlignment(Qt.AlignCenter)
+        self._target_badge.hide()
         self._batch_roster_panel = QFrame(self.viewport())
         self._batch_roster_panel.setObjectName("evidenceBatchRoster")
         self._batch_roster_panel.setFixedWidth(176)
@@ -790,6 +796,35 @@ class EvidenceImageView(QGraphicsView):
         self._position_frame_badge()
         self._frame_badge.show()
         self._frame_badge.raise_()
+
+    def set_target_badge(self, text: str, kind: str = "next") -> None:
+        """下一位 N 号 / N 号 已点 in the top right corner of the picture; empty hides it."""
+        value = str(text or "").strip()
+        if not value:
+            self._target_badge.hide()
+            return
+        state = (value, kind)
+        if state != getattr(self, "_target_state", None):
+            self._target_state = state
+            self._target_badge.setStyleSheet(
+                "QLabel#evidenceTargetBadge { background: %s; color: %s; border: 3px solid #111827;"
+                " border-radius: 4px; padding: 2px 14px; font-size: 22pt; font-weight: 800; }"
+                % {"alert": ("#b42318", "#ffffff"), "done": ("#2fb872", "#ffffff")}.get(kind, ("#ffd84d", "#111827")))
+            self._target_badge.setText(value)
+            self._target_badge.adjustSize()
+        self._target_badge.show()
+        self._target_badge.raise_()
+        self._position_target_badge()
+
+    def target_badge_text(self) -> str:
+        return "" if self._target_badge.isHidden() else self._target_badge.text()
+
+    def _position_target_badge(self) -> None:
+        # 11-14: top, left of the middle, where the riders come in ("视角不在右边");
+        # right of the camera's own date and time, which stay readable.
+        width = self.viewport().width()
+        left = min(int(width * 0.41), width - self._target_badge.width() - 12)
+        self._target_badge.move(max(12, left), 6)
 
     def clear_frame_indicator(self) -> None:
         self._frame_badge.clear()
@@ -1430,6 +1465,7 @@ class EvidenceImageView(QGraphicsView):
         self._identity_badge.move(12, 12)
 
     def _position_frame_badge(self) -> None:
+        self._position_target_badge()
         if not self._frame_badge.isVisible():
             return
         margin = 12
@@ -1755,14 +1791,21 @@ class PassageEvidencePane(QFrame):
     def set_header_strip(self, widget) -> None:
         """WIDGET takes the middle of the header, in the place of 已过 N 人 (11-14: the cells of
         who is counted say the same and more, right above the picture); None gives it back."""
-        if widget is self._header_strip:
+        held = self._header_strip is not None and self._header.indexOf(self._header_strip) >= 0
+        if widget is self._header_strip and (widget is None or held):
             return
-        if self._header_strip is not None:
+        if held:
             self._header.removeWidget(self._header_strip)
         self._header_strip = widget
         if widget is not None:
             self._header.insertWidget(self._header.indexOf(self.passed_label), widget, 1)
             self.passed_label.hide()
+        # The cells need the whole line (11-14: the camera name and the frame block took a
+        # third of it); the time shown stays under the picture, beside the frame buttons.
+        self.title_label.setVisible(widget is None)
+        self.frame_indicator_label.setVisible(widget is None)
+        self.quality_label.setVisible(widget is None and self.source_kind == REGULAR_SOURCE
+                                      and self.camera_index == 1)
 
     def set_active_judging(self, active: bool) -> None:
         active = bool(active)
@@ -1802,6 +1845,16 @@ class PassageEvidencePane(QFrame):
         self._workbench_compact = bool(enabled)
         self._workbench_allow_maximize = bool(allow_maximize)
         compact = self._workbench_compact
+        # 11-14: the picture was letterboxed by height.  The position slider had a
+        # line of its own under it; in the workbench it shares the buttons' line.
+        if compact != (self.controls_layout.indexOf(self.timeline) >= 0):
+            if compact:
+                self.layout().removeWidget(self.timeline)
+                self.controls_layout.insertWidget(self.controls_layout.indexOf(self.time_label) + 1,
+                                                  self.timeline, 1)
+            else:
+                self.controls_layout.removeWidget(self.timeline)
+                self.layout().insertWidget(self.layout().indexOf(self.video_view) + 1, self.timeline)
         self.zoom_out_btn.setVisible(not compact)
         self.actual_size_btn.setVisible(not compact)
         self.zoom_in_btn.setVisible(not compact)

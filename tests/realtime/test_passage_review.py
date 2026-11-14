@@ -7220,3 +7220,66 @@ def test_the_running_count_box_sits_in_the_header_and_hides_when_empty(qapp):
     assert pane.passed_label.text() == "已过 45 人 · 5 号" and not pane.passed_label.isHidden()
     pane.set_passed_count("")
     assert pane.passed_label.isHidden()
+
+
+def test_the_cells_take_the_header_line_and_another_camera_can_take_them_over(qapp):
+    """11-14：格子占画面上方整行，机位名和帧号让位；格子换到另一机位后，原机位的标题要回来。"""
+
+    from PyQt5.QtWidgets import QLabel
+
+    first, second = PassageEvidencePane("机位 1", REGULAR_SOURCE), PassageEvidencePane("机位 2", REGULAR_SOURCE)
+    strip = QLabel("cells")
+    first.set_passed_count("已过 45 人 · 5 号")
+    first.set_header_strip(strip)
+    assert first._header.indexOf(strip) >= 0
+    assert first.title_label.isHidden() and first.frame_indicator_label.isHidden() and first.passed_label.isHidden()
+    first.set_passed_count("已过 46 人 · 6 号")
+    assert first.passed_label.isHidden()  # the cells say it
+
+    first.set_header_strip(None)       # what the window does before another pane takes them
+    second.set_header_strip(strip)
+    assert second._header.indexOf(strip) >= 0 and first._header.indexOf(strip) < 0
+    assert not first.title_label.isHidden() and not first.frame_indicator_label.isHidden()
+    assert second.title_label.isHidden()
+
+    # Taken away without being given back: asking again puts them in, not "already here".
+    first.set_header_strip(strip)
+    assert first._header.indexOf(strip) >= 0
+    second.set_header_strip(strip)
+    assert second._header.indexOf(strip) >= 0
+
+
+def test_in_the_workbench_the_position_slider_shares_the_line_of_the_frame_buttons(qapp):
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE)
+    assert pane.layout().indexOf(pane.timeline) >= 0 and pane.controls_layout.indexOf(pane.timeline) < 0
+    pane.set_workbench_compact(True)
+    assert pane.controls_layout.indexOf(pane.timeline) == pane.controls_layout.indexOf(pane.time_label) + 1
+    assert pane.layout().indexOf(pane.timeline) < 0
+    pane.set_workbench_compact(True)  # again: nothing moves twice
+    assert pane.controls_layout.indexOf(pane.timeline) == pane.controls_layout.indexOf(pane.time_label) + 1
+    pane.set_workbench_compact(False)
+    assert pane.layout().indexOf(pane.timeline) == pane.layout().indexOf(pane.video_view) + 1
+    assert pane.controls_layout.indexOf(pane.timeline) < 0
+
+
+def test_the_picture_says_in_its_corner_who_the_next_click_is(qapp):
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE)
+    pane.resize(1000, 700)
+    pane.show()
+    qapp.processEvents()
+    view = pane.video_view
+    assert view.target_badge_text() == ""
+    view.set_target_badge("下一位 519 号")
+    assert view.target_badge_text() == "下一位 519 号"
+    badge = view._target_badge
+    assert badge.geometry().right() <= view.viewport().width() and badge.y() >= 0
+    assert badge.x() < view.viewport().width() / 2 < badge.geometry().right() + 300  # left of the middle, not the right corner
+    assert badge.testAttribute(Qt.WA_TransparentForMouseEvents)   # a click on it still counts the person under it
+    assert "#ffd84d" in badge.styleSheet()                        # yellow: still to click
+    view.set_target_badge("519 号 已点", "done")
+    assert "#2fb872" in badge.styleSheet()                        # clicked: green
+    view.set_target_badge("多 1 人", "alert")
+    assert "#b42318" in badge.styleSheet()
+    view.set_target_badge("")
+    assert view.target_badge_text() == ""
+

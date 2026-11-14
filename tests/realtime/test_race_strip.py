@@ -254,3 +254,32 @@ def test_a_fast_run_stops_where_something_comes_onto_the_line(tmp_path):
     assert line_arrivals(pieces, strips, T + 14_100, T + 15_500) == []     # still the one already there
     assert line_arrivals(pieces, strips, T + 25_000, T + 40_000) is None   # the strip ends before the stretch does
     assert line_arrivals([], strips, T + 10_000, T + 18_000) is None
+
+
+def test_while_the_recording_plays_the_strip_scrolls_under_a_cursor_that_stays_put(qapp, tmp_path):
+    """11-14：紫线走一段、整屏跳一次，看着不流畅。播放时游标停在原处，图在下面连续走，也不为每一帧重画。"""
+
+    view = RaceStripView()
+    view.resize(1200, view.height())
+    view.set_pieces([piece(tmp_path, T, T + 600_000)])
+    view.set_chips([(T + 300_000, "1", False)])
+    view.show()
+    view.set_cursor(T + 300_000)          # a jump: centred as before
+    assert view.x_of(T + 300_000) == pytest.approx(view.width() / 2)
+    view.grab()
+    renders, top, place = view.strip_renders, view.STRIP_TOP, view.x_of(view.cursor)
+    stamp = T + 300_000
+    for _ in range(100):                  # four seconds of frames
+        stamp += 40
+        view.set_cursor(stamp)
+        view.grab()
+        assert view.x_of(stamp) == pytest.approx(place, abs=.01)
+        assert view.STRIP_TOP >= top      # the picture under the strip is not shaken
+    assert view.strip_renders <= renders + 1
+
+    view.set_cursor(stamp + 60_000)       # a jump again: half a screen, as before
+    assert view.x_of(stamp + 60_000) == pytest.approx(view.width() / 2)
+    view.set_cursor(stamp + 59_000)       # stepping back does not drag the strip
+    start = view.view_ms
+    view.set_cursor(stamp + 58_960)
+    assert view.view_ms == start

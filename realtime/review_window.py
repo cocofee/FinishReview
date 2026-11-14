@@ -2559,7 +2559,10 @@ class FinishReviewWindow(PassageReviewSurface):
                     pane.set_header_strip(None)
                     strip.setParent(self.problem_panel)
                     strip.hide()
+                    pane.video_view.set_target_badge("")
+                    self._slot_pane = None
         self.setMinimumHeight(700 if expanded else 760)
+        self._set_compact_header(expanded)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
         self.filter_bar.setVisible(not expanded)
@@ -2585,10 +2588,37 @@ class FinishReviewWindow(PassageReviewSurface):
         self.return_problem_button.setVisible(expanded)
         self.manual_problem_button.setVisible(expanded)
         self.pipeline_label.setVisible(expanded)
-        self.crossing_cards.setVisible(expanded)
+        self.crossing_cards.setVisible(False)
+        self.recording_rail_button.setVisible(expanded)
         self._set_recording_rail_visible(not expanded or self.recording_rail_button.isChecked())
         self._problem_count_mode_changed(expanded)
         self._update_operator_controls()
+
+    def _set_compact_header(self, compact: bool) -> None:
+        """In the workbench the top bar is one low line, and 刷新 / 设置 are under 更多.
+
+        11-14: the picture was letterboxed by height (150 px of black either
+        side on a 16-inch laptop); every line taken off the top and the bottom
+        goes to it.
+        """
+        header = getattr(self, "runtime_header", None)
+        if header is None:
+            return
+        header.setMinimumHeight(38 if compact else 78)
+        header.layout().setContentsMargins(10, 1 if compact else 5, 10, 1 if compact else 5)
+        style = header.styleSheet()
+        header.setStyleSheet(style.replace("min-height: 32px", "min-height: 26px") if compact
+                             else style.replace("min-height: 26px", "min-height: 32px"))
+        for button in (self.recheck_button, self.settings_button):
+            button.setVisible(not compact)
+        self.product_title_label.setVisible(not compact)
+        menu = getattr(getattr(self.problem_panel, "more_button", None), "menu", lambda: None)()
+        if menu is not None and not getattr(self, "_header_actions", None):
+            menu.addSeparator()
+            self._header_actions = [menu.addAction("重新检查连接（刷新）", self.recheck_button.click),
+                                    menu.addAction("设备与赛事设置", self.settings_button.click)]
+        for action in getattr(self, "_header_actions", None) or ():
+            action.setVisible(compact)
 
     def _uses_popup_judging(self):
         return not getattr(self, "_problem_workbench_active", False) and super()._uses_popup_judging()
@@ -2677,7 +2707,9 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recording_rail_button = QPushButton("查找原录像", self.crossing_cards)
         self.recording_rail_button.setCheckable(True)
         self.recording_rail_button.toggled.connect(self._set_recording_rail_visible)
-        self.crossing_cards.toolbar.addWidget(self.recording_rail_button)
+        # 11-14: it sat alone on a band under the picture; it shares the picture's button line now.
+        self.evidence_panes[0].controls_layout.addWidget(self.recording_rail_button)
+        self.recording_rail_button.hide()
         self._creating_manual_crossing = False
         # 校时 lives on the judging toolbar (QuickReviewPanel.calibrate_button), not down here.
         self.group_start_button = QPushButton("回到团首", self)
@@ -3040,9 +3072,6 @@ class FinishReviewWindow(PassageReviewSurface):
                          and (mark["x"] - x_normalized) ** 2 + (mark["y"] - y_normalized) ** 2 < .02 ** 2), None)
         builds = panel._table_builds
         if existing is None:
-            from .wave_slots import person_thumb
-            panel.keep_thumb(frame["recorder_ms"], round(float(x_normalized), 4), round(float(y_normalized), 4),
-                             person_thumb(pane.video_view._pixmap_item.pixmap(), x_normalized, y_normalized))
             panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
         else:
             panel._editing_mark = existing
@@ -3102,8 +3131,15 @@ class FinishReviewWindow(PassageReviewSurface):
             text = self.problem_panel.passed_count_text(self._frame_for_problem_count(pane))
             if hasattr(self.problem_panel, "refresh_slots") and hasattr(pane, "set_header_strip"):
                 # The cells of who is counted take the place of 已过 N 人 · X 号 (11-14).
+                holder = getattr(self, "_slot_pane", None)
+                if holder is not None and holder is not pane:
+                    holder.set_header_strip(None)  # another camera's picture had them: its own header is back
+                self._slot_pane = pane
                 pane.set_header_strip(self.problem_panel.wave_slots)
                 self.problem_panel.refresh_slots(text.split(" · ")[0])
+                if hasattr(pane.video_view, "set_target_badge"):
+                    _key, words, kind = self.problem_panel.current_target()
+                    pane.video_view.set_target_badge(words, kind)
         if hasattr(pane, "set_passed_count"):
             pane.set_passed_count(text)
 
@@ -3394,12 +3430,13 @@ class FinishReviewWindow(PassageReviewSurface):
     def _set_recording_rail_visible(self, visible):
         workbench = getattr(self, "_problem_workbench_active", False)
         self.video_filmstrip.setVisible(bool(visible) or not workbench)
-        self.crossing_cards.setVisible(workbench)
+        self.crossing_cards.setVisible(False)
         # Without the recording rail the bottom holds two buttons only: give the
         # picture the height instead of leaving an empty band.
         compact = workbench and not visible
         self.preview_panel.setMinimumHeight(0 if compact else 190 if workbench else 420)
-        self.preview_panel.setMaximumHeight(self.crossing_cards.sizeHint().height() + 16 if compact else 16777215)
+        self.preview_panel.setMaximumHeight(0 if compact else 16777215)
+        self.preview_panel.setVisible(not compact)
     def _refresh_crossing_cards(self):
         if not hasattr(self, "crossing_cards"):
             return
