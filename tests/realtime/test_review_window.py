@@ -1213,7 +1213,8 @@ def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
     assert window.evidence_panes[0].controls_layout.indexOf(window.group_start_button) >= 0
     status_y = panel.status_widget.mapTo(panel.quick_toolbar, panel.status_widget.rect().center()).y()
     action_y = buttons[0].mapTo(panel.quick_toolbar, buttons[0].rect().center()).y()
-    assert abs(status_y - action_y) <= 2  # no separate status band above the actions
+    # No separate status band above the actions; with nothing to say it is not there at all (11-14).
+    assert not panel.status_widget.isVisible() or abs(status_y - action_y) <= 2
     assert not window.video_filmstrip.full_race.follow_button.isHidden()
     window.video_filmstrip.full_race.follow_button.setChecked(True)
     window.video_filmstrip.full_race.follow_button.setChecked(False)
@@ -1227,7 +1228,7 @@ def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
     ("分析失败，等待重试", "芯片自检等待更新", "证据缺口 无", "分析失败"),
     ("分析已暂停；录像继续", "芯片自检等待更新", "证据缺口 无", "分析已暂停"),
     ("等待已封存录像", "芯片自检读取失败：磁盘错误", "证据缺口 无", "芯片自检读取失败"),
-    ("空闲", "芯片自检等待更新", "证据缺口 2 条待证据", "2 条待证据"),
+    ("空闲", "芯片自检等待更新", "证据缺口 2 条待证据", ""),   # 11-14: nothing to do about it, not shown
     ("空闲", "芯片自检等待更新", "证据缺口 0 条待证据 · 2 人无录像可核", "2 人无录像可核"),
 ])
 def test_workbench_pipeline_only_shows_actionable_state(qapp, tmp_path, monkeypatch, analysis, chip, gap, expected):
@@ -1246,11 +1247,12 @@ def test_workbench_pipeline_only_shows_actionable_state(qapp, tmp_path, monkeypa
         window._on_clock_tick()
         text = window.pipeline_label.text()
         assert expected in text
-        assert all(word not in text for word in ("未启动", "封存到", "积压 0", "分析到", "证据缺口 无"))
+        assert all(word not in text for word in ("未启动", "封存到", "积压 0", "分析到", "证据缺口", "条待证据"))
         assert "封存到" in window.pipeline_label.toolTip()
         assert window.pipeline_label.isHidden() == (not expected)
-        # The selected-row status now shares the same line with alerts and keys.
-        assert not panel.confirmation_status.isHidden()
+        # 11-14: the wave's status line is not shown; what needs doing is said beside 本波.
+        panel._sync_arrival_confirmation()
+        assert panel.confirmation_status.isHidden()
     finally:
         window.close()
 

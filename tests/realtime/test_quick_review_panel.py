@@ -2177,3 +2177,29 @@ def test_the_person_the_operator_is_on_stands_out_in_the_table_and_the_cells(wav
     wave_panel.refresh_slots("已过 3 人")
     assert wave_panel.current_target()[1:] == ("多 1 人", "alert") and yellow_rows() == []
 
+
+def test_beside_the_count_of_the_wave_only_what_needs_doing_is_said(wave_panel, qapp):
+    """11-14：过线图上面“芯片 1 · 已点 1 · 已核”平时和“本波 1/1”重复。只在有事要做时，在本波旁边说。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel._sync_arrival_confirmation()
+    wave_panel.refresh_slots("已过 1 人")
+    assert wave_panel.confirmation_status.isHidden()
+    assert "没看" in wave_panel.confirmation_status.text()          # still worked out, for the alert
+    alert = wave_panel.wave_slots.alert()
+    assert "没看" in alert and "芯片" not in alert and "已点" not in alert
+
+    for x, offset in ((.4, 400), (.6, 900)):
+        look_through(wave_panel, offset - 400, offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    look_through(wave_panel, -600, 1500, 100)                        # the whole wave seen
+    wave_panel._sync_arrival_confirmation()
+    wave_panel.refresh_slots("已过 3 人")
+    assert wave_panel.confirmation_status.text().endswith("已核")
+    assert wave_panel.wave_slots.alert() == ""                       # all well: nothing said
+    wave_panel.wave_slots.grab()
+

@@ -55,7 +55,7 @@ class WaveSlotRow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._slots = ()
-        self._summary = ""
+        self._summary, self._alert = "", ""
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMouseTracking(True)
         self.hide()
@@ -72,22 +72,30 @@ class WaveSlotRow(QWidget):
     def summary(self):
         return self._summary
 
-    def set_slots(self, slots, summary=""):
-        """SLOTS in arrival order; an empty list hides the row."""
+    def alert(self):
+        return self._alert
+
+    def set_slots(self, slots, summary="", alert=""):
+        """SLOTS in arrival order; an empty list hides the row.  ALERT is said in amber after SUMMARY."""
         slots = tuple(slots)
-        if (slots, summary) == (self._slots, self._summary):
+        if (slots, summary, alert) == (self._slots, self._summary, self._alert):
             return
-        self._slots, self._summary = slots, summary
+        self._slots, self._summary, self._alert = slots, summary, alert
+        self.setToolTip("")
         self.setVisible(bool(slots))
         self.update()
 
-    def _summary_width(self):
-        if not self._summary:
+    def _text_width(self, text):
+        if not text:
             return 0
         font = QFont(self.font())
         font.setBold(True)
         font.setPointSize(10)
-        return QFontMetrics(font).horizontalAdvance(self._summary) + 10
+        return QFontMetrics(font).horizontalAdvance(text) + 10
+
+    def _summary_width(self):
+        """The words in front of the cells: the count, then what needs doing about this wave."""
+        return self._text_width(self._summary) + self._text_width(self._alert)
 
     def focus_index(self):
         """The cell kept in view: the next person of the wave on the picture, else its first cell."""
@@ -146,8 +154,16 @@ class WaveSlotRow(QWidget):
             font.setBold(True)
             font.setPointSize(10)
             painter.setFont(font)
-            painter.drawText(QRect(4, 0, self._summary_width(), self.height()),
+            painter.drawText(QRect(4, 0, self._text_width(self._summary), self.height()),
                              Qt.AlignVCenter | Qt.AlignLeft, self._summary)
+        if self._alert:
+            font = QFont(self.font())
+            font.setBold(True)
+            font.setPointSize(10)
+            painter.setFont(font)
+            painter.setPen(QColor("#b45309"))
+            painter.drawText(QRect(4 + self._text_width(self._summary), 0, self._text_width(self._alert),
+                                   self.height()), Qt.AlignVCenter | Qt.AlignLeft, self._alert)
         area = self._cells_area()
         painter.setClipRect(area)
         font = QFont(self.font())

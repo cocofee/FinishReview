@@ -4412,10 +4412,12 @@ class FinishReviewWindow(PassageReviewSurface):
         backlog_seconds = max(0, (max(short_ends) - min(through)) // 1000) if short_ends and through else 0
         chip_note = (panel.chip_status.split("（")[0].split("：")[0]
                      if any(word in panel.chip_status for word in ("发现", "失败", "错误")) else "")
+        # 11-14: "证据缺口 602 条待证据" hung there all race and told the operator
+        # nothing to do.  People nobody can check on any recording are still said.
         gap = panel.evidence_gap_text()
         notes = [f"● 录像 {duration}" if recording else "", chip_note, analysis_note,
                  f"分析落后 {backlog_seconds} 秒" if backlog_seconds else "",
-                 gap if gap != "证据缺口 无" else ""]
+                 gap.split(" · ", 1)[1] if " · " in gap else ""]
         self.pipeline_label.setText(" ｜ ".join(note for note in notes if note))
         self.pipeline_label.setToolTip(
             f"封存到 {sealed} · 分析到 {analyzed} · 积压 {backlog_seconds} 秒\n"

@@ -130,6 +130,9 @@ NUMBER_KEYS = (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5)
 AUTO_PICTURE_REASON = "自动对上：按过线顺序对应芯片，操作员按回车接受"
 AUTO_TEXT = "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；回车接受对应，号码不对按 4 撤回。"
 
+# What the wave's status line alone told the operator (see _sync_arrival_confirmation).
+WAVE_ALERT_WORDS = ("没看", "芯片有变化", "不算人工确认", "回车接受", "可能多人")
+
 
 @dataclass
 class ArrivalRow:
@@ -2059,6 +2062,12 @@ class QuickReviewPanel(ProblemListPanel):
         self.confirmation_status.setText(status)
         self.confirmation_status.setToolTip(status)
         self.confirmation_status.setStyleSheet(f"color:{color}; font-weight:600;" if color else "")
+        # 11-14: above the strip this line mostly repeated 本波 n/m.  What only it
+        # said goes beside 本波, over the picture, and only while there is
+        # something to do about it; the line itself is no longer shown.
+        self._wave_alert = " · ".join(part for part in status.split(" · ")
+                                      if any(word in part for word in WAVE_ALERT_WORDS))
+        self.confirmation_status.setVisible(False)
 
     def _wave_status(self, plan):
         """The count of a wave against its chips, and its color: green 已核, red 多/少, amber not all seen."""
@@ -2490,7 +2499,8 @@ class QuickReviewPanel(ProblemListPanel):
         slots, summary = self.wave_slot_list()
         target = self.current_target()
         self._mark_target_row(target[0], target[2])
-        self.wave_slots.set_slots(slots, "　".join(part for part in (passed, summary) if part))
+        self.wave_slots.set_slots(slots, "　".join(part for part in (passed, summary) if part),
+                                  getattr(self, "_wave_alert", ""))
 
     def _slot_clicked(self, index):
         """A filled cell: back to the frame that person was clicked on, to look again; nothing is changed."""
@@ -2800,7 +2810,9 @@ class QuickReviewPanel(ProblemListPanel):
         return list(unique.values())
 
     def refresh_status_visibility(self):
-        labels = [label for label in self.status_widget.findChildren(QLabel) if label is not self.finish_line_status]
+        labels = [label for label in self.status_widget.findChildren(QLabel)
+                  if label is not self.finish_line_status and label is not self.confirmation_status]
+        self.confirmation_status.setVisible(False)  # said beside 本波 when it matters (11-14)
         for label in labels:
             label.setVisible(bool(label.text()))
         self.status_widget.setVisible(any(label.text() for label in labels))
