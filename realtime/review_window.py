@@ -2651,6 +2651,7 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
         self.problem_panel.run_requested.connect(self._run_problem_playback)
+        self.problem_panel.run_speed.connect(self._run_problem_speed)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
         self.problem_panel.delete_requested.connect(self._delete_problem_record)
         self.problem_panel.calibration_requested.connect(self._calibrate_crossing_frame)
@@ -2894,6 +2895,16 @@ class FinishReviewWindow(PassageReviewSurface):
                 and pane is self._active_playback_pane()):
             self.problem_panel.cancel_picture_mark(x, y)
 
+    def _problem_wheel_step(self, delta: int, pane) -> None:
+        """The wheel over the counting picture: hold whatever was playing, one frame on or back."""
+
+        if not getattr(self, "_problem_workbench_active", False):
+            return
+        stop = getattr(self.problem_panel, "stop_run", None)
+        if stop is not None:
+            stop()
+        self._step_pane(pane, int(delta))
+
     def _problem_count_clicked(self, x_normalized: float, y_normalized: float, pane=None) -> None:
         """A click records the displayed frame; an unreported crossing starts its own item."""
 
@@ -2952,6 +2963,13 @@ class FinishReviewWindow(PassageReviewSurface):
         pane = self._active_playback_pane()
         if pane is not None and bool(playing) != bool(pane.is_playing):
             self._toggle_pane(pane)
+
+    def _run_problem_speed(self, speed) -> None:
+        """A run through a stretch the strip shows empty plays fast; a pause ends that."""
+
+        pane = self._active_playback_pane()
+        if pane is not None:
+            pane.set_play_speed(speed)
 
     def _toggle_active_pane(self) -> None:
         """Space.  On the arrival list's wave it plays on to the next person and stops (11-12).
@@ -3015,12 +3033,14 @@ class FinishReviewWindow(PassageReviewSurface):
         existing = next((i for i, mark in enumerate(panel.current_marks())
                          if mark_on_frame(mark, frame, frame["recorder_ms"])
                          and (mark["x"] - x_normalized) ** 2 + (mark["y"] - y_normalized) ** 2 < .02 ** 2), None)
+        builds = panel._table_builds
         if existing is None:
             panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
         else:
             panel._editing_mark = existing
         index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
-        if panel._wave_plan() is not None:
+        wave = panel._wave_plan() is not None
+        if wave:
             # On a wave's picture the row of whoever was clicked is selected.
             panel.show_counted(panel._editing_mark)
         elif index is not None:
@@ -3028,8 +3048,12 @@ class FinishReviewWindow(PassageReviewSurface):
             panel._active_item = item
             panel.table.setCurrentCell(index, 0)
             panel._sync_arrival_confirmation()
-        panel._quick_render_signature = None
-        panel._render()
+        if not (wave and panel._table_builds != builds):
+            # Saving the wave's count filled the table already, and the row of
+            # whoever was clicked is selected: a second fill only cost the
+            # operator a fifth of a second a click (古浪, 11-14).
+            panel._quick_render_signature = None
+            panel._render()
         self._problem_count_mode_changed(True)
         self._problem_marks_changed(())
         panel.hint.setText(
@@ -3568,6 +3592,7 @@ class FinishReviewWindow(PassageReviewSurface):
         pane.video_view.count_mark_cancelled.connect(
             lambda x, y, pane=pane: self._problem_count_cancelled(x, y, pane)
         )
+        pane.video_view.frame_wheel.connect(lambda delta, pane=pane: self._problem_wheel_step(delta, pane))
         self._problem_count_mode_changed(True)
 
     def start_receiver(self) -> None:

@@ -451,6 +451,8 @@ class EvidenceImageView(QGraphicsView):
     # comes from whoever knows which frame is on screen.
     count_mark_selected = pyqtSignal(float, float)
     count_mark_cancelled = pyqtSignal(float, float)
+    # The wheel over a picture people are counted on: one frame on (+1) or back (-1).
+    frame_wheel = pyqtSignal(int)
     marker_confirm_requested = pyqtSignal()
     marker_cancel_requested = pyqtSignal()
     marker_delete_requested = pyqtSignal()
@@ -1005,7 +1007,13 @@ class EvidenceImageView(QGraphicsView):
 
     def wheelEvent(self, event) -> None:
         if self.has_frame and event.angleDelta().y():
-            self.zoom_by(1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2)
+            if self._count_mode and not event.modifiers() & Qt.ControlModifier:
+                # Counting people: the wheel walks the recording a frame at a
+                # time (down is on), the hand never leaves the mouse to find
+                # the frame someone meets the line on.  Ctrl + wheel zooms.
+                self.frame_wheel.emit(-1 if event.angleDelta().y() > 0 else 1)
+            else:
+                self.zoom_by(1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2)
             event.accept()
             return
         super().wheelEvent(event)
@@ -1518,6 +1526,7 @@ class PassageEvidencePane(QFrame):
         self._idle_prefetch_enabled = False
         self._target_position_ms = 0
         self._playing = False
+        self._play_speed = 1.0
         self._duration_ms = 0
         self._fps = 0.0
         self._frame_count = 0
@@ -2828,6 +2837,16 @@ class PassageEvidencePane(QFrame):
             and self._location.video_path.is_file()
         )
 
+    def set_play_speed(self, speed: float) -> None:
+        """How fast ▶ plays from now on; a pause puts it back to normal speed."""
+
+        self._play_speed = max(1.0, min(4.0, float(speed)))
+        even = getattr(self._worker, "set_even_playback", None)
+        if callable(even):
+            even(True)  # a fast run steps evenly; at normal speed it changes nothing
+        if self._playing and self._worker is not None:
+            self._worker.set_shuttle_speed(self._play_speed)
+
     def set_playing(self, playing: bool) -> None:
         worker = self._worker
         if worker is None:
@@ -2837,9 +2856,10 @@ class PassageEvidencePane(QFrame):
         self._full_resolution_timer.stop()
         self._playing = bool(playing)
         if self._playing:
-            worker.set_shuttle_speed(1.0)
+            worker.set_shuttle_speed(self._play_speed)
             self.play_btn.setText("Ⅱ")
         else:
+            self._play_speed = 1.0
             worker.pause()
             self.play_btn.setText("▶")
             self._last_full_resolution_request = -1
@@ -2900,8 +2920,10 @@ class PassageEvidencePane(QFrame):
         position_ms = self._target_position_ms + clamped_delta_ms
         self._playing = bool(linked_playing)
         seek_and_play = getattr(worker, "seek_and_play", None)
+        if not self._playing:
+            self._play_speed = 1.0
         if self._playing and callable(seek_and_play):
-            seek_and_play(position_ms, 1.0)
+            seek_and_play(position_ms, self._play_speed)
         else:
             worker.pause()
             preview_seek = getattr(worker, "seek_preview", None)
@@ -2910,16 +2932,18 @@ class PassageEvidencePane(QFrame):
             else:
                 worker.seek(position_ms)
             if self._playing:
-                worker.set_shuttle_speed(1.0)
+                worker.set_shuttle_speed(self._play_speed)
         self.play_btn.setText("Ⅱ" if self._playing else "▶")
 
     def set_linked_playing(self, playing: bool) -> None:
         self._full_resolution_timer.stop()
         self._playing = bool(playing)
         worker = self._worker
+        if not self._playing:
+            self._play_speed = 1.0
         if worker is not None:
             if self._playing:
-                worker.set_shuttle_speed(1.0)
+                worker.set_shuttle_speed(self._play_speed)
             else:
                 worker.pause()
                 self._last_full_resolution_request = -1

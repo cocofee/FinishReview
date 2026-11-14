@@ -36,6 +36,13 @@ EXTENT_MARGIN_MS = 30_000
 RESCAN_MS = 10_000
 AUTO_LABELLED = 2                   # a chip's "done": labelled by the system, not yet looked at (auto_label)
 FIGURE_LEVEL = 15                   # colour change on the line that is someone there, not light or noise
+# Someone on the finish line, for a fast run to stop at (line_arrivals): this
+# many of the hundred places differ from the empty line.  古浪 11-14, read-only:
+# 199 of 201 chip crossings had it within a second, a random moment 18 %; the
+# line was like that 8 % of the time, 190 times away from any chip (2.5 a minute).
+ARRIVAL_PLACES = 10
+ARRIVAL_CONTEXT_MS = 20_000         # the empty line is the median of this much on either side
+ARRIVAL_MERGE_MS = 300              # shorter breaks are the same body (wheel, frame, wheel)
 
 
 @dataclass(frozen=True)
@@ -262,6 +269,62 @@ def frame_at(pieces, chip_ms):
                     "position_ms": max(0, min(piece.end_ms - piece.start_ms - 1,
                                               piece.recorder_of(chip_ms) - piece.start_ms)),
                     "frame_index": None}
+    return None
+
+
+def line_arrivals(pieces, cache, start_ms, end_ms):
+    """When something comes onto the finish line between two chip-clock moments; None when the strip cannot tell.
+
+    For a fast run through a stretch without chips to stop at (11-14: "自动跑到
+    下一位，我主要是担心中间会漏").  Not a person count and not a rider: a
+    shadow, staff or the crowd at the end of the line stop the run as well, and
+    the operator looks.  Whoever is on the line at START_MS already is not an
+    arrival.  None wherever the stretch is not sampled without a hole: the
+    caller then goes on as it did without a strip.
+    """
+
+    if end_ms <= start_ms:
+        return []
+    low, high = start_ms - ARRIVAL_CONTEXT_MS, end_ms + ARRIVAL_CONTEXT_MS
+    for archive in (True, False):
+        parts = sorted((piece for piece in pieces if piece.aligned and piece.archive == archive
+                        and piece.chip_end > low and piece.chip_start < high), key=lambda piece: piece.chip_start)
+        try:
+            loaded = [cache.get(piece) for piece in parts]
+        except (OSError, ValueError, KeyError, BadZipFile, EOFError):
+            continue
+        if not loaded:
+            continue
+        times = np.concatenate([part[0] for part in loaded])
+        image = np.concatenate([part[1] for part in loaded], axis=1)
+        order = np.argsort(times, kind="stable")
+        times, image = times[order], image[:, order]
+        inside = (times >= low) & (times <= high)
+        times, image = times[inside], image[:, inside]
+        stretch = (times >= start_ms - 200) & (times <= end_ms + 200)
+        if (times.size < 50 or stretch.sum() < 3 or times[stretch][0] > start_ms + 200
+                or times[stretch][-1] < end_ms - 200 or np.diff(times[stretch]).max() > 1000):
+            continue
+        context = image[:, ::3].astype(np.int16)
+        background = np.median(context, axis=1)
+        calm = (np.abs(context - background[:, None, :]).max(axis=2) > FIGURE_LEVEL).mean(axis=1) <= 0.25
+        if calm.sum() < 20:
+            continue
+        columns = np.flatnonzero(stretch)
+        change = np.abs(image[:, columns].astype(np.int16) - background[:, None, :]).max(axis=2)
+        taken = ((change > FIGURE_LEVEL) & calm[:, None]).sum(axis=0) >= ARRIVAL_PLACES
+        arrivals, last, length, first = [], None, 0, None
+        for moment, there in zip(times[columns], taken):
+            if not there:
+                continue
+            if last is None or moment - last > ARRIVAL_MERGE_MS:
+                first, length = moment, 0
+            length += 1
+            last = moment
+            # Two frames of it: one frame alone is a flicker of light.
+            if length == 2 and first > start_ms:
+                arrivals.append(float(first))
+        return [moment for moment in arrivals if moment < end_ms]
     return None
 
 

@@ -6,7 +6,8 @@ from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
-from realtime.race_strip import RaceStripPanel, RaceStripView, StripPiece, earlier_arrival, first_crossing
+from realtime.race_strip import (RaceStripPanel, RaceStripView, StripPiece, earlier_arrival, first_crossing,
+                                 line_arrivals)
 from tests.realtime.test_quick_review_panel import panel, qapp
 
 
@@ -230,3 +231,26 @@ def test_someone_on_the_line_before_a_crossing_without_a_chip_is_found(tmp_path)
     walking = image.copy()
     body(walking, slice(10, 40), at - 1900, at + 300)     # someone walking along the line all along
     assert earlier_arrival([piece(tmp_path)], _Strips(times, walking), at) is None
+
+
+def test_a_fast_run_stops_where_something_comes_onto_the_line(tmp_path):
+    """11-14：空档快扫，线上一有人影就停；一帧的闪光、扫之前就在线上的人不算，没有过线图就说不知道。"""
+    times = T + np.arange(0, 30_000, 40, dtype=np.float64)
+    rng = np.random.default_rng(3)
+    image = (100 + rng.integers(-2, 3, (100, times.size, 3))).astype(np.uint8)
+
+    def body(rows, start, end):
+        image[rows, int(np.searchsorted(times, T + start)):int(np.searchsorted(times, T + end))] = 30
+
+    body(slice(20, 50), 9_800, 10_300)      # on the line already when the run starts
+    body(slice(20, 50), 12_000, 12_040)     # one frame: light, not a body
+    body(slice(60, 90), 14_000, 14_400)     # someone without a chip
+    body(slice(10, 15), 15_000, 15_400)     # five places of a hundred: too little
+    body(slice(30, 60), 16_000, 16_200)     # the next one
+    strips = _Strips(times, image)
+    pieces = [piece(tmp_path)]
+    assert line_arrivals(pieces, strips, T + 10_000, T + 18_000) == [T + 14_000, T + 16_000]
+    assert line_arrivals(pieces, strips, T + 10_000, T + 13_000) == []
+    assert line_arrivals(pieces, strips, T + 14_100, T + 15_500) == []     # still the one already there
+    assert line_arrivals(pieces, strips, T + 25_000, T + 40_000) is None   # the strip ends before the stretch does
+    assert line_arrivals([], strips, T + 10_000, T + 18_000) is None

@@ -734,6 +734,28 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         window._problem_count_cancelled(.7, .62, pane)  # right click: 22 is taken back, 23 moves up
         assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22"]
         assert sum(row.decision is not None for row in panel._arrival_rows) == 2
+        # A count fills the table once, not twice (11-14: a click took most of a
+        # second on 古浪).  On the picture the wheel walks a frame at a time,
+        # down is on; Ctrl + wheel zooms.  No letter key counts anyone: Q was
+        # tried and taken out again, it was no faster than the click.
+        fills = panel._table_builds
+        window._problem_count_clicked(.7, .62, pane)
+        assert panel._table_builds == fills + 1
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Q)
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
+        from PyQt5.QtCore import QPoint, QPointF
+        from PyQt5.QtGui import QWheelEvent
+        viewport = pane.video_view.viewport()
+        steps = QSignalSpy(pane.video_view.frame_wheel)
+        zoom = pane.video_view.transform().m11()
+        for angle, modifier in ((-120, Qt.NoModifier), (120, Qt.NoModifier), (120, Qt.ControlModifier)):
+            point = viewport.rect().center()
+            QApplication.sendEvent(viewport, QWheelEvent(
+                QPointF(point), QPointF(viewport.mapToGlobal(point)), QPoint(0, 0), QPoint(0, angle),
+                Qt.NoButton, modifier, Qt.NoScrollPhase, False))
+        assert [step[0] for step in steps] == [1, -1]  # down is on, up is back
+        assert pane.video_view.transform().m11() > zoom  # Ctrl + wheel still zooms
     finally:
         window.close()
 
