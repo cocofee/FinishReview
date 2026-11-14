@@ -2590,6 +2590,12 @@ class FinishReviewWindow(PassageReviewSurface):
         self.pipeline_label.setVisible(expanded)
         self.crossing_cards.setVisible(False)
         self.recording_rail_button.setVisible(expanded)
+        if not getattr(self, "_picture_hint_bound", False):
+            self._picture_hint_bound = True
+            self.problem_panel.hint.changed.connect(self.picture_hint.set_hint)
+        self.picture_hint.set_hint(self.problem_panel.hint.text())
+        self.picture_hint.setVisible(expanded)
+        self.problem_panel.hint.setVisible(not expanded)
         self._set_recording_rail_visible(not expanded or self.recording_rail_button.isChecked())
         self._problem_count_mode_changed(expanded)
         self._update_operator_controls()
@@ -2710,6 +2716,12 @@ class FinishReviewWindow(PassageReviewSurface):
         # 11-14: it sat alone on a band under the picture; it shares the picture's button line now.
         self.evidence_panes[0].controls_layout.addWidget(self.recording_rail_button)
         self.recording_rail_button.hide()
+        # 11-14: the advice sits beside the picture's buttons, not at the foot of the window.
+        from .problem_panel import PictureHint
+        self.picture_hint = PictureHint(self)
+        controls = self.evidence_panes[0].controls_layout
+        controls.insertWidget(controls.indexOf(self.evidence_panes[0].time_label) + 1, self.picture_hint, 3)
+        self.picture_hint.hide()
         self._creating_manual_crossing = False
         # 校时 lives on the judging toolbar (QuickReviewPanel.calibrate_button), not down here.
         self.group_start_button = QPushButton("回到团首", self)
@@ -3283,7 +3295,9 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = item.evidence.get("frame", {}) if item else {}
         actual = self._frame_for_problem_count(pane)
         if actual:
-            self.problem_panel.record_viewed_frame(actual, actual["recorder_ms"])
+            stamp = self.problem_panel.record_viewed_frame(actual, actual["recorder_ms"])
+            if getattr(self.problem_panel, "quick_review", False):
+                pane.set_judged_time(actual["position_ms"], stamp)  # the table's clock, not the recorder's
         normal = self._normal_crossing_cards.get(self._opened_normal_crossing)
         if normal is not None:
             self.problem_panel.set_browsing(True)

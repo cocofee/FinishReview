@@ -6057,6 +6057,14 @@ def test_the_workbench_gives_its_height_to_the_picture_and_gives_it_back(qapp, t
         assert not window.preview_panel.isVisibleTo(window)
         assert pane.controls_layout.indexOf(pane.timeline) >= 0
 
+        # The advice is on the picture's button line, not at the foot of the window.
+        assert pane.controls_layout.indexOf(window.picture_hint) >= 0 and window.picture_hint.isVisibleTo(window)
+        assert not panel.hint.isVisibleTo(window)
+        panel.hint.setText("后面还有人压线就点他，\n没有就按空格。")
+        assert window.picture_hint.hint() == "后面还有人压线就点他， 没有就按空格。"
+        assert window.picture_hint.toolTip() == window.picture_hint.hint()
+        window.picture_hint.grab()
+
         window._show_problem_count_badge(pane)
         assert pane._header.indexOf(panel.wave_slots) >= 0 and window._slot_pane is pane
         assert pane.title_label.isHidden() and pane.frame_indicator_label.isHidden()
@@ -6078,5 +6086,6 @@ def test_the_workbench_gives_its_height_to_the_picture_and_gives_it_back(qapp, t
         assert not pane.title_label.isHidden() and not pane.frame_indicator_label.isHidden()
         assert pane.layout().indexOf(pane.timeline) >= 0
         assert window.recording_rail_button.isHidden()
+        assert window.picture_hint.isHidden() and not panel.hint.isHidden()
     finally:
         window.close()

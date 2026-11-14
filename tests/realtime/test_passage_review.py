@@ -7283,3 +7283,25 @@ def test_the_picture_says_in_its_corner_who_the_next_click_is(qapp):
     view.set_target_badge("")
     assert view.target_badge_text() == ""
 
+
+def test_the_time_under_the_picture_can_be_the_judged_time_and_a_later_refresh_keeps_it(qapp):
+    """11-14：左下角是录像机时钟，比左表和过线图晚 0.6 秒；工作台里三处一个钟，高清帧刷新也不改回去。"""
+
+    from types import SimpleNamespace
+
+    pane = PassageEvidencePane("机位 1", REGULAR_SOURCE)
+    pane._event = SimpleNamespace(timeline_timestamp_ms=1_792_293_924_000)
+    pane._target_position_ms, pane._current_position_ms = 5000, 5124
+    pane._update_time_label(5124)
+    assert pane.time_label.text() == "11:25:24.124"
+    pane.set_judged_time(5124, 1_792_293_923_510)
+    assert pane.time_label.text() == "11:25:23.510"
+    assert "录像机时钟 11:25:24.124" in pane.time_label.toolTip()
+    pane._update_time_label(5124)            # the full-resolution frame of the same position
+    assert pane.time_label.text() == "11:25:23.510"
+    pane._update_time_label(5164)            # another frame, not told yet: never an old judged time
+    assert pane.time_label.text() == "11:25:24.164"
+    pane._current_position_ms = 5164
+    pane.set_judged_time(5164, None)
+    assert pane.time_label.text() == "11:25:24.164"
+

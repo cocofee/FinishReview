@@ -2739,6 +2739,18 @@ class PassageEvidencePane(QFrame):
             f"预计过线 {format_passage_time(event.timeline_timestamp_ms)}；"
             f"距预计过线 {delta_ms:+d} ms"
         )
+        judged = getattr(self, "_judged_time", None)
+        if judged is not None and judged[0] == int(position_ms):
+            # One clock on the screen (11-14): the table and the strip are in chip
+            # time, this label gave the recorder's, 0.6 s later on 古浪.
+            self.time_label.setToolTip(
+                f"校时后的时间，与左表和过线图一致；录像机时钟 {self.time_label.text()}。" + self.time_label.toolTip())
+            self.time_label.setText(format_passage_time(judged[1]))
+
+    def set_judged_time(self, position_ms, timestamp_ms) -> None:
+        """Show the calibrated (chip) time for the frame at POSITION_MS; None goes back to the recorder's."""
+        self._judged_time = None if timestamp_ms is None else (int(position_ms), int(timestamp_ms))
+        self._update_time_label(self._current_position_ms)
 
     def _update_frame_indicator(self, position_ms: int) -> None:
         event = self._event

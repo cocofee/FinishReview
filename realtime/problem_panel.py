@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PyQt5.QtCore import QEvent, QProcess, QProcessEnvironment, QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QPixmap
+from PyQt5.QtGui import QColor, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QScrollArea,
+    QSizePolicy,
 )
 
 from .bunch_timeline import BunchTimeline
@@ -144,6 +145,46 @@ STATE_WAITING = "待证据"
 STATE_HANDOFF = "待 CycleRace"
 # 正常单人的行：芯片已经答过，不是待处理，只是一条可复查的过线记录。
 STATE_AUTO = "自动对应"
+
+
+class HintLabel(QLabel):
+    """The panel's one line of advice; whoever shows it elsewhere hears every change."""
+
+    changed = pyqtSignal(str)
+
+    def setText(self, text):  # noqa: N802 (Qt name)
+        super().setText(text)
+        self.changed.emit(str(text or ""))
+
+
+class PictureHint(QLabel):
+    """The advice on the picture's own button line: one line, cut with … when too long.
+
+    11-14: it was small grey print at the very bottom of the window, never seen
+    while watching the recording.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(120)
+        self.setStyleSheet("color: #1f2937; font-size: 11pt; font-weight: 600;")
+
+    def set_hint(self, text):
+        self._full = " ".join(str(text or "").split())
+        self.setToolTip(self._full)
+        self.update()
+
+    def hint(self):
+        return self._full
+
+    def shown_text(self):
+        return self.fontMetrics().elidedText(self._full, Qt.ElideRight, max(0, self.width() - 8))
+
+    def paintEvent(self, _event):  # noqa: N802 (Qt name)
+        painter = QPainter(self)
+        painter.drawText(self.rect().adjusted(6, 0, -2, 0), Qt.AlignVCenter | Qt.AlignLeft, self.shown_text())
 
 
 class ProblemListPanel(QFrame):
@@ -522,7 +563,7 @@ class ProblemListPanel(QFrame):
         self.big_bar.addWidget(self.big_title, 1)
         self.big_bar.addWidget(self.big_keys)
         layout.addLayout(self.big_bar)
-        self.hint = QLabel("", self)
+        self.hint = HintLabel("", self)
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color: #667085; font-size: 9pt;")
         layout.addWidget(self.hint)

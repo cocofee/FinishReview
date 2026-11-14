@@ -351,7 +351,6 @@ class QuickReviewPanel(ProblemListPanel):
         menu.addSeparator()
         menu.addAction("分析录像", self._toggle_analysis)
         menu.addAction("导出给计时系统（补录 / 建议删除）", self.export)
-        menu.addAction("导出过线记录", self.export_arrivals)
         menu.addAction("删除选中的芯片记录…", self._request_delete)
         menu.addSeparator()
         menu.addAction("清空试验数据", self.clear_data_requested.emit)
@@ -2129,12 +2128,15 @@ class QuickReviewPanel(ProblemListPanel):
         return uncovered_intervals(start, end, seen, tolerance=100)
 
     def record_viewed_frame(self, frame, recorder_ms):
-        """Remember, in chip time, what of the recording the operator has looked at."""
+        """Remember, in chip time, what of the recording the operator has looked at.
+
+        Gives that chip time back (None when the frame has none) for the picture to show.
+        """
         super().record_viewed_frame(frame, recorder_ms)
         self.timeline.current = int(recorder_ms)
         crossing = recorder_crossing_time(recorder_ms, frame, self.workspace_dir)
         if crossing is None or self.workspace_dir is None:
-            return
+            return None
         stamp = crossing.value_ms
         self._shown_ms = stamp
         self.race_strip.set_cursor(stamp, frame.get("camera_index") or 1)
@@ -2164,6 +2166,7 @@ class QuickReviewPanel(ProblemListPanel):
                 QTimer.singleShot(0, lambda: self._run_arrived(tail))  # rule outside the frame callback
             elif stamp >= self._run_to - RUN_SLOW_MS:
                 self._run_slow()  # the last stretch at normal speed, to stop on the frame
+        return stamp
 
     def _run_slow(self):
         """Back to normal speed; True when the run was playing fast."""
