@@ -1797,6 +1797,13 @@ def run_signals(panel):
     return runs
 
 
+def past_the_one_just_clicked(panel):
+    """The second right after a click is looked through 0.3 s a Space at a time (11-15);
+    tests about what Space does later start past it."""
+    panel._clicked_at = None
+    panel._close_behind_ms = 0
+
+
 def test_a_click_holds_the_recording_and_space_goes_on_to_the_next_chip(wave_panel, qapp):
     """11-14：大集团里点完人录像自己往前跑，盯不住人。点完停住；滚轮一帧一帧走，空格到下一位停住。"""
 
@@ -1808,15 +1815,96 @@ def test_a_click_holds_the_recording_and_space_goes_on_to_the_next_chip(wave_pan
     assert runs == [] and wave_panel._run_to is None
     assert "录像停在这里" in wave_panel.hint.text() and "20 号" in wave_panel.hint.text()
 
-    assert wave_panel.play_on()
-    assert runs == [True] and wave_panel._run_to == T0 + 400 and not wave_panel._run_tail
-    look_through(wave_panel, 100, 200, 100)
-    assert runs == [True]  # not there yet
-    look_through(wave_panel, 300, 400, 40)
+    assert wave_panel.play_on()  # 11-15: right after a click, 0.3 s at a time
+    assert runs == [True] and wave_panel._run_to == T0 + 300 and not wave_panel._run_tail
+    look_through(wave_panel, 100, 300, 100)
     qapp.processEvents()
-    assert runs == [True, False] and wave_panel._run_to is None
+    assert runs == [True, False]
+    assert wave_panel.play_on()  # 20 is due right here: a little further, as always
+    assert wave_panel._run_to == T0 + 600 and not wave_panel._run_tail
+    look_through(wave_panel, 340, 600, 20)
+    qapp.processEvents()
+    assert runs == [True, False, True, False] and wave_panel._run_to is None
     assert "20 号" in wave_panel.hint.text()
     assert wave_panel._selected_arrival().bib == "61"  # nothing was counted or moved on by the run
+
+
+def test_after_a_click_space_never_runs_past_whoever_is_right_behind(wave_panel, qapp, monkeypatch):
+    """11-15 古浪 12 号：没芯片、紧跟 57 号 0.27 秒。点完 57 按空格，录像快放到本波末尾，12 号一闪而过。
+    点完人后 1 秒内，空格每次只走 0.3 秒、正常速度。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    monkeypatch.setattr(module, "line_arrivals", lambda *_args: [])   # the two are one blob on the strip
+    speeds = []
+    wave_panel.run_speed.connect(speeds.append)
+    count_the_wave(wave_panel, qapp)                                     # the last one at 900
+    wave_panel.race_strip.view.pieces = [
+        StripPiece(Path("none.npz"), 1, "s", Path("none.avi"), T0 - 10_000, T0 + 60_000, False, 0)]
+    look_through(wave_panel, 900, 900)
+    assert wave_panel.play_on()
+    assert wave_panel._run_to == T0 + 1200 and not wave_panel._run_tail and speeds[-1] == 1.0
+    assert "往前走一点" in wave_panel.hint.text()
+    look_through(wave_panel, 920, 1200, 20)
+    qapp.processEvents()
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 1500 and speeds[-1] == 1.0
+    look_through(wave_panel, 1220, 1500, 20)
+    qapp.processEvents()
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 1800
+    look_through(wave_panel, 1520, 1800, 20)
+    qapp.processEvents()
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 2100     # still under a second after 76's chip
+    look_through(wave_panel, 1820, 2100, 20)
+    qapp.processEvents()
+    wave_panel.play_on()                                                 # a second on: as before
+    assert wave_panel._run_to != T0 + 2400
+
+
+def test_behind_a_lone_rider_one_space_goes_on_and_right_behind_someone_it_stops_on_them(
+        wave_panel, qapp, monkeypatch):
+    """11-15：一个人的话按好几下空格才走得动，太麻烦。过线图能看出线上空了又有人上来：
+    有就停在他压线的地方，没有就照旧一下走到下一位。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    entries = {}
+    monkeypatch.setattr(module, "line_next_entry",
+                        lambda _pieces, _cache, start, end: entries.get("at", float("inf")))
+    monkeypatch.setattr(module, "line_arrivals", lambda *_args: [])
+    speeds = []
+    wave_panel.run_speed.connect(speeds.append)
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel.race_strip.view.pieces = [
+        StripPiece(Path("none.npz"), 1, "s", Path("none.avi"), T0 - 10_000, T0 + 60_000, False, 0)]
+    # Nobody right behind 61: one Space, on to 20 as before.
+    assert wave_panel.play_on() and runs == [True] and wave_panel._run_to == T0 + 400
+    wave_panel.stop_run()
+    # Someone without a chip 0.27 s behind: Space stops on them, at normal speed.
+    entries["at"] = T0 + 270
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 270 and speeds[-1] == 1.0
+    assert "紧跟着有人上线" in wave_panel.hint.text()
+
+
+def test_right_behind_a_chip_space_steps_however_one_got_there(wave_panel, qapp):
+    """11-15：57 号是上一轮点过的，这次只是选中它再按空格，后面的人照样被快放过去。"""
+
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "5"))                  # a row, not a click on the picture
+    look_through(wave_panel, 10_000, 10_000)                            # 5's chip is at 10 s
+    assert wave_panel._clicked_at is None
+    assert wave_panel.play_on() and runs == [True]
+    assert wave_panel._run_to == T0 + 10_300 and not wave_panel._run_fast
+    assert "紧跟" in wave_panel.hint.text()
 
 
 def test_someone_due_on_this_picture_keeps_it_where_it_is(wave_panel, qapp):
@@ -1859,6 +1947,7 @@ def test_a_wave_counted_even_is_played_past_its_tail_and_then_opens_the_next(wav
     runs = run_signals(wave_panel)
     count_the_wave(wave_panel, qapp)
     assert runs == [] and wave_panel._run_to is None  # the last click holds as well
+    past_the_one_just_clicked(wave_panel)
     assert wave_panel.play_on()
     assert wave_panel._run_to == T0 + 900 + 1000 and wave_panel._run_tail
     assert wave_panel._selected_arrival().bib == "76"  # not before the tail is seen
@@ -1886,6 +1975,7 @@ def test_a_wave_counted_even_sweeps_to_the_next_one_and_stops_where_something_is
     wave_panel.run_speed.connect(speeds.append)
     runs = run_signals(wave_panel)
     count_the_wave(wave_panel, qapp)
+    past_the_one_just_clicked(wave_panel)
     assert wave_panel.play_on()
     look_through(wave_panel, 1000, 1900, 100)
     wave_panel.race_strip.view.pieces = pieces
@@ -1914,6 +2004,7 @@ def test_a_wave_that_does_not_count_even_stays_at_its_tail(wave_panel, qapp):
     look_through(wave_panel, 1000, 1400, 100)
     count_on_picture(wave_panel, .8, 1400)  # a fourth person at the back: no chip
     qapp.processEvents()
+    past_the_one_just_clicked(wave_panel)
     assert wave_panel.play_on()
     look_through(wave_panel, 1500, 1900, 100)
     qapp.processEvents()
@@ -1945,6 +2036,7 @@ def test_a_run_aims_at_the_next_chip_shifted_by_how_late_this_wave_is_seen(wave_
     look_through(wave_panel, 500, 500)
     count_on_picture(wave_panel, .2, 500)  # chips at 0, 400, 900: seen 500 ms late
     qapp.processEvents()
+    past_the_one_just_clicked(wave_panel)
     assert runs == [] and wave_panel.play_on()
     assert runs == [True] and wave_panel._run_to == T0 + 900
 

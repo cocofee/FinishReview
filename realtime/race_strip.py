@@ -287,6 +287,82 @@ def line_arrivals(pieces, cache, start_ms, end_ms):
 
     if end_ms <= start_ms:
         return []
+    seen = _line_taken(pieces, cache, start_ms, end_ms)
+    if seen is None:
+        return None
+    arrivals, last, length, first = [], None, 0, None
+    for moment, there in zip(*seen):
+        if not there:
+            continue
+        if last is None or moment - last > ARRIVAL_MERGE_MS:
+            first, length = moment, 0
+        length += 1
+        last = moment
+        # Two frames of it: one frame alone is a flicker of light.
+        if length == 2 and first > start_ms:
+            arrivals.append(float(first))
+    return [moment for moment in arrivals if moment < end_ms]
+
+
+def line_clear_at(pieces, cache, start_ms, end_ms):
+    """When the finish line is empty again after START_MS (two frames of nobody on it).
+
+    inf when it is not empty before END_MS, None when the strip cannot tell.
+    11-15: whoever is right behind the one just counted keeps the line taken.
+    """
+
+    if end_ms <= start_ms:
+        return float("inf")
+    seen = _line_taken(pieces, cache, start_ms, end_ms)
+    if seen is None:
+        return None
+    empty = 0
+    for moment, there in zip(*seen):
+        if moment < start_ms:
+            continue
+        empty = 0 if there else empty + 1
+        if empty == 2:
+            return float(moment)
+    return float("inf")
+
+
+def line_next_entry(pieces, cache, start_ms, end_ms):
+    """When someone new comes onto the line after START_MS: it is empty two frames, then taken two.
+
+    inf when nobody does before END_MS, None when the strip cannot tell.
+    11-15 古浪 12 号, 0.27 s behind 57: line_arrivals takes breaks under
+    ARRIVAL_MERGE_MS for one body, so the two were one arrival.  Right after
+    someone counted the line is empty again within some 0.25 s; whatever
+    comes onto it next is someone else.
+    """
+
+    if end_ms <= start_ms:
+        return float("inf")
+    seen = _line_taken(pieces, cache, start_ms, end_ms)
+    if seen is None:
+        return None
+    empty = taken = 0
+    first = None
+    for moment, there in zip(*seen):
+        if moment < start_ms:
+            continue
+        if not there:
+            empty, taken = empty + 1, 0
+            continue
+        if empty >= 2:
+            if taken == 0:
+                first = moment
+            taken += 1
+            if taken == 2:
+                return float(first)
+        elif taken == 0:
+            empty = 0
+    return float("inf")
+
+
+def _line_taken(pieces, cache, start_ms, end_ms):
+    """(moments, taken) of the strip between two chip-clock moments: is someone on the line at each."""
+
     low, high = start_ms - ARRIVAL_CONTEXT_MS, end_ms + ARRIVAL_CONTEXT_MS
     for archive in (True, False):
         parts = sorted((piece for piece in pieces if piece.aligned and piece.archive == archive
@@ -315,18 +391,7 @@ def line_arrivals(pieces, cache, start_ms, end_ms):
         columns = np.flatnonzero(stretch)
         change = np.abs(image[:, columns].astype(np.int16) - background[:, None, :]).max(axis=2)
         taken = ((change > FIGURE_LEVEL) & calm[:, None]).sum(axis=0) >= ARRIVAL_PLACES
-        arrivals, last, length, first = [], None, 0, None
-        for moment, there in zip(times[columns], taken):
-            if not there:
-                continue
-            if last is None or moment - last > ARRIVAL_MERGE_MS:
-                first, length = moment, 0
-            length += 1
-            last = moment
-            # Two frames of it: one frame alone is a flicker of light.
-            if length == 2 and first > start_ms:
-                arrivals.append(float(first))
-        return [moment for moment in arrivals if moment < end_ms]
+        return times[columns], taken
     return None
 
 

@@ -904,15 +904,16 @@ class EvidenceImageView(QGraphicsView):
             self.viewport().setCursor(
                 Qt.CrossCursor if self._count_mode else Qt.ArrowCursor
             )
-            self.setToolTip(
-                COUNT_MODE_HELP if self._count_mode else "滚轮放大后，中键拖动查看号码"
-            )
+            # 11-15: the floating hint sat on the picture where people are clicked.
+            self.setToolTip("")
             return
         self._marker_mode = bool(enabled) and self.has_frame
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._marker_mode:
+        if self._workbench_compact:
+            self.setToolTip("")  # 11-15: no floating hint over the picture in the workbench
+        elif self._marker_mode:
             self.setToolTip(
                 "单击放置判读线；Shift + 左键拖动判读线；"
                 "中键拖动缩放后的画面"
@@ -939,7 +940,9 @@ class EvidenceImageView(QGraphicsView):
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._marker_mode:
+        if self._workbench_compact:
+            self.setToolTip("")  # 11-15: no floating hint over the picture in the workbench
+        elif self._marker_mode:
             self.setToolTip(
                 "单击放置判读线；Shift + 左键拖动判读线；"
                 "中键拖动缩放后的画面"
@@ -958,7 +961,9 @@ class EvidenceImageView(QGraphicsView):
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._marker_mode:
+        if self._workbench_compact:
+            self.setToolTip("")  # 11-15: no floating hint over the picture in the workbench
+        elif self._marker_mode:
             self.setToolTip(
                 "单击放置判读线；Shift + 左键拖动判读线；"
                 "中键拖动缩放后的画面"

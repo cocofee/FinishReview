@@ -7,7 +7,7 @@ from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
 from realtime.race_strip import (RaceStripPanel, RaceStripView, StripPiece, earlier_arrival, first_crossing,
-                                 line_arrivals)
+                                 line_arrivals, line_next_entry)
 from tests.realtime.test_quick_review_panel import panel, qapp
 
 
@@ -254,6 +254,26 @@ def test_a_fast_run_stops_where_something_comes_onto_the_line(tmp_path):
     assert line_arrivals(pieces, strips, T + 14_100, T + 15_500) == []     # still the one already there
     assert line_arrivals(pieces, strips, T + 25_000, T + 40_000) is None   # the strip ends before the stretch does
     assert line_arrivals([], strips, T + 10_000, T + 18_000) is None
+
+
+def test_someone_right_behind_is_the_line_taken_again_after_it_was_empty(tmp_path):
+    """11-15 古浪 12 号：紧跟 57 号 0.27 秒、过线图上看着像一团。线空了两帧又有人上来，就是下一个人。"""
+    times = T + np.arange(0, 30_000, 40, dtype=np.float64)
+    rng = np.random.default_rng(5)
+    image = (100 + rng.integers(-2, 3, (100, times.size, 3))).astype(np.uint8)
+
+    def body(rows, start, end):
+        image[rows, int(np.searchsorted(times, T + start)):int(np.searchsorted(times, T + end))] = 30
+
+    body(slice(20, 50), 10_000, 10_180)     # 57 on the line
+    body(slice(25, 55), 10_260, 10_460)     # 12, 0.26 s behind: a gap under ARRIVAL_MERGE_MS
+    body(slice(20, 50), 14_000, 14_200)     # a lone rider
+    strips = _Strips(times, image)
+    pieces = [piece(tmp_path)]
+    assert line_arrivals(pieces, strips, T + 10_000, T + 11_000) == []          # one body to line_arrivals
+    assert line_next_entry(pieces, strips, T + 10_000, T + 11_000) == T + 10_280
+    assert line_next_entry(pieces, strips, T + 14_000, T + 15_000) == float("inf")
+    assert line_next_entry(pieces, strips, T + 25_000, T + 40_000) is None
 
 
 def test_while_the_recording_plays_the_strip_scrolls_under_a_cursor_that_stays_put(qapp, tmp_path):
