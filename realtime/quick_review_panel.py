@@ -102,6 +102,9 @@ CLOSE_BEHIND_MS = 1000
 # first SAME_BODY_MS after the one counted are their own back wheel.  Only
 # where the strip cannot tell does Space step RUN_STEP_MS at a time.
 SAME_BODY_MS = 150
+# Within this of the frame shown a clicked person is the one on screen (one
+# frame at 25 fps is 40 ms): Space goes on to the next one, not to them.
+SAME_FRAME_MS = 20
 # A chip of a confirmed wave that nobody on the picture was counted for
 # (older confirmations only; a wave now shows 少 N until someone is counted).
 WAVE_NO_PERSON = "wave_no_person"
@@ -1987,12 +1990,20 @@ class QuickReviewPanel(ProblemListPanel):
         ordered = sorted((i for i, mark in enumerate(marks) if i not in plan.labels and not is_excluded(mark)),
                          key=crossing_order)
         counting = [i for i in ordered if not marks[i].get("no_chip")]
+
+        def chip_ms(row):
+            # The chip's own time.  A row already saved from a click carries that
+            # click's moment as its time_ms; fitting against it would just give
+            # back the pairing saved click by click (11-15 盲测, 261 号: the one
+            # without a chip always ended up as the wave's last person).
+            return int(row.event.timeline_timestamp_ms) if row.event is not None else row.time_ms
+
         fit = None
-        if len(counting) > len(free) and free and all(row.time_ms is not None for row in free):
+        if len(counting) > len(free) and free and all(chip_ms(row) is not None for row in free):
             # 11-14 (古浪 6 号): the one without a chip is where the clicks shift
             # onto the next chip's time, not the last person of the wave.
-            free.sort(key=lambda row: row.time_ms)
-            fit = fit_wave([crossing_order(i)[0] for i in counting], [row.time_ms for row in free])
+            free.sort(key=chip_ms)
+            fit = fit_wave([crossing_order(i)[0] for i in counting], [chip_ms(row) for row in free])
         if fit is not None:
             chosen = dict(zip(counting, fit.chip_of_click))
             for i in ordered:
@@ -2219,6 +2230,9 @@ class QuickReviewPanel(ProblemListPanel):
         if self._run_to is not None:
             if abs(stamp - self._run_to) > RUN_STALE_MS:
                 self._run_to = None  # the operator went elsewhere: nothing to stop
+                # ... nor a wave to open at its end (11-15: 63 号 Space opened 23 号, the
+                # row after a wave left mid-sweep minutes before).
+                self._run_between = None
                 if self._run_slow():
                     self.run_requested.emit(False)  # never left playing fast with nowhere to stop
             elif stamp >= self._run_to - RUN_STOP_LEAD_MS:
@@ -2286,6 +2300,9 @@ class QuickReviewPanel(ProblemListPanel):
             arrivals = line_arrivals(pieces, self.race_strip.view.cache, now + RUN_NEAR_MS, limit)
         self._run_swept = arrivals is not None
         seen += [int(moment) for moment in arrivals or ()]
+        counted = self._next_counted(now, plan)
+        if counted is not None and counted[0] < limit:
+            seen.append(int(counted[0]))  # someone already clicked comes first: stop on them
         if seen or due:
             return min(seen + due[:1]), False
         return (end, True) if end > now + RUN_NEAR_MS else None
@@ -2331,6 +2348,8 @@ class QuickReviewPanel(ProblemListPanel):
         right here but not at the line yet: RUN_STEP_MS on, then stop again.
         False with no wave on screen or past its tail: Space then plays as always.
         """
+        # Space goes on from the frame shown, whatever was being swept before (11-15).
+        self._run_between = None
         row = self._selected_arrival()
         if row is not None and row.key in self._auto_labels and self._auto_review is None:
             self._accept_auto_wave(row)   # looked at, right: on to the next wave (11-15)
@@ -2339,8 +2358,11 @@ class QuickReviewPanel(ProblemListPanel):
         now = self._shown_ms
         if now is None or self._auto_review is not None:
             return False
+        counted = self._next_counted(now, plan)
         if self._close_behind(now, plan):
             entry = self._next_on_line(now)
+            if counted is not None and (entry is None or counted[0] <= entry):
+                return self._run_to_counted(counted, plan)
             if entry is None:
                 return self._step_on(now, plan)
             if entry != float("inf"):
@@ -2390,6 +2412,32 @@ class QuickReviewPanel(ProblemListPanel):
         if not pieces:
             return None
         return line_next_entry(pieces, self.race_strip.view.cache, now + SAME_BODY_MS, now + CLOSE_BEHIND_MS)
+
+    def _next_counted(self, now, plan):
+        """(moment, label) of the next person already clicked on this wave, ahead of NOW.
+
+        Going back over a wave counted even, no chip is left to stop at and a
+        tight bunch shows on the strip as one long shape: Space ran past many
+        (11-15 古浪, from 73 号 on).  It goes from one clicked person to the next.
+        """
+        if plan is None or not plan.marks:
+            return None
+        ahead = sorted((moment, index) for index, moment in self._run_offset(plan)[1].items()
+                       if moment > now + SAME_FRAME_MS and not is_excluded(plan.marks[index]))
+        if not ahead:
+            return None
+        moment, index = ahead[0]
+        return moment, plan.labels.get(index, "")
+
+    def _run_to_counted(self, counted, plan):
+        """On to the next person already clicked, at normal speed, and stop on them."""
+        moment, label = counted
+        self._run_to, self._run_tail, self._run_fast = int(moment), False, False
+        self.hint.setText(f"{self._run_count(plan)}；到下一位已点的人"
+                          + (f"（{label}）" if label else "") + "，中间有没点到的人就按空格停下再点他。")
+        self.run_speed.emit(1.0)
+        self.run_requested.emit(True)
+        return True
 
     def _run_to_entry(self, entry, plan):
         """Right behind the one counted someone comes onto the line: play there at normal speed and stop."""
