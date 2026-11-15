@@ -1428,21 +1428,17 @@ def test_a_person_flagged_without_a_chip_cannot_be_counted_again(wave_panel):
     assert saved(wave_panel) == {}
 
 
-def test_a_detected_crossing_at_a_counted_moment_stays_a_row_shown_as_near_someone_counted(wave_panel):
-    """Review 10-29: hidden, it might be someone nobody counted; it is shown, 已点附近 (疑点保留)."""
+def test_a_detected_crossing_at_a_counted_moment_is_not_a_row_of_its_own(wave_panel):
+    """11-15：一个人一个人点，空格会停在紧跟的人身上；离已点的人 0.5 秒内的分析过线不再单列“已点附近”。"""
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     count_on_picture(wave_panel, .2, 100)
     detected = wave_panel.add_manual_problem(dict(FRAME, frame_index=9, recorder_ms=T0 + 300), recorder_ms=T0 + 300)
     far = wave_panel.add_manual_problem(dict(FRAME, frame_index=60, recorder_ms=T0 + 3000), recorder_ms=T0 + 3000)
     rows = {entry.item.item_id: index for index, entry in enumerate(wave_panel._arrival_rows)}
-    assert detected.item_id in rows and far.item_id in rows
-    assert wave_panel.table.item(rows[detected.item_id], 3).text() == "已点附近"
+    assert detected.item_id not in rows and far.item_id in rows
     assert wave_panel.table.item(rows[far.item_id], 3).text() == "待定"
-    assert "多半就是那个人" in wave_panel.table.item(rows[detected.item_id], 3).toolTip()
-    assert "待定" in wave_panel.attention_button.toolTip()  # still to look at
-    wave_panel._arrival_clicked(rows[detected.item_id])
-    assert "按 1 排除" in wave_panel.hint.text()
-    assert menu_labels(wave_panel, rows[detected.item_id])[:2] == ["补录号码…", "不是运动员"]
+    assert detected.item_id in {item.item_id for item in wave_panel.items}   # kept, only not shown
+    assert all(wave_panel.table.item(i, 3).text() != "已点附近" for i in range(wave_panel.table.rowCount()))
 
 
 def counted_short(wave_panel):
@@ -1752,6 +1748,20 @@ def test_enter_accepts_the_paired_evidence_without_padding_or_claiming_manual_co
     assert (decision["frame"]["marker_x_normalized"], decision["frame"]["marker_y_normalized"]) == (
         round(people[1].x, 4), round(people[1].y, 4))
     assert wave_panel._auto_labels == {}
+    assert wave_panel._arrival_exports() == ([], [], 0)
+
+
+def test_space_on_a_wave_the_system_paired_accepts_it_and_goes_on(wave_panel, monkeypatch):
+    """11-15：点人时每点都自动存，回车不再是确认。自动对上的一波看一眼对就按空格往下走，仍记为系统对应。"""
+
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    assert "按空格往下走" in wave_panel.hint.text() and "回车" not in wave_panel.hint.text()
+    wave_panel._arrival_drafts["seen"] = {}
+    assert wave_panel.play_on()
+    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
+    assert states(wave_panel)["61"] == "已接受对应"                  # the system's pairing, not a manual count
+    assert wave_panel._selected_arrival().bib == "5"                 # on to the next wave
     assert wave_panel._arrival_exports() == ([], [], 0)
 
 

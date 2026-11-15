@@ -139,11 +139,15 @@ ROW_KEYS = {Qt.Key_1: ("这人不是运动员", "不是运动员", "非运动员
             Qt.Key_3: ("这人没芯片：补录号码…", "补录号码…", "改号码…")}
 KEY_NAMES = {Qt.Key_1: "1 不是运动员", Qt.Key_2: "2 双芯片", Qt.Key_3: "3 补录号码"}
 NUMBER_KEYS = (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5)
-AUTO_PICTURE_REASON = "自动对上：按过线顺序对应芯片，操作员按回车接受"
-AUTO_TEXT = "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；回车接受对应，号码不对按 4 撤回。"
+AUTO_PICTURE_REASON = "自动对上：按过线顺序对应芯片，操作员看过往下走即接受"
+AUTO_TEXT = "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；看一眼对就按空格往下走，号码不对按 4 撤回。"
+# 11-15: people are counted one by one and every click is saved; Enter no longer
+# confirms anything.  An 自动对上 wave is accepted by going on from it, Space
+# (or Enter); it is still saved as the system's pairing, never as a manual count.
+AUTO_GO_ON = "自动对上 · 未人工确认 · 看一眼，对就按空格往下走，不对按 4 撤回"
 
 # What the wave's status line alone told the operator (see _sync_arrival_confirmation).
-WAVE_ALERT_WORDS = ("分不清", "没看", "芯片有变化", "不算人工确认", "回车接受", "可能多人")
+WAVE_ALERT_WORDS = ("分不清", "没看", "芯片有变化", "不算人工确认", "按空格往下走", "可能多人")
 
 
 @dataclass
@@ -618,8 +622,14 @@ class QuickReviewPanel(ProblemListPanel):
         rows = self._fold_unverified(rows, assigned, counting)
         self._unverified_groups = sum(self._row_state(row) == "画面待核" for row in rows)
         rows = [row for row in rows if row.event is not None or self._candidate_shown(row.item, assigned, counting)]
-        self._near_counted_items = frozenset(row.item.item_id for row in rows
-                                       if row.event is None and self._near_counted_moment(row.item, assigned, moments))
+        # 11-15: a crossing the analysis saw within COUNTED_REACH_MS of someone
+        # counted is no longer a row (it was 已点附近: "这样会造成困惑").  People
+        # are counted one by one now and Space stops on whoever comes onto the
+        # line right behind (line_next_entry).  Nothing on disk changes.
+        near = frozenset(row.item.item_id for row in rows
+                         if row.event is None and self._near_counted_moment(row.item, assigned, moments))
+        rows = [row for row in rows if row.item.item_id not in near or row.event is not None]
+        self._near_counted_items = frozenset()
         rows = self._without_repeats(rows)
         rows = self._fold_fragments(rows, assigned)
         # Arrival order is chip time.  Not the order the records came in: a chip
@@ -1687,7 +1697,7 @@ class QuickReviewPanel(ProblemListPanel):
         if self._row_state(row) == "待定" and row.item.item_id in self._near_counted_items:
             text = NEAR_COUNTED_TEXT
         if self._row_state(row) == "待定" and row.key in self._auto_labels:
-            text = "自动对上 · 未人工确认、不导出 · 回车接受对应"
+            text = AUTO_GO_ON
         if text:
             self.hint.setText(text)
 
@@ -2080,7 +2090,7 @@ class QuickReviewPanel(ProblemListPanel):
         elif plan is not None and (plan.marks or plan.split):
             status, color = self._wave_status(plan)
         elif row is not None and row.key in self._auto_labels and wave is not None:
-            status = f"自动对上 · 芯片 {len(wave)} · 回车接受对应"
+            status = f"自动对上 · 芯片 {len(wave)} · 对就按空格往下走，不对按 4"
             color = "#3b5b7a"
         elif row is not None and wave is None and self._row_state(row) == "待定" and row.time_ms is not None:
             # A crossing without a chip may be several people: it is looked at
@@ -2321,6 +2331,10 @@ class QuickReviewPanel(ProblemListPanel):
         right here but not at the line yet: RUN_STEP_MS on, then stop again.
         False with no wave on screen or past its tail: Space then plays as always.
         """
+        row = self._selected_arrival()
+        if row is not None and row.key in self._auto_labels and self._auto_review is None:
+            self._accept_auto_wave(row)   # looked at, right: on to the next wave (11-15)
+            return True
         plan = self._run_plan()
         now = self._shown_ms
         if now is None or self._auto_review is not None:
