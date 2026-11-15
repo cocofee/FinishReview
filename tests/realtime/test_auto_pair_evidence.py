@@ -50,7 +50,7 @@ def test_auto_wave_opens_bound_frame_even_before_strip_is_ready(wave_panel, monk
     assert decoded[-1][0] == people[0].frame["frame_index"]
     assert abs(float(decoded[-1][1][:, :, 1].mean()) - decoded[-1][0] * 5) < 4
     drawn = wave_panel.picture_overlays(jumps[-1])
-    assert [(label, auto, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, auto in drawn] == [
+    assert [(label, auto, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, auto, *_ in drawn] == [
         ("61", True, False)]
     count = len(jumps)
     wave_panel._arrival_clicked(row(wave_panel, "76"))
@@ -113,7 +113,7 @@ def test_auto_row_click_decodes_same_person_in_window_archive(qapp, tmp_path, mo
                      frame_index=110, position_ms=5500, recorder_ms=moment)
         overlays = panel.picture_overlays(shown)
         assert any(label == event.bib and auto and not ghost
-                   for _x, _y, label, _ok, _alert, _dot, ghost, auto in overlays)
+                   for _x, _y, label, _ok, _alert, _dot, ghost, auto, *_ in overlays)
         assert not panel._arrival_store.active((event.race_id, event.stage_id))
         assert "未校时/匹配" not in panel.hint.text()
     finally:
@@ -161,5 +161,5 @@ def test_accept_does_not_claim_manual_viewing_or_enter_exports(wave_panel, monke
     assert not any(entry[0] == dict(FRAME) for entry in spy)
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     drawn = wave_panel.picture_overlays(people[0].frame)
-    assert any(label == "61" and auto and not confirmed for _, _, label, confirmed, _, _, _, auto in drawn)
+    assert any(label == "61" and auto and not confirmed for _, _, label, confirmed, _, _, _, auto, *_ in drawn)
     assert wave_panel.race_strip.view.chips[0][2] == 2

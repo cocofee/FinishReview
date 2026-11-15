@@ -434,6 +434,10 @@ def review_status_text(
 
 # Screen size of the number beside a person on the picture.
 PERSON_TAG_FONT_PX = 30  # 11-12: 20 px was too small to read at a glance
+# 11-16: in a bunch the number tags covered the riders behind (古浪 507 over 547).
+# A counted person is a ring only; their number shows while the mouse is on it.
+HOVER_REACH_PX = 16
+SELECTED_RING_PX = 15  # the outer ring of the one selected (just clicked, or picked on the left)
 # The tag sits this far to the right of the click, level with it, off the
 # person's body (operator, 11-12); left or above when that place is taken.
 PERSON_TAG_LIFT_PX = 60
@@ -512,8 +516,9 @@ class EvidenceImageView(QGraphicsView):
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
-            tuple[float, float, str, bool, bool, bool, bool, bool], ...
+            tuple[float, float, str, bool, bool, bool, bool, bool, bool, bool], ...
         ] = ()
+        self._hover_position: Optional[QPoint] = None  # the mouse over the picture, for ring numbers
         self._show_marker_label = True
         self._show_identity_badge = True
         self._mouse_press_position: Optional[QPoint] = None
@@ -1012,6 +1017,9 @@ class EvidenceImageView(QGraphicsView):
                 bool(marker[5]) if len(marker) > 5 else False,
                 bool(marker[6]) if len(marker) > 6 else False,
                 bool(marker[7]) if len(marker) > 7 else False,
+                # 11-16: the number only while the mouse is on the ring; the selected one ringed twice.
+                bool(marker[8]) if len(marker) > 8 else False,
+                bool(marker[9]) if len(marker) > 9 else False,
             )
             for marker in markers
             for x_normalized, y_normalized, label, confirmed, simple in [marker[:5]]
@@ -1087,7 +1095,33 @@ class EvidenceImageView(QGraphicsView):
             return
         super().mousePressEvent(event)
 
+    def _hovered_marker(self, position) -> int:
+        """Index of the ring (numbered on hover) under the mouse, -1 for none."""
+        if position is None or self._source_width <= 0 or self._source_height <= 0:
+            return -1
+        best, reach = -1, HOVER_REACH_PX ** 2
+        for index, marker in enumerate(self._history_markers):
+            if not marker[8] or marker[6]:
+                continue
+            point = self.mapFromScene(QPointF(marker[0] * self._source_width, marker[1] * self._source_height))
+            distance = (point.x() - position.x()) ** 2 + (point.y() - position.y()) ** 2
+            if distance <= reach:
+                best, reach = index, distance
+        return best
+
+    def leaveEvent(self, event) -> None:
+        if self._hovered_marker(self._hover_position) >= 0:
+            self.viewport().update()
+        self._hover_position = None
+        super().leaveEvent(event)
+
     def mouseMoveEvent(self, event) -> None:
+        if not event.buttons():
+            # Only looking: the ring under the mouse shows its number, nothing else changes.
+            before = self._hovered_marker(self._hover_position)
+            self._hover_position = event.pos()
+            if self._hovered_marker(self._hover_position) != before:
+                self.viewport().update()
         if (
             self._pan_dragging
             and self._pan_last_position is not None
@@ -1290,6 +1324,18 @@ class EvidenceImageView(QGraphicsView):
             candidates.append((overlap, candidate))
         return min(candidates, key=lambda value: value[0])[1]
 
+    @staticmethod
+    def _draw_selected_ring(painter, x, y, color, scale):
+        """A second ring round the one selected: their number is in the corner badge."""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(color, 2.5)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QPointF(x, y), SELECTED_RING_PX / scale, SELECTED_RING_PX / scale)
+        painter.restore()
+
     def _draw_person_tag(self, painter, x, y, label, color, dashed, ghost, scale, visible, occupied):
         """A point and number label, not a timing line or a tracking box."""
         painter.save()
@@ -1341,9 +1387,9 @@ class EvidenceImageView(QGraphicsView):
                 for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
                     painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
                                      QPointF(b[0] * self._source_width, b[1] * self._source_height))
-        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost, auto) in enumerate(
-            self._history_markers
-        ):
+        hovered = self._hovered_marker(self._hover_position)
+        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost, auto,
+                    hover_only, selected) in enumerate(self._history_markers):
             x = x_normalized * self._source_width
             y = y_normalized * self._source_height
             # Grey-blue and dashed: paired by the system (自动对上), nobody has counted them yet.
@@ -1354,8 +1400,11 @@ class EvidenceImageView(QGraphicsView):
                 color.setAlpha(150)
             if self._workbench_compact or dot:
                 if visible.adjusted(-6 / scale, -6 / scale, 6 / scale, 6 / scale).contains(QPointF(x, y)):
-                    self._draw_person_tag(painter, x, y, label, color,
+                    shown = label if not hover_only or index == hovered else ""
+                    self._draw_person_tag(painter, x, y, shown, color,
                                           auto or (not confirmed and not simple), ghost, scale, visible, occupied)
+                    if selected and not ghost:
+                        self._draw_selected_ring(painter, x, y, color, scale)
                 continue
             pen = QPen(color, 2)
             pen.setCosmetic(True)

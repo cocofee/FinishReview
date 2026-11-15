@@ -3141,21 +3141,6 @@ class FinishReviewWindow(PassageReviewSurface):
             pane.video_view.set_history_markers(self._continuous_marker_overlays(pane))
             self._show_problem_count_badge(pane)
 
-    def _followed_mark_overlays(self, pane, image):
-        """11-12: a counted person's tag rides along with them for about a second."""
-        if pane is not self._problem_pane() or not hasattr(self.problem_panel, "follow_marks"):
-            return ()
-        from .mark_follow import MarkFollower
-        follower = getattr(self, "_mark_follower", None)
-        if follower is None:
-            follower = self._mark_follower = MarkFollower()
-        try:
-            followed = follower.update(self._frame_for_problem_count(pane), image, self.problem_panel.follow_marks())
-        except Exception:  # a display aid: never let it stop the recording
-            follower.reset()
-            return ()
-        return tuple((x, y, label, True, False, False, False, False) for x, y, label in followed)
-
     def _show_problem_count_badge(self, pane) -> None:
         """已过 N 人 · X 号 above the picture, read against the timing software."""
         text = ""
@@ -3307,8 +3292,7 @@ class FinishReviewWindow(PassageReviewSurface):
         if getattr(self.problem_panel, "quick_review", False):
             # The red "待补录" identity guide is not the camera's finish line.
             pane.video_view.clear_marker()
-            pane.video_view.set_history_markers(self._problem_count_overlays(pane)
-                                                + self._followed_mark_overlays(pane, image))
+            pane.video_view.set_history_markers(self._problem_count_overlays(pane))
             self._show_problem_count_badge(pane)
             self.problem_panel._sync_arrival_confirmation()
         if pane is not self._active_playback_pane():
@@ -3579,7 +3563,7 @@ class FinishReviewWindow(PassageReviewSurface):
             target = f"第 {index + 1} 帧" if index is not None else f"片内 {position / 1000:.2f} 秒"
             self._active_playback_pane().set_reference_only(reference)
             if frame.get("auto_pair"):
-                self.problem_panel.hint.setText("已定位自动对应的过线原帧；灰蓝号码为系统对应，不算人工点数或裁判确认。")
+                self.problem_panel.hint.setText("已定位自动对应的过线原帧；灰蓝虚线圈为系统对应（鼠标移到圈上看号码），不算人工点数或裁判确认。")
             elif reference:
                 date_note = "；芯片日期与接收日期不同，按接收日期查找，正式时间未改" if frame.get("date_aligned") else ""
                 self.problem_panel.hint.setText(
