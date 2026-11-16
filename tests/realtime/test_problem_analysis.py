@@ -904,6 +904,81 @@ def test_crossing_gate_can_read_context_across_two_second_segments(tmp_path, mon
     assert len(problem_analysis._verification_sources(files, crossing)) == 2
 
 
+def test_neighbour_frames_are_found_as_before_without_scanning_every_strip(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from realtime.problem_rules import CrossingRecord
+    from realtime.target_crossing import VERIFICATION_OFFSETS_MS
+
+    def scan_every_strip(files, crossing):
+        # The lookup as it was before the index: kept here as the reference.
+        own = next((item for item in files if str(item.meta.get("video_path")) == crossing.video_path), None)
+        if own is None:
+            return []
+        sources = []
+        for offset in VERIFICATION_OFFSETS_MS:
+            target = crossing.recorder_ms + offset
+            for item in files:
+                if (item.meta.get("session_id") != crossing.session_id
+                        or item.meta.get("line_digest") != own.meta.get("line_digest")
+                        or (item.geometry.width, item.geometry.height) != (own.geometry.width, own.geometry.height)
+                        or not len(item.pts)):
+                    continue
+                if not item.start_ms + item.pts[0] - 25 <= target <= item.end_ms + 25:
+                    continue
+                position = float(item.pts[int(np.argmin(np.abs(item.start_ms + item.pts - target)))])
+                stamp = item.start_ms + position
+                if any(left <= stamp <= right for left, right in item.meta.get("excluded_ranges", [])):
+                    continue
+                if abs(stamp - target) <= 50:
+                    sources.append((item, position))
+                    break
+        return sources
+
+    def strip(name, start, pts, session="s1", digest="line", size=(320, 240), excluded=()):
+        return problem_analysis._FileStrip(
+            tmp_path / f"{name}.npz",
+            {"video_path": str(tmp_path / f"{name}.ts"), "session_id": session, "line_digest": digest,
+             "excluded_ranges": [list(value) for value in excluded]},
+            start, np.asarray(pts, dtype=np.int64), SimpleNamespace(width=size[0], height=size[1]),
+        )
+
+    files = [
+        # A 5-minute archive whose kept pieces leave it only the 4-6 s gap.
+        strip("archive", 0, range(0, 10_000, 40), excluded=[(0, 3_990), (6_010, 10_000)]),
+        strip("piece0", 0, range(0, 2_000, 40)),
+        strip("piece1", 2_000, range(0, 2_000, 40)),
+        strip("piece3", 6_000, range(0, 2_000, 40)),
+        strip("gappy", 8_000, range(0, 2_000, 200)),
+        strip("empty", 9_000, []),
+        strip("other_session", 0, range(0, 10_000, 40), session="s2"),
+        strip("redrawn_line", 0, range(0, 10_000, 40), digest="moved"),
+        strip("other_size", 0, range(0, 10_000, 40), size=(640, 480)),
+    ]
+    crossings = [
+        CrossingRecord(1, session, "segment", str(tmp_path / f"{name}.ts"), ms, 0, ms, 0, 0, 1,
+                       contact=(10, 10), segment_points=((0, 0), (1, 1)))
+        for name, session in (("piece0", "s1"), ("archive", "s1"), ("gappy", "s1"), ("empty", "s1"),
+                              ("other_session", "s2"), ("redrawn_line", "s1"), ("other_size", "s1"),
+                              ("missing", "s1"))
+        for ms in range(-700, 11_000, 130)
+    ]
+    found = [problem_analysis._verification_sources(files, crossing) for crossing in crossings]
+    assert found == [scan_every_strip(files, crossing) for crossing in crossings]
+    assert sum(len(sources) == 3 for sources in found) > 50  # the cases above are really exercised
+    assert any(source[0].meta["video_path"].endswith("archive.ts") for sources in found for source in sources)
+
+    # One verification pass indexes the strips once, not once per crossing.
+    built = []
+    real_index = problem_analysis._verification_index
+    monkeypatch.setattr(problem_analysis, "_verification_index", lambda files: built.append(1) or real_index(files))
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"test")
+    config = AnalysisConfig(tmp_path, model_path=model)
+    many = [crossing for crossing in crossings if crossing.recorder_ms < 0][:5]
+    problem_analysis._verify_crossing_candidates(config, 1, files, many, progress=lambda *a: None, checkpoint=None)
+    assert len(many) == 5 and built == [1]
+
+
 @pytest.mark.parametrize("label", ["pedestrian", "vehicle"])
 def test_verified_non_bicycle_targets_cannot_be_auto_paired_to_chips(synthetic_race, tmp_path, monkeypatch, label):
     from realtime.target_crossing import TargetCrossingCheck

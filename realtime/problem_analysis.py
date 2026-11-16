@@ -701,22 +701,44 @@ def _save_bike_cache(path, payload):
     temporary.replace(path)
 
 
-def _verification_sources(files, crossing):
+def _verification_index(files):
+    """Strips by recording and by (session, line, frame size), keeping their order.
+
+    Built once per verification pass: scanning every strip of the race for every
+    crossing made a long race's idle live round take seconds.
+    """
+    own, groups = {}, {}
+    for item in files:
+        own.setdefault(str(item.meta.get("video_path")), item)
+        if not len(item.pts):
+            continue
+        key = (item.meta.get("session_id"), item.meta.get("line_digest"), item.geometry.width, item.geometry.height)
+        groups.setdefault(key, []).append(item)
+    spans = {
+        key: (items,
+              np.array([item.start_ms + item.pts[0] - 25 for item in items], dtype=np.float64),
+              np.array([item.end_ms + 25 for item in items], dtype=np.float64))
+        for key, items in groups.items()
+    }
+    return own, spans
+
+
+def _verification_sources(files, crossing, index=None):
     """Resolve real neighbouring frames, never borrowing another line/session."""
-    own = next((item for item in files if str(item.meta.get("video_path")) == crossing.video_path), None)
+    own_by_path, spans = index if index is not None else _verification_index(files)
+    own = own_by_path.get(crossing.video_path)
     if own is None:
         return []
+    group = spans.get((crossing.session_id, own.meta.get("line_digest"), own.geometry.width, own.geometry.height))
+    if group is None:
+        return []
+    items, starts, ends = group
     sources = []
     for offset in VERIFICATION_OFFSETS_MS:
         target = crossing.recorder_ms + offset
-        for item in files:
-            if (item.meta.get("session_id") != crossing.session_id
-                    or item.meta.get("line_digest") != own.meta.get("line_digest")
-                    or (item.geometry.width, item.geometry.height) != (own.geometry.width, own.geometry.height)
-                    or not len(item.pts)):
-                continue
-            if not item.start_ms + item.pts[0] - 25 <= target <= item.end_ms + 25:
-                continue
+        # Same order as the strips: the first one that holds the frame wins.
+        for position_index in np.nonzero((starts <= target) & (target <= ends))[0]:
+            item = items[int(position_index)]
             position = float(item.pts[int(np.argmin(np.abs(item.start_ms + item.pts - target)))])
             stamp = item.start_ms + position
             if any(left <= stamp <= right for left, right in item.meta.get("excluded_ranges", [])):
@@ -746,8 +768,9 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
             runtime.close()
             runtime.model_key = model_key
         detector = runtime.detector
+    lookup = _verification_index(files) if crossings else None
     for index, crossing in enumerate(crossings):
-        sources = _verification_sources(files, crossing)
+        sources = _verification_sources(files, crossing, lookup)
         signature = []
         for item, position in sources:
             path = Path(item.meta["video_path"])
