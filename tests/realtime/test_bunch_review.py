@@ -1394,6 +1394,40 @@ def test_a_confirmed_group_lists_the_doubts_it_still_holds_as_rows(synthetic_bun
         app.processEvents()
 
 
+def test_one_list_refresh_reads_the_workspace_once_for_all_confirmed_groups(synthetic_bunch, monkeypatch):
+    """Each refresh asks every confirmed group whether its evidence changed. In a
+    long race each re-read of the workspace took a sixth of a second, once per
+    group and every second, so the groups now share one read per refresh."""
+
+    from realtime.analysis_workspace import AnalysisWorkspace
+
+    app = QApplication.instance() or QApplication([])
+    root, item, _events = synthetic_bunch
+    second = replace(item, item_id='bunch:synthetic-2')
+    write_children(root, item, [second])
+    store = BunchReviewStore(root / 'finish_problems')
+    for group in (item, second):
+        context = load_context(root, group)
+        store.save(context, [counted(context, chip.recorder_ms, chip.bib) for chip in context.chips], 20,
+                   completed=True, fully_viewed=True, viewed_ranges=full_view(context))
+    panel = ProblemListPanel()
+    try:
+        panel.set_workspace(root)
+        alone = {group.item_id: panel.state(group) for group in (item, second)}
+        assert alone == dict.fromkeys(alone, '已处理：集团人工核对')
+        reads = []
+        real = AnalysisWorkspace.__init__
+        monkeypatch.setattr(AnalysisWorkspace, '__init__',
+                            lambda self, *args, **kwargs: reads.append(1) or real(self, *args, **kwargs))
+        panel.refresh()
+        assert len(reads) == 1
+        assert panel._context_share is None
+        assert {group.item_id: panel.state(group) for group in (item, second)} == alone
+    finally:
+        panel.close()
+        app.processEvents()
+
+
 @pytest.mark.parametrize('kind', [KIND_NEAR_CROSSING, KIND_NO_CHIP_CROSSING])
 def test_same_frame_other_person_stays_pending_without_reopening_group(synthetic_bunch, kind):
     app = QApplication.instance() or QApplication([])

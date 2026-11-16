@@ -203,15 +203,28 @@ class BunchContext:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) -> BunchContext:
+def load_context(workspace: Path, item: ProblemItem, camera: int | None = None, *,
+                 shared: dict | None = None) -> BunchContext:
+    """``shared``: one dict for several groups read at the same moment (one list
+    refresh), so the workspace, clocks and recordings are read once, not per group."""
+
     from .problem_analysis import config_from_workspace, line_for_segment
 
     workspace = Path(workspace)
     if item.evidence.get("configuration_stale") or item.evidence.get("superseded"):
         raise ValueError("本团证据已变化，请重新分析后再核对。")
-    source = AnalysisWorkspace(workspace, include_review_segments=True)
+
+    def once(key, build):
+        if shared is None:
+            return build()
+        key = (str(workspace), key)
+        if key not in shared:
+            shared[key] = build()
+        return shared[key]
+
+    source = once("source", lambda: AnalysisWorkspace(workspace, include_review_segments=True))
     frame = item.evidence.get("frame") or {}
-    clocks = ClockModelStore(workspace / CLOCK_MODEL_FILENAME)
+    clocks = once("clocks", lambda: ClockModelStore(workspace / CLOCK_MODEL_FILENAME))
     primary = frame.get("camera_index") or item.evidence.get("camera_index")
     if camera is None and primary is None:
         candidates = [index for index in source.camera_indexes() if clocks.get(index, item.calibration_version)]
@@ -223,7 +236,7 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
              else clocks.latest(camera))
     if model is None:
         raise ValueError(f"机位 {camera} 缺少本条问题对应的校时版本，请先校时或重新分析。")
-    archives = source.archive_segments(camera)
+    archives = once(("archives", camera), lambda: source.archive_segments(camera))
     chips = []
     for event_id, bib in zip(item.event_ids, item.bibs):
         candidates = [read for read in source.reads if read.event_id == event_id and read.bib == bib]
@@ -251,7 +264,7 @@ def load_context(workspace: Path, item: ProblemItem, camera: int | None = None) 
     segments = tuple(s for s in archives if s.start_ms <= end and s.end_ms >= start)
     if not segments:
         raise ValueError(f"机位 {camera} 的本团原录像缺失；未打开其他时段录像。")
-    config = config_from_workspace(workspace)
+    config = once("config", lambda: config_from_workspace(workspace))
     anchor = next((segment for segment in segments if segment.segment.segment_id == frame.get("segment_id")), segments[0])
     line = dict((frame.get("line_config") if camera == frame.get("camera_index") else None)
                 or line_for_segment(config, source, anchor) or {})

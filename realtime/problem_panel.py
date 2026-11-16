@@ -701,7 +701,20 @@ class ProblemListPanel(QFrame):
     def set_events_provider(self, provider: Callable[[], object]) -> None:
         self._events_provider = provider
 
+    # While one refresh runs: every confirmed group checks its evidence against
+    # the same read of the workspace (see ``load_context(shared=...)``).
+    _context_share = None
+
     def refresh(self) -> None:
+        previous = self._context_share
+        if previous is None:
+            self._context_share = {}
+        try:
+            self._refresh_rows()
+        finally:
+            self._context_share = previous
+
+    def _refresh_rows(self) -> None:
         if self.problem_dir is None:
             return
         current = self.current_item()
@@ -926,7 +939,7 @@ class ProblemListPanel(QFrame):
                 return STATE_STALE
             from .bunch_review import load_context
             try:
-                context = load_context(self.workspace_dir, item, record["camera"])
+                context = load_context(self.workspace_dir, item, record["camera"], shared=self._context_share)
                 checked = self.bunch_store.get(context)
                 if checked is None:
                     return STATE_STALE
