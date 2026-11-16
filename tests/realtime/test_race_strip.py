@@ -6,7 +6,8 @@ from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication
 
-from realtime.race_strip import RaceStripPanel, RaceStripView, StripPiece, earlier_arrival, first_crossing
+from realtime.race_strip import (RaceStripPanel, RaceStripView, StripPiece, earlier_arrival, first_crossing,
+                                 line_arrivals, line_next_entry)
 from tests.realtime.test_quick_review_panel import panel, qapp
 
 
@@ -230,3 +231,75 @@ def test_someone_on_the_line_before_a_crossing_without_a_chip_is_found(tmp_path)
     walking = image.copy()
     body(walking, slice(10, 40), at - 1900, at + 300)     # someone walking along the line all along
     assert earlier_arrival([piece(tmp_path)], _Strips(times, walking), at) is None
+
+
+def test_a_fast_run_stops_where_something_comes_onto_the_line(tmp_path):
+    """11-14：空档快扫，线上一有人影就停；一帧的闪光、扫之前就在线上的人不算，没有过线图就说不知道。"""
+    times = T + np.arange(0, 30_000, 40, dtype=np.float64)
+    rng = np.random.default_rng(3)
+    image = (100 + rng.integers(-2, 3, (100, times.size, 3))).astype(np.uint8)
+
+    def body(rows, start, end):
+        image[rows, int(np.searchsorted(times, T + start)):int(np.searchsorted(times, T + end))] = 30
+
+    body(slice(20, 50), 9_800, 10_300)      # on the line already when the run starts
+    body(slice(20, 50), 12_000, 12_040)     # one frame: light, not a body
+    body(slice(60, 90), 14_000, 14_400)     # someone without a chip
+    body(slice(10, 15), 15_000, 15_400)     # five places of a hundred: too little
+    body(slice(30, 60), 16_000, 16_200)     # the next one
+    strips = _Strips(times, image)
+    pieces = [piece(tmp_path)]
+    assert line_arrivals(pieces, strips, T + 10_000, T + 18_000) == [T + 14_000, T + 16_000]
+    assert line_arrivals(pieces, strips, T + 10_000, T + 13_000) == []
+    assert line_arrivals(pieces, strips, T + 14_100, T + 15_500) == []     # still the one already there
+    assert line_arrivals(pieces, strips, T + 25_000, T + 40_000) is None   # the strip ends before the stretch does
+    assert line_arrivals([], strips, T + 10_000, T + 18_000) is None
+
+
+def test_someone_right_behind_is_the_line_taken_again_after_it_was_empty(tmp_path):
+    """11-15 古浪 12 号：紧跟 57 号 0.27 秒、过线图上看着像一团。线空了两帧又有人上来，就是下一个人。"""
+    times = T + np.arange(0, 30_000, 40, dtype=np.float64)
+    rng = np.random.default_rng(5)
+    image = (100 + rng.integers(-2, 3, (100, times.size, 3))).astype(np.uint8)
+
+    def body(rows, start, end):
+        image[rows, int(np.searchsorted(times, T + start)):int(np.searchsorted(times, T + end))] = 30
+
+    body(slice(20, 50), 10_000, 10_180)     # 57 on the line
+    body(slice(25, 55), 10_260, 10_460)     # 12, 0.26 s behind: a gap under ARRIVAL_MERGE_MS
+    body(slice(20, 50), 14_000, 14_200)     # a lone rider
+    strips = _Strips(times, image)
+    pieces = [piece(tmp_path)]
+    assert line_arrivals(pieces, strips, T + 10_000, T + 11_000) == []          # one body to line_arrivals
+    assert line_next_entry(pieces, strips, T + 10_000, T + 11_000) == T + 10_280
+    assert line_next_entry(pieces, strips, T + 14_000, T + 15_000) == float("inf")
+    assert line_next_entry(pieces, strips, T + 25_000, T + 40_000) is None
+
+
+def test_while_the_recording_plays_the_strip_scrolls_under_a_cursor_that_stays_put(qapp, tmp_path):
+    """11-14：紫线走一段、整屏跳一次，看着不流畅。播放时游标停在原处，图在下面连续走，也不为每一帧重画。"""
+
+    view = RaceStripView()
+    view.resize(1200, view.height())
+    view.set_pieces([piece(tmp_path, T, T + 600_000)])
+    view.set_chips([(T + 300_000, "1", False)])
+    view.show()
+    view.set_cursor(T + 300_000)          # a jump: centred as before
+    assert view.x_of(T + 300_000) == pytest.approx(view.width() / 2)
+    view.grab()
+    renders, top, place = view.strip_renders, view.STRIP_TOP, view.x_of(view.cursor)
+    stamp = T + 300_000
+    for _ in range(100):                  # four seconds of frames
+        stamp += 40
+        view.set_cursor(stamp)
+        view.grab()
+        assert view.x_of(stamp) == pytest.approx(place, abs=.01)
+        assert view.STRIP_TOP >= top      # the picture under the strip is not shaken
+    assert view.strip_renders <= renders + 1
+
+    view.set_cursor(stamp + 60_000)       # a jump again: half a screen, as before
+    assert view.x_of(stamp + 60_000) == pytest.approx(view.width() / 2)
+    view.set_cursor(stamp + 59_000)       # stepping back does not drag the strip
+    start = view.view_ms
+    view.set_cursor(stamp + 58_960)
+    assert view.view_ms == start

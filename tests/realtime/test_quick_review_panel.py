@@ -755,8 +755,10 @@ def test_an_extra_person_is_a_row_that_opens_where_they_were_clicked(wave_panel)
     wave_panel._arrival_clicked(row(wave_panel, "5"))
     extra = next(i for i, entry in enumerate(wave_panel._arrival_rows) if entry.mark is not None)
     wave_panel._arrival_clicked(extra)
-    assert jumps[-1]["recorder_ms"] == T0 + 1000
-    assert wave_panel._editing_mark == 3
+    # 11-15: by the chips' own times the one without a chip is the third click
+    # (76 crossed at +900, the last click sits right on it).
+    assert jumps[-1]["recorder_ms"] == T0 + 700
+    assert wave_panel._editing_mark == 2
     assert "多出一人" in wave_panel.hint.text()
     # Up / Down step past it to the pictures either side.
     wave_panel._step(1)
@@ -764,7 +766,7 @@ def test_an_extra_person_is_a_row_that_opens_where_they_were_clicked(wave_panel)
 
     wave_panel._arrival_clicked(extra)
     wave_panel.frame = dict(jumps[-1])
-    assert wave_panel.cancel_picture_mark(.8, .5)
+    assert wave_panel.cancel_picture_mark(.6, .5)
     assert all(entry.mark is None for entry in wave_panel._arrival_rows)
     assert wave_panel._selected_arrival().bib in {"61", "20", "76"}
     assert "芯片 3 · 已点 3" in wave_panel.confirmation_status.text()
@@ -776,21 +778,23 @@ def test_counting_a_wave_labels_people_in_chip_order_and_flags_the_one_without_a
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     for x, offset in ((.2, 100), (.4, 500), (.6, 700), (.8, 1000)):
         count_on_picture(wave_panel, x, offset)
-    assert labels(wave_panel) == ["61", "20", "76", "多 1"]
-    assert [wave_panel.picture_mark_warning(mark) for mark in wave_panel.current_marks()] == [False] * 3 + [True]
+    # Each click is saved at once in order; once there is one too many, the chips'
+    # own times put the one without a chip third (11-15), not last.
+    assert labels(wave_panel) == ["61", "20", "多 1", "76"]
+    assert [wave_panel.picture_mark_warning(mark) for mark in wave_panel.current_marks()] == [False, False, True, False]
     assert "芯片 3 · 已点 4 · 多 1 人" in wave_panel.confirmation_status.text()
-    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 700}  # each click saved at once
+    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
     assert wave_panel.table.item(row(wave_panel, "61"), 0).foreground().color().name() == "#b42318"
     # The wave's picture is not a row of its own; the one extra person is, at their own time.
-    assert [entry.bib for entry in wave_panel._arrival_rows] == ["61", "20", "76", "", "5"]
-    assert wave_panel.table.item(3, 3).text() == "多出"
-    assert wave_panel._arrival_rows[3].time_ms == T0 + 1000
+    assert [entry.bib for entry in wave_panel._arrival_rows] == ["61", "20", "", "76", "5"]
+    assert wave_panel.table.item(2, 3).text() == "多出"
+    assert wave_panel._arrival_rows[2].time_ms == T0 + 700
 
     wave_panel.frame = dict(FRAME, frame_index=19, position_ms=950, recorder_ms=T0 + 700)
-    wave_panel._arrival_clicked(row(wave_panel, "76"))  # the third person, picked on the left
+    wave_panel._arrival_clicked(2)  # the third person, the 多出 row on the left
     wave_panel._ask_bib = lambda current: None  # the bib is not read yet
-    menu(wave_panel, "这人没芯片：补录号码…")
-    # The person without a chip moves onto a 疑似漏读 row at their own time; 76 shifts to the next one.
+    menu(wave_panel, "补录号码…")
+    # The person without a chip moves onto a 疑似漏读 row at their own time; 76 stays on the next one.
     assert labels(wave_panel) == ["61", "20", "76"]
     assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
     rows = wave_panel._arrival_rows
@@ -802,7 +806,7 @@ def test_counting_a_wave_labels_people_in_chip_order_and_flags_the_one_without_a
     assert "已核" in wave_panel.confirmation_status.text() or "秒没看" in wave_panel.confirmation_status.text()
     # Still drawn on the wave's picture, in red.
     drawn = wave_panel.picture_overlays(wave_panel.frame)
-    assert any(label == "无芯片" and alert and not ghost for _x, _y, label, _ok, alert, _dot, ghost, _auto in drawn)
+    assert any(label == "无芯片" and alert and not ghost for _x, _y, label, _ok, alert, _dot, ghost, _auto, *_ in drawn)
 
 
 def test_every_click_saves_and_the_unseen_part_only_shows_never_blocks(wave_panel):
@@ -854,7 +858,7 @@ def test_a_person_counted_on_a_nearby_frame_is_drawn_faded_and_can_be_cancelled_
     count_on_picture(wave_panel, .2, 100)  # frame 7
     later = dict(FRAME, frame_index=10, position_ms=400, recorder_ms=T0 + 250)
     drawn = wave_panel.picture_overlays(later)
-    assert [(label, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, _auto in drawn] == [("61", True)]
+    assert [(label, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, _auto, *_ in drawn] == [("61", True)]
     # Further on the rider has moved away: no ring left on empty road.
     assert wave_panel.picture_overlays(dict(later, frame_index=11, recorder_ms=T0 + 300)) == []
     assert wave_panel.picture_overlays(dict(later, frame_index=5, recorder_ms=T0)) == []  # not before the click
@@ -1428,21 +1432,17 @@ def test_a_person_flagged_without_a_chip_cannot_be_counted_again(wave_panel):
     assert saved(wave_panel) == {}
 
 
-def test_a_detected_crossing_at_a_counted_moment_stays_a_row_shown_as_near_someone_counted(wave_panel):
-    """Review 10-29: hidden, it might be someone nobody counted; it is shown, 已点附近 (疑点保留)."""
+def test_a_detected_crossing_at_a_counted_moment_is_not_a_row_of_its_own(wave_panel):
+    """11-15：一个人一个人点，空格会停在紧跟的人身上；离已点的人 0.5 秒内的分析过线不再单列“已点附近”。"""
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     count_on_picture(wave_panel, .2, 100)
     detected = wave_panel.add_manual_problem(dict(FRAME, frame_index=9, recorder_ms=T0 + 300), recorder_ms=T0 + 300)
     far = wave_panel.add_manual_problem(dict(FRAME, frame_index=60, recorder_ms=T0 + 3000), recorder_ms=T0 + 3000)
     rows = {entry.item.item_id: index for index, entry in enumerate(wave_panel._arrival_rows)}
-    assert detected.item_id in rows and far.item_id in rows
-    assert wave_panel.table.item(rows[detected.item_id], 3).text() == "已点附近"
+    assert detected.item_id not in rows and far.item_id in rows
     assert wave_panel.table.item(rows[far.item_id], 3).text() == "待定"
-    assert "多半就是那个人" in wave_panel.table.item(rows[detected.item_id], 3).toolTip()
-    assert "待定" in wave_panel.attention_button.toolTip()  # still to look at
-    wave_panel._arrival_clicked(rows[detected.item_id])
-    assert "按 1 排除" in wave_panel.hint.text()
-    assert menu_labels(wave_panel, rows[detected.item_id])[:2] == ["补录号码…", "不是运动员"]
+    assert detected.item_id in {item.item_id for item in wave_panel.items}   # kept, only not shown
+    assert all(wave_panel.table.item(i, 3).text() != "已点附近" for i in range(wave_panel.table.rowCount()))
 
 
 def counted_short(wave_panel):
@@ -1526,7 +1526,7 @@ def test_enter_on_a_suspected_miss_takes_the_bib_read_off_the_frame(wave_panel):
     QTest.keyClick(wave_panel, Qt.Key_Return)
     entry = wave_panel._arrival_rows[index]
     assert entry.bib == "88" and wave_panel.table.item(index, 3).text() == "补录"
-    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 700}  # chips untouched
+    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}  # chips untouched
     QTest.keyClick(wave_panel, Qt.Key_Backspace)
     assert wave_panel._row_state(wave_panel._arrival_rows[index]) == "疑似漏读"
 
@@ -1727,7 +1727,7 @@ def test_a_wave_with_as_many_people_as_chips_is_paired_by_the_system_and_nothing
     assert "自动对上" in wave_panel.confirmation_status.text()
     # Drawn on the frame its person was seen on, with the chip's bib, as the system's pairing.
     drawn = wave_panel.picture_overlays(dict(FRAME, frame_index=15, position_ms=750, recorder_ms=T0 + 500))
-    assert [(label, auto, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, auto in drawn] == [("20", True, False)]
+    assert [(label, auto, ghost) for _x, _y, label, _ok, _alert, _dot, ghost, auto, *_ in drawn] == [("20", True, False)]
 
 
 def test_a_wave_with_a_different_number_of_people_or_a_blocked_view_is_left_to_hand(wave_panel, monkeypatch):
@@ -1752,6 +1752,20 @@ def test_enter_accepts_the_paired_evidence_without_padding_or_claiming_manual_co
     assert (decision["frame"]["marker_x_normalized"], decision["frame"]["marker_y_normalized"]) == (
         round(people[1].x, 4), round(people[1].y, 4))
     assert wave_panel._auto_labels == {}
+    assert wave_panel._arrival_exports() == ([], [], 0)
+
+
+def test_space_on_a_wave_the_system_paired_accepts_it_and_goes_on(wave_panel, monkeypatch):
+    """11-15：点人时每点都自动存，回车不再是确认。自动对上的一波看一眼对就按空格往下走，仍记为系统对应。"""
+
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    assert "按空格往下走" in wave_panel.hint.text() and "回车" not in wave_panel.hint.text()
+    wave_panel._arrival_drafts["seen"] = {}
+    assert wave_panel.play_on()
+    assert saved(wave_panel) == {"61": 100, "20": 500, "76": 1000}
+    assert states(wave_panel)["61"] == "已接受对应"                  # the system's pairing, not a manual count
+    assert wave_panel._selected_arrival().bib == "5"                 # on to the next wave
     assert wave_panel._arrival_exports() == ([], [], 0)
 
 
@@ -1789,3 +1803,708 @@ def test_calibration_is_a_front_button_that_turns_red_until_the_recording_is_cal
     assert button.text() == "已校时" and "c2410c" not in button.styleSheet()
     QTest.mouseClick(button, Qt.LeftButton)  # still there to redo it
     assert len(spy) == 2
+
+
+def run_signals(panel):
+    runs = []
+    panel.run_requested.connect(runs.append)
+    return runs
+
+
+def past_the_one_just_clicked(panel):
+    """The second right after a click is looked through 0.3 s a Space at a time (11-15);
+    tests about what Space does later start past it."""
+    panel._clicked_at = None
+    panel._close_behind_ms = 0
+
+
+def test_a_click_holds_the_recording_and_space_goes_on_to_the_next_chip(wave_panel, qapp):
+    """11-14：大集团里点完人录像自己往前跑，盯不住人。点完停住；滚轮一帧一帧走，空格到下一位停住。"""
+
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert runs == [] and wave_panel._run_to is None
+    assert "录像停在这里" in wave_panel.hint.text() and "20 号" in wave_panel.hint.text()
+
+    assert wave_panel.play_on()  # 11-15: right after a click, 0.3 s at a time
+    assert runs == [True] and wave_panel._run_to == T0 + 300 and not wave_panel._run_tail
+    look_through(wave_panel, 100, 300, 100)
+    qapp.processEvents()
+    assert runs == [True, False]
+    assert wave_panel.play_on()  # 20 is due right here: a little further, as always
+    assert wave_panel._run_to == T0 + 600 and not wave_panel._run_tail
+    look_through(wave_panel, 340, 600, 20)
+    qapp.processEvents()
+    assert runs == [True, False, True, False] and wave_panel._run_to is None
+    assert "20 号" in wave_panel.hint.text()
+    assert wave_panel._selected_arrival().bib == "61"  # nothing was counted or moved on by the run
+
+
+def test_after_a_click_space_never_runs_past_whoever_is_right_behind(wave_panel, qapp, monkeypatch):
+    """11-15 古浪 12 号：没芯片、紧跟 57 号 0.27 秒。点完 57 按空格，录像快放到本波末尾，12 号一闪而过。
+    点完人后 1 秒内，空格每次只走 0.3 秒、正常速度。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    monkeypatch.setattr(module, "line_arrivals", lambda *_args: [])   # the two are one blob on the strip
+    speeds = []
+    wave_panel.run_speed.connect(speeds.append)
+    count_the_wave(wave_panel, qapp)                                     # the last one at 900
+    wave_panel.race_strip.view.pieces = [
+        StripPiece(Path("none.npz"), 1, "s", Path("none.avi"), T0 - 10_000, T0 + 60_000, False, 0)]
+    look_through(wave_panel, 900, 900)
+    assert wave_panel.play_on()
+    assert wave_panel._run_to == T0 + 1200 and not wave_panel._run_tail and speeds[-1] == 1.0
+    assert "往前走一点" in wave_panel.hint.text()
+    look_through(wave_panel, 920, 1200, 20)
+    qapp.processEvents()
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 1500 and speeds[-1] == 1.0
+    look_through(wave_panel, 1220, 1500, 20)
+    qapp.processEvents()
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 1800
+    look_through(wave_panel, 1520, 1800, 20)
+    qapp.processEvents()
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 2100     # still under a second after 76's chip
+    look_through(wave_panel, 1820, 2100, 20)
+    qapp.processEvents()
+    wave_panel.play_on()                                                 # a second on: as before
+    assert wave_panel._run_to != T0 + 2400
+
+
+def test_behind_a_lone_rider_one_space_goes_on_and_right_behind_someone_it_stops_on_them(
+        wave_panel, qapp, monkeypatch):
+    """11-15：一个人的话按好几下空格才走得动，太麻烦。过线图能看出线上空了又有人上来：
+    有就停在他压线的地方，没有就照旧一下走到下一位。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    entries = {}
+    monkeypatch.setattr(module, "line_next_entry",
+                        lambda _pieces, _cache, start, end: entries.get("at", float("inf")))
+    monkeypatch.setattr(module, "line_arrivals", lambda *_args: [])
+    speeds = []
+    wave_panel.run_speed.connect(speeds.append)
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel.race_strip.view.pieces = [
+        StripPiece(Path("none.npz"), 1, "s", Path("none.avi"), T0 - 10_000, T0 + 60_000, False, 0)]
+    # Nobody right behind 61: one Space, on to 20 as before.
+    assert wave_panel.play_on() and runs == [True] and wave_panel._run_to == T0 + 400
+    wave_panel.stop_run()
+    # Someone without a chip 0.27 s behind: Space stops on them, at normal speed.
+    entries["at"] = T0 + 270
+    assert wave_panel.play_on() and wave_panel._run_to == T0 + 270 and speeds[-1] == 1.0
+    assert "紧跟着有人上线" in wave_panel.hint.text()
+
+
+def test_right_behind_a_chip_space_steps_however_one_got_there(wave_panel, qapp):
+    """11-15：57 号是上一轮点过的，这次只是选中它再按空格，后面的人照样被快放过去。"""
+
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "5"))                  # a row, not a click on the picture
+    look_through(wave_panel, 10_000, 10_000)                            # 5's chip is at 10 s
+    assert wave_panel._clicked_at is None
+    assert wave_panel.play_on() and runs == [True]
+    assert wave_panel._run_to == T0 + 10_300 and not wave_panel._run_fast
+    assert "紧跟" in wave_panel.hint.text()
+
+
+def test_someone_due_on_this_picture_keeps_it_where_it_is(wave_panel, qapp):
+    wave_panel.events[1] = event("20", "b", T0 + 100)  # side by side with 61
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert runs == [] and wave_panel._run_to is None
+
+
+def test_a_key_or_a_row_holds_the_run(wave_panel, qapp):
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert wave_panel.play_on() and runs == [True]
+    assert wave_panel.stop_run() and runs == [True, False]
+    assert not wave_panel.stop_run() and runs == [True, False]
+
+    assert wave_panel.play_on() and runs == [True, False, True]
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
+    assert runs[-1] is False and wave_panel._run_to is None
+
+
+def count_the_wave(panel, qapp):
+    panel._arrival_clicked(row(panel, "61"))
+    for x, offset in ((.2, 0), (.4, 400), (.6, 900)):
+        look_through(panel, max(0, offset - 400), offset, 100)
+        count_on_picture(panel, x, offset)
+        qapp.processEvents()
+
+
+def test_a_wave_counted_even_is_played_past_its_tail_and_then_opens_the_next(wave_panel, qapp):
+    """人数对上、看到本波末尾后 1 秒（防尾部有没芯片的人）才到下一处；对不上就停着。没有过线图时直接到下一处并说明。"""
+
+    runs = run_signals(wave_panel)
+    count_the_wave(wave_panel, qapp)
+    assert runs == [] and wave_panel._run_to is None  # the last click holds as well
+    past_the_one_just_clicked(wave_panel)
+    assert wave_panel.play_on()
+    assert wave_panel._run_to == T0 + 900 + 1000 and wave_panel._run_tail
+    assert wave_panel._selected_arrival().bib == "76"  # not before the tail is seen
+    look_through(wave_panel, 1000, 1900, 100)
+    qapp.processEvents()
+    assert runs[-1] is False
+    assert wave_panel._selected_arrival().bib == "5"
+    assert "对上" in wave_panel.hint.text() and "没有过线图" in wave_panel.hint.text()
+
+
+def test_a_wave_counted_even_sweeps_to_the_next_one_and_stops_where_something_is_on_the_line(
+        wave_panel, qapp, monkeypatch):
+    """11-14 古浪 11:49:14→11:49:21：点齐后直接跳到下一波，中间几秒没人看过。改成快扫过去，线上有人影就停。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    found = [T0 + 5000]
+    monkeypatch.setattr(module, "line_arrivals",
+                        lambda _pieces, _cache, start, end: [moment for moment in found if start < moment < end])
+    pieces = [StripPiece(Path("none.npz"), 1, "s", Path("none.avi"), T0 - 10_000, T0 + 60_000, False, 0)]
+    speeds = []
+    wave_panel.run_speed.connect(speeds.append)
+    runs = run_signals(wave_panel)
+    count_the_wave(wave_panel, qapp)
+    past_the_one_just_clicked(wave_panel)
+    assert wave_panel.play_on()
+    look_through(wave_panel, 1000, 1900, 100)
+    wave_panel.race_strip.view.pieces = pieces
+    qapp.processEvents()
+    # Even: not a jump to 5, a fast run that stops at whoever is on the line at 5 s.
+    assert wave_panel._selected_arrival().bib == "76"
+    assert wave_panel._run_to == T0 + 5000 and speeds[-1] == 4.0 and runs[-1] is True
+    assert "快扫到下一波" in wave_panel.hint.text()
+    look_through(wave_panel, 2000, 5000, 200)
+    qapp.processEvents()
+    assert runs[-1] is False and wave_panel._run_to is None and speeds[-1] == 1.0
+    assert wave_panel._selected_arrival().bib == "76" and "人影" in wave_panel.hint.text()
+    # Not a rider: Space sweeps on, and at the next chip its row opens.
+    found = []
+    wave_panel.race_strip.view.pieces = pieces
+    assert wave_panel.play_on()
+    assert wave_panel._run_to == T0 + 10_000 and runs[-1] is True
+    look_through(wave_panel, 5200, 10_000, 200)
+    qapp.processEvents()
+    assert runs[-1] is False and wave_panel._selected_arrival().bib == "5"
+    assert "对上" in wave_panel.hint.text() and "没有过线图" not in wave_panel.hint.text()
+
+
+def test_a_wave_that_does_not_count_even_stays_at_its_tail(wave_panel, qapp):
+    count_the_wave(wave_panel, qapp)
+    look_through(wave_panel, 1000, 1400, 100)
+    count_on_picture(wave_panel, .8, 1400)  # a fourth person at the back: no chip
+    qapp.processEvents()
+    past_the_one_just_clicked(wave_panel)
+    assert wave_panel.play_on()
+    look_through(wave_panel, 1500, 1900, 100)
+    qapp.processEvents()
+    assert wave_panel._selected_arrival().bib != "5"
+    assert "多 1 人" in wave_panel.confirmation_status.text()
+    assert "看到末尾" in wave_panel.hint.text()
+
+
+def test_in_a_tight_wave_seen_late_on_the_picture_the_run_never_skips_the_next_rider(wave_panel, qapp):
+    """11-11 现场：一波人很密、画面上压线比芯片晚半秒时，录像一口气放过了整波，没法点。"""
+
+    wave_panel.events[:3] = [event("61", "a", T0), event("20", "b", T0 + 100), event("76", "c", T0 + 200)]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 500)  # 61 crosses half a second after its chip
+    qapp.processEvents()
+    assert runs == [] and wave_panel._run_to is None  # it stays
+    assert "20 号" in wave_panel.hint.text()
+    count_on_picture(wave_panel, .4, 650)
+    qapp.processEvents()
+    assert runs == [] and wave_panel._run_to is None
+
+
+def test_a_run_aims_at_the_next_chip_shifted_by_how_late_this_wave_is_seen(wave_panel, qapp):
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 500, 500)
+    count_on_picture(wave_panel, .2, 500)  # chips at 0, 400, 900: seen 500 ms late
+    qapp.processEvents()
+    past_the_one_just_clicked(wave_panel)
+    assert runs == [] and wave_panel.play_on()
+    assert runs == [True] and wave_panel._run_to == T0 + 900
+
+
+def test_space_on_a_wave_nobody_is_clicked_on_yet_plays_to_the_first_chip_and_stops(wave_panel, qapp):
+    """11-12 古浪：大集团里按空格录像一口气放完，来不及一个个点；空格也要走到下一位停住。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, -600, -600)
+    runs = run_signals(wave_panel)
+    assert wave_panel.play_on()
+    assert runs == [True] and wave_panel._run_to == T0 and not wave_panel._run_tail
+    assert "已点 0/3 人" in wave_panel.hint.text() and "走到下一位" in wave_panel.hint.text()
+    look_through(wave_panel, -400, 0, 40)
+    qapp.processEvents()
+    assert runs == [True, False] and wave_panel._run_to is None
+    assert "61 号" in wave_panel.hint.text()
+    assert not any(entry.decision for entry in wave_panel._arrival_rows)  # Space counts nobody
+
+
+def test_space_with_the_next_rider_due_here_but_not_at_the_line_moves_a_little(wave_panel, qapp):
+    wave_panel.events[:3] = [event("61", "a", T0), event("20", "b", T0 + 100), event("76", "c", T0 + 200)]
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 500)
+    qapp.processEvents()
+    assert runs == [] and "录像停在这里" in wave_panel.hint.text()
+    look_through(wave_panel, 500, 500)
+    assert wave_panel.play_on()
+    assert runs == [True] and wave_panel._run_to == T0 + 500 + 300 and not wave_panel._run_tail
+    look_through(wave_panel, 540, 800, 40)
+    qapp.processEvents()
+    assert runs == [True, False] and wave_panel._run_to is None
+
+
+def test_space_past_the_wave_or_with_no_wave_plays_as_always(wave_panel, qapp):
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 900 + 1000, 900 + 1000)
+    runs = run_signals(wave_panel)
+    assert not wave_panel.play_on() and runs == []
+    wave_panel._shown_ms = None  # no picture shown yet
+    assert not wave_panel.play_on() and runs == []
+
+def test_going_back_over_a_counted_wave_space_goes_from_one_clicked_person_to_the_next(
+        wave_panel, qapp, monkeypatch):
+    """11-15 古浪：回头看点齐的一波，点完 73 号按空格，一下过去好多人。要一个一个停在已点的人身上。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    # A tight bunch: on the strip the line never empties, someone new only after the wave.
+    monkeypatch.setattr(module, "line_arrivals", lambda _pieces, _cache, start, end: [
+        moment for moment in [T0 + 4000] if start < moment < end])
+    monkeypatch.setattr(module, "line_next_entry", lambda *_args: float("inf"))
+    count_the_wave(wave_panel, qapp)
+    wave_panel.race_strip.view.pieces = [StripPiece(Path("none.npz"), 1, "s", Path("none.avi"),
+                                                    T0 - 10_000, T0 + 60_000, False, 0)]
+    runs, speeds, opened = run_signals(wave_panel), [], []
+    wave_panel.run_speed.connect(speeds.append)
+    wave_panel.jump_requested.connect(opened.append)
+    marks = wave_panel.current_marks()
+    look_through(wave_panel, 0, 0)                    # back on the first one clicked
+    for index, there in ((1, 400), (2, 900)):
+        wave_panel._clicked_at = None
+        assert wave_panel.play_on()
+        assert wave_panel._run_to == T0 + there and speeds[-1] == 1.0 and runs[-1] is True
+        assert "到下一位已点的人" in wave_panel.hint.text()
+        # The run stops two frames short; the clicked person's own frame opens and
+        # their row is picked out: nothing invites a second click on them.
+        look_through(wave_panel, there - 200, there - 80, 40)
+        qapp.processEvents()
+        assert runs[-1] is False and wave_panel._run_to is None
+        assert opened[-1] == dict(marks[index]["frame"], reference_only=True)
+        assert wave_panel._editing_mark == index
+        assert wave_panel._selected_arrival().bib == ["61", "20", "76"][index]
+        assert "不用再点" in wave_panel.hint.text() and "机器看到" not in wave_panel.hint.text()
+        look_through(wave_panel, there, there)        # the window shows that frame
+    # Behind the last one clicked it plays on as before (the tail, then the next wave).
+    look_through(wave_panel, 900, 900)
+    wave_panel.play_on()
+    assert wave_panel._run_to is None or wave_panel._run_to > T0 + 900
+
+
+def test_a_clicked_person_ahead_is_never_swept_past_fast(wave_panel, qapp, monkeypatch):
+    """审查 11-15：已点的人排在前面时，不能被 4 倍速扫过去。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    monkeypatch.setattr(module, "line_arrivals", lambda _pieces, _cache, start, end: [
+        moment for moment in [T0 + 4000] if start < moment < end])
+    count_the_wave(wave_panel, qapp)
+    past_the_one_just_clicked(wave_panel)
+    wave_panel.race_strip.view.pieces = [StripPiece(Path("none.npz"), 1, "s", Path("none.avi"),
+                                                    T0 - 10_000, T0 + 60_000, False, 0)]
+    speeds = []
+    wave_panel.run_speed.connect(speeds.append)
+    look_through(wave_panel, -1500, -1500)            # well before the wave, nothing close behind
+    assert wave_panel.play_on()
+    assert wave_panel._run_to == T0 and speeds[-1] == 1.0 and not wave_panel._run_fast
+
+
+def test_a_run_left_behind_stops_playing_and_a_jump_ends_it(wave_panel, qapp):
+    """审查 11-15：操作员走开后，正常速度的运行也要停；跳到别处时运行作废。"""
+
+    runs = run_signals(wave_panel)
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, -600, -600)
+    assert wave_panel.play_on() and runs == [True] and not wave_panel._run_fast
+    look_through(wave_panel, 45_000, 45_000)
+    assert wave_panel._run_to is None and runs == [True, False]
+    look_through(wave_panel, -600, -600)
+    assert wave_panel.play_on() and wave_panel._run_to is not None
+    wave_panel.jump_requested.emit(dict(FRAME, recorder_ms=T0 + 30_000))
+    assert wave_panel._run_to is None and wave_panel._run_counted is None
+
+
+def test_space_on_a_system_pairing_that_cannot_be_saved_still_goes_on(wave_panel, monkeypatch):
+    """审查 11-15：自动对上存不上时，空格要说明原因并照常往下走，不能什么都不做却当作已处理。"""
+
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, -600, -600)
+    past_the_one_just_clicked(wave_panel)
+    monkeypatch.setattr(wave_panel, "picture_candidate", lambda _frame: (None, "这一处画面不能自动保存"))
+    runs = run_signals(wave_panel)
+    assert wave_panel.play_on()
+    assert runs == [True] and "这一处画面不能自动保存" in wave_panel.hint.text()
+    assert not any(entry.decision for entry in wave_panel._arrival_rows)
+
+
+def test_a_crossing_hidden_beside_someone_counted_still_holds_back_the_system_pairing(wave_panel, monkeypatch):
+    """审查 11-15：已点附近的过线不再单列一行，但它仍是疑点，这一波不自动对上。"""
+
+    from realtime import quick_review_panel as module
+
+    asked = []
+    real = module.label_wave
+
+    def spy(*args, **kwargs):
+        asked.append(kwargs.get("near_counted"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, "label_wave", spy)
+    auto_people(wave_panel, monkeypatch, (100, 500, 1000))
+    assert wave_panel._auto_labels and asked[0] is False     # nothing hidden: paired
+    # A crossing beside someone counted, hidden from the table, inside this wave.
+    keep = type(wave_panel)._without_repeats
+
+    def hidden_here(self, rows):
+        self._near_counted_times = (T0 + 600,)
+        return keep(self, rows)
+
+    monkeypatch.setattr(type(wave_panel), "_without_repeats", hidden_here)
+    asked.clear()
+    wave_panel._quick_render_signature = None
+    wave_panel._render()
+    assert True in asked and not wave_panel._auto_labels
+
+
+def test_rings_on_the_picture_carry_their_number_for_the_mouse_only_and_the_one_clicked_is_selected(
+        wave_panel, qapp):
+    """11-16：画面上只留小圈；刚点的人圈两圈，号码在右上角和上方号码格里。"""
+
+    count_the_wave(wave_panel, qapp)
+    marks = wave_panel.current_marks()
+    drawn = wave_panel.picture_overlays(marks[-1]["frame"])
+    here = [overlay for overlay in drawn if not overlay[6]]
+    assert here and all(overlay[8] for overlay in drawn)             # numbers only under the mouse
+    assert [(overlay[2], overlay[9]) for overlay in here] == [("76", True)]
+    wave_panel.show_counted(0)
+    drawn = wave_panel.picture_overlays(marks[0]["frame"])
+    assert [(overlay[2], overlay[9]) for overlay in drawn if not overlay[6]] == [("61", True)]
+    assert not any(overlay[9] for overlay in wave_panel.picture_overlays(marks[-1]["frame"]))
+
+
+def test_space_goes_on_from_where_one_is_never_to_the_row_after_a_wave_left_mid_sweep(
+        wave_panel, qapp, monkeypatch):
+    """11-15 古浪：76…3 那一波点齐后快扫，中途去看别处；后来在 63 号按空格，走到位就打开了 23 号。
+    空格要从当前看的这个人往后走，回头看过也一样。"""
+
+    from pathlib import Path
+
+    from realtime import quick_review_panel as module
+    from realtime.race_strip import StripPiece
+
+    monkeypatch.setattr(module, "line_arrivals",
+                        lambda _pieces, _cache, start, end: [moment for moment in [T0 + 5000] if start < moment < end])
+    pieces = [StripPiece(Path("none.npz"), 1, "s", Path("none.avi"), T0 - 10_000, T0 + 90_000, False, 0)]
+    count_the_wave(wave_panel, qapp)
+    past_the_one_just_clicked(wave_panel)
+    assert wave_panel.play_on()
+    look_through(wave_panel, 1000, 1900, 100)
+    wave_panel.race_strip.view.pieces = pieces
+    qapp.processEvents()
+    assert wave_panel._run_between is not None and wave_panel._run_to == T0 + 5000   # sweeping to the next wave
+    # The operator goes to look elsewhere mid-sweep: that sweep is over, its wave too.
+    look_through(wave_panel, 45_000, 45_000)
+    wave_panel.race_strip.view.pieces = pieces
+    assert wave_panel._run_to is None and wave_panel._run_between is None
+    # And Space anywhere starts afresh from the frame shown.
+    wave_panel._run_between = (wave_panel.current_item(), "there")
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
+    look_through(wave_panel, 9000, 9000)
+    opened = []
+    wave_panel.jump_requested.connect(opened.append)
+    wave_panel.play_on()
+    assert wave_panel._run_between is None or wave_panel._run_between[0] is not wave_panel.current_item()
+    look_through(wave_panel, 9200, 12_000, 200)
+    qapp.processEvents()
+    assert all(frame.get("recorder_ms", T0 + 9000) >= T0 + 9000 for frame in opened)  # never back
+
+
+def test_space_sweeps_an_empty_stretch_fast_and_stops_where_something_comes_onto_the_line(
+        wave_panel, qapp, monkeypatch):
+    """11-14：空档里滚轮和正常播放都太慢，跳过去又怕漏人：快扫，线上一有人影就停，最后一小段回到正常速度。"""
+
+    from realtime import quick_review_panel as module
+
+    asked = []
+
+    def arrivals(_pieces, _cache, start, end):
+        asked.append((start, end))
+        return [moment for moment in found if start < moment < end]
+
+    monkeypatch.setattr(module, "line_arrivals", arrivals)
+    speeds = []
+    wave_panel.run_speed.connect(speeds.append)
+    runs = run_signals(wave_panel)
+    # Past the wave (chips at 0, 400, 900 and a second of tail): someone without a chip 6 s on.
+    found = [T0 + 8000]
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 2000, 2000)
+    from pathlib import Path
+
+    from realtime.race_strip import StripPiece
+    pieces = [StripPiece(Path("none.npz"), 1, "s", Path("none.avi"), T0 - 10_000, T0 + 60_000, False, 0)]
+    wave_panel.race_strip.view.pieces = pieces
+    assert wave_panel.play_on()
+    assert runs == [True] and speeds == [4.0] and wave_panel._run_to == T0 + 8000
+    assert "人影" in wave_panel.hint.text()
+    look_through(wave_panel, 2040, 7560, 40)
+    assert speeds == [4.0] and runs == [True]            # still sweeping
+    look_through(wave_panel, 7600, 7640, 40)
+    assert speeds == [4.0, 1.0] and runs == [True]       # the last 0.4 s at normal speed
+    look_through(wave_panel, 7680, 8000, 40)
+    qapp.processEvents()
+    assert runs == [True, False] and wave_panel._run_to is None and speeds == [4.0, 1.0]
+    # Stopped by hand while sweeping: normal speed again, never left fast.
+    found = []
+    wave_panel.race_strip.view.pieces = pieces  # a render of the test panel reloads its (empty) strip
+    assert wave_panel.play_on() and speeds[-1] == 4.0
+    assert wave_panel.stop_run() and speeds[-1] == 1.0 and runs[-1] is False
+    # Where the strip does not cover the stretch, Space plays as it always did.
+    monkeypatch.setattr(module, "line_arrivals", lambda *_args: None)
+    count = len(runs)
+    assert not wave_panel.play_on() and len(runs) == count
+
+
+def test_every_run_or_hold_says_how_many_are_counted_and_who_was_just_clicked(wave_panel, qapp):
+    """11-11：录像自己往前走后，刚点的圈就看不到了，提示里要说清点到第几个、刚点的是谁。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert "已点 1/3 人（刚点的记为 61 号）" in wave_panel.hint.text()
+    look_through(wave_panel, 100, 400, 40)
+    qapp.processEvents()
+    assert "已点 1/3 人" in wave_panel.hint.text() and "20 号" in wave_panel.hint.text()
+
+
+
+def test_the_running_count_above_the_video_says_how_many_passed_and_the_last_bib(wave_panel, qapp):
+    """11-12：视频上方中间写“已过 N 人 · X 号”，和计时软件的累计人数直接对。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    first = count_on_picture(wave_panel, .2, 0)
+    count_on_picture(wave_panel, .4, 400)
+    qapp.processEvents()
+    assert wave_panel.passed_count_text(dict(first, recorder_ms=T0 - 1)) == "已过 0 人"
+    assert wave_panel.passed_count_text(first) == "已过 1 人 · 61 号"
+    assert wave_panel.passed_count_text(dict(first, recorder_ms=T0 + 600)) == "已过 2 人 · 20 号"
+    assert wave_panel.passed_count_text(dict(first, recorder_ms=T0 + 600, camera_index=2)) == "已过 0 人"
+
+
+def test_a_crossing_the_machine_thinks_is_staff_is_listed_with_its_reason(panel):
+    """11-12：机器觉得不像选手的过线照样列出，选中时说明理由，由操作员判断。"""
+    panel.events = []
+    evidence = {"frame": dict(FRAME), "recorder_ms": FRAME["recorder_ms"], "unlike_athlete": "站着或慢走",
+                "crossing_check": {"state": "confirmed", "reason": "person_track"}}
+    panel.items = [ProblemItem("staff?", KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO, "", evidence=evidence)]
+    panel._render()
+    assert panel.table.rowCount() == 1
+    row = panel._arrival_rows[0]
+    assert "机器看着不像选手（站着或慢走），由你判断" in panel._unlike_athlete(row)
+    panel._show_row_hint(row)
+    assert panel.hint.text().startswith("机器看着不像选手（站着或慢走）")
+    assert "机器看着不像选手" in panel.table.item(0, 3).toolTip()
+
+
+def test_the_cells_above_the_picture_fill_in_arrival_order_as_people_are_clicked(wave_panel, qapp):
+    """11-14：大集团里看不出点了几个、点了谁。画面上方全场一人一格、从左到右，点一个人填一格，多点的人是红格。"""
+
+    from realtime.wave_slots import DONE, EXTRA, NEXT, TODO
+
+    def cells():
+        wave_panel.refresh_slots("已过 0 人")
+        return [(slot.label, slot.state, slot.current) for slot in wave_panel.wave_slots.slots()]
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    assert cells() == [("61", NEXT, True), ("20", TODO, True), ("76", TODO, True), ("5", TODO, False)]
+    assert wave_panel.wave_slots.summary() == "已过 0 人　本波 0/3"
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    assert cells() == [("61", DONE, True), ("20", NEXT, True), ("76", TODO, True), ("5", TODO, False)]
+    for x, offset in ((.4, 400), (.6, 900), (.8, 1400)):
+        look_through(wave_panel, offset - 400, offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    # The person beyond the last chip sits where they crossed, before 5, not at the end.
+    assert cells() == [("61", DONE, True), ("20", DONE, True), ("76", DONE, True), ("多 1", EXTRA, True),
+                       ("5", TODO, False)]
+    assert wave_panel.wave_slots.summary() == "已过 0 人　本波 4/3 多 1 人"
+
+    # A filled cell goes back to the frame that person was clicked on; nothing is counted or undone.
+    jumps = []
+    wave_panel.jump_requested.connect(jumps.append)
+    marks = len(wave_panel.current_marks())
+    second = wave_panel.wave_slots.slots()[1]
+    wave_panel.wave_slots.mark_clicked.emit(second.mark)
+    assert len(jumps) == 1 and jumps[0]["reference_only"] and jumps[0]["recorder_ms"] == T0 + 400
+    assert len(wave_panel.current_marks()) == marks and wave_panel._selected_arrival().bib == "20"
+
+    # On to someone crossing alone: the cells stay, the bunch before stays green.
+    wave_panel._arrival_clicked(row(wave_panel, "5"))
+    states = cells()
+    assert [cell[:2] for cell in states[:3]] == [("61", DONE), ("20", DONE), ("76", DONE)]
+    assert states[-1] == ("5", NEXT, True) and not any(cell[2] for cell in states[:-1])
+
+
+def test_the_cells_are_not_rebuilt_for_every_frame_shown(wave_panel, qapp):
+    """11-14 审查：一波还没点人时每显示一帧都把全场重算一遍，4 倍快扫正是最吃紧的时候。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel.refresh_slots("已过 0 人")
+    hits = wave_panel.slot_cache_hits
+    for offset in range(0, 500, 50):  # frames going by, nobody clicked yet
+        look_through(wave_panel, offset, offset)
+        wave_panel.refresh_slots("已过 0 人")
+    assert wave_panel.slot_cache_hits == hits + 10
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel.refresh_slots("已过 1 人")  # a click is seen at once
+    assert [slot.state for slot in wave_panel.wave_slots.slots()][:2] == ["done", "next"]
+    hits = wave_panel.slot_cache_hits
+    for _ in range(5):
+        wave_panel.refresh_slots("已过 1 人")
+    assert wave_panel.slot_cache_hits == hits + 5
+
+
+def test_the_person_the_operator_is_on_stands_out_in_the_table_and_the_cells(wave_panel, qapp):
+    """11-14：“我现在点到哪一个人物，好像不能一下看出来”。下一位要点的人：左表标黄加粗、格子标黄；点齐后是刚点的人。"""
+
+    from PyQt5.QtGui import QColor
+
+    def yellow_rows():
+        table = wave_panel.table
+        return [wave_panel._arrival_rows[i].bib for i in range(table.rowCount())
+                if table.item(i, 0) is not None and table.item(i, 0).background().color() == QColor("#ffd84d")]
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    wave_panel.refresh_slots("已过 0 人")
+    key, words, kind = wave_panel.current_target()
+    assert words == "下一位 61 号" and kind == "next" and yellow_rows() == ["61"]
+    assert [slot.label for slot in wave_panel.wave_slots.slots() if slot.target] == ["61"]
+    assert wave_panel.table.styleSheet() == wave_panel.TARGET_ROW_STYLE   # the selected row is that person
+
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel.refresh_slots("已过 1 人")
+    assert wave_panel.current_target()[1] == "下一位 20 号" and yellow_rows() == ["20"]
+    assert [slot.label for slot in wave_panel.wave_slots.slots() if slot.target] == ["20"]
+
+    for x, offset in ((.4, 400), (.6, 900)):
+        look_through(wave_panel, offset - 400, offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    wave_panel.refresh_slots("已过 3 人")
+    words = wave_panel.current_target()[1]
+    assert words.endswith("已点") or words == "本波点齐"
+    assert wave_panel.current_target()[2] == "done" and yellow_rows() == []   # yellow is only ever the next one
+
+    look_through(wave_panel, 1000, 1400, 100)
+    count_on_picture(wave_panel, .8, 1400)            # one more than the chips
+    qapp.processEvents()
+    wave_panel.refresh_slots("已过 3 人")
+    assert wave_panel.current_target()[1:] == ("多 1 人", "alert") and yellow_rows() == []
+
+
+def test_beside_the_count_of_the_wave_only_what_needs_doing_is_said(wave_panel, qapp):
+    """11-14：过线图上面“芯片 1 · 已点 1 · 已核”平时和“本波 1/1”重复。只在有事要做时，在本波旁边说。"""
+
+    wave_panel._arrival_clicked(row(wave_panel, "61"))
+    look_through(wave_panel, 0, 0)
+    count_on_picture(wave_panel, .2, 0)
+    qapp.processEvents()
+    wave_panel._sync_arrival_confirmation()
+    wave_panel.refresh_slots("已过 1 人")
+    assert wave_panel.confirmation_status.isHidden()
+    assert "没看" in wave_panel.confirmation_status.text()          # still worked out, for the alert
+    alert = wave_panel.wave_slots.alert()
+    assert "没看" in alert and "芯片" not in alert and "已点" not in alert
+
+    for x, offset in ((.4, 400), (.6, 900)):
+        look_through(wave_panel, offset - 400, offset, 100)
+        count_on_picture(wave_panel, x, offset)
+        qapp.processEvents()
+    look_through(wave_panel, -600, 1500, 100)                        # the whole wave seen
+    wave_panel._sync_arrival_confirmation()
+    wave_panel.refresh_slots("已过 3 人")
+    assert wave_panel.confirmation_status.text().endswith("已核")
+    assert wave_panel.wave_slots.alert() == ""                       # all well: nothing said
+    wave_panel.wave_slots.grab()
+
+
+
+def test_clicked_one_by_one_the_person_without_a_chip_is_still_found_inside_the_bunch(qapp, tmp_path):
+    """11-15 盲测 261 号：每点一下就按顺序存一下，最后多出来的那下以前总算在最后一个人身上。
+    要按芯片自己的时间算：没芯片的人在集团里，挨得太近的几个人都列出来交给裁判。"""
+
+    chips = [129, 650, 960, 1320, 2719, 2890, 2940, 3079, 3099, 3731, 3753, 4781, 6253, 7110]
+    clicks = [68, 548, 948, 1228, 2588, 2668, 2828, 2829, 3028, 3068, 3668, 3708, 4788, 6188, 7108]
+    directory = tmp_path / "finish_problems"
+    directory.mkdir()
+    (directory / "problem_list.json").write_text(json.dumps({"race_id": SCOPE[0], "stage_id": SCOPE[1],
+                                                            "items": []}), encoding="utf-8")
+    panel = QuickReviewPanel()
+    panel.events = [event(str(100 + i), f"e{i}", T0 + 1000 + t) for i, t in enumerate(chips)]
+    panel.frame = dict(FRAME)
+    panel.set_events_provider(lambda: panel.events)
+    panel.set_frame_provider(lambda: panel.frame)
+    panel.set_workspace(tmp_path)
+    panel.set_scope(*SCOPE)
+    for i, moment in enumerate(clicks):
+        count_on_picture(panel, round(.05 + .06 * i, 3), 1000 + moment)
+    assert labels(panel)[4] == "多 1"                              # 261 号: just ahead of 246
+    assert labels(panel)[-1] == "113"                              # not the wave's last person
+    assert saved(panel)["104"] == 1000 + clicks[5]                # the saved pairing moves along with it
+    assert "分不清" in panel._wave_status(panel._wave_plan())[0]

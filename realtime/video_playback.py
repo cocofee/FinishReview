@@ -443,6 +443,7 @@ class VideoPlaybackWorker(QThread):
         self._stop_requested = False
         self._playing = True
         self._speed = 1.0
+        self._even_playback = False
         self._direction = 1
         self._seek_frame: Optional[tuple[int, int]] = None
         self._full_resolution_frame: Optional[tuple[int, int]] = None
@@ -521,6 +522,19 @@ class VideoPlaybackWorker(QThread):
             self._navigation_frame_index = self._current_frame_index
             self._full_resolution_frame = None
             self._condition.notify_all()
+
+    def set_even_playback(self, even: bool) -> None:
+        """Fast forward in even steps of SPEED frames, never further ahead than that.
+
+        Playback follows the clock: when decoding cannot keep up at 4x the
+        target frame runs ahead, a gap of more than a dozen frames is reached
+        by a seek, which is slower still, and the picture jumps (11-14, a
+        sweep "直接跳到那个人去了").  Even playback is as fast as the decoder
+        allows, up to the speed asked for, and shows one frame in SPEED.
+        """
+
+        with self._condition:
+            self._even_playback = bool(even)
 
     def set_shuttle_speed(self, speed: float) -> None:
         speed = max(-4.0, min(4.0, float(speed)))
@@ -1212,17 +1226,25 @@ class VideoPlaybackWorker(QThread):
             if self._seek_frame is None and self._step_frame is None:
                 self._navigation_frame_index = frame_index
             presentation = None
+            # Even fast forward waits for its frame to be drawn as well: the
+            # decoder runs ahead of a busy window, which then shows one frame
+            # in twenty and the picture jumps (11-14).
             if (self._presentation_ack_enabled and self._playing
-                    and self._direction < 0 and self._speed <= 1.0):
+                    and (self._direction < 0 and self._speed <= 1.0
+                         or self._even_playback and self._direction > 0 and self._speed > 1.0)):
                 presentation = (self._request_generation, frame_index)
                 self._pending_presentation = presentation
             self._last_frame_emitted_at = time.monotonic()
         self.frame_ready.emit(image, position_ms, frame_index)
         if presentation is not None:
+            # Reverse review waits as long as it takes; a fast run goes on after
+            # half a second, drawn or not, so it can never hang on a busy window.
+            deadline = None if self._direction < 0 else time.monotonic() + 0.5
             with self._condition:
                 while (self._pending_presentation == presentation
                        and self._request_generation == presentation[0]
-                       and not self._stop_requested):
+                       and not self._stop_requested
+                       and (deadline is None or time.monotonic() < deadline)):
                     self._condition.wait(timeout=0.05)
                 if self._pending_presentation == presentation:
                     self._pending_presentation = None
@@ -1601,6 +1623,7 @@ class VideoPlaybackWorker(QThread):
                     self._step_frame = None
                     playing = self._playing
                     speed = self._speed
+                    even = self._even_playback
                     direction = self._direction
                     anchor_reset = self._anchor_reset
                     self._anchor_reset = False
@@ -1706,6 +1729,8 @@ class VideoPlaybackWorker(QThread):
                     target = last_frame_index - 1
                 else:
                     target = anchor_frame + direction * int(elapsed * self._fps * speed)
+                    if even and direction > 0 and speed > 1.0:
+                        target = min(target, last_frame_index + max(1, int(round(speed))))
                 if (
                     (direction > 0 and self._frame_count and target >= self._frame_count)
                     or (direction < 0 and target < 0)

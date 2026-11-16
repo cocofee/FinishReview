@@ -20,6 +20,7 @@ from .auto_label import WAVE_REACH_MS, label_wave, people_on_line
 from .arrival_review import (
     ARRIVAL_REVIEWS_FILENAME, ArrivalReviewStore, candidate_binding, event_binding,
 )
+from .extra_person import fit_wave
 from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, uncovered_intervals
 from .chip_history import format_chip_time
 from .crossing_time import item_crossing_time, manual_clock_offsets, recorder_crossing_time, workspace_clocks
@@ -30,8 +31,10 @@ from .problem_items import (
     STATUS_WAITING, ProblemItem, stable_item_id,
 )
 from .problem_panel import ProblemListPanel
+from .wave_slots import DONE, ELSEWHERE, EXTRA, NEXT, NO_CHIP, TODO, Slot, WaveSlotRow
 from .problem_resolutions import _frame_text, _passage_number, export_lists
-from .race_strip import AUTO_LABELLED, RaceStripPanel, earlier_arrival, first_crossing, frame_at
+from .race_strip import (AUTO_LABELLED, RaceStripPanel, earlier_arrival, first_crossing, frame_at, line_next_entry,
+                         line_arrivals)
 
 
 # Chips closer together than this are one wave, and the operator counts the
@@ -63,6 +66,50 @@ REVIEW_STALL_MS = 3000
 # Shift+3 excludes this row and the undecided pictures after it, up to a chip or
 # a gap this long: someone walking about at the line (特奥测试, 10-28).
 EXCLUSION_RUN_GAP_MS = 10_000
+# 点一个人，录像自己走到下一位 (11-11): after a click on a wave's picture the
+# recording plays on to the next chip nobody is counted for, or the next person
+# the analysis saw, and stops there.  Someone due within RUN_NEAR_MS is on the
+# picture already (side by side, or the clock a little off): it stays.  With
+# nobody left it plays RUN_TAIL_MS past the last chip, so a rider without a chip
+# at the back of the wave is seen, and a wave that then counts even opens the next.
+RUN_NEAR_MS = 200
+RUN_STOP_LEAD_MS = 80
+RUN_TAIL_MS = 1000
+RUN_STALE_MS = 30_000
+# Space on a wave goes the same way (11-12, 古浪: in a big bunch Space played
+# everyone past before one could be clicked).  With the next chip due right
+# here but nobody at the line yet, Space moves RUN_STEP_MS on and stops again.
+RUN_STEP_MS = 300
+# Space through a stretch with nobody due (11-14: wheel and normal play are too
+# slow there, a jump could miss someone): the recording plays this fast, every
+# frame shown, down to RUN_SLOW_MS before where it stops, and it also stops
+# where the strip shows something coming onto the line (line_arrivals).  Only
+# where the strip covers the stretch, and only when it is at least this long.
+RUN_FAST_SPEED = 4.0
+RUN_FAST_MIN_MS = 1000
+RUN_SLOW_MS = 400
+# Between waves Space sweeps the same way, this far at a time (under
+# RUN_STALE_MS), to the next chip or to whatever comes onto the line first.
+SWEEP_REACH_MS = 25_000
+# 11-15 古浪 12 号 (no chip, 0.27 s behind 57): after 57 Space ran on fast and
+# the one right behind went past unseen ("大集团这个有点危险").  For this long
+# after any chip, or anyone counted, Space only moves RUN_STEP_MS at a time, at
+# normal speed, however the operator got there (a click, a row, the strip).
+CLOSE_BEHIND_MS = 1000
+# Space there plays on at normal speed and stops where the strip shows someone
+# new come onto the line (line_next_entry); a lone rider's line stays empty and
+# Space goes on as before, one press (11-15: "一个人的话还要点好几次").  The
+# first SAME_BODY_MS after the one counted are their own back wheel.  Only
+# where the strip cannot tell does Space step RUN_STEP_MS at a time.
+SAME_BODY_MS = 150
+def row_moment(row):
+    """A chip row's chip time (not its rider's click); a row without a chip, its own time."""
+    return int(row.event.timeline_timestamp_ms) if row.event is not None else row.time_ms
+
+
+# Within this of the frame shown a clicked person is the one on screen (one
+# frame at 25 fps is 40 ms): Space goes on to the next one, not to them.
+SAME_FRAME_MS = 20
 # A chip of a confirmed wave that nobody on the picture was counted for
 # (older confirmations only; a wave now shows 少 N until someone is counted).
 WAVE_NO_PERSON = "wave_no_person"
@@ -100,8 +147,15 @@ ROW_KEYS = {Qt.Key_1: ("这人不是运动员", "不是运动员", "非运动员
             Qt.Key_3: ("这人没芯片：补录号码…", "补录号码…", "改号码…")}
 KEY_NAMES = {Qt.Key_1: "1 不是运动员", Qt.Key_2: "2 双芯片", Qt.Key_3: "3 补录号码"}
 NUMBER_KEYS = (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5)
-AUTO_PICTURE_REASON = "自动对上：按过线顺序对应芯片，操作员按回车接受"
-AUTO_TEXT = "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；回车接受对应，号码不对按 4 撤回。"
+AUTO_PICTURE_REASON = "自动对上：按过线顺序对应芯片，操作员看过往下走即接受"
+AUTO_TEXT = "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；看一眼对就按空格往下走，号码不对按 4 撤回。"
+# 11-15: people are counted one by one and every click is saved; Enter no longer
+# confirms anything.  An 自动对上 wave is accepted by going on from it, Space
+# (or Enter); it is still saved as the system's pairing, never as a manual count.
+AUTO_GO_ON = "自动对上 · 未人工确认 · 看一眼，对就按空格往下走，不对按 4 撤回"
+
+# What the wave's status line alone told the operator (see _sync_arrival_confirmation).
+WAVE_ALERT_WORDS = ("分不清", "没看", "芯片有变化", "不算人工确认", "按空格往下走", "可能多人")
 
 
 @dataclass
@@ -137,6 +191,7 @@ class WavePlan:
     extra_chips: list = field(default_factory=list)  # chips marked 多余芯片: nobody is counted for them
     people: int = 0
     split: int = 0  # people marked 无芯片 and moved onto a 疑似漏读 row of their own
+    near: dict = field(default_factory=dict)  # a 多 n's index -> the clicks it may as well be (times too close)
 
     @property
     def matches(self):
@@ -154,6 +209,9 @@ class QuickReviewPanel(ProblemListPanel):
     delete_requested = pyqtSignal(str)
     # 校时: the window learns the video offset from the current frame and a chip record.
     calibration_requested = pyqtSignal()
+    run_speed = pyqtSignal(float)               # how fast the run plays (RUN_FAST_SPEED)
+    # True: play the recording on from the frame shown; False: hold it (see RUN_NEAR_MS).
+    run_requested = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         self._quick_ready = False
@@ -174,12 +232,25 @@ class QuickReviewPanel(ProblemListPanel):
         self._plan_cache = None
         self._quick_render_signature = None
         self._simultaneous = Counter()
+        self._table_builds = 0  # times the table was filled again (a click fills it once, not twice)
         self._frame_provider = lambda: None
         self._shown_ms = None
         self._landing_pending = None
         # A 不是运动员 (1, or the run from the right click) still playing the unseen part of its rows
         # before excluding them.
         self._auto_review = None
+        # The chip-clock moment the recording is playing on to after a click,
+        # whether that is the wave's tail (nobody left to count before it), and
+        # the moment of the click a run is still to start from.
+        self._run_to = None
+        self._run_fast, self._run_swept = False, False
+        self._run_between = None
+        self._run_tail = False
+        self._run_from = None
+        self._clicked_at = None  # chip time of the person just clicked (see CLOSE_BEHIND_MS)
+        self._close_behind_ms = CLOSE_BEHIND_MS
+        self._run_counted = None  # mark index a run to someone already clicked lands on
+        self._offset_cache = None  # (key, _run_offset result): one Space asks for it several times
         # 只看要处理的: the table shows only the rows still to settle, and those
         # settled for the timing system (补录, 多余芯片).
         self._attention_only = False
@@ -191,6 +262,7 @@ class QuickReviewPanel(ProblemListPanel):
         # keeps): the window must not reopen the item's stored frame over it.
         self.holds_picture = False
         super().__init__(parent)
+        self.jump_requested.connect(self._forget_run)  # a jump elsewhere ends any run
         self.header.hide()
         self.detail_scroll.hide()
         self.timeline.hide()
@@ -208,6 +280,7 @@ class QuickReviewPanel(ProblemListPanel):
         self._auto_reasons = {}  # wave index -> why it was not paired (shown on its rows)
         self._auto_landing_key = None  # only keep a paired wave after opening its bound evidence
         self._earlier_shown = frozenset()  # the 可能多人 the table shows
+        self._near_counted_times = ()  # their moments: hidden from the table, still a doubt for 自动对上
         self._near_counted_items = frozenset()  # item ids of crossings within COUNTED_REACH_MS of someone counted
         self._strip_end = (None, 0.0)  # (pieces, the strip's last chip-clock moment)
         self._earlier_timer = QTimer(self)
@@ -236,7 +309,7 @@ class QuickReviewPanel(ProblemListPanel):
         self.table.setColumnHidden(5, True)
         self.table.setMinimumWidth(340)
         self.table.setMaximumWidth(440)
-        self.table.setToolTip("点一行看这一刻；选中后按 1 不是运动员、2 双芯片、3 补录号码、4 撤销（右键同样）")
+        self.table.setToolTip("点一行看这一刻；有人压线就在画面上点他，滚轮前后一帧；选中后按 1 不是运动员、2 双芯片、3 补录号码、4 撤销（右键同样）")
         # Everything a row still needs is settled from the row itself (10-29),
         # by 1 / 2 / 3 / 4 or its right click: the picture only counts people.
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -312,7 +385,6 @@ class QuickReviewPanel(ProblemListPanel):
         menu.addSeparator()
         menu.addAction("分析录像", self._toggle_analysis)
         menu.addAction("导出给计时系统（补录 / 建议删除）", self.export)
-        menu.addAction("导出过线记录", self.export_arrivals)
         menu.addAction("删除选中的芯片记录…", self._request_delete)
         menu.addSeparator()
         menu.addAction("清空试验数据", self.clear_data_requested.emit)
@@ -341,6 +413,12 @@ class QuickReviewPanel(ProblemListPanel):
         self.race_strip.seek_requested.connect(self._seek_race_strip)
         self.race_strip.ready.connect(self._strip_ready)
         self.layout().insertWidget(1, self.race_strip)
+        # The head count; the window puts it above the picture, in the place of 已过 N 人 (see wave_slots).
+        self.wave_slots = WaveSlotRow(self)
+        self.wave_slots.mark_clicked.connect(self._slot_clicked)
+        self._slot_cache, self.slot_cache_hits = None, 0
+        self._target_row_state, self._target_cells = None, []
+        self.layout().insertWidget(2, self.wave_slots)
         self._quick_ready = True
         QApplication.instance().installEventFilter(self)
         self._render()
@@ -556,10 +634,21 @@ class QuickReviewPanel(ProblemListPanel):
         rows = self._fold_unverified(rows, assigned, counting)
         self._unverified_groups = sum(self._row_state(row) == "画面待核" for row in rows)
         rows = [row for row in rows if row.event is not None or self._candidate_shown(row.item, assigned, counting)]
-        self._near_counted_items = frozenset(row.item.item_id for row in rows
-                                       if row.event is None and self._near_counted_moment(row.item, assigned, moments))
+        # 11-15: a crossing the analysis saw within COUNTED_REACH_MS of someone
+        # counted is no longer a row (it was 已点附近: "这样会造成困惑").  People
+        # are counted one by one now and Space stops on whoever comes onto the
+        # line right behind (line_next_entry).  Nothing on disk changes.
+        near = frozenset(row.item.item_id for row in rows
+                         if row.event is None and self._near_counted_moment(row.item, assigned, moments))
+        # Still a doubt for 自动对上: a wave with such a crossing is left to hand counting.
+        self._near_counted_times = tuple(row.time_ms for row in rows
+                                         if row.item.item_id in near and row.time_ms is not None)
+        self._near_counted_items = frozenset()
         rows = self._without_repeats(rows)
+        # Folded first, then hidden: the later pieces of a hidden crossing go with
+        # it instead of standing as rows of their own beside the counted rider.
         rows = self._fold_fragments(rows, assigned)
+        rows = [row for row in rows if row.item.item_id not in near or row.event is not None]
         # Arrival order is chip time.  Not the order the records came in: a chip
         # added later (古浪 6 号) sat after the whole wave and gave its rider's
         # click to the next bib.  A corrected video time never moves a chip.
@@ -866,7 +955,7 @@ class QuickReviewPanel(ProblemListPanel):
             match = label_wave(
                 [(row.key, stamp) for row, stamp in zip(wave, stamps)], people, clock_ok=True,
                 maybe_several=any(self._earlier_arrival(row, read=False) is not None for row in near),
-                near_counted=any(row.item.item_id in self._near_counted_items for row in near))
+                near_counted=any(start <= moment <= end for moment in self._near_counted_times))
             if match.reasons:
                 self._auto_reasons[index] = match.reasons
                 continue
@@ -874,7 +963,7 @@ class QuickReviewPanel(ProblemListPanel):
                 self._auto_labels[chip_key] = by_key[person_key]
 
     def _accept_auto_wave(self, row):
-        """Accept the existing pairs on Enter, preserving their original frames.
+        """Accept the existing pairs, preserving their original frames; True once on the next wave.
 
         Acceptance is an explicit operator action, not proof of viewing a fixed
         span or a manual count. Existing undo and durable rollback still apply.
@@ -882,10 +971,10 @@ class QuickReviewPanel(ProblemListPanel):
         wave = self._row_wave(row) or ()
         pairs = [(chip, self._auto_labels[chip.key]) for chip in wave if chip.key in self._auto_labels]
         if not pairs:
-            return
+            return False
         if len(pairs) != len(wave):
             self.hint.setText("自动对应不完整，请重新核对本波。")
-            return
+            return False
         frames = [dict(person.frame, marker_x_normalized=person.x, marker_y_normalized=person.y)
                   for _chip, person in pairs]
         self.holds_picture = True  # the frame on screen stays where the operator looked
@@ -896,23 +985,23 @@ class QuickReviewPanel(ProblemListPanel):
             item, refusal = self.picture_candidate(frames[0])
             if refusal:
                 self.hint.setText(refusal)
-                return
+                return False
             if item is not None:
                 previous_marks = list(self._marks.get(item.item_id, ()))
                 if previous_marks:
                     self.hint.setText("这一波已有人工标记，请核对画面，不再自动添加。")
-                    return
+                    return False
             counted = self.picture_marks()
             if any(mark_on_frame(mark, frame, person.recorder_ms)
                    and (mark["x"] - person.x) ** 2 + (mark["y"] - person.y) ** 2 < .02 ** 2
                    for (_chip, person), frame in zip(pairs, frames) for _owner, mark in counted):
                 self.hint.setText("自动对上未保存：有人已点过，请核对原有标记，勿重复点人。")
-                return
+                return False
             if item is None:
                 item = self.add_manual_problem(frames[0], reason=AUTO_PICTURE_REASON,
                                                recorder_ms=frames[0]["recorder_ms"])
                 if item is None:
-                    return
+                    return False
                 created = True
                 self.adopt_picture_candidate(item, row.key)
             self.open_picture(item)
@@ -927,13 +1016,13 @@ class QuickReviewPanel(ProblemListPanel):
             if plan is None or len(plan.marks) != len(pairs):
                 self._drop_auto_marks(item, previous_marks,
                                       "自动对上未保存：人数标记未能完整添加，请核对原有标记。", created=created)
-                return
+                return False
             if not self._save_wave(plan, operation_id=operation_id):
                 self._drop_auto_marks(item, previous_marks, self.hint.text(), created=created)
-                return
+                return False
         except (OSError, RuntimeError, ValueError) as error:
             self._drop_auto_marks(item, previous_marks, f"自动对上未保存：{error}", created=created)
-            return
+            return False
         finally:
             self.holds_picture = False
         self.save_drafts()
@@ -941,8 +1030,9 @@ class QuickReviewPanel(ProblemListPanel):
         if plan is not None and len(plan.marks) == len(pairs) and plan.marks and all(
                 row.decision is not None for row in plan.chips):
             self._next_wave(item)
-        else:
-            self.hint.setText("自动对上没有全部存上：请在画面上核对这一波。")
+            return True
+        self.hint.setText("自动对上没有全部存上：请在画面上核对这一波。")
+        return False
 
     def _drop_auto_marks(self, item, previous_marks, message, *, created=False):
         """只清理本次临时标记；撤回失败时保留已落盘判定及对应画面。"""
@@ -1024,7 +1114,7 @@ class QuickReviewPanel(ProblemListPanel):
         extra.sort(key=lambda row: row.time_ms)
         merged = []
         for row in rows:
-            moment = int(row.event.timeline_timestamp_ms) if row.event is not None else row.time_ms
+            moment = row_moment(row)
             while extra and moment is not None and extra[0].time_ms < moment:
                 merged.append(extra.pop(0))
             merged.append(row)
@@ -1196,6 +1286,7 @@ class QuickReviewPanel(ProblemListPanel):
             self._sync_arrival_confirmation()
             return True
         self._quick_render_signature = signature
+        self._table_builds += 1
         # Who carries which second chip: shown on the carrier's row too.
         carried = {}
         for row in rows:
@@ -1218,7 +1309,7 @@ class QuickReviewPanel(ProblemListPanel):
             state = self._row_state(row)
             # A chip row shows its chip time, so the column reads in the table's
             # order; the frame its rider was clicked on is in the tooltip.
-            moment = int(row.event.timeline_timestamp_ms) if row.event is not None else row.time_ms
+            moment = row_moment(row)
             time = format_chip_time(moment) if moment is not None and state != "画面待核" else "—"
             category = self._row_category(row)
             number = ""
@@ -1276,6 +1367,8 @@ class QuickReviewPanel(ProblemListPanel):
                            "多余芯片": f"{self._carrier_text(row)}，导出到建议删除清单（CycleRace 人工处理）；"
                                        "按 2 改携带人，4 撤回",
                            }.get(state, tooltip)
+                if self._unlike_athlete(row):
+                    tooltip = self._unlike_athlete(row) + chr(10) + tooltip
                 if row.bib and row.bib in carried and row.event is not None:
                     tooltip = f"{row.bib} 号另带 {'、'.join(carried[row.bib])} 号芯片（双芯片）\n" + tooltip
                 if arrival is not None:
@@ -1552,6 +1645,7 @@ class QuickReviewPanel(ProblemListPanel):
             return
         if self._auto_review is not None:
             self._stop_auto_review("换了一行，自动补看已停止；这一行未排除。")
+        self.stop_run()
         self._last_saved_key = None
         row = self._arrival_rows[index]
         if row.decision:
@@ -1616,12 +1710,21 @@ class QuickReviewPanel(ProblemListPanel):
         if arrival is not None:
             text = (f"可能多人：过线前 {(row.time_ms - arrival) / 1000:.1f} 秒线上还有人到，"
                     "已从那时放起；看到几个人就点几个。")
+        if self._unlike_athlete(row):
+            text = self._unlike_athlete(row) + (text or "")
         if self._row_state(row) == "待定" and row.item.item_id in self._near_counted_items:
             text = NEAR_COUNTED_TEXT
         if self._row_state(row) == "待定" and row.key in self._auto_labels:
-            text = "自动对上 · 未人工确认、不导出 · 回车接受对应"
+            text = AUTO_GO_ON
         if text:
             self.hint.setText(text)
+
+    def _unlike_athlete(self, row):
+        """11-12: the analysis thinks this one is not an athlete, but the operator decides."""
+        reason = row.item.evidence.get("unlike_athlete") if row is not None and row.event is None else None
+        if not reason or self._row_state(row) not in ("待定", "疑似漏读"):
+            return ""
+        return f"机器看着不像选手（{reason}），由你判断：工作人员按 1，是选手按 3 补录号码。"
 
     def _row_menu(self, pos):
         """Right click on a row of the left table: what that row still needs, and nothing else."""
@@ -1899,8 +2002,40 @@ class QuickReviewPanel(ProblemListPanel):
                                               self.workspace_dir, clocks=clocks)
             return (crossing.value_ms if crossing is not None else int(mark["recorder_ms"]), index)
 
-        for i in sorted((i for i, mark in enumerate(marks) if i not in plan.labels and not is_excluded(mark)),
-                        key=crossing_order):
+        ordered = sorted((i for i, mark in enumerate(marks) if i not in plan.labels and not is_excluded(mark)),
+                         key=crossing_order)
+        counting = [i for i in ordered if not marks[i].get("no_chip")]
+
+        def chip_ms(row):
+            # The chip's own time.  A row already saved from a click carries that
+            # click's moment as its time_ms; fitting against it would just give
+            # back the pairing saved click by click (11-15 盲测, 261 号: the one
+            # without a chip always ended up as the wave's last person).
+            return int(row.event.timeline_timestamp_ms)  # every row of a wave has its chip
+
+        fit = None
+        if len(counting) > len(free) and free:
+            # 11-14 (古浪 6 号): the one without a chip is where the clicks shift
+            # onto the next chip's time, not the last person of the wave.
+            free.sort(key=chip_ms)
+            fit = fit_wave([crossing_order(i)[0] for i in counting], [chip_ms(row) for row in free])
+        if fit is not None:
+            chosen = dict(zip(counting, fit.chip_of_click))
+            for i in ordered:
+                if marks[i].get("no_chip"):
+                    plan.no_chip.append(i)
+                    plan.labels[i] = "无芯片"
+                elif chosen[i] is not None:
+                    plan.assigned.append((i, free[chosen[i]]))
+                    plan.labels[i] = free[chosen[i]].bib
+                else:
+                    plan.extra.append(i)
+                    plan.labels[i] = f"多 {len(plan.extra)}"
+            for extra in fit.extras:
+                if not extra.sure:
+                    plan.near[counting[extra.click]] = tuple(counting[c] for c in extra.candidates)
+            ordered, free = [], []
+        for i in ordered:
             if marks[i].get("no_chip"):
                 plan.no_chip.append(i)
                 plan.labels[i] = "无芯片"
@@ -1981,7 +2116,7 @@ class QuickReviewPanel(ProblemListPanel):
         elif plan is not None and (plan.marks or plan.split):
             status, color = self._wave_status(plan)
         elif row is not None and row.key in self._auto_labels and wave is not None:
-            status = f"自动对上 · 芯片 {len(wave)} · 回车接受对应"
+            status = f"自动对上 · 芯片 {len(wave)} · 对就按空格往下走，不对按 4"
             color = "#3b5b7a"
         elif row is not None and wave is None and self._row_state(row) == "待定" and row.time_ms is not None:
             # A crossing without a chip may be several people: it is looked at
@@ -2002,6 +2137,12 @@ class QuickReviewPanel(ProblemListPanel):
         self.confirmation_status.setText(status)
         self.confirmation_status.setToolTip(status)
         self.confirmation_status.setStyleSheet(f"color:{color}; font-weight:600;" if color else "")
+        # 11-14: above the strip this line mostly repeated 本波 n/m.  What only it
+        # said goes beside 本波, over the picture, and only while there is
+        # something to do about it; the line itself is no longer shown.
+        self._wave_alert = " · ".join(part for part in status.split(" · ")
+                                      if any(word in part for word in WAVE_ALERT_WORDS))
+        self.confirmation_status.setVisible(False)
 
     def _wave_status(self, plan):
         """The count of a wave against its chips, and its color: green 已核, red 多/少, amber not all seen."""
@@ -2013,6 +2154,10 @@ class QuickReviewPanel(ProblemListPanel):
             status += f" · 双芯片 {len(plan.extra_chips)}"
         if plan.extra:
             status += f" · 多 {len(plan.extra)} 人"
+            for i, near in plan.near.items():
+                names = "、".join(plan.labels[c] if plan.labels[c].startswith("多") else f"{plan.labels[c]} 号"
+                                 for c in near)
+                status += f" · {plan.labels[i]} 分不清：{names} 挨得太近，请裁判看录像"
         if plan.unmatched:
             status += f" · 少 {len(plan.unmatched)} 人"
         missing = len(plan.no_chip) + plan.split
@@ -2071,12 +2216,15 @@ class QuickReviewPanel(ProblemListPanel):
         return uncovered_intervals(start, end, seen, tolerance=100)
 
     def record_viewed_frame(self, frame, recorder_ms):
-        """Remember, in chip time, what of the recording the operator has looked at."""
+        """Remember, in chip time, what of the recording the operator has looked at.
+
+        Gives that chip time back (None when the frame has none) for the picture to show.
+        """
         super().record_viewed_frame(frame, recorder_ms)
         self.timeline.current = int(recorder_ms)
         crossing = recorder_crossing_time(recorder_ms, frame, self.workspace_dir)
         if crossing is None or self.workspace_dir is None:
-            return
+            return None
         stamp = crossing.value_ms
         self._shown_ms = stamp
         self.race_strip.set_cursor(stamp, frame.get("camera_index") or 1)
@@ -2094,6 +2242,598 @@ class QuickReviewPanel(ProblemListPanel):
             self._sync_arrival_confirmation()  # "还有 x 秒没看" counts down on this very frame
         if self._auto_review is not None:
             self._advance_auto_review()
+        if self._run_to is not None:
+            if abs(stamp - self._run_to) > RUN_STALE_MS:
+                self._run_to = None  # the operator went elsewhere: nothing to stop
+                # ... nor a wave to open at its end (11-15: 63 号 Space opened 23 号, the
+                # row after a wave left mid-sweep minutes before).
+                self._run_between = self._run_counted = None
+                self._run_slow()
+                self.run_requested.emit(False)  # never left playing with nowhere to stop
+            elif stamp >= self._run_to - RUN_STOP_LEAD_MS:
+                tail, self._run_to = self._run_tail, None
+                self._run_slow()
+                self.run_requested.emit(False)
+                QTimer.singleShot(0, lambda: self._run_arrived(tail))  # rule outside the frame callback
+            elif stamp >= self._run_to - RUN_SLOW_MS:
+                self._run_slow()  # the last stretch at normal speed, to stop on the frame
+        return stamp
+
+    def _run_slow(self):
+        """Back to normal speed; True when the run was playing fast."""
+        fast, self._run_fast = self._run_fast, False
+        if fast:
+            self.run_speed.emit(1.0)
+        return fast
+
+    def _forget_run(self, _frame=None):
+        """A jump (a row, the strip, a counted person's frame) ends any run quietly.
+
+        The window holds the recording on every jump; what the run was to do at
+        its end must not happen later somewhere else (11-15: 63 号 → 23 号).
+        """
+        self._run_to = None
+        self._run_between = self._run_counted = None
+        self._run_slow()
+
+    def stop_run(self):
+        """Hold the recording a click set playing; True when it was."""
+        self._run_from = None
+        if self._run_to is None:
+            return False
+        self._run_to = None
+        self._run_slow()
+        self._run_between = self._run_counted = None
+        self.run_requested.emit(False)
+        return True
+
+    def _run_target(self, plan, now, ahead=None):
+        """(moment, tail) the recording plays on to from NOW, in chip time.
+
+        () when it stays where it is, None when there is nothing left to play.
+
+        The next person: a chip of this wave nobody is counted for, or someone
+        the analysis saw cross before the wave's tail ends.  The tail: nobody
+        left, so on to RUN_TAIL_MS after the last chip.
+        """
+        stamps = [int(row.event.timeline_timestamp_ms) for row in plan.chips]
+        if not stamps:
+            return None
+        offset, crossing_of = self._run_offset(plan)
+        end = max(stamps) + offset + RUN_TAIL_MS
+        due = sorted(int(row.event.timeline_timestamp_ms) + offset for row in plan.unmatched if row.decision is None)
+        if due and due[0] <= now + RUN_NEAR_MS:
+            # The next chip in order is on this picture, or (clicked out of order)
+            # behind it: either way nothing is to be played past.
+            return ()
+        limit = due[0] if due else end
+        seen = []
+        if self.workspace_dir:
+            try:
+                people = people_on_line(self.workspace_dir, int(self.race_strip.camera or 1))
+            except (OSError, ValueError, KeyError):
+                people = []
+            counted = list(crossing_of.values())
+            seen = [person.chip_ms for person in people
+                    if person.aligned and now + RUN_NEAR_MS < person.chip_ms < limit
+                    and not any(abs(person.chip_ms - value) <= RUN_NEAR_MS for value in counted)]
+        # Whatever comes onto the line before then, chip or not, seen by the
+        # analysis or not: the strip shows it (None: no strip of this stretch).
+        arrivals = None
+        pieces = self.race_strip.view.pieces
+        if pieces and limit > now + RUN_NEAR_MS:
+            arrivals = line_arrivals(pieces, self.race_strip.view.cache, now + RUN_NEAR_MS, limit)
+        self._run_swept = arrivals is not None
+        seen += [int(moment) for moment in arrivals or ()]
+        ahead = ahead or self._next_counted(now, plan)
+        if ahead is not None and ahead[0] < limit:
+            seen.append(int(ahead[0]))  # someone already clicked comes first: stop on them
+        if seen or due:
+            return min(seen + due[:1]), False
+        return (end, True) if end > now + RUN_NEAR_MS else None
+
+    def _run_offset(self, plan):
+        """(ms, {mark index: crossing ms}): how far this wave's clicks run off their chips.
+
+        Where people are clicked on the picture runs some hundred ms off their
+        chips (the clock, where on the bike the line is met).  In a tight wave
+        the next chip then looked already gone and the run went through the
+        whole wave (11-11).  This wave's own clicks say how far off it runs.
+        """
+        clocks = workspace_clocks(self.workspace_dir) if self.workspace_dir else None
+        key = (self.workspace_dir, id(clocks), tuple(row.key for row in plan.chips),
+               tuple((mark["recorder_ms"], (mark.get("frame") or {}).get("session_id", "")) for mark in plan.marks),
+               tuple((index, row.key) for index, row in plan.assigned))
+        if self._offset_cache is not None and self._offset_cache[0] == key:
+            return self._offset_cache[1]
+        result = self._compute_run_offset(plan)
+        self._offset_cache = (key, result)
+        return result
+
+    def _compute_run_offset(self, plan):
+        crossing_of = {}
+        if self.workspace_dir:
+            for index, mark in enumerate(plan.marks):
+                crossing = recorder_crossing_time(mark["recorder_ms"], mark.get("frame") or {}, self.workspace_dir)
+                if crossing is not None:
+                    crossing_of[index] = crossing.value_ms
+        offsets = sorted(crossing_of[index] - int(row.event.timeline_timestamp_ms)
+                         for index, row in plan.assigned if index in crossing_of)
+        return (offsets[len(offsets) // 2] if offsets else 0), crossing_of
+
+    def _run_plan(self):
+        """The wave being looked through: its picture's plan, or before anyone is
+        clicked on it (no picture yet), its chips alone."""
+        plan = self._wave_plan()
+        if plan is not None:
+            return plan
+        wave = self._row_wave(self._selected_arrival())
+        if not wave:
+            return None
+        plan = WavePlan(None, list(wave), [])
+        plan.extra_chips = [row for row in wave if row.note == "多余芯片"]
+        plan.unmatched = [row for row in wave if row.decision is None and row.note != "多余芯片"]
+        plan.people = sum(row.decision is not None for row in wave)
+        return plan
+
+    def play_on(self):
+        """Space on a wave: play on to the next person and stop there, as after a click (11-12).
+
+        Space used to play the recording straight on, and in a big bunch
+        everyone went past before one could be clicked (古浪).  Someone due
+        right here but not at the line yet: RUN_STEP_MS on, then stop again.
+        False with no wave on screen or past its tail: Space then plays as always.
+        """
+        # Space goes on from the frame shown, whatever was being swept before (11-15).
+        self._run_between = None
+        self._run_counted = None
+        row = self._selected_arrival()
+        if row is not None and row.key in self._auto_labels and self._auto_review is None:
+            if self._accept_auto_wave(row):   # looked at, right: on to the next wave (11-15)
+                return True
+            # Not accepted (the hint says why): Space still goes on from the frame shown.
+            refused = self.hint.text()
+            moved = self._play_on_from_here()
+            self.hint.setText(refused + ("　" + self.hint.text() if moved else ""))
+            return moved
+        return self._play_on_from_here()
+
+    def _play_on_from_here(self):
+        plan = self._run_plan()
+        now = self._shown_ms
+        if now is None or self._auto_review is not None:
+            return False
+        counted = self._next_counted(now, plan)
+        if self._close_behind(now, plan):
+            entry = self._next_on_line(now)
+            if counted is not None and (entry is None or counted[0] <= entry):
+                return self._run_to_counted(counted, plan)
+            if entry is None:
+                return self._step_on(now, plan)
+            if entry != float("inf"):
+                return self._run_to_entry(entry, plan)
+        if plan is None or not plan.chips:
+            return self._sweep_on(now)
+        offset, _crossings = self._run_offset(plan)
+        end = max(int(row.event.timeline_timestamp_ms) for row in plan.chips) + offset + RUN_TAIL_MS
+        if now >= end - RUN_NEAR_MS:
+            if self._wave_even(plan, now) and self._following_row(plan.item) is not None:
+                self._sweep_between(now, plan.item)
+                return True
+            return self._sweep_on(now)
+        target = self._run_target(plan, now, counted)
+        if target and counted is not None and target == (int(counted[0]), False):
+            return self._run_to_counted(counted, plan)  # never swept past fast (11-15 review)
+        step = target == ()
+        if step:
+            target = (min(now + RUN_STEP_MS, end), False)
+        if not target:
+            return False
+        self._run_to, self._run_tail = target
+        # A stretch the strip shows empty is played fast, not jumped: every frame is still seen.
+        self._run_fast = not step and self._run_swept and target[0] - now >= RUN_FAST_MIN_MS
+        self.hint.setText(self._run_count(plan) + "；"
+                          + ("录像往前走一点" if step else "录像走到本波末尾" if self._run_tail else "录像走到下一位")
+                          + ("（快扫，线上一有人影就停）" if self._run_fast else "")
+                          + "，中间有人就按空格停下再点他。")
+        self.run_speed.emit(RUN_FAST_SPEED if self._run_fast else 1.0)
+        self.run_requested.emit(True)
+        return True
+
+    def _close_behind(self, now, plan):
+        """NOW is within CLOSE_BEHIND_MS after a chip or after someone counted (see CLOSE_BEHIND_MS)."""
+        reach = self._close_behind_ms
+        if reach <= 0:
+            return False
+        moments = [int(row.event.timeline_timestamp_ms) for row in self._arrival_rows if row.event is not None]
+        moments += [row.time_ms for row in self._arrival_rows if row.time_ms is not None]
+        if self._clicked_at is not None:
+            moments.append(self._clicked_at)
+        if plan is not None and plan.marks:
+            moments += list(self._run_offset(plan)[1].values())
+        return any(moment - RUN_NEAR_MS <= now < moment + reach for moment in moments)
+
+    def _next_on_line(self, now):
+        """When someone new comes onto the line within CLOSE_BEHIND_MS (inf: nobody, None: no strip)."""
+        pieces = self.race_strip.view.pieces
+        if not pieces:
+            return None
+        return line_next_entry(pieces, self.race_strip.view.cache, now + SAME_BODY_MS, now + CLOSE_BEHIND_MS)
+
+    def _next_counted(self, now, plan):
+        """(moment, label) of the next person already clicked on this wave, ahead of NOW.
+
+        Going back over a wave counted even, no chip is left to stop at and a
+        tight bunch shows on the strip as one long shape: Space ran past many
+        (11-15 古浪, from 73 号 on).  It goes from one clicked person to the next.
+        """
+        if plan is None or not plan.marks:
+            return None
+        ahead = sorted((moment, index) for index, moment in self._run_offset(plan)[1].items()
+                       if moment > now + SAME_FRAME_MS and not is_excluded(plan.marks[index]))
+        if not ahead:
+            return None
+        moment, index = ahead[0]
+        return moment, plan.labels.get(index, ""), index
+
+    def _run_to_counted(self, counted, plan):
+        """On to the next person already clicked, at normal speed, and stop on them.
+
+        The run stops RUN_STOP_LEAD_MS short; on arrival the very frame they
+        were clicked on opens and their row is selected (_land_on_counted).
+        """
+        moment, label, index = counted
+        self._run_counted = index
+        self._run_to, self._run_tail, self._run_fast = int(moment), False, False
+        self.hint.setText(f"{self._run_count(plan)}；到下一位已点的人"
+                          + (f"（{label}）" if label else "") + "，中间有没点到的人就按空格停下再点他。")
+        self.run_speed.emit(1.0)
+        self.run_requested.emit(True)
+        return True
+
+    def _run_to_entry(self, entry, plan):
+        """Right behind the one counted someone comes onto the line: play there at normal speed and stop."""
+        self._run_to, self._run_tail, self._run_fast = int(entry), False, False
+        counted = self._run_count(plan) + "；" if plan is not None and plan.chips else ""
+        self.hint.setText(counted + "后面紧跟着有人上线，停在他压线的地方：是运动员就点他，不是就再按空格。")
+        self.run_speed.emit(1.0)
+        self.run_requested.emit(True)
+        return True
+
+    def _step_on(self, now, plan):
+        """Space right behind someone: RUN_STEP_MS on at normal speed, then stop again."""
+        self._run_to, self._run_tail, self._run_fast = now + RUN_STEP_MS, False, False
+        counted = self._run_count(plan) + "；" if plan is not None and plan.chips else ""
+        self.hint.setText(counted + "刚过一个人，录像往前走一点（0.3 秒）：紧跟在后面的人会停在画面上，有就点他。")
+        self.run_speed.emit(1.0)
+        self.run_requested.emit(True)
+        return True
+
+    def _sweep_on(self, now):
+        """Space with no wave to count here: fast on to the next chip, or to what comes onto the line.
+
+        The long empty stretches are between waves (11-14); played at normal
+        speed they take as long as they did in the race, and a jump to the next
+        chip would pass someone without one.  False where the strip does not
+        cover the stretch: Space then plays as it always did.
+        """
+        pieces = self.race_strip.view.pieces
+        if not pieces:
+            return False
+        ahead = [int(row.event.timeline_timestamp_ms) for row in self._arrival_rows
+                 if row.event is not None and int(row.event.timeline_timestamp_ms) > now + RUN_NEAR_MS]
+        limit = min([now + SWEEP_REACH_MS] + ahead)
+        arrivals = line_arrivals(pieces, self.race_strip.view.cache, now + RUN_NEAR_MS, limit)
+        if arrivals is None:
+            return False
+        target = int(min(arrivals + [limit]))
+        self._run_to, self._run_tail = target, False
+        self._run_fast = target - now >= RUN_FAST_MIN_MS
+        self.hint.setText(("快扫到线上有人影的地方" if arrivals else "这一段线上没有人影，快扫到下一个芯片"
+                           if limit in ahead else "这一段线上没有人影，快扫过去；再按空格继续")
+                          + "。看到有人压线就按空格停下再点他。")
+        self.run_speed.emit(RUN_FAST_SPEED if self._run_fast else 1.0)
+        self.run_requested.emit(True)
+        return True
+
+    def _run_on(self):
+        """After a click on a wave's picture: say how far it is counted; the recording holds."""
+        now, self._run_from = self._run_from, None
+        plan = self._wave_plan()
+        if now is None or plan is None or not plan.marks or self._auto_review is not None:
+            return
+        # The recording stays where it was clicked (11-14: in a bunch a run to
+        # "the next person" took riders past before one could be pinned, "我根本
+        # 就盯不住那个人").  The wheel walks a frame at a time, Space goes on.
+        if self._run_target(plan, now) is None:  # nobody left and the tail already passed
+            self._wave_counted(plan, now)
+        elif plan.unmatched:
+            self.hint.setText(f"{self._run_count(plan)}；录像停在这里：滚轮一帧一帧走，"
+                              f"空格到下一位（{plan.unmatched[0].bib} 号）。")
+        else:
+            self.hint.setText(f"{self._run_count(plan)}；录像停在这里：后面还有人压线就点他，"
+                              "没有就按空格看到本波末尾。")
+
+    def _land_on_counted(self, index):
+        """Stopped at someone already clicked: their own frame, their row, nothing to click again.
+
+        11-15 review: the run stopped two frames short and said "机器看到有人过线：
+        是运动员就点" — clicking the same rider again made the wave 多 1, and the
+        next Space came back to the same person.
+        """
+        plan = self._wave_plan()
+        if plan is None or not 0 <= index < len(plan.marks):
+            return
+        frame = plan.marks[index].get("frame") or {}
+        self.show_counted(index)
+        if frame.get("recorder_ms") is not None:
+            self.jump_requested.emit(dict(frame, reference_only=True))
+        label = plan.labels.get(index, "")
+        self.hint.setText(f"{self._run_count(plan)}；这是已点的" + (f" {label}" if label else "")
+                          + "（不用再点）：空格到下一位，中间有没点到的人就点他。")
+
+    def _run_arrived(self, tail):
+        counted, self._run_counted = self._run_counted, None
+        if counted is not None:
+            self._run_between = None
+            self._land_on_counted(counted)
+            return
+        between, self._run_between = self._run_between, None
+        if between is not None and self._run_to is None:
+            item, arrived = between
+            if arrived == "figure":
+                self.hint.setText("线上有人影，停下了：是运动员就点他；不是就按空格继续扫到下一波。")
+            elif self._shown_ms is not None:
+                self._sweep_between(self._shown_ms, item, arrived == "there")
+            return
+        plan = self._run_plan()
+        if plan is None or self._run_to is not None:
+            return
+        if tail and self._shown_ms is not None and self._wave_counted(plan, self._shown_ms):
+            return
+        status = self._wave_status(plan)[0] if plan.marks or plan.split else ""
+        if tail:
+            self.hint.setText((f"本波看到末尾：{status}。" if status else "本波看到末尾。") + (
+                "回车到下一波。" if plan.matches
+                else "多的人按 3 补录或 1 排除，多的芯片按 2；处理完回车到下一波。"))
+        elif plan.unmatched:
+            self.hint.setText(f"{self._run_count(plan)}；到下一位（{plan.unmatched[0].bib} 号）：点压线的人；"
+                              "还没到线按空格往前走，← → 一帧一帧。")
+        else:
+            self.hint.setText("这里机器看到有人过线：是运动员就点，不是就按空格继续。")
+
+    def current_target(self, plan=None):
+        """(row key, words, kind) for the person the operator is on; kind is next, done or alert.
+
+        Yellow means one thing only, the next person to click; clicked, it turns
+        green (11-14: "这个黄色是下一个还是…变化有点怪").
+
+        The next click's bib while the wave has chips left; once it is counted
+        even, whoever is selected (just clicked).  11-14: "我现在点到哪一个人物，
+        好像不能一下看出来": it is said on the left, in the cells and on the picture.
+        """
+        plan = plan or self._run_plan()
+        if plan is None:
+            return None, "", "done"
+        if plan.extra:
+            return None, f"多 {len(plan.extra)} 人", "alert"
+        if plan.unmatched:
+            return plan.unmatched[0].key, f"下一位 {plan.unmatched[0].bib} 号", "next"
+        row = self._selected_arrival()
+        chips = {chip.key for chip in plan.chips}
+        if row is not None and row.key in chips and row.bib:
+            return row.key, f"{row.bib} 号 已点", "done"
+        return None, "本波点齐", "done"
+
+    TARGET_ROW_STYLE = "QTableWidget::item:selected {background:#ffd84d; color:#111827;}"
+    DONE_ROW_STYLE = "QTableWidget::item:selected {background:#7fdca4; color:#0b3d2a;}"
+    PLAIN_ROW_STYLE = "QTableWidget::item:selected {background:#d6eeea; color:#123d36;}"
+
+    def _mark_target_row(self, key, kind="next"):
+        """The row of the person the operator is on, bold: yellow to click, green once clicked."""
+        state = (self._table_builds, key, self._selected_key, kind)
+        if state == self._target_row_state:
+            return
+        if self._target_row_state is not None and self._target_row_state[0] == self._table_builds:
+            for cell, brush, font, pen in self._target_cells:
+                cell.setBackground(brush)
+                cell.setForeground(pen)
+                cell.setFont(font)
+        self._target_row_state, self._target_cells = state, []
+        index = next((i for i, row in enumerate(self._arrival_rows) if row.key == key), None) if key else None
+        if index is not None:
+            for column in range(self.table.columnCount()):
+                cell = self.table.item(index, column)
+                if cell is None:
+                    continue
+                self._target_cells.append((cell, cell.background(), cell.font(), cell.foreground()))
+                font = cell.font()
+                font.setBold(True)
+                cell.setFont(font)
+                cell.setBackground(QColor("#7fdca4" if kind == "done" else "#ffd84d"))
+        selected = self._selected_arrival()
+        style = ((self.DONE_ROW_STYLE if kind == "done" else self.TARGET_ROW_STYLE)
+                 if key and selected is not None and selected.key == key
+                 else self.PLAIN_ROW_STYLE)
+        if style != self.table.styleSheet():
+            self.table.setStyleSheet(style)
+
+    def wave_slot_list(self, plan=None):
+        """One cell an arrival, the whole race in table order; the wave on the picture is marked current."""
+        plan = plan or self._run_plan()  # before anyone is clicked on it: its chips alone
+        # Asked for on every frame shown.  Before anyone is clicked on a wave its
+        # plan is made anew each time (_run_plan): the cells are kept by what the
+        # plan is made of, never by the plan object (11-14: 250 rows a frame at 4x).
+        picture = plan.item.item_id if plan is not None and plan.item is not None else None
+        key = (self._table_builds, len(self._arrival_rows), picture,
+               self._plan_cache[0] if picture is not None and self._plan_cache is not None else None,
+               tuple(row.key for row in plan.chips) if plan is not None else None,
+               plan.unmatched[0].key if plan is not None and plan.unmatched else None,
+               plan.people if plan is not None else None)
+        target = self.current_target(plan)[0]
+        key += (target,)
+        if self._slot_cache is not None and self._slot_cache[0] == key:
+            self.slot_cache_hits += 1
+            return self._slot_cache[1]
+        holder, chips, following, marks = {}, set(), None, []
+        if plan is not None:
+            chips = {row.key for row in plan.chips}
+            holder = {row.key: i for i, row in plan.assigned}
+            marks = plan.marks
+            for i, mark in enumerate(marks):
+                if i in plan.labels and i not in plan.no_chip and i not in plan.extra and not is_excluded(mark):
+                    row = self._decided_row(mark, plan.item)
+                    if row is not None:
+                        holder.setdefault(row.key, i)
+            following = plan.unmatched[0].key if plan.unmatched else None
+        slots = []
+        for row in self._arrival_rows:
+            state = self._row_state(row)
+            if state in ("已排除", "画面待核") or row.note == "多余芯片":
+                continue
+            if row.event is None:  # somebody without a chip record: 多出 or 疑似漏读
+                index = next((i for i, mark in enumerate(marks) if mark is row.mark), None)
+                if index is not None and index in plan.extra:
+                    slots.append(Slot(plan.labels[index], EXTRA, index, True))
+                else:
+                    slots.append(Slot(str(row.bib) if row.entered and row.bib else "无芯片", NO_CHIP,
+                                      index, index is not None))
+            elif row.key in chips:
+                index = holder.get(row.key)
+                if index is not None:
+                    slots.append(Slot(str(row.bib), DONE, index, True, row.key == target))
+                elif row.decision is not None and not self._counted_here(row, plan.item):
+                    slots.append(Slot(str(row.bib), ELSEWHERE, None, True, row.key == target))
+                else:
+                    slots.append(Slot(str(row.bib), NEXT if row.key == following else TODO, None, True,
+                                      row.key == target))
+            else:
+                slots.append(Slot(str(row.bib), DONE if row.decision else TODO))
+        summary = ""
+        if plan is not None:
+            count = len(plan.chips) - len(plan.extra_chips)
+            summary = f"本波 {plan.people}/{count}" + (f" 多 {len(plan.extra)} 人" if plan.extra else "")
+        self._slot_cache = (key, (slots, summary))
+        return slots, summary
+
+    def refresh_slots(self, passed=""):
+        """PASSED: 已过 N 人 up to the frame shown, said in front of the cells."""
+        if not self._quick_ready:
+            return
+        slots, summary = self.wave_slot_list()
+        target = self.current_target()
+        self._mark_target_row(target[0], target[2])
+        self.wave_slots.set_slots(slots, "　".join(part for part in (passed, summary) if part),
+                                  getattr(self, "_wave_alert", ""))
+
+    def _slot_clicked(self, index):
+        """A filled cell: back to the frame that person was clicked on, to look again; nothing is changed."""
+        plan = self._wave_plan()
+        if plan is None or not 0 <= index < len(plan.marks):
+            return
+        frame = plan.marks[index].get("frame") or {}
+        self.stop_run()
+        self.show_counted(index)
+        if frame.get("recorder_ms") is None:
+            self.hint.setText("这个人被点的那一帧没有记下来，回不去。")
+            return
+        self.jump_requested.emit(dict(frame, reference_only=True))
+        self.hint.setText(f"回到点 {plan.labels.get(index, '这个人')} 的那一帧（只看，不改动）；"
+                          "要撤销按 4。")
+
+    def _run_count(self, plan):
+        """How far the wave is counted, said every time the recording moves or holds (11-11:
+        once it moves on, the ring of whoever was just clicked is gone)."""
+        chips = len(plan.chips) - len(plan.extra_chips)
+        last = plan.labels.get(len(plan.marks) - 1, "") if plan.marks else ""
+        return f"已点 {plan.people}/{chips} 人" + (f"（刚点的记为 {last} 号）" if last else "")
+
+    def passed_count_text(self, frame):
+        """已过 N 人 · X 号: everyone counted on this camera up to the frame shown.
+
+        Like the timing software's running count, so the two can be read side
+        by side (11-12).  One person is one spot on the picture: a rider with
+        two chips counts once; 多出 people count, people set aside do not.
+        """
+        if frame is None:
+            return ""
+        current, camera = int(frame["recorder_ms"]), int(frame.get("camera_index") or 1)
+        spots = {}
+        for row in self._arrival_rows:
+            saved = (row.decision or {}).get("frame") or {}
+            if saved.get("marker_x_normalized") is not None and saved.get("recorder_ms") is not None:
+                if self._row_state(row) == "已排除":
+                    continue
+                spot = (int(saved.get("camera_index") or 1), int(saved["recorder_ms"]),
+                        round(float(saved["marker_x_normalized"]), 4), round(float(saved["marker_y_normalized"]), 4))
+                spots.setdefault(spot, row.bib)
+            elif row.mark is not None and not is_excluded(row.mark):
+                spot = (int((row.mark.get("frame") or {}).get("camera_index") or camera), int(row.mark["recorder_ms"]),
+                        round(float(row.mark["x"]), 4), round(float(row.mark["y"]), 4))
+                spots.setdefault(spot, "")
+        passed = sorted((spot[1], bib) for spot, bib in spots.items() if spot[0] == camera and spot[1] <= current)
+        if not passed:
+            return "已过 0 人"
+        bib = passed[-1][1]
+        return f"已过 {len(passed)} 人 · " + (f"{bib} 号" if bib else "无芯片")
+
+    def _wave_even(self, plan, now):
+        """This wave is counted even and looked through to its last chip."""
+        last = max((int(row.event.timeline_timestamp_ms) for row in plan.chips), default=None)
+        return not (last is None or now < last - RUN_NEAR_MS or not plan.marks or not plan.matches
+                    or self._wave_outdated(plan) or self._unseen(plan))
+
+    def _wave_counted(self, plan, now):
+        """A wave counted even and looked through to its last chip: on to the next one by itself."""
+        if not self._wave_even(plan, now):
+            return False
+        self._sweep_between(now, plan.item)
+        return True
+
+    def _following_row(self, item):
+        """The row _next_wave opens after ITEM's wave, or None."""
+        plan = self._wave_plan(item)
+        keys = {chip.key for chip in plan.chips} if plan is not None else set()
+        positions = [i for i, row in enumerate(self._arrival_rows) if row.key in keys]
+        if not positions:
+            return None
+        return next((self._arrival_rows[i] for i in range(max(positions) + 1, len(self._arrival_rows))
+                     if not self.table.isRowHidden(i)
+                     and self._arrival_rows[i].item.item_id != item.item_id
+                     and self._arrival_rows[i].item.evidence.get("wave_parent") != item.item_id), None)
+
+    def _sweep_between(self, now, item, there=False):
+        """From a wave counted even to the next row: played fast, stopping where something comes onto the line.
+
+        The wave used to open the next one by itself, over seconds nobody had
+        looked at (11-14, 古浪 11:49:14 to 11:49:21: "感觉不是按照录像的那个顺序
+        过去的，直接就跳过去的").  Where the strip does not cover the stretch
+        the next row opens as it did, and the hint says so.
+        """
+        following = self._following_row(item)
+        moment = None
+        if following is not None:
+            moment = (following.time_ms if following.time_ms is not None
+                      else int(following.event.timeline_timestamp_ms) if following.event is not None else None)
+        pieces = self.race_strip.view.pieces
+        arrivals = None
+        if not there and moment is not None and moment > now + RUN_NEAR_MS and pieces:
+            limit = min(int(moment), now + SWEEP_REACH_MS)
+            arrivals = line_arrivals(pieces, self.race_strip.view.cache, now + RUN_NEAR_MS, limit)
+        if arrivals is None:
+            jumped = not there and moment is not None and moment > now + RUN_FAST_MIN_MS
+            self._next_wave(item)
+            self.hint.setText("上一波人数与芯片对上，已到下一处。"
+                              + ("中间这一段没有过线图，是直接跳过来的。" if jumped else "")
+                              + ("后面没有要看的了。" if "后面没有" in self.hint.text() else ""))
+            return
+        target = int(min(arrivals + [limit]))
+        self._run_between = (item, "figure" if arrivals else "there" if limit == int(moment) else "hop")
+        self._run_to, self._run_tail = target, False
+        self._run_fast = target - now >= RUN_FAST_MIN_MS
+        self.hint.setText("上一波人数与芯片对上，快扫到下一波（线上一有人影就停）；回车直接跳到下一波，空格停。")
+        self.run_speed.emit(RUN_FAST_SPEED if self._run_fast else 1.0)
+        self.run_requested.emit(True)
 
     def picture_candidate(self, frame):
         """Which picture a click on the frame counts a person on.
@@ -2233,6 +2973,11 @@ class QuickReviewPanel(ProblemListPanel):
             return []
         current, camera = int(frame["recorder_ms"]), int(frame.get("camera_index") or 1)
         bibs = {row.key: row.bib for row in self._arrival_rows}
+        # 11-16: rings only, the number while the mouse is on one (it is in the corner
+        # badge and the cells above); the one selected is ringed twice.
+        chosen = self._selected_key
+        marks_now = self.current_marks()
+        editing = marks_now[self._editing_mark] if 0 <= self._editing_mark < len(marks_now) else None
         # 自动对上: grey-blue dashed with the bib on the frame the person was seen
         # crossing on, faded on the frames just around it.
         automatic = []
@@ -2241,7 +2986,8 @@ class QuickReviewPanel(ProblemListPanel):
                 continue
             here = mark_on_frame({"recorder_ms": person.recorder_ms, "frame": person.frame}, frame, current)
             if here or abs(current - person.recorder_ms) <= GHOST_REACH_MS:
-                automatic.append((person.x, person.y, bibs.get(key, ""), False, False, False, not here, True))
+                automatic.append((person.x, person.y, bibs.get(key, ""), False, False, False, not here, True,
+                                  True, key == chosen))
         # Saved bindings also remain visible when another table row is selected.
         for row in self._arrival_rows:
             decision = row.decision or {}
@@ -2252,7 +2998,7 @@ class QuickReviewPanel(ProblemListPanel):
             if mark_on_frame({"recorder_ms": saved["recorder_ms"], "frame": saved}, frame, current):
                 auto = bool(decision.get("auto_label"))
                 automatic.append((float(saved["marker_x_normalized"]), float(saved["marker_y_normalized"]),
-                                  row.bib, not auto, False, False, False, auto))
+                                  row.bib, not auto, False, False, False, auto, True, row.key == chosen))
         item = self.current_item()
         if item is None:
             return automatic
@@ -2266,19 +3012,28 @@ class QuickReviewPanel(ProblemListPanel):
             else:
                 label, alert = "无芯片", True
             auto = bool(mark.get("auto_label"))
+            picked = mark is editing
             if mark_on_frame(mark, frame, current):
-                shown.append((float(mark["x"]), float(mark["y"]), label, not alert and not auto, alert, False, False, auto))
+                shown.append((float(mark["x"]), float(mark["y"]), label, not alert and not auto, alert, False, False, auto,
+                              True, picked))
             elif (int((mark.get("frame") or {}).get("camera_index") or camera) == camera
                   and 0 < current - int(mark["recorder_ms"]) <= GHOST_REACH_MS):
-                ghosts.append((float(mark["x"]), float(mark["y"]), label, not alert and not auto, alert, False, True, auto))
-        # A saved binding may also be a current picture mark; draw it only once.
+                ghosts.append((float(mark["x"]), float(mark["y"]), label, not alert and not auto, alert, False, True, auto,
+                               True, False))
+        # A saved binding may also be a current picture mark; draw it only once
+        # (selected when either says so).
         unique = {}
         for overlay in automatic + ghosts + shown:
-            unique[(round(overlay[0], 4), round(overlay[1], 4), overlay[2], overlay[6])] = overlay
+            spot = (round(overlay[0], 4), round(overlay[1], 4), overlay[2], overlay[6])
+            if spot in unique and unique[spot][9]:
+                overlay = overlay[:9] + (True,)
+            unique[spot] = overlay
         return list(unique.values())
 
     def refresh_status_visibility(self):
-        labels = [label for label in self.status_widget.findChildren(QLabel) if label is not self.finish_line_status]
+        labels = [label for label in self.status_widget.findChildren(QLabel)
+                  if label is not self.finish_line_status and label is not self.confirmation_status]
+        self.confirmation_status.setVisible(False)  # said beside 本波 when it matters (11-14)
         for label in labels:
             label.setVisible(bool(label.text()))
         self.status_widget.setVisible(any(label.text() for label in labels))
@@ -2746,14 +3501,20 @@ class QuickReviewPanel(ProblemListPanel):
                                     for owner, mark in self.picture_marks()):
             self.hint.setText("这个人已点过（无芯片）；并排选手请分别点各自前轮。")
             return
+        self.stop_run()  # a click while it plays counts on the frame shown, and holds it
         before = len(self.current_marks())
         super().add_mark(x, y, recorder_ms, frame)
         plan = self._wave_plan()
         if save and plan is not None and len(plan.marks) > before:
-            self._save_wave(plan)
+            stored = self._save_wave(plan)
             self.show_counted(self._editing_mark)
             self.marks_changed.emit(tuple(self.current_marks()))
             self.hint.setText(self.picture_mark_hint())
+            if stored:
+                crossing = recorder_crossing_time(recorder_ms, ref, self.workspace_dir) if self.workspace_dir else None
+                self._run_from = crossing.value_ms if crossing is not None else int(recorder_ms)
+                self._clicked_at = self._run_from
+                QTimer.singleShot(0, self._run_on)  # once the window has drawn the click
 
     def show_counted(self, index):
         """Pick out someone counted on a wave's picture: their row is selected on the left.
@@ -3460,6 +4221,8 @@ class QuickReviewPanel(ProblemListPanel):
         if self._auto_review is not None and event.key() not in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt):
             self._stop_auto_review("已停止自动补看，这一行未排除。")
             return True
+        if event.key() not in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta):
+            self.stop_run()  # the key then does what it always does, on the frame held
         if event.key() in NUMBER_KEYS + (Qt.Key_NumberSign,) and not event.modifiers() & (
                 Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
             # 1 / 2 / 3 act on the selected row, 4 undoes (10-29); 5 and # are no keys any more.

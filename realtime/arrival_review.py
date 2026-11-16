@@ -27,11 +27,31 @@ def event_binding(event) -> str:
                         event.is_active])
 
 
+# The table asks for a picture's binding some forty times a row on every
+# render (12 000 hashes, half of the second a click took on 古浪, 11-14).
+# Remembered per item object: an item is frozen and nothing edits its frame in
+# place, and a new frame, signature or flag is a new object or a changed key.
+# The entry holds the item, so its id cannot be handed to another one.
+_BINDINGS: dict = {}
+_BINDINGS_LIMIT = 20_000
+
+
 def candidate_binding(item) -> str:
-    return fingerprint([item.item_id, dict(item.evidence.get("frame") or {}),
-                        item.calibration_version, item.evidence.get("analysis_signature", ""),
-                        bool(item.evidence.get("configuration_stale")),
-                        bool(item.evidence.get("superseded"))])
+    evidence = item.evidence
+    frame = evidence.get("frame")
+    signature = evidence.get("analysis_signature", "")
+    stale = bool(evidence.get("configuration_stale"))
+    superseded = bool(evidence.get("superseded"))
+    known = _BINDINGS.get(id(item))
+    if (known is not None and known[0] is item and known[1] is frame
+            and known[2] == (signature, stale, superseded)):
+        return known[3]
+    binding = fingerprint([item.item_id, dict(frame or {}), item.calibration_version, signature,
+                           stale, superseded])
+    if len(_BINDINGS) >= _BINDINGS_LIMIT:
+        _BINDINGS.clear()
+    _BINDINGS[id(item)] = (item, frame, (signature, stale, superseded), binding)
+    return binding
 
 
 class ArrivalReviewStore:

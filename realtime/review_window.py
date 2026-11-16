@@ -651,6 +651,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self._held_race_ids: set[str] = set()
         # Races whose recording the first chip already started, or the operator stopped.
         self._auto_recorded_race_ids: set[str] = set()
+        self._recording_reminder_race = ""
+        self._last_chip_race_id = ""
         # The base review surface starts timers while the production window is
         # still being assembled. Initialise health-check state before that
         # happens so an early clock tick cannot observe half-built state.
@@ -1466,9 +1468,12 @@ class FinishReviewWindow(PassageReviewSurface):
 
     def _toggle_recording(self) -> None:
         if self._recording_any_active():
-            race_id = self._race_being_recorded()
-            if race_id:
-                self._auto_recorded_race_ids.add(race_id)
+            # Stopped on purpose: no reminder for this race again.  The race the
+            # chips name counts too; without race details here the folder's own
+            # id is empty and the stop used to be forgotten.
+            for race_id in (self._race_being_recorded(), self._last_chip_race_id):
+                if race_id:
+                    self._auto_recorded_race_ids.add(race_id)
             self.stop_recording()
             return
         if self._workspace_mode == "archive":
@@ -2446,6 +2451,15 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recheck_button.setStyleSheet(tool_button_style)
         self.settings_button.setStyleSheet(tool_button_style)
         self.problem_list_button.setStyleSheet(tool_button_style)
+        self.recording_reminder = QPushButton("有芯片读数，还没录像 ▶", panel)
+        self.recording_reminder.setObjectName("finishRecordingReminder")
+        self.recording_reminder.setToolTip("正式比赛请点右边「开始录像」。只是测芯片就不用管；点这条提示本场不再提醒。")
+        self.recording_reminder.setStyleSheet(
+            "QPushButton { background: #b42318; color: #ffffff; border: none; border-radius: 4px;"
+            " padding: 2px 10px; font-size: 10pt; font-weight: 700; }")
+        self.recording_reminder.clicked.connect(self._dismiss_recording_reminder)
+        self.recording_reminder.hide()
+        top_layout.addWidget(self.recording_reminder)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.setMinimumWidth(88)
@@ -2552,7 +2566,17 @@ class FinishReviewWindow(PassageReviewSurface):
         # In the workbench the picture already fills the room; F enlarges nothing.
         for pane in self.evidence_panes:
             pane._maximize_shortcut.setEnabled(not expanded)
+            if not expanded and hasattr(pane, "set_passed_count"):
+                pane.set_passed_count("")
+                if getattr(pane, "_header_strip", None) is not None:
+                    strip = pane._header_strip
+                    pane.set_header_strip(None)
+                    strip.setParent(self.problem_panel)
+                    strip.hide()
+                    pane.video_view.set_target_badge("")
+                    self._slot_pane = None
         self.setMinimumHeight(700 if expanded else 760)
+        self._set_compact_header(expanded)
         self.problem_panel.card.setVisible(not expanded)
         self.problem_panel.filmstrip.setVisible(not expanded)
         self.filter_bar.setVisible(not expanded)
@@ -2578,10 +2602,51 @@ class FinishReviewWindow(PassageReviewSurface):
         self.return_problem_button.setVisible(expanded)
         self.manual_problem_button.setVisible(expanded)
         self.pipeline_label.setVisible(expanded)
-        self.crossing_cards.setVisible(expanded)
+        self.crossing_cards.setVisible(False)
+        self.recording_rail_button.setVisible(expanded)
+        if not getattr(self, "_picture_hint_bound", False):
+            self._picture_hint_bound = True
+            self.problem_panel.hint.changed.connect(self.picture_hint.set_hint)
+        self.picture_hint.set_hint(self.problem_panel.hint.text())
+        self.picture_hint.setVisible(expanded)
+        self.problem_panel.hint.setVisible(not expanded)
         self._set_recording_rail_visible(not expanded or self.recording_rail_button.isChecked())
         self._problem_count_mode_changed(expanded)
         self._update_operator_controls()
+
+    def _set_compact_header(self, compact: bool) -> None:
+        """In the workbench the top bar is one low line, and 刷新 / 设置 are under 更多.
+
+        11-14: the picture was letterboxed by height (150 px of black either
+        side on a 16-inch laptop); every line taken off the top and the bottom
+        goes to it.
+        """
+        header = getattr(self, "runtime_header", None)
+        if header is None:
+            return
+        header.setMinimumHeight(38 if compact else 78)
+        header.layout().setContentsMargins(10, 1 if compact else 5, 10, 1 if compact else 5)
+        style = header.styleSheet()
+        header.setStyleSheet(style.replace("min-height: 32px", "min-height: 26px") if compact
+                             else style.replace("min-height: 26px", "min-height: 32px"))
+        for button in (self.recheck_button, self.settings_button):
+            button.setVisible(not compact)
+        self.product_title_label.setVisible(not compact)
+        menu = getattr(getattr(self.problem_panel, "more_button", None), "menu", lambda: None)()
+        if menu is not None and not getattr(self, "_header_actions", None):
+            menu.addAction("清理旧赛事文件夹…", self._clean_old_folders)
+            menu.addSeparator()
+            self._header_actions = [menu.addAction("重新检查连接（刷新）", self.recheck_button.click),
+                                    menu.addAction("设备与赛事设置", self.settings_button.click)]
+        for action in getattr(self, "_header_actions", None) or ():
+            action.setVisible(compact)
+
+    def _clean_old_folders(self) -> None:
+        """Folders left by earlier tests: the operator ticks which go (see workspace_cleanup)."""
+        from .workspace_cleanup import clean_old_folders
+        done = clean_old_folders(self, self.workspace_root, self.output_dir)
+        if done:
+            self.problem_panel.hint.setText(done)
 
     def _uses_popup_judging(self):
         return not getattr(self, "_problem_workbench_active", False) and super()._uses_popup_judging()
@@ -2648,6 +2713,8 @@ class FinishReviewWindow(PassageReviewSurface):
         self.problem_panel.marks_changed.connect(self._problem_marks_changed)
         self.problem_panel.count_mode_changed.connect(self._problem_count_mode_changed)
         self.problem_panel.frame_step_requested.connect(self._step_active_pane)
+        self.problem_panel.run_requested.connect(self._run_problem_playback)
+        self.problem_panel.run_speed.connect(self._run_problem_speed)
         self.problem_panel.clear_data_requested.connect(self._clear_event_data)
         self.problem_panel.delete_requested.connect(self._delete_problem_record)
         self.problem_panel.calibration_requested.connect(self._calibrate_crossing_frame)
@@ -2668,7 +2735,15 @@ class FinishReviewWindow(PassageReviewSurface):
         self.recording_rail_button = QPushButton("查找原录像", self.crossing_cards)
         self.recording_rail_button.setCheckable(True)
         self.recording_rail_button.toggled.connect(self._set_recording_rail_visible)
-        self.crossing_cards.toolbar.addWidget(self.recording_rail_button)
+        # 11-14: it sat alone on a band under the picture; it shares the picture's button line now.
+        self.evidence_panes[0].controls_layout.addWidget(self.recording_rail_button)
+        self.recording_rail_button.hide()
+        # 11-14: the advice sits beside the picture's buttons, not at the foot of the window.
+        from .problem_panel import PictureHint
+        self.picture_hint = PictureHint(self)
+        controls = self.evidence_panes[0].controls_layout
+        controls.insertWidget(controls.indexOf(self.evidence_panes[0].time_label) + 1, self.picture_hint, 3)
+        self.picture_hint.hide()
         self._creating_manual_crossing = False
         # 校时 lives on the judging toolbar (QuickReviewPanel.calibrate_button), not down here.
         self.group_start_button = QPushButton("回到团首", self)
@@ -2891,6 +2966,16 @@ class FinishReviewWindow(PassageReviewSurface):
                 and pane is self._active_playback_pane()):
             self.problem_panel.cancel_picture_mark(x, y)
 
+    def _problem_wheel_step(self, delta: int, pane) -> None:
+        """The wheel over the counting picture: hold whatever was playing, one frame on or back."""
+
+        if not getattr(self, "_problem_workbench_active", False):
+            return
+        stop = getattr(self.problem_panel, "stop_run", None)
+        if stop is not None:
+            stop()
+        self._step_pane(pane, int(delta))
+
     def _problem_count_clicked(self, x_normalized: float, y_normalized: float, pane=None) -> None:
         """A click records the displayed frame; an unreported crossing starts its own item."""
 
@@ -2943,6 +3028,38 @@ class FinishReviewWindow(PassageReviewSurface):
         self._refresh_crossing_cards()
         self.problem_panel.setFocus()
 
+    def _run_problem_playback(self, playing) -> None:
+        """The arrival list plays the recording on to the next person, or holds it: what Space does."""
+
+        pane = self._active_playback_pane()
+        if pane is not None and bool(playing) != bool(pane.is_playing):
+            self._toggle_pane(pane)
+
+    def _run_problem_speed(self, speed) -> None:
+        """A run through a stretch the strip shows empty plays fast; a pause ends that."""
+
+        pane = self._active_playback_pane()
+        if pane is not None:
+            pane.set_play_speed(speed)
+
+    def _toggle_active_pane(self) -> None:
+        """Space.  On the arrival list's wave it plays on to the next person and stops (11-12).
+
+        古浪 big bunch: Space played the recording straight on and everyone went
+        past before one could be clicked.  A run playing is held; plain playing
+        is paused; with no wave on screen Space plays as it always did.
+        """
+
+        panel = getattr(self, "problem_panel", None)
+        if getattr(self, "_problem_workbench_active", False) and getattr(panel, "quick_review", False):
+            pane = self._active_playback_pane()
+            if pane is not None and pane.is_playing:
+                if panel.stop_run():
+                    return
+            elif pane is not None and panel.play_on():
+                return
+        PassageReviewSurface._toggle_active_pane(self)
+
     def _quick_review_mark_arrival(self, frame, x_normalized, y_normalized, pane) -> None:
         """Use the operator's picture click as the bicycle cue, not a final ruling."""
 
@@ -2987,12 +3104,14 @@ class FinishReviewWindow(PassageReviewSurface):
         existing = next((i for i, mark in enumerate(panel.current_marks())
                          if mark_on_frame(mark, frame, frame["recorder_ms"])
                          and (mark["x"] - x_normalized) ** 2 + (mark["y"] - y_normalized) ** 2 < .02 ** 2), None)
+        builds = panel._table_builds
         if existing is None:
             panel.add_mark(x_normalized, y_normalized, frame["recorder_ms"], frame)
         else:
             panel._editing_mark = existing
         index = next((i for i, entry in enumerate(panel._arrival_rows) if entry.key == selected_key), None)
-        if panel._wave_plan() is not None:
+        wave = panel._wave_plan() is not None
+        if wave:
             # On a wave's picture the row of whoever was clicked is selected.
             panel.show_counted(panel._editing_mark)
         elif index is not None:
@@ -3000,8 +3119,12 @@ class FinishReviewWindow(PassageReviewSurface):
             panel._active_item = item
             panel.table.setCurrentCell(index, 0)
             panel._sync_arrival_confirmation()
-        panel._quick_render_signature = None
-        panel._render()
+        if not (wave and panel._table_builds != builds):
+            # Saving the wave's count filled the table already, and the row of
+            # whoever was clicked is selected: a second fill only cost the
+            # operator a fifth of a second a click (古浪, 11-14).
+            panel._quick_render_signature = None
+            panel._render()
         self._problem_count_mode_changed(True)
         self._problem_marks_changed(())
         panel.hint.setText(
@@ -3016,6 +3139,28 @@ class FinishReviewWindow(PassageReviewSurface):
         pane = self._problem_pane()
         if pane is not None:
             pane.video_view.set_history_markers(self._continuous_marker_overlays(pane))
+            self._show_problem_count_badge(pane)
+
+    def _show_problem_count_badge(self, pane) -> None:
+        """已过 N 人 · X 号 above the picture, read against the timing software."""
+        text = ""
+        if (getattr(self, "_problem_workbench_active", False) and pane is self._problem_pane()
+                and getattr(self.problem_panel, "quick_review", False)
+                and hasattr(self.problem_panel, "passed_count_text")):
+            text = self.problem_panel.passed_count_text(self._frame_for_problem_count(pane))
+            if hasattr(self.problem_panel, "refresh_slots") and hasattr(pane, "set_header_strip"):
+                # The cells of who is counted take the place of 已过 N 人 · X 号 (11-14).
+                holder = getattr(self, "_slot_pane", None)
+                if holder is not None and holder is not pane:
+                    holder.set_header_strip(None)  # another camera's picture had them: its own header is back
+                self._slot_pane = pane
+                pane.set_header_strip(self.problem_panel.wave_slots)
+                self.problem_panel.refresh_slots(text.split(" · ")[0])
+                if hasattr(pane.video_view, "set_target_badge"):
+                    _key, words, kind = self.problem_panel.current_target()
+                    pane.video_view.set_target_badge(words, kind)
+        if hasattr(pane, "set_passed_count"):
+            pane.set_passed_count(text)
 
     def _continuous_marker_overlays(self, pane):
         """The counted people ride along with the crossing markers of the same frame."""
@@ -3148,6 +3293,7 @@ class FinishReviewWindow(PassageReviewSurface):
             # The red "待补录" identity guide is not the camera's finish line.
             pane.video_view.clear_marker()
             pane.video_view.set_history_markers(self._problem_count_overlays(pane))
+            self._show_problem_count_badge(pane)
             self.problem_panel._sync_arrival_confirmation()
         if pane is not self._active_playback_pane():
             return
@@ -3155,7 +3301,9 @@ class FinishReviewWindow(PassageReviewSurface):
         frame = item.evidence.get("frame", {}) if item else {}
         actual = self._frame_for_problem_count(pane)
         if actual:
-            self.problem_panel.record_viewed_frame(actual, actual["recorder_ms"])
+            stamp = self.problem_panel.record_viewed_frame(actual, actual["recorder_ms"])
+            if getattr(self.problem_panel, "quick_review", False):
+                pane.set_judged_time(actual["position_ms"], stamp)  # the table's clock, not the recorder's
         normal = self._normal_crossing_cards.get(self._opened_normal_crossing)
         if normal is not None:
             self.problem_panel.set_browsing(True)
@@ -3302,12 +3450,13 @@ class FinishReviewWindow(PassageReviewSurface):
     def _set_recording_rail_visible(self, visible):
         workbench = getattr(self, "_problem_workbench_active", False)
         self.video_filmstrip.setVisible(bool(visible) or not workbench)
-        self.crossing_cards.setVisible(workbench)
+        self.crossing_cards.setVisible(False)
         # Without the recording rail the bottom holds two buttons only: give the
         # picture the height instead of leaving an empty band.
         compact = workbench and not visible
         self.preview_panel.setMinimumHeight(0 if compact else 190 if workbench else 420)
-        self.preview_panel.setMaximumHeight(self.crossing_cards.sizeHint().height() + 16 if compact else 16777215)
+        self.preview_panel.setMaximumHeight(0 if compact else 16777215)
+        self.preview_panel.setVisible(not compact)
     def _refresh_crossing_cards(self):
         if not hasattr(self, "crossing_cards"):
             return
@@ -3414,7 +3563,7 @@ class FinishReviewWindow(PassageReviewSurface):
             target = f"第 {index + 1} 帧" if index is not None else f"片内 {position / 1000:.2f} 秒"
             self._active_playback_pane().set_reference_only(reference)
             if frame.get("auto_pair"):
-                self.problem_panel.hint.setText("已定位自动对应的过线原帧；灰蓝号码为系统对应，不算人工点数或裁判确认。")
+                self.problem_panel.hint.setText("已定位自动对应的过线原帧；灰蓝虚线圈为系统对应（鼠标移到圈上看号码），不算人工点数或裁判确认。")
             elif reference:
                 date_note = "；芯片日期与接收日期不同，按接收日期查找，正式时间未改" if frame.get("date_aligned") else ""
                 self.problem_panel.hint.setText(
@@ -3512,6 +3661,7 @@ class FinishReviewWindow(PassageReviewSurface):
         pane.video_view.count_mark_cancelled.connect(
             lambda x, y, pane=pane: self._problem_count_cancelled(x, y, pane)
         )
+        pane.video_view.frame_wheel.connect(lambda delta, pane=pane: self._problem_wheel_step(delta, pane))
         self._problem_count_mode_changed(True)
 
     def start_receiver(self) -> None:
@@ -4246,10 +4396,12 @@ class FinishReviewWindow(PassageReviewSurface):
         backlog_seconds = max(0, (max(short_ends) - min(through)) // 1000) if short_ends and through else 0
         chip_note = (panel.chip_status.split("（")[0].split("：")[0]
                      if any(word in panel.chip_status for word in ("发现", "失败", "错误")) else "")
+        # 11-14: "证据缺口 602 条待证据" hung there all race and told the operator
+        # nothing to do.  People nobody can check on any recording are still said.
         gap = panel.evidence_gap_text()
         notes = [f"● 录像 {duration}" if recording else "", chip_note, analysis_note,
                  f"分析落后 {backlog_seconds} 秒" if backlog_seconds else "",
-                 gap if gap != "证据缺口 无" else ""]
+                 gap.split(" · ", 1)[1] if " · " in gap else ""]
         self.pipeline_label.setText(" ｜ ".join(note for note in notes if note))
         self.pipeline_label.setToolTip(
             f"封存到 {sealed} · 分析到 {analyzed} · 积压 {backlog_seconds} 秒\n"
@@ -4466,8 +4618,16 @@ class FinishReviewWindow(PassageReviewSurface):
         )
 
     def _auto_start_recording_for_passage(self, event: PassageEvent) -> bool:
-        # The first chip starts a forgotten recording once per race; a recording
-        # the operator stopped is not started again by later chips.
+        """A chip read while nothing records: say so in red, start nothing.
+
+        11-14: the first chip of a race used to start the recording.  Before a
+        race the chips are tested again and again, and every test left a
+        recording and a folder behind ("它就会自动连接录像…非常麻烦").  The
+        reminder beside 开始录像 stays for a race that really was forgotten; a
+        click on it puts it away for this race, as stopping a recording does.
+        """
+        if event.is_active and not self._is_test_passage(event):
+            self._last_chip_race_id = event.race_id
         if (
             self._workspace_mode != "live"
             or not event.is_active
@@ -4478,23 +4638,26 @@ class FinishReviewWindow(PassageReviewSurface):
             or not self._is_live_passage(event)
         ):
             return False
-        try:
-            self.start_recording()
-        except Exception as error:  # noqa: BLE001 - passage storage must survive.
-            self._runtime_error = sanitize_recording_message(error)
-            self._auto_recording_error = self._runtime_error
-            logger.exception(
-                "Failed to auto-start recording for live passage %s",
-                event.event_id,
-            )
-            return False
-        self._auto_recorded_race_ids.add(event.race_id)
-        logger.info(
-            "Recording auto-started for live passage %s in group %s",
-            event.event_id,
-            event.group_id,
-        )
-        return True
+        if self._recording_reminder_race != event.race_id:
+            self._recording_reminder_race = event.race_id
+            logger.info("Chip read %s while not recording: reminder shown", event.event_id)
+        self._sync_recording_reminder()
+        return False
+
+    def _sync_recording_reminder(self) -> None:
+        label = getattr(self, "recording_reminder", None)
+        if label is None:
+            return
+        race = self._recording_reminder_race
+        if race and (self._recording_any_active() or race in self._auto_recorded_race_ids
+                     or self._workspace_mode != "live"):
+            race = self._recording_reminder_race = ""
+        label.setVisible(bool(race))
+
+    def _dismiss_recording_reminder(self) -> None:
+        if self._recording_reminder_race:
+            self._auto_recorded_race_ids.add(self._recording_reminder_race)
+        self._sync_recording_reminder()
 
     def _enter_race_opened_in_cyclerace(self) -> None:
         """Starting to record is when the race open in CycleRace gets its folder here.
@@ -5252,6 +5415,7 @@ class FinishReviewWindow(PassageReviewSurface):
         )
         self._update_event_header()
         self._update_operator_controls()
+        self._sync_recording_reminder()
 
     def set_finish_line_roi(
         self,

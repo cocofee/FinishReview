@@ -734,6 +734,28 @@ def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, t
         window._problem_count_cancelled(.7, .62, pane)  # right click: 22 is taken back, 23 moves up
         assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22"]
         assert sum(row.decision is not None for row in panel._arrival_rows) == 2
+        # A count fills the table once, not twice (11-14: a click took most of a
+        # second on 古浪).  On the picture the wheel walks a frame at a time,
+        # down is on; Ctrl + wheel zooms.  No letter key counts anyone: Q was
+        # tried and taken out again, it was no faster than the click.
+        fills = panel._table_builds
+        window._problem_count_clicked(.7, .62, pane)
+        assert panel._table_builds == fills + 1
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
+        QTest.keyClick(pane.video_view.viewport(), Qt.Key_Q)
+        assert [overlay[2] for overlay in window._problem_count_overlays(pane)] == ["21", "22", "23"]
+        from PyQt5.QtCore import QPoint, QPointF
+        from PyQt5.QtGui import QWheelEvent
+        viewport = pane.video_view.viewport()
+        steps = QSignalSpy(pane.video_view.frame_wheel)
+        zoom = pane.video_view.transform().m11()
+        for angle, modifier in ((-120, Qt.NoModifier), (120, Qt.NoModifier), (120, Qt.ControlModifier)):
+            point = viewport.rect().center()
+            QApplication.sendEvent(viewport, QWheelEvent(
+                QPointF(point), QPointF(viewport.mapToGlobal(point)), QPoint(0, 0), QPoint(0, angle),
+                Qt.NoButton, modifier, Qt.NoScrollPhase, False))
+        assert [step[0] for step in steps] == [1, -1]  # down is on, up is back
+        assert pane.video_view.transform().m11() > zoom  # Ctrl + wheel still zooms
     finally:
         window.close()
 
@@ -1191,7 +1213,8 @@ def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
     assert window.evidence_panes[0].controls_layout.indexOf(window.group_start_button) >= 0
     status_y = panel.status_widget.mapTo(panel.quick_toolbar, panel.status_widget.rect().center()).y()
     action_y = buttons[0].mapTo(panel.quick_toolbar, buttons[0].rect().center()).y()
-    assert abs(status_y - action_y) <= 2  # no separate status band above the actions
+    # No separate status band above the actions; with nothing to say it is not there at all (11-14).
+    assert not panel.status_widget.isVisible() or abs(status_y - action_y) <= 2
     assert not window.video_filmstrip.full_race.follow_button.isHidden()
     window.video_filmstrip.full_race.follow_button.setChecked(True)
     window.video_filmstrip.full_race.follow_button.setChecked(False)
@@ -1205,7 +1228,7 @@ def test_workbench_primary_actions_and_filmstrip_fit_laptop(qapp, tmp_path):
     ("分析失败，等待重试", "芯片自检等待更新", "证据缺口 无", "分析失败"),
     ("分析已暂停；录像继续", "芯片自检等待更新", "证据缺口 无", "分析已暂停"),
     ("等待已封存录像", "芯片自检读取失败：磁盘错误", "证据缺口 无", "芯片自检读取失败"),
-    ("空闲", "芯片自检等待更新", "证据缺口 2 条待证据", "2 条待证据"),
+    ("空闲", "芯片自检等待更新", "证据缺口 2 条待证据", ""),   # 11-14: nothing to do about it, not shown
     ("空闲", "芯片自检等待更新", "证据缺口 0 条待证据 · 2 人无录像可核", "2 人无录像可核"),
 ])
 def test_workbench_pipeline_only_shows_actionable_state(qapp, tmp_path, monkeypatch, analysis, chip, gap, expected):
@@ -1224,11 +1247,12 @@ def test_workbench_pipeline_only_shows_actionable_state(qapp, tmp_path, monkeypa
         window._on_clock_tick()
         text = window.pipeline_label.text()
         assert expected in text
-        assert all(word not in text for word in ("未启动", "封存到", "积压 0", "分析到", "证据缺口 无"))
+        assert all(word not in text for word in ("未启动", "封存到", "积压 0", "分析到", "证据缺口", "条待证据"))
         assert "封存到" in window.pipeline_label.toolTip()
         assert window.pipeline_label.isHidden() == (not expected)
-        # The selected-row status now shares the same line with alerts and keys.
-        assert not panel.confirmation_status.isHidden()
+        # 11-14: the wave's status line is not shown; what needs doing is said beside 本波.
+        panel._sync_arrival_confirmation()
+        assert panel.confirmation_status.isHidden()
     finally:
         window.close()
 
@@ -2801,16 +2825,38 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert receiver.stopped
 
 
-def test_first_live_formal_passage_auto_starts_recording(qapp, tmp_path):
+def test_a_chip_read_while_not_recording_reminds_in_red_and_starts_nothing(qapp, tmp_path):
+    """11-14：赛前反复测芯片，每测一次就自动录一段、多一个文件夹。改成红色提醒，不自动录。"""
     window = _window(tmp_path)
     window.start_receiver()
 
     _FakeReceiver.instances[-1].deliver(_event())
     qapp.processEvents()
 
+    assert window.recorder is None and not _FakeRecorder.instances
+    assert window.passage_store.get("race-1-stage-1-passage-15") is not None   # the chip itself is kept
+    assert not window.recording_reminder.isHidden()
+
+    window._toggle_recording()                      # the operator starts it: the reminder goes
+    qapp.processEvents()
     assert window.recorder is not None and window.recorder.is_running
-    assert len(_FakeRecorder.instances) == 1
-    assert window.passage_store.get("race-1-stage-1-passage-15") is not None
+    window._update_runtime_status()
+    assert window.recording_reminder.isHidden()
+    window.close()
+
+
+def test_a_click_on_the_reminder_puts_it_away_for_this_race(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+    _FakeReceiver.instances[-1].deliver(_event())
+    qapp.processEvents()
+    assert not window.recording_reminder.isHidden()
+
+    window.recording_reminder.click()
+    assert window.recording_reminder.isHidden()
+    _FakeReceiver.instances[-1].deliver(_event(event_id="race-1-stage-1-passage-16"))
+    qapp.processEvents()
+    assert window.recording_reminder.isHidden() and window.recorder is None
     window.close()
 
 
@@ -2856,6 +2902,7 @@ def test_a_recording_the_operator_stopped_is_not_restarted_by_chips(qapp, tmp_pa
 
     receiver.deliver(_event(event_id="first", sequence=15))
     qapp.processEvents()
+    window._toggle_recording()                 # the operator starts it (11-14: chips start nothing)
     assert window.recorder is not None and window.recorder.is_running
 
     window._toggle_recording()
@@ -2865,6 +2912,7 @@ def test_a_recording_the_operator_stopped_is_not_restarted_by_chips(qapp, tmp_pa
     qapp.processEvents()
     assert not window._recording_any_active()
     assert len(_FakeRecorder.instances) == 1
+    assert window.recording_reminder.isHidden()   # stopped on purpose: not nagged about it either
     assert window.passage_store.get("second") is not None
     window.close()
 
@@ -2980,7 +3028,7 @@ def test_live_test_group_id_without_metadata_does_not_auto_start_recording(
     window.close()
 
 
-def test_first_formal_passage_after_test_group_starts_only_one_recorder(
+def test_a_test_group_chip_is_not_reminded_about_and_the_first_formal_one_is(
     qapp,
     tmp_path,
 ):
@@ -3004,13 +3052,15 @@ def test_first_formal_passage_after_test_group_starts_only_one_recorder(
     qapp.processEvents()
     assert window.recorder is None
 
+    assert window.recording_reminder.isHidden()
+
     receiver.deliver(_event(event_id="formal-first", sequence=16))
     qapp.processEvents()
-    assert window.recorder is not None and window.recorder.is_running
+    assert window.recorder is None and not window.recording_reminder.isHidden()
 
     receiver.deliver(_event(event_id="formal-second", sequence=17))
     qapp.processEvents()
-    assert len(_FakeRecorder.instances) == 1
+    assert not _FakeRecorder.instances and not window.recording_reminder.isHidden()
     window.close()
 
 
@@ -3026,39 +3076,6 @@ def test_historical_passage_does_not_auto_start_recording(qapp, tmp_path):
 
     assert window.recorder is None
     assert window.table.rowCount() == 1
-    window.close()
-
-
-def test_auto_recording_failure_does_not_drop_live_passage(qapp, tmp_path):
-    class _FailRecorder(_FakeRecorder):
-        def start(self):
-            raise RuntimeError("camera unavailable")
-
-    _FailRecorder.instances.clear()
-    _FakeReceiver.instances.clear()
-    window = FinishReviewWindow(
-        "rtsp://camera/live",
-        tmp_path,
-        passage_host="127.0.0.1",
-        passage_port=18765,
-        passage_batch_interval_ms=0,
-        recorder_factory=_FailRecorder,
-        receiver_factory=_FakeReceiver,
-    )
-    window.start_receiver()
-
-    _FakeReceiver.instances[-1].deliver(_event())
-    qapp.processEvents()
-
-    assert window.recorder is None
-    assert window.passage_store.get("race-1-stage-1-passage-15") is not None
-    assert window.table.rowCount() == 1
-    assert window._runtime_error == "camera unavailable"
-    assert window.camera_status_label.text() == "录像设备: 自动启动失败"
-    assert window.camera_status_label.toolTip() == "camera unavailable"
-    # A device that is in trouble is exactly what the strip exists for.
-    assert not window.camera_status_label.isHidden()
-    assert not window.runtime_status_strip.isHidden()
     window.close()
 
 
@@ -5358,7 +5375,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.25.10 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.25.11 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -5372,7 +5389,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.25.10"
+    assert window.product_title_label.text() == "FinishReview v0.25.11"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()
@@ -5931,5 +5948,139 @@ def test_a_row_opens_in_its_sealed_archive_on_the_same_picture(qapp, tmp_path):
         window.__dict__.pop("_archive_shifts", None)
         opened, position, _index = window._problem_frame_source(location, 500, 10)
         assert opened is location and position == 500
+    finally:
+        window.close()
+
+
+def test_the_arrival_list_s_run_plays_and_holds_the_active_pane_like_space():
+    """11-11：点人后录像自己走到下一位——面板只发「放 / 停」，窗口按空格的同一条路去做。"""
+
+    class Pane:
+        is_playing = False
+
+    class Window:
+        def __init__(self):
+            self.pane, self.toggled = Pane(), 0
+
+        def _active_playback_pane(self):
+            return self.pane
+
+        def _toggle_pane(self, pane):
+            self.toggled += 1
+            pane.is_playing = not pane.is_playing
+
+    window = Window()
+    run = review_window_module.FinishReviewWindow._run_problem_playback
+    run(window, True)
+    run(window, True)  # already playing: Space is not pressed a second time
+    assert window.toggled == 1 and window.pane.is_playing
+    run(window, False)
+    run(window, False)
+    assert window.toggled == 2 and not window.pane.is_playing
+    window.pane = None
+    run(window, True)  # no recording open: nothing to play
+
+
+def test_space_on_the_arrival_list_plays_a_wave_on_to_the_next_person():
+    """11-12 古浪：大集团里空格一口气放完；工作台上空格改成走到下一位停住，放着时空格停。"""
+
+    class Pane:
+        is_playing = False
+
+    class Panel:
+        quick_review = True
+
+        def __init__(self):
+            self.calls, self.answer = [], True
+
+        def stop_run(self):
+            self.calls.append("stop")
+            return self.answer
+
+        def play_on(self):
+            self.calls.append("play_on")
+            return self.answer
+
+    class Window:
+        def __init__(self):
+            self.pane, self.problem_panel, self.toggled = Pane(), Panel(), 0
+            self._problem_workbench_active = True
+
+        def _active_playback_pane(self):
+            return self.pane
+
+        def _toggle_pane(self, pane):
+            self.toggled += 1
+
+    space = review_window_module.FinishReviewWindow._toggle_active_pane
+    window = Window()
+    space(window)
+    assert window.problem_panel.calls == ["play_on"] and window.toggled == 0
+    window.pane.is_playing = True
+    space(window)  # the run playing: Space holds it
+    assert window.problem_panel.calls[-1] == "stop" and window.toggled == 0
+    window.problem_panel.answer = False
+    space(window)  # playing plainly: Space pauses as always
+    assert window.toggled == 1
+    window.pane.is_playing = False
+    space(window)  # nothing of a wave left: Space plays as always
+    assert window.problem_panel.calls[-1] == "play_on" and window.toggled == 2
+    window._problem_workbench_active = False
+    space(window)  # not on the arrival list: the panel is not asked
+    assert window.toggled == 3 and len(window.problem_panel.calls) == 4
+
+
+def test_the_workbench_gives_its_height_to_the_picture_and_gives_it_back(qapp, tmp_path):
+    """11-14：画面被高度卡住、两侧黑边。工作台里顶栏压成一行，刷新/设置进「更多」，画面下面不留空带。"""
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.resize(1280, 720)
+        window.show()
+        qapp.processEvents()
+        pane, panel = window.regular_pane, window.problem_panel
+        assert window.runtime_header.minimumHeight() == 38
+        assert window.recheck_button.isHidden() and window.settings_button.isHidden()
+        shown = [action.text() for action in panel.more_button.menu().actions() if action.isVisible()]
+        assert "重新检查连接（刷新）" in shown and "设备与赛事设置" in shown
+        assert not window.crossing_cards.isVisibleTo(window)
+        assert pane.controls_layout.indexOf(window.recording_rail_button) >= 0
+        assert window.recording_rail_button.isVisibleTo(window)
+        # With nothing to judge yet the raw recording is offered once; put away, it leaves no band.
+        window.recording_rail_button.setChecked(False)
+        qapp.processEvents()
+        assert not window.preview_panel.isVisibleTo(window)
+        assert pane.controls_layout.indexOf(pane.timeline) >= 0
+
+        # The advice is on the picture's button line, not at the foot of the window.
+        assert pane.controls_layout.indexOf(window.picture_hint) >= 0 and window.picture_hint.isVisibleTo(window)
+        assert not panel.hint.isVisibleTo(window)
+        panel.hint.setText("后面还有人压线就点他，\n没有就按空格。")
+        assert window.picture_hint.hint() == "后面还有人压线就点他， 没有就按空格。"
+        assert window.picture_hint.toolTip() == window.picture_hint.hint()
+        window.picture_hint.grab()
+
+        window._show_problem_count_badge(pane)
+        assert pane._header.indexOf(panel.wave_slots) >= 0 and window._slot_pane is pane
+        assert pane.title_label.isHidden() and pane.frame_indicator_label.isHidden()
+
+        # 查找原录像 brings the recording rail back, and takes it away again.
+        window.recording_rail_button.setChecked(True)
+        qapp.processEvents()
+        assert window.preview_panel.isVisibleTo(window) and window.video_filmstrip.isVisibleTo(window)
+        window.recording_rail_button.setChecked(False)
+        qapp.processEvents()
+        assert not window.preview_panel.isVisibleTo(window)
+
+        window._set_problem_list_layout(False)
+        qapp.processEvents()
+        assert window.runtime_header.minimumHeight() == 78
+        assert not window.recheck_button.isHidden() and not window.settings_button.isHidden()
+        assert not any(action.isVisible() for action in window._header_actions)
+        assert pane._header.indexOf(panel.wave_slots) < 0 and window._slot_pane is None
+        assert not pane.title_label.isHidden() and not pane.frame_indicator_label.isHidden()
+        assert pane.layout().indexOf(pane.timeline) >= 0
+        assert window.recording_rail_button.isHidden()
+        assert window.picture_hint.isHidden() and not panel.hint.isHidden()
     finally:
         window.close()

@@ -433,7 +433,14 @@ def review_status_text(
 
 
 # Screen size of the number beside a person on the picture.
-PERSON_TAG_FONT_PX = 20
+PERSON_TAG_FONT_PX = 30  # 11-12: 20 px was too small to read at a glance
+# 11-16: in a bunch the number tags covered the riders behind (古浪 507 over 547).
+# A counted person is a ring only; their number shows while the mouse is on it.
+HOVER_REACH_PX = 16
+SELECTED_RING_PX = 15  # the outer ring of the one selected (just clicked, or picked on the left)
+# The tag sits this far to the right of the click, level with it, off the
+# person's body (operator, 11-12); left or above when that place is taken.
+PERSON_TAG_LIFT_PX = 60
 
 
 class EvidenceImageView(QGraphicsView):
@@ -448,6 +455,8 @@ class EvidenceImageView(QGraphicsView):
     # comes from whoever knows which frame is on screen.
     count_mark_selected = pyqtSignal(float, float)
     count_mark_cancelled = pyqtSignal(float, float)
+    # The wheel over a picture people are counted on: one frame on (+1) or back (-1).
+    frame_wheel = pyqtSignal(int)
     marker_confirm_requested = pyqtSignal()
     marker_cancel_requested = pyqtSignal()
     marker_delete_requested = pyqtSignal()
@@ -507,8 +516,9 @@ class EvidenceImageView(QGraphicsView):
         self._marker: Optional[tuple[float, float, str, bool]] = None
         self._marker_simple = False
         self._history_markers: tuple[
-            tuple[float, float, str, bool, bool, bool, bool, bool], ...
+            tuple[float, float, str, bool, bool, bool, bool, bool, bool, bool], ...
         ] = ()
+        self._hover_position: Optional[QPoint] = None  # the mouse over the picture, for ring numbers
         self._show_marker_label = True
         self._show_identity_badge = True
         self._mouse_press_position: Optional[QPoint] = None
@@ -549,6 +559,12 @@ class EvidenceImageView(QGraphicsView):
         )
         self._frame_badge.setFixedSize(300, 34)
         self._frame_badge.hide()
+        # 11-14: who the next click is, in the corner of the picture the eyes are on.
+        self._target_badge = QLabel(self.viewport())
+        self._target_badge.setObjectName("evidenceTargetBadge")
+        self._target_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._target_badge.setAlignment(Qt.AlignCenter)
+        self._target_badge.hide()
         self._batch_roster_panel = QFrame(self.viewport())
         self._batch_roster_panel.setObjectName("evidenceBatchRoster")
         self._batch_roster_panel.setFixedWidth(176)
@@ -786,6 +802,35 @@ class EvidenceImageView(QGraphicsView):
         self._frame_badge.show()
         self._frame_badge.raise_()
 
+    def set_target_badge(self, text: str, kind: str = "next") -> None:
+        """下一位 N 号 / N 号 已点 in the top right corner of the picture; empty hides it."""
+        value = str(text or "").strip()
+        if not value:
+            self._target_badge.hide()
+            return
+        state = (value, kind)
+        if state != getattr(self, "_target_state", None):
+            self._target_state = state
+            self._target_badge.setStyleSheet(
+                "QLabel#evidenceTargetBadge { background: %s; color: %s; border: 3px solid #111827;"
+                " border-radius: 4px; padding: 2px 14px; font-size: 22pt; font-weight: 800; }"
+                % {"alert": ("#b42318", "#ffffff"), "done": ("#2fb872", "#ffffff")}.get(kind, ("#ffd84d", "#111827")))
+            self._target_badge.setText(value)
+            self._target_badge.adjustSize()
+        self._target_badge.show()
+        self._target_badge.raise_()
+        self._position_target_badge()
+
+    def target_badge_text(self) -> str:
+        return "" if self._target_badge.isHidden() else self._target_badge.text()
+
+    def _position_target_badge(self) -> None:
+        # 11-14: top, left of the middle, where the riders come in ("视角不在右边");
+        # right of the camera's own date and time, which stay readable.
+        width = self.viewport().width()
+        left = min(int(width * 0.41), width - self._target_badge.width() - 12)
+        self._target_badge.move(max(12, left), 6)
+
     def clear_frame_indicator(self) -> None:
         self._frame_badge.clear()
         self._frame_badge.hide()
@@ -864,15 +909,16 @@ class EvidenceImageView(QGraphicsView):
             self.viewport().setCursor(
                 Qt.CrossCursor if self._count_mode else Qt.ArrowCursor
             )
-            self.setToolTip(
-                COUNT_MODE_HELP if self._count_mode else "滚轮放大后，中键拖动查看号码"
-            )
+            # 11-15: the floating hint sat on the picture where people are clicked.
+            self.setToolTip("")
             return
         self._marker_mode = bool(enabled) and self.has_frame
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._marker_mode:
+        if self._workbench_compact:
+            self.setToolTip("")  # 11-15: no floating hint over the picture in the workbench
+        elif self._marker_mode:
             self.setToolTip(
                 "单击放置判读线；Shift + 左键拖动判读线；"
                 "中键拖动缩放后的画面"
@@ -899,7 +945,9 @@ class EvidenceImageView(QGraphicsView):
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._marker_mode:
+        if self._workbench_compact:
+            self.setToolTip("")  # 11-15: no floating hint over the picture in the workbench
+        elif self._marker_mode:
             self.setToolTip(
                 "单击放置判读线；Shift + 左键拖动判读线；"
                 "中键拖动缩放后的画面"
@@ -918,7 +966,9 @@ class EvidenceImageView(QGraphicsView):
         self.viewport().setCursor(
             Qt.CrossCursor if (self._marker_mode or self._count_mode) else Qt.ArrowCursor
         )
-        if self._marker_mode:
+        if self._workbench_compact:
+            self.setToolTip("")  # 11-15: no floating hint over the picture in the workbench
+        elif self._marker_mode:
             self.setToolTip(
                 "单击放置判读线；Shift + 左键拖动判读线；"
                 "中键拖动缩放后的画面"
@@ -967,6 +1017,9 @@ class EvidenceImageView(QGraphicsView):
                 bool(marker[5]) if len(marker) > 5 else False,
                 bool(marker[6]) if len(marker) > 6 else False,
                 bool(marker[7]) if len(marker) > 7 else False,
+                # 11-16: the number only while the mouse is on the ring; the selected one ringed twice.
+                bool(marker[8]) if len(marker) > 8 else False,
+                bool(marker[9]) if len(marker) > 9 else False,
             )
             for marker in markers
             for x_normalized, y_normalized, label, confirmed, simple in [marker[:5]]
@@ -1002,7 +1055,13 @@ class EvidenceImageView(QGraphicsView):
 
     def wheelEvent(self, event) -> None:
         if self.has_frame and event.angleDelta().y():
-            self.zoom_by(1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2)
+            if self._count_mode and not event.modifiers() & Qt.ControlModifier:
+                # Counting people: the wheel walks the recording a frame at a
+                # time (down is on), the hand never leaves the mouse to find
+                # the frame someone meets the line on.  Ctrl + wheel zooms.
+                self.frame_wheel.emit(-1 if event.angleDelta().y() > 0 else 1)
+            else:
+                self.zoom_by(1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2)
             event.accept()
             return
         super().wheelEvent(event)
@@ -1036,7 +1095,33 @@ class EvidenceImageView(QGraphicsView):
             return
         super().mousePressEvent(event)
 
+    def _hovered_marker(self, position) -> int:
+        """Index of the ring (numbered on hover) under the mouse, -1 for none."""
+        if position is None or self._source_width <= 0 or self._source_height <= 0:
+            return -1
+        best, reach = -1, HOVER_REACH_PX ** 2
+        for index, marker in enumerate(self._history_markers):
+            if not marker[8] or marker[6]:
+                continue
+            point = self.mapFromScene(QPointF(marker[0] * self._source_width, marker[1] * self._source_height))
+            distance = (point.x() - position.x()) ** 2 + (point.y() - position.y()) ** 2
+            if distance <= reach:
+                best, reach = index, distance
+        return best
+
+    def leaveEvent(self, event) -> None:
+        if self._hovered_marker(self._hover_position) >= 0:
+            self.viewport().update()
+        self._hover_position = None
+        super().leaveEvent(event)
+
     def mouseMoveEvent(self, event) -> None:
+        if not event.buttons():
+            # Only looking: the ring under the mouse shows its number, nothing else changes.
+            before = self._hovered_marker(self._hover_position)
+            self._hover_position = event.pos()
+            if self._hovered_marker(self._hover_position) != before:
+                self.viewport().update()
         if (
             self._pan_dragging
             and self._pan_last_position is not None
@@ -1227,10 +1312,10 @@ class EvidenceImageView(QGraphicsView):
         font.setBold(True)
         width = min(max(34, QFontMetrics(font).horizontalAdvance(label) + 16) / scale, visible.width())
         height = min((PERSON_TAG_FONT_PX + 10) / scale, visible.height())
-        gap = 12 / scale
+        gap, lift = 12 / scale, PERSON_TAG_LIFT_PX / scale
         candidates = []
-        for dx, dy in ((gap, -height - gap), (-width - gap, -height - gap),
-                       (gap, gap), (-width - gap, gap), (gap, -2 * height - gap)):
+        for dx, dy in ((lift, -height / 2), (-width - lift, -height / 2), (gap, -height - lift),
+                       (-width - gap, -height - lift), (gap, gap), (-width - gap, gap)):
             left = max(visible.left(), min(x + dx, visible.right() - width))
             top = max(visible.top(), min(y + dy, visible.bottom() - height))
             candidate = QRectF(left, top, width, height)
@@ -1239,11 +1324,23 @@ class EvidenceImageView(QGraphicsView):
             candidates.append((overlap, candidate))
         return min(candidates, key=lambda value: value[0])[1]
 
+    @staticmethod
+    def _draw_selected_ring(painter, x, y, color, scale):
+        """A second ring round the one selected: their number is in the corner badge."""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(color, 2.5)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QPointF(x, y), SELECTED_RING_PX / scale, SELECTED_RING_PX / scale)
+        painter.restore()
+
     def _draw_person_tag(self, painter, x, y, label, color, dashed, ghost, scale, visible, occupied):
         """A point and number label, not a timing line or a tracking box."""
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        radius = (5 if ghost else 7) / scale
+        radius = (7 if ghost else 10) / scale
         pen = QPen(color, 2.5)
         pen.setCosmetic(True)
         if dashed or ghost:
@@ -1290,9 +1387,9 @@ class EvidenceImageView(QGraphicsView):
                 for a, b in zip(self._finish_line_points, self._finish_line_points[1:]):
                     painter.drawLine(QPointF(a[0] * self._source_width, a[1] * self._source_height),
                                      QPointF(b[0] * self._source_width, b[1] * self._source_height))
-        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost, auto) in enumerate(
-            self._history_markers
-        ):
+        hovered = self._hovered_marker(self._hover_position)
+        for index, (x_normalized, y_normalized, label, confirmed, simple, dot, ghost, auto,
+                    hover_only, selected) in enumerate(self._history_markers):
             x = x_normalized * self._source_width
             y = y_normalized * self._source_height
             # Grey-blue and dashed: paired by the system (自动对上), nobody has counted them yet.
@@ -1303,8 +1400,11 @@ class EvidenceImageView(QGraphicsView):
                 color.setAlpha(150)
             if self._workbench_compact or dot:
                 if visible.adjusted(-6 / scale, -6 / scale, 6 / scale, 6 / scale).contains(QPointF(x, y)):
-                    self._draw_person_tag(painter, x, y, label, color,
+                    shown = label if not hover_only or index == hovered else ""
+                    self._draw_person_tag(painter, x, y, shown, color,
                                           auto or (not confirmed and not simple), ghost, scale, visible, occupied)
+                    if selected and not ghost:
+                        self._draw_selected_ring(painter, x, y, color, scale)
                 continue
             pen = QPen(color, 2)
             pen.setCosmetic(True)
@@ -1419,6 +1519,7 @@ class EvidenceImageView(QGraphicsView):
         self._identity_badge.move(12, 12)
 
     def _position_frame_badge(self) -> None:
+        self._position_target_badge()
         if not self._frame_badge.isVisible():
             return
         margin = 12
@@ -1515,6 +1616,7 @@ class PassageEvidencePane(QFrame):
         self._idle_prefetch_enabled = False
         self._target_position_ms = 0
         self._playing = False
+        self._play_speed = 1.0
         self._duration_ms = 0
         self._fps = 0.0
         self._frame_count = 0
@@ -1566,6 +1668,21 @@ class PassageEvidencePane(QFrame):
         )
         self.frame_indicator_label.setMinimumHeight(30)
         self.frame_indicator_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        # 11-12: 已过 N 人 · X 号 in the middle above the picture, read against the
+        # timing software's own running count (the operator's words).
+        self.passed_label = QLabel("")
+        self.passed_label.setObjectName("evidencePassedCount")
+        self.passed_label.setAlignment(Qt.AlignCenter)
+        self.passed_label.setStyleSheet(
+            "QLabel#evidencePassedCount {"
+            " background: #0b2b1f; color: #ffffff;"
+            " border: 2px solid #1bbf83; border-radius: 3px;"
+            " padding: 2px 18px; font-size: 18pt; font-weight: 800;"
+            "}"
+        )
+        self.passed_label.setMinimumHeight(40)
+        self.passed_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.passed_label.hide()
         self.camera_combo = QComboBox(self)
         self.camera_combo.setMinimumWidth(88)
         self.camera_combo.setToolTip("切换普通录像机位")
@@ -1581,6 +1698,9 @@ class PassageEvidencePane(QFrame):
         header.addWidget(self.active_badge)
         header.addWidget(self.frame_indicator_label)
         header.addWidget(self.camera_combo)
+        header.addStretch()
+        header.addWidget(self.passed_label)
+        self._header, self._header_strip = header, None
         header.addStretch()
         header.addWidget(self.quality_label)
         header.addWidget(self.status_label)
@@ -1714,6 +1834,33 @@ class PassageEvidencePane(QFrame):
             self._frame_step_shortcuts.append(shortcut)
         self._set_transport_enabled(False)
 
+
+    def set_passed_count(self, text: str) -> None:
+        """已过 N 人 · X 号 in the middle of the header; empty hides it."""
+        value = str(text or "").strip()
+        if value != self.passed_label.text():
+            self.passed_label.setText(value)
+        self.passed_label.setVisible(bool(value) and self._header_strip is None)
+
+    def set_header_strip(self, widget) -> None:
+        """WIDGET takes the middle of the header, in the place of 已过 N 人 (11-14: the cells of
+        who is counted say the same and more, right above the picture); None gives it back."""
+        held = self._header_strip is not None and self._header.indexOf(self._header_strip) >= 0
+        if widget is self._header_strip and (widget is None or held):
+            return
+        if held:
+            self._header.removeWidget(self._header_strip)
+        self._header_strip = widget
+        if widget is not None:
+            self._header.insertWidget(self._header.indexOf(self.passed_label), widget, 1)
+            self.passed_label.hide()
+        # The cells need the whole line (11-14: the camera name and the frame block took a
+        # third of it); the time shown stays under the picture, beside the frame buttons.
+        self.title_label.setVisible(widget is None)
+        self.frame_indicator_label.setVisible(widget is None)
+        self.quality_label.setVisible(widget is None and self.source_kind == REGULAR_SOURCE
+                                      and self.camera_index == 1)
+
     def set_active_judging(self, active: bool) -> None:
         active = bool(active)
         if self.property("activeJudging") == active:
@@ -1752,6 +1899,16 @@ class PassageEvidencePane(QFrame):
         self._workbench_compact = bool(enabled)
         self._workbench_allow_maximize = bool(allow_maximize)
         compact = self._workbench_compact
+        # 11-14: the picture was letterboxed by height.  The position slider had a
+        # line of its own under it; in the workbench it shares the buttons' line.
+        if compact != (self.controls_layout.indexOf(self.timeline) >= 0):
+            if compact:
+                self.layout().removeWidget(self.timeline)
+                self.controls_layout.insertWidget(self.controls_layout.indexOf(self.time_label) + 1,
+                                                  self.timeline, 1)
+            else:
+                self.controls_layout.removeWidget(self.timeline)
+                self.layout().insertWidget(self.layout().indexOf(self.video_view) + 1, self.timeline)
         self.zoom_out_btn.setVisible(not compact)
         self.actual_size_btn.setVisible(not compact)
         self.zoom_in_btn.setVisible(not compact)
@@ -2636,6 +2793,18 @@ class PassageEvidencePane(QFrame):
             f"预计过线 {format_passage_time(event.timeline_timestamp_ms)}；"
             f"距预计过线 {delta_ms:+d} ms"
         )
+        judged = getattr(self, "_judged_time", None)
+        if judged is not None and judged[0] == int(position_ms):
+            # One clock on the screen (11-14): the table and the strip are in chip
+            # time, this label gave the recorder's, 0.6 s later on 古浪.
+            self.time_label.setToolTip(
+                f"校时后的时间，与左表和过线图一致；录像机时钟 {self.time_label.text()}。" + self.time_label.toolTip())
+            self.time_label.setText(format_passage_time(judged[1]))
+
+    def set_judged_time(self, position_ms, timestamp_ms) -> None:
+        """Show the calibrated (chip) time for the frame at POSITION_MS; None goes back to the recorder's."""
+        self._judged_time = None if timestamp_ms is None else (int(position_ms), int(timestamp_ms))
+        self._update_time_label(self._current_position_ms)
 
     def _update_frame_indicator(self, position_ms: int) -> None:
         event = self._event
@@ -2801,6 +2970,16 @@ class PassageEvidencePane(QFrame):
             and self._location.video_path.is_file()
         )
 
+    def set_play_speed(self, speed: float) -> None:
+        """How fast ▶ plays from now on; a pause puts it back to normal speed."""
+
+        self._play_speed = max(1.0, min(4.0, float(speed)))
+        even = getattr(self._worker, "set_even_playback", None)
+        if callable(even):
+            even(True)  # a fast run steps evenly; at normal speed it changes nothing
+        if self._playing and self._worker is not None:
+            self._worker.set_shuttle_speed(self._play_speed)
+
     def set_playing(self, playing: bool) -> None:
         worker = self._worker
         if worker is None:
@@ -2810,9 +2989,10 @@ class PassageEvidencePane(QFrame):
         self._full_resolution_timer.stop()
         self._playing = bool(playing)
         if self._playing:
-            worker.set_shuttle_speed(1.0)
+            worker.set_shuttle_speed(self._play_speed)
             self.play_btn.setText("Ⅱ")
         else:
+            self._play_speed = 1.0
             worker.pause()
             self.play_btn.setText("▶")
             self._last_full_resolution_request = -1
@@ -2873,8 +3053,10 @@ class PassageEvidencePane(QFrame):
         position_ms = self._target_position_ms + clamped_delta_ms
         self._playing = bool(linked_playing)
         seek_and_play = getattr(worker, "seek_and_play", None)
+        if not self._playing:
+            self._play_speed = 1.0
         if self._playing and callable(seek_and_play):
-            seek_and_play(position_ms, 1.0)
+            seek_and_play(position_ms, self._play_speed)
         else:
             worker.pause()
             preview_seek = getattr(worker, "seek_preview", None)
@@ -2883,16 +3065,18 @@ class PassageEvidencePane(QFrame):
             else:
                 worker.seek(position_ms)
             if self._playing:
-                worker.set_shuttle_speed(1.0)
+                worker.set_shuttle_speed(self._play_speed)
         self.play_btn.setText("Ⅱ" if self._playing else "▶")
 
     def set_linked_playing(self, playing: bool) -> None:
         self._full_resolution_timer.stop()
         self._playing = bool(playing)
         worker = self._worker
+        if not self._playing:
+            self._play_speed = 1.0
         if worker is not None:
             if self._playing:
-                worker.set_shuttle_speed(1.0)
+                worker.set_shuttle_speed(self._play_speed)
             else:
                 worker.pause()
                 self._last_full_resolution_request = -1

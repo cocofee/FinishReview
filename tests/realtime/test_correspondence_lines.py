@@ -113,7 +113,7 @@ def test_compact_video_auto_binding_uses_small_tag_and_ring(qapp, monkeypatch):
         assert (color, dashed, ghost) == (AUTO_COLOR, True, False)
         assert visible.contains(tag)
         assert 0 < tag.width() * scale < 60
-        assert 0 < tag.height() * scale <= 22
+        assert 0 < tag.height() * scale <= 42  # 30 px number tag (11-12): 40 px high
         assert image.pixelColor(320, 80) == QColor("#606060")
         assert image.pixelColor(320, 400) == QColor("#606060")
         assert any(image.pixelColor(px, py) != QColor("#606060")

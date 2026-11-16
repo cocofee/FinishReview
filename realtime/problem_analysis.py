@@ -103,6 +103,7 @@ from .person_crossing import (configured_direction, extract_people, learn_profil
                               people_at_line, person_model_path)
 from .rider_counting import count_line_problem, extract_riders, riders_at_line
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
+from .problem_rules import _crossing_evidence as crossing_evidence
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
 from .target_sport import CYCLING, DEFAULT_SPORT, POLICY_VERSION, RUNNING, normalize_sport, policy_for
 
@@ -912,12 +913,16 @@ def _write_follow(output_dir: Path, people, camera: int, bibs: dict) -> None:
 
 def _athlete_leftovers(people, result, matched, video_only, pairing_crossings, reads, *, direction, live,
                        riders=False):
-    """Crossings no chip claimed, minus the people who are plainly not athletes.
+    """Crossings no chip claimed, each one a question for the operator.
 
     What paired athletes looked like here (direction, size, speed, lane) is
-    learned per race; a leftover unlike them is a spectator, photographer or
-    official.  Those are counted, not queued.  Anyone athlete-like stays a
-    question: a missed chip must never be filtered away.
+    learned per race; a leftover unlike them is probably a spectator,
+    photographer or official, but 11-12 the operator ruled that the machine
+    may not decide that: it could drop an athlete whose chip was missed.  So
+    they come back apart, as (crossing, reason), each listed on its own with
+    the machine's reason (kept out of the athlete-like rules: three of them
+    at one spot would otherwise fold a chipless athlete into 可能有人停留).
+    Only line traffic after every group has run all its laps is left out.
     """
 
     from .chip_checks import lap_targets
@@ -927,11 +932,14 @@ def _athlete_leftovers(people, result, matched, video_only, pairing_crossings, r
                              if crossing.key in person_of], direction)
     reasons: Counter = Counter()
     dropped = []
+    unlike: dict = {}
+    kept = []
     paired_keys = {crossing.key for crossing in pairing_crossings}
     for person in people.crossings:
         if person.record.key not in paired_keys and not person.vehicle:
             reasons["反方向"] += 1  # held out of pairing by the sprint arrow
             dropped.append([person.record.recorder_ms, "反方向"])
+            unlike[person.record.key] = (person.record, "反方向")
     cutoff = None
     times = [read.chip_ms for read in reads if not read.excluded and read.active_now]
     targets = lap_targets(reads, ChipCheckContext(race_finished=not live, now_ms=int(time.time() * 1000)))
@@ -939,20 +947,23 @@ def _athlete_leftovers(people, result, matched, video_only, pairing_crossings, r
         # Multi-lap and every group has run its laps: later line traffic is
         # the venue emptying, not an athlete without a chip.
         cutoff = max(times) + AFTER_FINISH_MS
-    kept = []
     for crossing in video_only:
         person = person_of.get(crossing.key)
         reason = not_athlete_reason(person, profile, direction, riders=riders) if person is not None else ""
-        if not reason and cutoff is not None and crossing.recorder_ms > cutoff:
-            reason = "全部完赛之后"
+        after = not reason and cutoff is not None and crossing.recorder_ms > cutoff
+        if reason or after:
+            reasons[reason or "全部完赛之后"] += 1
+            dropped.append([crossing.recorder_ms, reason or "全部完赛之后"])
+        if after:
+            continue
         if reason:
-            reasons[reason] += 1
-            dropped.append([crossing.recorder_ms, reason])
+            unlike.setdefault(crossing.key, (crossing, reason))
         else:
             kept.append(crossing)
     result["people"] = dict(people.stats, direction=direction, profile=profile.payload() if profile else None,
-                            not_athletes=dict(reasons), not_athlete_times=dropped[:500])
-    return kept
+                            not_athletes=dict(reasons), not_athlete_times=dropped[:500],
+                            asked_not_athletes=len(unlike))
+    return kept, sorted(unlike.values(), key=lambda entry: entry[0].recorder_ms)
 
 
 def _uncalibrated_video_items(
@@ -1502,10 +1513,12 @@ def analyse_camera(
                            and crossing_checks[c.key].state == "confirmed"
                            and not policy.is_target(verified_verdicts[c.key].label)]
         chip_only += pairing.chip_only
+    unlike_athletes = []
     if people is not None:
         _write_follow(output_dir, people, camera, {crossing.key: read.bib for crossing, read, _residual in matched})
-        video_only = _athlete_leftovers(people, result, matched, video_only, pairing_crossings, reads,
-                                        direction=direction, live=config.live, riders=rider is not None)
+        video_only, unlike_athletes = _athlete_leftovers(people, result, matched, video_only, pairing_crossings,
+                                                         reads, direction=direction, live=config.live,
+                                                         riders=rider is not None)
     uncalibrated_sessions = sorted({
         name for _start, _end, name in coverage
         if name and served_sessions is not None and name not in served_sessions
@@ -1637,7 +1650,24 @@ def analyse_camera(
     # Unverified line evidence stays available for manual review, but never
     # participates in pairing or becomes a video-only rider.
     paired_keys = {item.key for item in crossings}
-    result["items"] = list(outcome.items) + _unchecked_line_items(
+    # 11-12: a crossing the machine thinks is not an athlete still asks, on its
+    # own row, and says why; the operator decides (1 不是运动员 / 3 补录).
+    race_start = (model.to_recorder(min(read.chip_ms for read in pairing_reads)) - PRE_RACE_MARGIN_MS
+                  if pairing_reads else None)
+    outcome_items = list(outcome.items)
+    for crossing, reason in unlike_athletes:
+        if race_start is not None and crossing.recorder_ms < race_start:
+            continue  # before the first athlete: the same as 赛前活动 for everyone else
+        chip_time = model.to_chip(crossing.recorder_ms, crossing.session_id)
+        outcome_items.append(ProblemItem(
+            item_id=stable_item_id(KIND_NO_CHIP_CROSSING, camera, crossing.key),
+            kind=KIND_NO_CHIP_CROSSING, category=CATEGORY_VIDEO,
+            detail=f"{format_chip_time(chip_time)} 有人过线，附近没有芯片；机器看着不像选手（{reason}），是不是由你判断",
+            chip_time_ms=chip_time, status=STATUS_OPEN, status_note="待人工确认", priority=60,
+            evidence=dict(crossing_evidence(crossing, int(model.version), policy=policy), unlike_athlete=reason),
+            calibration_version=int(model.version),
+        ))
+    result["items"] = outcome_items + _unchecked_line_items(
         [c for c in line_candidates if c.key not in paired_keys], crossing_checks, camera, model,
     )
     result["auto_passed"] = outcome.auto_passed

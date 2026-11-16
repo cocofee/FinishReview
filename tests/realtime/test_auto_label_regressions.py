@@ -223,7 +223,7 @@ def test_auto_status_and_acceptance_do_not_require_a_view_interval(wave_panel, m
     wave_panel._arrival_clicked(row(wave_panel, "61"))
     wave_panel._arrival_drafts["seen"] = {}
     wave_panel._sync_arrival_confirmation()
-    assert "回车接受对应" in wave_panel.confirmation_status.text()
+    assert "对就按空格往下走" in wave_panel.confirmation_status.text()
     assert "没看" not in wave_panel.confirmation_status.text()
     assert "已看完" not in wave_panel.confirmation_status.text()
     wave_panel._enter_key()
@@ -291,7 +291,7 @@ def test_refusal_reason_refreshes_without_row_or_pair_changes(wave_panel, monkey
 def test_auto_row_tooltip_keeps_only_the_short_acceptance_hint(wave_panel, monkeypatch):
     auto_people(wave_panel, monkeypatch, (100, 500, 1000))
     tooltip = wave_panel.table.item(row(wave_panel, "61"), 3).toolTip()
-    assert tooltip == "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；回车接受对应，号码不对按 4 撤回。"
+    assert tooltip == "自动对应：灰蓝小标签仅表示系统对应，不是人工确认；看一眼对就按空格往下走，号码不对按 4 撤回。"
     assert "点击回看" not in tooltip
     assert "按 1/2/3/4" not in tooltip
 
