@@ -159,7 +159,7 @@ def test_settle_run_reports_a_chip_outside_the_recording_as_a_coverage_gap(synth
     assert {entry["bib"] for entry in live["auto_passed"]} < {entry["bib"] for entry in settled["auto_passed"]}
 
 
-def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_race, tmp_path):
+def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_race, tmp_path, monkeypatch):
     root, _workspace, _config, _strips = synthetic_race
     for name in ("cyclerace_passage_events.jsonl", "finish_lines.json"):
         (tmp_path / name).write_bytes((root / name).read_bytes())
@@ -203,6 +203,18 @@ def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_
     assert publications[-1]["cameras"]["1"]["pending_segments"] == 0
     assert live["performance"]["new_video_seconds"] == 95
     assert live["summary"]["auto_passed"] >= len(CROSSINGS_S) - 2
+    # The next round (a new process in the field) answers from the saved strip
+    # index: no strip is reopened and the list does not change.
+    assert (tmp_path / "finish_problems/strips/camera_01.index").is_file()
+    opened = []
+    real_load = np.load
+    monkeypatch.setattr(np, "load", lambda path, *a, **k: opened.append(Path(path).name) or real_load(path, *a, **k))
+    run_offline_analysis(config, lower_priority=False)
+    monkeypatch.undo()
+    again = json.loads((tmp_path / "finish_problems/problem_list.json").read_text(encoding="utf-8"))
+    assert not [name for name in opened if name.endswith(".npz")]
+    assert sorted(item["item_id"] for item in again["items"]) == sorted(item["item_id"] for item in payload["items"])
+    assert again["summary"] == payload["summary"]
     before = {item["frame"]["segment_id"] for item in payload["auto_passed"]}
     archive = tmp_path / "camera_01_session_archive_0000.avi"
     archive.write_bytes(source.read_bytes())

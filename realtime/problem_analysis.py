@@ -103,6 +103,7 @@ from .person_follow import follow_path, follow_payload
 from .person_crossing import (configured_direction, extract_people, learn_profile, not_athlete_reason,
                               people_at_line, person_model_path)
 from .rider_counting import count_line_problem, extract_riders, riders_at_line
+from .strip_index import StripIndex
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
 from .target_sport import CYCLING, DEFAULT_SPORT, POLICY_VERSION, RUNNING, normalize_sport, policy_for
@@ -160,8 +161,15 @@ def strip_path(output_dir: Path, segment: ArchiveSegment) -> Path:
     return output_dir / "strips" / f"camera_{segment.camera_index:02d}" / (segment.path.stem + ".npz")
 
 
-def _strip_is_current(path: Path, segment: ArchiveSegment, digest: str, samples: int) -> bool:
-    meta = read_strip_meta(path) if path.is_file() else None
+def strip_folder(config, camera) -> Path:
+    return config.resolved_output() / "strips" / f"camera_{int(camera):02d}"
+
+
+def _strip_is_current(path: Path, segment: ArchiveSegment, digest: str, samples: int, index=None) -> bool:
+    if index is not None:
+        meta = index.meta(path)
+    else:
+        meta = read_strip_meta(path) if path.is_file() else None
     if not meta:
         return False
     try:
@@ -186,12 +194,14 @@ def extract_strips(
     checkpoint: Optional[Callable[[], None]] = None,
     cancelled: Callable[[], bool] = lambda: False,
     unreadable: Optional[list] = None,
+    strip_index=None,
 ) -> list[Path]:
     """Sample every recording file of one camera; reuse up-to-date strips.
 
     With ``unreadable`` given, a recording that cannot be opened or decoded is
     added to it and skipped (the caller keeps that time as not yet analysed);
-    without it the error is raised as before.
+    without it the error is raised as before. ``strip_index`` (a ``StripIndex``) answers
+    whether a strip is current without reopening it.
     """
 
     output_dir = config.resolved_output()
@@ -222,7 +232,7 @@ def extract_strips(
         digest = line_config_digest(effective)
         target = strip_path(output_dir, segment)
         progress("线取样", index, len(segments))
-        if not _strip_is_current(target, segment, digest, config.samples):
+        if not _strip_is_current(target, segment, digest, config.samples, strip_index):
             started = time.perf_counter()
             try:
                 strip = sample_video_file(
@@ -401,6 +411,17 @@ class _VerificationRuntime:
         self.files = {}
         self.line_detections = {}
         self.people = {}
+        self.strip_indexes = {}
+
+    def strip_index(self, folder):
+        folder = Path(folder)
+        if folder not in self.strip_indexes:
+            self.strip_indexes[folder] = StripIndex(folder)
+        return self.strip_indexes[folder]
+
+    def save_strip_indexes(self):
+        for index in self.strip_indexes.values():
+            index.save()
 
     def reader(self, path, threads):
         path = Path(path)
@@ -437,12 +458,21 @@ def _load_file_strips(paths: list[Path], runtime=None) -> list[_FileStrip]:
             files.append(saved[1])
             continue
         # Do not decompress every historical image strip on each live tick.
-        with np.load(path) as data:
-            meta = json.loads(bytes(data["meta"]).decode("utf-8"))
+        if runtime is not None:
+            # Each strip's own copy: nothing shared with the saved index.
+            saved = runtime.strip_index(path.parent).data(path)
+            meta = dict(saved.meta)
             geometry = LineGeometry(int(meta["width"]), int(meta["height"]),
-                                    data["xs"], data["ys"], data["nx"], data["ny"],
+                                    saved.xs.copy(), saved.ys.copy(), saved.nx.copy(), saved.ny.copy(),
                                     meta.get("line_source", "configured"), meta.get("snap_offset_px", 0.0))
-            files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), data["pts_ms"], geometry))
+            files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), saved.pts.copy(), geometry))
+        else:
+            with np.load(path) as data:
+                meta = json.loads(bytes(data["meta"]).decode("utf-8"))
+                geometry = LineGeometry(int(meta["width"]), int(meta["height"]),
+                                        data["xs"], data["ys"], data["nx"], data["ny"],
+                                        meta.get("line_source", "configured"), meta.get("snap_offset_px", 0.0))
+                files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), data["pts_ms"], geometry))
         if runtime is not None:
             runtime.files[path] = (stamp, files[-1])
     files.sort(key=lambda item: item.start_ms)
@@ -1883,6 +1913,7 @@ def _live_progress(result, segments, pending, missing, config, reads, unreadable
 def _run_live_batches(config, workspace, cameras, governor, summary, progress, cancelled):
     """Publish cumulative evidence every few seconds of new media, round-robin."""
     jobs, results = [], {}
+    runtime = _VerificationRuntime()
     for camera in cameras:
         segments = workspace.archive_segments(camera)
         ready, pending, missing = [], deque(), []
@@ -1892,13 +1923,15 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 missing.append(segment)
                 continue
             path = strip_path(config.resolved_output(), segment)
-            if _strip_is_current(path, segment, line_config_digest(effective), config.samples):
+            index = runtime.strip_index(path.parent)
+            if _strip_is_current(path, segment, line_config_digest(effective), config.samples, index):
                 ready.append(path)
             else:
                 pending.append(segment)
         jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing,
                          unreadable=[]))
-    runtime = _VerificationRuntime()
+    # A long catch-up must not lose what it has learned about the strips if it is stopped.
+    runtime.save_strip_indexes()
 
     def input_stamp():
         values = []
@@ -1942,7 +1975,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 new_paths = extract_strips(
                     config, tuple(batch), line_for_camera(config, workspace, camera) or {}, progress=progress,
                     checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
-                    unreadable=job["unreadable"],
+                    unreadable=job["unreadable"], strip_index=runtime.strip_index(strip_folder(config, camera)),
                 )
                 job["ready"].extend(new_paths)
                 sampling_seconds = time.perf_counter() - sample_started
@@ -2004,6 +2037,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                                       processing_ratio=round(elapsed / new_video_seconds, 3) if new_video_seconds else None,
                                       publications=batches)
     finally:
+        runtime.save_strip_indexes()
         runtime.close()
 
 
