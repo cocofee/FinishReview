@@ -5375,7 +5375,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     window.show()
     qapp.processEvents()
 
-    assert window.windowTitle() == "FinishReview v0.25.11 · 终点多源复核"
+    assert window.windowTitle() == "FinishReview v0.25.12 · 终点多源复核"
     assert window.recorder is None
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
@@ -5389,7 +5389,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.mark_high_speed_button is window.high_speed_pane.mark_btn
     assert window.transport_layout.indexOf(window.confirm_next_button) >= 0
     assert window.capture_status_label.isHidden()
-    assert window.product_title_label.text() == "FinishReview v0.25.11"
+    assert window.product_title_label.text() == "FinishReview v0.25.12"
     assert window.product_subtitle_label.text() == "终点多源复核"
     assert window.product_subtitle_label.isHidden()
     assert window.event_path_label.isVisible()
