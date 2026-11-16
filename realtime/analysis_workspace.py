@@ -43,6 +43,7 @@ SCOPE_FILE = "review_event_scope.json"
 FINISH_LINE_FILES = ("finish_lines.json", "long_image_lines.json")
 _ARCHIVE_SUFFIX_RE = re.compile(r"_archive_\d+$", re.IGNORECASE)
 _VIDEO_SUFFIXES = {".mkv", ".mp4", ".mov", ".avi", ".ts"}
+_SHORT_END_REASONS = ("retained_filmstrip_segment", "retained_problem_segment")
 RACE_CLOCK_MARGIN_MS = 3 * 60 * 60 * 1000
 # Clock jitter between back-to-back sessions is not a second recording.
 SESSION_OVERLAP_TOLERANCE_MS = 200
@@ -311,11 +312,13 @@ class AnalysisWorkspace:
             segments.append(ArchiveSegment(segment, path, session))
         # Prefer retained immutable short segments; never detect a rider twice
         # when their long archive is published. Non-overlapping history remains.
-        shorts = [item for item in segments if item.segment.end_reason in ("retained_filmstrip_segment", "retained_problem_segment")]
+        shorts = [item for item in segments if item.segment.end_reason in _SHORT_END_REASONS]
         if self.include_review_segments and shorts:
             selected = list(shorts)
             for item in segments:
-                if item in shorts:
+                # Ask the reason, not ``item in shorts``: comparing every pair of
+                # segments made a long race's listing take seconds.
+                if item.segment.end_reason in _SHORT_END_REASONS:
                     continue
                 overlap = sorted((max(item.start_ms, other.start_ms), min(item.end_ms, other.end_ms))
                                  for other in shorts if other.camera_index == item.camera_index
