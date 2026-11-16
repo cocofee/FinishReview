@@ -742,7 +742,20 @@ class ProblemListPanel(QFrame):
     def set_events_provider(self, provider: Callable[[], object]) -> None:
         self._events_provider = provider
 
+    # While one refresh runs: every confirmed group checks its evidence against
+    # the same read of the workspace (see ``load_context(shared=...)``).
+    _context_share = None
+
     def refresh(self) -> None:
+        previous = self._context_share
+        if previous is None:
+            self._context_share = {}
+        try:
+            self._refresh_rows()
+        finally:
+            self._context_share = previous
+
+    def _refresh_rows(self) -> None:
         if self.problem_dir is None:
             return
         current = self.current_item()
@@ -876,6 +889,8 @@ class ProblemListPanel(QFrame):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
                 if value.get("pending_segments"):
                     detail += f"；{value['pending_segments']} 个片段排队中"
+                if value.get("unreadable_segments"):
+                    detail += f"；{len(value['unreadable_segments'])} 个录像片段打不开或已损坏，已跳过，下一轮重试"
                 statuses.append(f"机位 {camera}：{detail}")
             self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；目标识别状态待分析。"
         # A manual count of several people becomes one independent crossing per
@@ -967,7 +982,7 @@ class ProblemListPanel(QFrame):
                 return STATE_STALE
             from .bunch_review import load_context
             try:
-                context = load_context(self.workspace_dir, item, record["camera"])
+                context = load_context(self.workspace_dir, item, record["camera"], shared=self._context_share)
                 checked = self.bunch_store.get(context)
                 if checked is None:
                     return STATE_STALE

@@ -77,6 +77,7 @@ from .line_sampling import (
     DEFAULT_DECODE_THREADS,
     DEFAULT_SAMPLES,
     LineGeometry,
+    LineSamplingError,
     line_config_digest,
     load_strip,
     read_strip_meta,
@@ -102,6 +103,7 @@ from .person_follow import follow_path, follow_payload
 from .person_crossing import (configured_direction, extract_people, learn_profile, not_athlete_reason,
                               people_at_line, person_model_path)
 from .rider_counting import count_line_problem, extract_riders, riders_at_line
+from .strip_index import StripIndex
 from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge_obstructions
 from .problem_rules import _crossing_evidence as crossing_evidence
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
@@ -160,8 +162,15 @@ def strip_path(output_dir: Path, segment: ArchiveSegment) -> Path:
     return output_dir / "strips" / f"camera_{segment.camera_index:02d}" / (segment.path.stem + ".npz")
 
 
-def _strip_is_current(path: Path, segment: ArchiveSegment, digest: str, samples: int) -> bool:
-    meta = read_strip_meta(path) if path.is_file() else None
+def strip_folder(config, camera) -> Path:
+    return config.resolved_output() / "strips" / f"camera_{int(camera):02d}"
+
+
+def _strip_is_current(path: Path, segment: ArchiveSegment, digest: str, samples: int, index=None) -> bool:
+    if index is not None:
+        meta = index.meta(path)
+    else:
+        meta = read_strip_meta(path) if path.is_file() else None
     if not meta:
         return False
     try:
@@ -185,8 +194,16 @@ def extract_strips(
     progress: ProgressCallback = _noop_progress,
     checkpoint: Optional[Callable[[], None]] = None,
     cancelled: Callable[[], bool] = lambda: False,
+    unreadable: Optional[list] = None,
+    strip_index=None,
 ) -> list[Path]:
-    """Sample every recording file of one camera; reuse up-to-date strips."""
+    """Sample every recording file of one camera; reuse up-to-date strips.
+
+    With ``unreadable`` given, a recording that cannot be opened or decoded is
+    added to it and skipped (the caller keeps that time as not yet analysed);
+    without it the error is raised as before. ``strip_index`` (a ``StripIndex``) answers
+    whether a strip is current without reopening it.
+    """
 
     output_dir = config.resolved_output()
     if config.sampling_profiles and not config.race_id:
@@ -216,14 +233,21 @@ def extract_strips(
         digest = line_config_digest(effective)
         target = strip_path(output_dir, segment)
         progress("线取样", index, len(segments))
-        if not _strip_is_current(target, segment, digest, config.samples):
+        if not _strip_is_current(target, segment, digest, config.samples, strip_index):
             started = time.perf_counter()
-            strip = sample_video_file(
-                segment.path, effective,
-                samples=config.samples, threads=config.decode_threads,
-                snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
-                fast_decode=config.fast_decode,
-            )
+            try:
+                strip = sample_video_file(
+                    segment.path, effective,
+                    samples=config.samples, threads=config.decode_threads,
+                    snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
+                    fast_decode=config.fast_decode,
+                )
+            except LineSamplingError as error:
+                if unreadable is None:
+                    raise
+                logger.warning("skipping unreadable recording %s: %s", segment.path.name, error)
+                unreadable.append(segment)
+                continue
             if cancelled():
                 break
             save_started = time.perf_counter()
@@ -388,6 +412,17 @@ class _VerificationRuntime:
         self.files = {}
         self.line_detections = {}
         self.people = {}
+        self.strip_indexes = {}
+
+    def strip_index(self, folder):
+        folder = Path(folder)
+        if folder not in self.strip_indexes:
+            self.strip_indexes[folder] = StripIndex(folder)
+        return self.strip_indexes[folder]
+
+    def save_strip_indexes(self):
+        for index in self.strip_indexes.values():
+            index.save()
 
     def reader(self, path, threads):
         path = Path(path)
@@ -424,12 +459,21 @@ def _load_file_strips(paths: list[Path], runtime=None) -> list[_FileStrip]:
             files.append(saved[1])
             continue
         # Do not decompress every historical image strip on each live tick.
-        with np.load(path) as data:
-            meta = json.loads(bytes(data["meta"]).decode("utf-8"))
+        if runtime is not None:
+            # Each strip's own copy: nothing shared with the saved index.
+            saved = runtime.strip_index(path.parent).data(path)
+            meta = dict(saved.meta)
             geometry = LineGeometry(int(meta["width"]), int(meta["height"]),
-                                    data["xs"], data["ys"], data["nx"], data["ny"],
+                                    saved.xs.copy(), saved.ys.copy(), saved.nx.copy(), saved.ny.copy(),
                                     meta.get("line_source", "configured"), meta.get("snap_offset_px", 0.0))
-            files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), data["pts_ms"], geometry))
+            files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), saved.pts.copy(), geometry))
+        else:
+            with np.load(path) as data:
+                meta = json.loads(bytes(data["meta"]).decode("utf-8"))
+                geometry = LineGeometry(int(meta["width"]), int(meta["height"]),
+                                        data["xs"], data["ys"], data["nx"], data["ny"],
+                                        meta.get("line_source", "configured"), meta.get("snap_offset_px", 0.0))
+                files.append(_FileStrip(path, meta, int(meta["media_started_at_ms"]), data["pts_ms"], geometry))
         if runtime is not None:
             runtime.files[path] = (stamp, files[-1])
     files.sort(key=lambda item: item.start_ms)
@@ -702,22 +746,44 @@ def _save_bike_cache(path, payload):
     temporary.replace(path)
 
 
-def _verification_sources(files, crossing):
+def _verification_index(files):
+    """Strips by recording and by (session, line, frame size), keeping their order.
+
+    Built once per verification pass: scanning every strip of the race for every
+    crossing made a long race's idle live round take seconds.
+    """
+    own, groups = {}, {}
+    for item in files:
+        own.setdefault(str(item.meta.get("video_path")), item)
+        if not len(item.pts):
+            continue
+        key = (item.meta.get("session_id"), item.meta.get("line_digest"), item.geometry.width, item.geometry.height)
+        groups.setdefault(key, []).append(item)
+    spans = {
+        key: (items,
+              np.array([item.start_ms + item.pts[0] - 25 for item in items], dtype=np.float64),
+              np.array([item.end_ms + 25 for item in items], dtype=np.float64))
+        for key, items in groups.items()
+    }
+    return own, spans
+
+
+def _verification_sources(files, crossing, index=None):
     """Resolve real neighbouring frames, never borrowing another line/session."""
-    own = next((item for item in files if str(item.meta.get("video_path")) == crossing.video_path), None)
+    own_by_path, spans = index if index is not None else _verification_index(files)
+    own = own_by_path.get(crossing.video_path)
     if own is None:
         return []
+    group = spans.get((crossing.session_id, own.meta.get("line_digest"), own.geometry.width, own.geometry.height))
+    if group is None:
+        return []
+    items, starts, ends = group
     sources = []
     for offset in VERIFICATION_OFFSETS_MS:
         target = crossing.recorder_ms + offset
-        for item in files:
-            if (item.meta.get("session_id") != crossing.session_id
-                    or item.meta.get("line_digest") != own.meta.get("line_digest")
-                    or (item.geometry.width, item.geometry.height) != (own.geometry.width, own.geometry.height)
-                    or not len(item.pts)):
-                continue
-            if not item.start_ms + item.pts[0] - 25 <= target <= item.end_ms + 25:
-                continue
+        # Same order as the strips: the first one that holds the frame wins.
+        for position_index in np.nonzero((starts <= target) & (target <= ends))[0]:
+            item = items[int(position_index)]
             position = float(item.pts[int(np.argmin(np.abs(item.start_ms + item.pts - target)))])
             stamp = item.start_ms + position
             if any(left <= stamp <= right for left, right in item.meta.get("excluded_ranges", [])):
@@ -747,8 +813,9 @@ def _verify_crossing_candidates(config, camera, files, crossings, *, progress, c
             runtime.close()
             runtime.model_key = model_key
         detector = runtime.detector
+    lookup = _verification_index(files) if crossings else None
     for index, crossing in enumerate(crossings):
-        sources = _verification_sources(files, crossing)
+        sources = _verification_sources(files, crossing, lookup)
         signature = []
         for item, position in sources:
             path = Path(item.meta["video_path"])
@@ -1821,19 +1888,27 @@ def missing_line_item(camera: int, missing) -> ProblemItem:
         evidence={"segments": [segment.segment.segment_id for segment in missing], "ranges": ranges})
 
 
-def _live_progress(result, segments, pending, missing, config, reads):
-    """Do not turn an unfinished batch (or a cache hole) into missing evidence."""
+def _live_progress(result, segments, pending, missing, config, reads, unreadable=()):
+    """Do not turn an unfinished batch (or a cache hole) into missing evidence.
+
+    ``unreadable``: recordings that could not be opened or decoded this round. They
+    are retried next round and meanwhile say so, instead of waiting for ever unexplained.
+    """
     pending_ranges = [list(span) for segment in pending for span in uncovered_ranges(
         segment.start_ms, segment.end_ms, segment.excluded_ranges)]
     result["sealed_through_ms"] = max((s.end_ms for s in segments), default=None)
     result["pending_video_ranges"] = pending_ranges
     result["pending_segments"] = len(pending)
+    unreadable_ranges = [list(span) for segment in unreadable for span in uncovered_ranges(
+        segment.start_ms, segment.end_ms, segment.excluded_ranges)]
+    result["unreadable_segments"] = [s.segment.segment_id for s in unreadable]
+    result["unreadable_ranges"] = unreadable_ranges
     result["missing_line_segments"] = [s.segment.segment_id for s in missing]
     result["missing_line_ranges"] = missing_line_ranges(missing)
     coverage = result.get("coverage", [])
     scanned = max((end for _start, end, _session in coverage), default=None)
     # Coverage remains explicit; the headline never jumps over an unscanned hole.
-    blocked_ranges = list(pending_ranges)
+    blocked_ranges = [*pending_ranges, *unreadable_ranges]
     blocked_ranges.extend([s.start_ms, s.end_ms] for s in missing)
     if scanned is not None:
         frontier = min([scanned, *(left for left, _right in blocked_ranges)])
@@ -1850,9 +1925,13 @@ def _live_progress(result, segments, pending, missing, config, reads):
                 left - COVERAGE_MARGIN_MS <= expected <= right + COVERAGE_MARGIN_MS
                 for left, right in blocked_ranges
             ):
+                broken = any(left - COVERAGE_MARGIN_MS <= expected <= right + COVERAGE_MARGIN_MS
+                             for left, right in unreadable_ranges)
                 deferred.extend(waiting_items(
                     [read for read in reads if read.event_id in item.event_ids],
-                    result["camera_index"], "录像已封存，等待分析或终点线配置，暂不判定缺少录像",
+                    result["camera_index"],
+                    "该时段的录像片段打不开或已损坏，已跳过，请检查录像文件；暂不判定缺少录像" if broken
+                    else "录像已封存，等待分析或终点线配置，暂不判定缺少录像",
                 ))
             else:
                 deferred.append(item)
@@ -1864,6 +1943,7 @@ def _live_progress(result, segments, pending, missing, config, reads):
 def _run_live_batches(config, workspace, cameras, governor, summary, progress, cancelled):
     """Publish cumulative evidence every few seconds of new media, round-robin."""
     jobs, results = [], {}
+    runtime = _VerificationRuntime()
     for camera in cameras:
         segments = workspace.archive_segments(camera)
         ready, pending, missing = [], deque(), []
@@ -1873,12 +1953,15 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 missing.append(segment)
                 continue
             path = strip_path(config.resolved_output(), segment)
-            if _strip_is_current(path, segment, line_config_digest(effective), config.samples):
+            index = runtime.strip_index(path.parent)
+            if _strip_is_current(path, segment, line_config_digest(effective), config.samples, index):
                 ready.append(path)
             else:
                 pending.append(segment)
-        jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing))
-    runtime = _VerificationRuntime()
+        jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing,
+                         unreadable=[]))
+    # A long catch-up must not lose what it has learned about the strips if it is stopped.
+    runtime.save_strip_indexes()
 
     def input_stamp():
         values = []
@@ -1922,6 +2005,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 new_paths = extract_strips(
                     config, tuple(batch), line_for_camera(config, workspace, camera) or {}, progress=progress,
                     checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
+                    unreadable=job["unreadable"], strip_index=runtime.strip_index(strip_folder(config, camera)),
                 )
                 job["ready"].extend(new_paths)
                 sampling_seconds = time.perf_counter() - sample_started
@@ -1941,7 +2025,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                     return
                 # A stop/settle run may remove the chip delay only once its entire
                 # snapshot is sampled. Intermediate batches are not final gaps.
-                current_config = replace(config, evidence_delay_ms=max(10_000, config.evidence_delay_ms)) if pending else config
+                current_config = replace(config, evidence_delay_ms=max(10_000, config.evidence_delay_ms)) if pending or job["unreadable"] else config
                 analysis_started = time.perf_counter()
                 if job["ready"]:
                     result = analyse_camera(
@@ -1952,7 +2036,8 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                     reason = "等待已封存录像" if not job["segments"] else "等待实际终点线或不跨改线边界的封存片段"
                     result = dict(camera_index=camera, error=reason, items=waiting_items(workspace.reads, camera, reason),
                                   auto_passed=[], waiting_reason="recording" if not job["segments"] else "finish_line")
-                _live_progress(result, job["segments"], pending, job["missing"], current_config, workspace.reads)
+                _live_progress(result, job["segments"], pending, job["missing"], current_config, workspace.reads,
+                               job["unreadable"])
                 result["performance"] = dict(
                     new_video_seconds=round(duration_ms / 1000, 3),
                     sampling_seconds=round(sampling_seconds, 3),
@@ -1982,6 +2067,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                                       processing_ratio=round(elapsed / new_video_seconds, 3) if new_video_seconds else None,
                                       publications=batches)
     finally:
+        runtime.save_strip_indexes()
         runtime.close()
 
 

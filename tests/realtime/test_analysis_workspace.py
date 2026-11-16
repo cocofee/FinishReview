@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from realtime.analysis_workspace import AnalysisWorkspace, session_id_for_path
+from realtime.analysis_workspace import AnalysisWorkspace, ArchiveSegment, session_id_for_path, uncovered_ranges
 from realtime.passage_evidence import VideoClockCalibrationStore
 from realtime.passage_receiver import PassageEvent
 from realtime.video_timeline import VideoTimelineStore
@@ -107,14 +107,14 @@ def test_finish_lines_fall_back_to_long_image_lines(tmp_path):
     assert session_id_for_path(root / "camera_01_x_archive_0012.mkv") == "camera_01_x"
 
 
-def _archived(root, name, start, duration=300_000, camera=1):
+def _archived(root, name, start, duration=300_000, camera=1, end_reason="continuous_archive_fallback"):
     path = root / "videos" / name
     path.write_bytes(b"\0")
     VideoTimelineStore(root / "video_timeline.jsonl").add_completed_segment(
         source_id=f"camera_0{camera}_review", camera_index=camera, video_path=path,
         media_started_at_ms=start, media_duration_ms=duration,
         clock_source="videopipe_system_clock", timing_error_ms=3_000,
-        end_reason="continuous_archive_fallback", race_id="",
+        end_reason=end_reason, race_id="",
     )
 
 
@@ -179,6 +179,40 @@ def test_overlapping_recordings_of_one_camera_cover_each_moment_once(tmp_path):
         (f"{first}_archive_0003.mkv", ()),
         (f"{third}_archive_0000.mkv", ()),
     ]
+
+
+def test_short_pieces_replace_their_archive_and_leave_it_only_the_gap(tmp_path, monkeypatch):
+    """A lost short piece is filled from its archive; a fully covered archive drops out.
+
+    The listing must not compare segments pairwise: a long race keeps thousands
+    of short pieces, and the live analysis lists them every round.
+    """
+
+    root = tmp_path / "race"
+    (root / "videos").mkdir(parents=True)
+    t = DAY + 36_000_000
+    _write_events(root, [_event("main", 1, t + 60_000)])
+    session = "camera_01_20260919_100000_000000"
+    _archived(root, f"{session}_archive_0000.mkv", t)
+    _archived(root, f"{session}_archive_0001.mkv", t + 300_000)
+    starts = [t + offset for offset in range(0, 600_000, 10_000) if not 100_000 <= offset < 120_000]
+    for number, start in enumerate(starts):
+        _archived(root, f"{session}_review_{number:010d}.ts", start, duration=10_000,
+                  end_reason="retained_problem_segment")
+    comparisons = []
+    original = ArchiveSegment.__eq__
+    monkeypatch.setattr(ArchiveSegment, "__eq__", lambda a, b: comparisons.append(1) or original(a, b))
+
+    segments = AnalysisWorkspace(root, include_review_segments=True).archive_segments(1)
+
+    shorts = [item for item in segments if "_review_" in item.path.name]
+    archives = [item for item in segments if "_archive_" in item.path.name]
+    assert [item.start_ms for item in shorts] == starts
+    assert [item.path.name for item in archives] == [f"{session}_archive_0000.mkv"]
+    assert list(uncovered_ranges(archives[0].start_ms, archives[0].end_ms, archives[0].excluded_ranges)) == [
+        (t + 100_000, t + 120_000),
+    ]
+    assert not comparisons
 
 
 SESSION = "camera_01_20260919_100000_000000"
