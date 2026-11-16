@@ -77,6 +77,7 @@ from .line_sampling import (
     DEFAULT_DECODE_THREADS,
     DEFAULT_SAMPLES,
     LineGeometry,
+    LineSamplingError,
     line_config_digest,
     load_strip,
     read_strip_meta,
@@ -184,8 +185,14 @@ def extract_strips(
     progress: ProgressCallback = _noop_progress,
     checkpoint: Optional[Callable[[], None]] = None,
     cancelled: Callable[[], bool] = lambda: False,
+    unreadable: Optional[list] = None,
 ) -> list[Path]:
-    """Sample every recording file of one camera; reuse up-to-date strips."""
+    """Sample every recording file of one camera; reuse up-to-date strips.
+
+    With ``unreadable`` given, a recording that cannot be opened or decoded is
+    added to it and skipped (the caller keeps that time as not yet analysed);
+    without it the error is raised as before.
+    """
 
     output_dir = config.resolved_output()
     if config.sampling_profiles and not config.race_id:
@@ -217,12 +224,19 @@ def extract_strips(
         progress("线取样", index, len(segments))
         if not _strip_is_current(target, segment, digest, config.samples):
             started = time.perf_counter()
-            strip = sample_video_file(
-                segment.path, effective,
-                samples=config.samples, threads=config.decode_threads,
-                snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
-                fast_decode=config.fast_decode,
-            )
+            try:
+                strip = sample_video_file(
+                    segment.path, effective,
+                    samples=config.samples, threads=config.decode_threads,
+                    snap=bool(effective.get("snap")), checkpoint=checkpoint, cancelled=cancelled,
+                    fast_decode=config.fast_decode,
+                )
+            except LineSamplingError as error:
+                if unreadable is None:
+                    raise
+                logger.warning("skipping unreadable recording %s: %s", segment.path.name, error)
+                unreadable.append(segment)
+                continue
             if cancelled():
                 break
             save_started = time.perf_counter()
@@ -1814,19 +1828,27 @@ def missing_line_item(camera: int, missing) -> ProblemItem:
         evidence={"segments": [segment.segment.segment_id for segment in missing], "ranges": ranges})
 
 
-def _live_progress(result, segments, pending, missing, config, reads):
-    """Do not turn an unfinished batch (or a cache hole) into missing evidence."""
+def _live_progress(result, segments, pending, missing, config, reads, unreadable=()):
+    """Do not turn an unfinished batch (or a cache hole) into missing evidence.
+
+    ``unreadable``: recordings that could not be opened or decoded this round. They
+    are retried next round and meanwhile say so, instead of waiting for ever unexplained.
+    """
     pending_ranges = [list(span) for segment in pending for span in uncovered_ranges(
         segment.start_ms, segment.end_ms, segment.excluded_ranges)]
     result["sealed_through_ms"] = max((s.end_ms for s in segments), default=None)
     result["pending_video_ranges"] = pending_ranges
     result["pending_segments"] = len(pending)
+    unreadable_ranges = [list(span) for segment in unreadable for span in uncovered_ranges(
+        segment.start_ms, segment.end_ms, segment.excluded_ranges)]
+    result["unreadable_segments"] = [s.segment.segment_id for s in unreadable]
+    result["unreadable_ranges"] = unreadable_ranges
     result["missing_line_segments"] = [s.segment.segment_id for s in missing]
     result["missing_line_ranges"] = missing_line_ranges(missing)
     coverage = result.get("coverage", [])
     scanned = max((end for _start, end, _session in coverage), default=None)
     # Coverage remains explicit; the headline never jumps over an unscanned hole.
-    blocked_ranges = list(pending_ranges)
+    blocked_ranges = [*pending_ranges, *unreadable_ranges]
     blocked_ranges.extend([s.start_ms, s.end_ms] for s in missing)
     if scanned is not None:
         frontier = min([scanned, *(left for left, _right in blocked_ranges)])
@@ -1843,9 +1865,13 @@ def _live_progress(result, segments, pending, missing, config, reads):
                 left - COVERAGE_MARGIN_MS <= expected <= right + COVERAGE_MARGIN_MS
                 for left, right in blocked_ranges
             ):
+                broken = any(left - COVERAGE_MARGIN_MS <= expected <= right + COVERAGE_MARGIN_MS
+                             for left, right in unreadable_ranges)
                 deferred.extend(waiting_items(
                     [read for read in reads if read.event_id in item.event_ids],
-                    result["camera_index"], "录像已封存，等待分析或终点线配置，暂不判定缺少录像",
+                    result["camera_index"],
+                    "该时段的录像片段打不开或已损坏，已跳过，请检查录像文件；暂不判定缺少录像" if broken
+                    else "录像已封存，等待分析或终点线配置，暂不判定缺少录像",
                 ))
             else:
                 deferred.append(item)
@@ -1870,7 +1896,8 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 ready.append(path)
             else:
                 pending.append(segment)
-        jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing))
+        jobs.append(dict(camera=camera, segments=segments, ready=ready, pending=pending, missing=missing,
+                         unreadable=[]))
     runtime = _VerificationRuntime()
 
     def input_stamp():
@@ -1915,6 +1942,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                 new_paths = extract_strips(
                     config, tuple(batch), line_for_camera(config, workspace, camera) or {}, progress=progress,
                     checkpoint=lambda: governor.checkpoint(cancelled), cancelled=cancelled,
+                    unreadable=job["unreadable"],
                 )
                 job["ready"].extend(new_paths)
                 sampling_seconds = time.perf_counter() - sample_started
@@ -1934,7 +1962,7 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                     return
                 # A stop/settle run may remove the chip delay only once its entire
                 # snapshot is sampled. Intermediate batches are not final gaps.
-                current_config = replace(config, evidence_delay_ms=max(10_000, config.evidence_delay_ms)) if pending else config
+                current_config = replace(config, evidence_delay_ms=max(10_000, config.evidence_delay_ms)) if pending or job["unreadable"] else config
                 analysis_started = time.perf_counter()
                 if job["ready"]:
                     result = analyse_camera(
@@ -1945,7 +1973,8 @@ def _run_live_batches(config, workspace, cameras, governor, summary, progress, c
                     reason = "等待已封存录像" if not job["segments"] else "等待实际终点线或不跨改线边界的封存片段"
                     result = dict(camera_index=camera, error=reason, items=waiting_items(workspace.reads, camera, reason),
                                   auto_passed=[], waiting_reason="recording" if not job["segments"] else "finish_line")
-                _live_progress(result, job["segments"], pending, job["missing"], current_config, workspace.reads)
+                _live_progress(result, job["segments"], pending, job["missing"], current_config, workspace.reads,
+                               job["unreadable"])
                 result["performance"] = dict(
                     new_video_seconds=round(duration_ms / 1000, 3),
                     sampling_seconds=round(sampling_seconds, 3),

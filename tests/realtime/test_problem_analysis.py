@@ -226,6 +226,55 @@ def test_two_second_segments_are_analyzed_before_archive_and_keep_ids(synthetic_
     assert len(bibs) == len(set(bibs)) == len(CROSSINGS_S)
 
 
+def test_one_unreadable_short_piece_does_not_stop_the_live_round_and_is_retried(synthetic_race, tmp_path):
+    root, _workspace, _config, _strips = synthetic_race
+    for name in ("cyclerace_passage_events.jsonl", "finish_lines.json"):
+        (tmp_path / name).write_bytes((root / name).read_bytes())
+    source = next((root / "videos").glob("*.avi"))
+    capture = cv2.VideoCapture(str(source))
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    good = {}
+    for index in range(4):
+        frames = [capture.read()[1] for _ in range(2 * FPS)]
+        path = tmp_path / f"camera_01_session_review_{index:016d}.avi"
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (WIDTH, HEIGHT))
+        for frame in frames:
+            writer.write(frame)
+        writer.release()
+        good[index] = path.read_bytes()
+        timeline.add_completed_segment(source_id="camera_01_review", camera_index=1, video_path=path,
+                                       media_started_at_ms=START + index * 2_000,
+                                       media_duration_ms=len(frames) * 1000 // FPS,
+                                       clock_source="videopipe_system_clock", timing_error_ms=0,
+                                       end_reason="retained_problem_segment", race_id=RACE)
+    capture.release()
+    broken = tmp_path / "camera_01_session_review_0000000000000001.avi"
+    broken.write_bytes(b"not a video")
+    config = AnalysisConfig(workspace=tmp_path, live=True, render_cards=False, min_available_mb=0)
+    list_path = tmp_path / "finish_problems/problem_list.json"
+
+    run_offline_analysis(config, lower_priority=False)  # used to raise LineSamplingError here
+    camera = json.loads(list_path.read_text(encoding="utf-8"))["cameras"]["1"]
+    assert camera["files"] == 3
+    assert camera["pending_segments"] == 0
+    assert len(camera["unreadable_segments"]) == 1  # said so, and not counted as analysed
+    assert camera["unreadable_ranges"] == [[START + 2_000, START + 4_000]]
+
+    broken.write_bytes(good[1])  # the next round tries it again
+    run_offline_analysis(config, lower_priority=False)
+    camera = json.loads(list_path.read_text(encoding="utf-8"))["cameras"]["1"]
+    assert camera["files"] == 4 and camera["pending_segments"] == 0 and not camera["unreadable_segments"]
+
+    # Outside a live round nothing changes: the error still surfaces.
+    broken.write_bytes(b"not a video")
+    from realtime.line_sampling import LineSamplingError
+    workspace = AnalysisWorkspace(tmp_path, include_review_segments=True)
+    with pytest.raises(LineSamplingError):
+        problem_analysis.extract_strips(
+            replace(config, live=False), workspace.archive_segments(1), workspace.finish_lines()[1],
+        )
+
+
 def test_pending_cache_holes_wait_instead_of_reporting_missing_video():
     from types import SimpleNamespace
     from realtime.problem_items import KIND_NO_VIDEO, KIND_WAITING, ProblemItem, CATEGORY_VIDEO
@@ -243,6 +292,30 @@ def test_pending_cache_holes_wait_instead_of_reporting_missing_video():
     assert result["analyzed_through_ms"] <= 2000
     assert [i.kind for i in result["items"]] == [KIND_WAITING, KIND_WAITING]
     assert {r.event_id for r in reads} == {eid for i in result["items"] for eid in i.event_ids}
+
+
+def test_chips_inside_an_unreadable_piece_say_so_and_others_keep_the_usual_wait():
+    from types import SimpleNamespace
+    from realtime.problem_items import KIND_NO_VIDEO, KIND_WAITING, ProblemItem, CATEGORY_VIDEO
+
+    def piece(name, start):
+        return SimpleNamespace(start_ms=start, end_ms=start + 2000, excluded_ranges=(),
+                               segment=SimpleNamespace(segment_id=name))
+
+    broken, queued = piece("broken", 2000), piece("queued", 10_000)
+    reads = [SimpleNamespace(event_id=f"event{i}", read_id=f"read{i}", chip_ms=chip, bib=str(i),
+                             excluded=False, manual_entry=False) for i, chip in enumerate((2500, 10_500))]
+    result = dict(camera_index=1, coverage=[[0, 2000, "s"], [4000, 10_000, "s"], [12_000, 20_000, "s"]],
+                  analyzed_through_ms=20_000, model=SimpleNamespace(to_recorder=lambda t: t),
+                  items=[ProblemItem(f"gap{i}", KIND_NO_VIDEO, CATEGORY_VIDEO, "gap", chip_time_ms=r.chip_ms,
+                                     event_ids=(r.event_id,)) for i, r in enumerate(reads)])
+    problem_analysis._live_progress(result, [broken, queued], [queued], [], AnalysisConfig(Path("."), live=True),
+                                    reads, [broken])
+    assert result["unreadable_segments"] == ["broken"] and result["unreadable_ranges"] == [[2000, 4000]]
+    assert result["pending_segments"] == 1 and result["scanned_through_ms"] == 2000
+    by_chip = {item.chip_time_ms: item for item in result["items"]}
+    assert {item.kind for item in by_chip.values()} == {KIND_WAITING}  # never "no recording"
+    assert "打不开" in by_chip[2500].detail and "打不开" not in by_chip[10_500].detail
 
 
 def test_clean_race_auto_passes_every_rider(synthetic_race):

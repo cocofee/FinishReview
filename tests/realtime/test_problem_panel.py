@@ -270,6 +270,18 @@ def test_gui_analysis_sets_utf8_unbuffered_worker_environment(qapp, tmp_path, mo
     panel._process = None
 
 
+def test_status_line_says_when_recording_pieces_were_skipped_as_unreadable(qapp, tmp_path):
+    _write_list(tmp_path, _items(), [], cameras={"1": {
+        "camera_index": 1, "pending_segments": 2, "unreadable_segments": ["a", "b", "c"]}})
+    panel = ProblemListPanel()
+    panel.set_workspace(tmp_path)
+    assert "2 个片段排队中" in panel.stage_detail
+    assert "3 个录像片段打不开或已损坏，已跳过，下一轮重试" in panel.stage_detail
+    _write_list(tmp_path, _items(), [], cameras={"1": {"camera_index": 1, "pending_segments": 2}})
+    panel.refresh()
+    assert "打不开" not in panel.stage_detail
+
+
 def test_refresh_preserves_selected_problem_and_per_item_drafts(qapp, tmp_path):
     items = _items()
     _write_list(tmp_path, items, [])

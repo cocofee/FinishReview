@@ -848,6 +848,8 @@ class ProblemListPanel(QFrame):
                     detail += "；部分片段缺线或跨改线边界，尚未核清"
                 if value.get("pending_segments"):
                     detail += f"；{value['pending_segments']} 个片段排队中"
+                if value.get("unreadable_segments"):
+                    detail += f"；{len(value['unreadable_segments'])} 个录像片段打不开或已损坏，已跳过，下一轮重试"
                 statuses.append(f"机位 {camera}：{detail}")
             self.stage_detail = "；".join(statuses) or "视频等待已封存录像及实际终点线；目标识别状态待分析。"
         # A manual count of several people becomes one independent crossing per
