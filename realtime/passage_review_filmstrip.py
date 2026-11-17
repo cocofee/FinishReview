@@ -1096,7 +1096,6 @@ class PassageReviewFilmstripMixin:
         self._mark_filmstrip_operator_busy()
         self._filmstrip_preview_timer.stop()
         self._pending_filmstrip_preview_position = None
-        pane = self._filmstrip_judgment_pane()
         # The filmstrip is a continuous-camera locating surface, not an
         # identity selector.  Clicking a nearby thumbnail must seek camera 1
         # while leaving the selected roster identity unchanged; otherwise a
