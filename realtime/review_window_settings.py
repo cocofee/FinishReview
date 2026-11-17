@@ -50,52 +50,53 @@ from .review_window_common import (
     _saved_race_folders,
     _saved_race_id,
 )
+from .ui_parts import UiPart
 
 logger = logging.getLogger("FinishReview")
 
 
-class FinishReviewSettingsMixin:
+class FinishReviewSettingsPart(UiPart):
     """Apply settings, open saved or received races, return to the live race, clear race data."""
 
     def _current_settings(self, *, output_dir: Path | None = None) -> FinishReviewSettings:
         return FinishReviewSettings(
-            source=self.source,
-            output_dir=output_dir or self.workspace_root,
-            passage_host=self.passage_host,
-            passage_port=self.passage_port,
-            camera_index=self.camera_index,
-            secondary_source=self.secondary_source,
-            high_speed_dir=self.high_speed_dir,
-            finishreview_ip=self.finishreview_ip,
-            cyclerace_ip=self.cyclerace_ip,
-            high_speed_pc_ip=self.high_speed_pc_ip,
-            switch_ip=self.switch_ip,
-            timing_provider=self.timing_provider,
-            racetiger_base_url=self.racetiger_base_url,
-            racetiger_pc=self.racetiger_pc,
-            racetiger_rid=self.racetiger_rid,
-            racetiger_token=self.racetiger_token,
-            racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
-            visual_detection_enabled=self._visual_detection_enabled,
-            visual_camera_index=self._visual_camera_index,
-            visual_finish_line=self._visual_finish_line,
-            visual_gate_width=self._visual_gate_width,
-            visual_forward_direction=self._visual_forward_direction,
-            visual_roi_top=self._visual_roi_top,
-            visual_roi_bottom=self._visual_roi_bottom,
+            source=self._host.source,
+            output_dir=output_dir or self._host.workspace_root,
+            passage_host=self._host.passage_host,
+            passage_port=self._host.passage_port,
+            camera_index=self._host.camera_index,
+            secondary_source=self._host.secondary_source,
+            high_speed_dir=self._host.high_speed_dir,
+            finishreview_ip=self._host.finishreview_ip,
+            cyclerace_ip=self._host.cyclerace_ip,
+            high_speed_pc_ip=self._host.high_speed_pc_ip,
+            switch_ip=self._host.switch_ip,
+            timing_provider=self._host.timing_provider,
+            racetiger_base_url=self._host.racetiger_base_url,
+            racetiger_pc=self._host.racetiger_pc,
+            racetiger_rid=self._host.racetiger_rid,
+            racetiger_token=self._host.racetiger_token,
+            racetiger_poll_interval_seconds=self._host.racetiger_poll_interval_seconds,
+            visual_detection_enabled=self._host._visual_detection_enabled,
+            visual_camera_index=self._host._visual_camera_index,
+            visual_finish_line=self._host._visual_finish_line,
+            visual_gate_width=self._host._visual_gate_width,
+            visual_forward_direction=self._host._visual_forward_direction,
+            visual_roi_top=self._host._visual_roi_top,
+            visual_roi_bottom=self._host._visual_roi_bottom,
         )
 
     def _saved_event_workspaces(self) -> tuple[EventWorkspaceDescriptor, ...]:
-        return discover_event_workspaces(self.workspace_root)
+        return discover_event_workspaces(self._host.workspace_root)
 
     def _received_event_candidates(self):
-        if self.timing_provider != "cyclerace":
+        if self._host.timing_provider != "cyclerace":
             return ()
         store = EventWorkspaceMetadataStore(
-            self._receiver_metadata_store.snapshot_path, self._receiver_passage_store,
-            VideoTimelineStore(self.workspace_root / ".finishreview" / "inbox_timeline.jsonl"),
+            self._host._receiver_metadata_store.snapshot_path, self._host._receiver_passage_store,
+            VideoTimelineStore(self._host.workspace_root / ".finishreview" / "inbox_timeline.jsonl"),
         )
-        received = self._receiver_passage_store.events(include_inactive=True)
+        received = self._host._receiver_passage_store.events(include_inactive=True)
         times = {}
         for event in received:
             scope = (event.race_id, event.stage_id)
@@ -103,57 +104,57 @@ class FinishReviewSettingsMixin:
         return tuple(sorted(store.candidates(), key=lambda item: -times.get((item.race_id, item.stage_id), 0)))
 
     def _select_received_event(self, race_id, stage_id) -> bool:
-        if self._recording_any_active():
-            QMessageBox.warning(self, "无法切换赛事", "请先停止普通录像，再接入当前赛事。")
+        if self._host._recording_any_active():
+            QMessageBox.warning(self._host, "无法切换赛事", "请先停止普通录像，再接入当前赛事。")
             return False
-        metadata = next((item for item in self._received_event_candidates()
+        metadata = next((item for item in self._host._received_event_candidates()
                          if (item.race_id, item.stage_id) == (race_id, stage_id)), None)
         if metadata is None:
             return False
-        authoritative = self._receiver_metadata_store.current()
+        authoritative = self._host._receiver_metadata_store.current()
         if authoritative is not None and (authoritative.race_id, authoritative.stage_id) == (race_id, stage_id):
-            return self._activate_cyclerace_workspace(authoritative, force=True, preserve_cyclerace_receiver=True)
+            return self._host._activate_cyclerace_workspace(authoritative, force=True, preserve_cyclerace_receiver=True)
         try:
-            target = _event_workspace_dir(self.workspace_root, metadata)
+            target = _event_workspace_dir(self._host.workspace_root, metadata)
             target.mkdir(parents=True, exist_ok=True)
             passages = PassageEventStore(target / "cyclerace_passage_events.jsonl")
-            self._merge_cyclerace_events(passages, race_id)
+            self._host._merge_cyclerace_events(passages, race_id)
             local = EventWorkspaceMetadataStore(target / "cyclerace_race_metadata.json", passages,
                                                 VideoTimelineStore(target / "video_timeline.jsonl"))
             local.select(race_id, stage_id)
-            applied = self._apply_settings(
-                self._current_settings(output_dir=target), persist_settings=False,
+            applied = self._host._apply_settings(
+                self._host._current_settings(output_dir=target), persist_settings=False,
                 update_workspace_root=False, preserve_cyclerace_receiver=True, reload_data_source=True,
             )
             if applied:
-                self._workspace_mode = "live"
-                save_workspace_mode(self.workspace_root, target, "live_received")
-                self._workspace_notice = "已接入收到的赛事；完整名单等待 CycleRace 同步"
-                self._capture_error = ""
-                self.refresh()
-                self._update_runtime_status()
+                self._host._workspace_mode = "live"
+                save_workspace_mode(self._host.workspace_root, target, "live_received")
+                self._host._workspace_notice = "已接入收到的赛事；完整名单等待 CycleRace 同步"
+                self._host._capture_error = ""
+                self._host.refresh()
+                self._host._update_runtime_status()
             return applied
         except (OSError, RuntimeError, ValueError) as error:
-            QMessageBox.warning(self, "无法接入赛事", str(error))
+            QMessageBox.warning(self._host, "无法接入赛事", str(error))
             return False
 
     def _select_workspace_event(self, race_id, stage_id) -> bool:
-        if self._recording_any_active():
-            QMessageBox.warning(self, "无法切换赛事", "请先停止普通录像。")
+        if self._host._recording_any_active():
+            QMessageBox.warning(self._host, "无法切换赛事", "请先停止普通录像。")
             return False
         try:
-            self.metadata_store.select(race_id, stage_id)
-            save_workspace_mode(self.workspace_root, self.output_dir, "archive")
+            self._host.metadata_store.select(race_id, stage_id)
+            save_workspace_mode(self._host.workspace_root, self._host.output_dir, "archive")
         except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "无法切换赛事", str(error))
+            QMessageBox.warning(self._host, "无法切换赛事", str(error))
             return False
-        self._invalidate_capture_refresh()
-        self._workspace_mode = "archive"
-        self._selected_event_id = ""
-        self._lookup_cache.clear()
-        self.video_filmstrip.full_race.clear()
-        self.refresh()
-        self._update_runtime_status()
+        self._host._invalidate_capture_refresh()
+        self._host._workspace_mode = "archive"
+        self._host._selected_event_id = ""
+        self._host._lookup_cache.clear()
+        self._host.video_filmstrip.full_race.clear()
+        self._host.refresh()
+        self._host._update_runtime_status()
         return True
 
     @staticmethod
@@ -163,36 +164,36 @@ class FinishReviewSettingsMixin:
         return summarize_event_workspace(workspace)
 
     def _open_saved_event_workspace(self, path: Path) -> bool:
-        if self.timing_provider != "cyclerace":
-            QMessageBox.warning(self, "无法打开赛事", "打开赛事仅支持 CycleRace。")
+        if self._host.timing_provider != "cyclerace":
+            QMessageBox.warning(self._host, "无法打开赛事", "打开赛事仅支持 CycleRace。")
             return False
-        if self._recording_any_active():
-            QMessageBox.warning(self, "无法打开赛事", "请先停止普通录像。")
+        if self._host._recording_any_active():
+            QMessageBox.warning(self._host, "无法打开赛事", "请先停止普通录像。")
             return False
         try:
-            workspace = validate_event_workspace(path, self.workspace_root)
+            workspace = validate_event_workspace(path, self._host.workspace_root)
         except EventWorkspaceError as error:
-            QMessageBox.warning(self, "无法打开赛事", str(error))
+            QMessageBox.warning(self._host, "无法打开赛事", str(error))
             return False
-        if workspace.path == self.output_dir.resolve() and self._workspace_mode == "live":
+        if workspace.path == self._host.output_dir.resolve() and self._host._workspace_mode == "live":
             return True
 
-        self._export_review_summary()
-        applied = self._apply_settings(
-            self._current_settings(output_dir=workspace.path),
+        self._host._export_review_summary()
+        applied = self._host._apply_settings(
+            self._host._current_settings(output_dir=workspace.path),
             persist_settings=False,
             update_workspace_root=False,
             preserve_cyclerace_receiver=True,
         )
         if not applied:
             return False
-        self._workspace_mode = "archive"
-        save_workspace_mode(self.workspace_root, self.output_dir, "archive")
-        self._archive_background_passage_count = 0
-        self._workspace_notice = ""
-        self._capture_error = ""
-        self.refresh()
-        self._update_runtime_status()
+        self._host._workspace_mode = "archive"
+        save_workspace_mode(self._host.workspace_root, self._host.output_dir, "archive")
+        self._host._archive_background_passage_count = 0
+        self._host._workspace_notice = ""
+        self._host._capture_error = ""
+        self._host.refresh()
+        self._host._update_runtime_status()
         return True
 
     def _may_enter_received_race(self, metadata: RaceMetadata) -> bool:
@@ -202,13 +203,13 @@ class FinishReviewSettingsMixin:
         A race that already has its folder, or that CycleRace sent today, enters as before.
         """
 
-        if any(race_id == metadata.race_id for _folder, race_id, _name in _saved_race_folders(self.workspace_root)):
+        if any(race_id == metadata.race_id for _folder, race_id, _name in _saved_race_folders(self._host.workspace_root)):
             return True
-        if (self.workspace_root / "cyclerace_race_metadata.json").is_file() and (
-                _saved_race_id(self.workspace_root) == metadata.race_id):
+        if (self._host.workspace_root / "cyclerace_race_metadata.json").is_file() and (
+                _saved_race_id(self._host.workspace_root) == metadata.race_id):
             return True
         try:
-            sent = datetime.fromtimestamp(self._receiver_metadata_store.snapshot_path.stat().st_mtime,
+            sent = datetime.fromtimestamp(self._host._receiver_metadata_store.snapshot_path.stat().st_mtime,
                                           BEIJING_TIMEZONE)
         except OSError:
             return True
@@ -218,7 +219,7 @@ class FinishReviewSettingsMixin:
         name = metadata.race_name or metadata.race_id
         stage = f"「{metadata.stage_name}」" if metadata.stage_name else ""
         answer = QMessageBox.question(
-            self, "返回当前赛事",
+            self._host, "返回当前赛事",
             "\n\n".join((
                 f"CycleRace 最后发来的是 {sent:%m-%d %H:%M} 的「{name}」{stage}，不是今天发来的。",
                 "进入这场会为它新建本场文件夹。今天的比赛请先在 CycleRace 打开，它会重新发来。",
@@ -227,52 +228,52 @@ class FinishReviewSettingsMixin:
         return answer == QMessageBox.Yes
 
     def _return_to_live_event(self) -> bool:
-        if self._workspace_mode != "archive":
+        if self._host._workspace_mode != "archive":
             return True
-        metadata = self._receiver_metadata_store.current()
-        if metadata is not None and not self._may_enter_received_race(metadata):
+        metadata = self._host._receiver_metadata_store.current()
+        if metadata is not None and not self._host._may_enter_received_race(metadata):
             return False
         try:
             if metadata is not None:
-                applied = self._activate_cyclerace_workspace(
+                applied = self._host._activate_cyclerace_workspace(
                     metadata,
                     force=True,
                     preserve_cyclerace_receiver=True,
                 )
             else:
-                received = self._received_event_candidates()
+                received = self._host._received_event_candidates()
                 if received:
-                    applied = self._select_received_event(received[0].race_id, received[0].stage_id)
-                elif self._current_metadata() is not None:
+                    applied = self._host._select_received_event(received[0].race_id, received[0].stage_id)
+                elif self._host._current_metadata() is not None:
                     # 已选的赛事也可以现场录像，不要求计时设备重新发送名单或芯片。
-                    save_workspace_mode(self.workspace_root, self.output_dir, "live")
+                    save_workspace_mode(self._host.workspace_root, self._host.output_dir, "live")
                     applied = True
                 else:
                     # Chinese kept out of strftime: Python 3.10 on an English Windows cannot encode it.
-                    target = self.workspace_root / ("现场录像_" + datetime.now(BEIJING_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f"))
-                    applied = self._apply_settings(
-                        self._current_settings(output_dir=target), persist_settings=False,
+                    target = self._host.workspace_root / ("现场录像_" + datetime.now(BEIJING_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f"))
+                    applied = self._host._apply_settings(
+                        self._host._current_settings(output_dir=target), persist_settings=False,
                         update_workspace_root=False, preserve_cyclerace_receiver=True,
                     )
                     if applied:
-                        save_workspace_mode(self.workspace_root, self.output_dir, "live_ready")
+                        save_workspace_mode(self._host.workspace_root, self._host.output_dir, "live_ready")
         except Exception as error:  # noqa: BLE001 - keep the archive open on failure.
             QMessageBox.warning(
-                self,
+                self._host,
                 "无法返回当前赛事",
                 sanitize_recording_message(error),
             )
             return False
         if not applied:
             return False
-        self._workspace_mode = "live"
-        self._archive_background_passage_count = 0
-        self._workspace_notice = "现场待机，可开始录像；无需等待芯片到达"
-        self._capture_error = ""
-        self._prepare_live_recording_view(int(time.time() * 1000), "现场待机：点击开始录像，等待本次画面。")
-        self.refresh()
-        self._apply_pending_focus()
-        self._update_runtime_status()
+        self._host._workspace_mode = "live"
+        self._host._archive_background_passage_count = 0
+        self._host._workspace_notice = "现场待机，可开始录像；无需等待芯片到达"
+        self._host._capture_error = ""
+        self._host._prepare_live_recording_view(int(time.time() * 1000), "现场待机：点击开始录像，等待本次画面。")
+        self._host.refresh()
+        self._host._apply_pending_focus()
+        self._host._update_runtime_status()
         return True
 
     def _prepare_live_recording_view(self, started_at_ms: int, message: str) -> None:
@@ -283,13 +284,13 @@ class FinishReviewSettingsMixin:
         this race are untouched.
         """
 
-        self._clear_selection_details()
-        self._opened_normal_crossing = ""
-        self.video_filmstrip.full_race.set_recording_start(started_at_ms)
-        if self._problem_workbench_active:
-            for pane in self.evidence_panes:
+        self._host._clear_selection_details()
+        self._host._opened_normal_crossing = ""
+        self._host.video_filmstrip.full_race.set_recording_start(started_at_ms)
+        if self._host._problem_workbench_active:
+            for pane in self._host.evidence_panes:
                 pane.clear_passage(message)
-            self._problem_count_mode_changed(True)
+            self._host._problem_count_mode_changed(True)
 
     def _clear_event_data(self) -> None:
         """Wipe this race's test data before the real race starts; nothing is kept back.
@@ -298,29 +299,29 @@ class FinishReviewSettingsMixin:
         认车模型、摄像头设置和保存位置不在此列，CycleRace 的正式成绩也不受任何影响。
         """
 
-        panel = getattr(self, "problem_panel", None)
+        panel = getattr(self._host, "problem_panel", None)
         # A held folder lock means a recorder of ours failed to stop.
-        if self._recording_any_active() or self._recording_lock.held:
-            QMessageBox.warning(self, "无法清空数据", "请先停止普通录像，再清空本场测试数据。")
+        if self._host._recording_any_active() or self._host._recording_lock.held:
+            QMessageBox.warning(self._host, "无法清空数据", "请先停止普通录像，再清空本场测试数据。")
             return
-        if self._workspace_mode == "archive":
+        if self._host._workspace_mode == "archive":
             QMessageBox.warning(
-                self, "无法清空数据",
+                self._host, "无法清空数据",
                 "正在查看历史赛事，未做任何改动。请先点「返回现场」，再清空本场测试数据。",
             )
             return
-        event_dir = self.output_dir.resolve()
-        root = self.workspace_root.resolve()
+        event_dir = self._host.output_dir.resolve()
+        root = self._host.workspace_root.resolve()
         if event_dir == root:
             # The root also holds every other race's folder; clearing it would take them too.
-            QMessageBox.warning(self, "无法清空数据", "本场数据直接放在保存根目录里，和其他赛事混在一起，未做任何改动。")
+            QMessageBox.warning(self._host, "无法清空数据", "本场数据直接放在保存根目录里，和其他赛事混在一起，未做任何改动。")
             return
         if not is_event_folder_under(event_dir, root):
-            QMessageBox.warning(self, "无法清空数据", "本场目录不在保存根目录中，未做任何改动。")
+            QMessageBox.warning(self._host, "无法清空数据", "本场目录不在保存根目录中，未做任何改动。")
             return
-        count = len(self.passage_store.events(include_inactive=True))
+        count = len(self._host.passage_store.events(include_inactive=True))
         answer = QMessageBox.question(
-            self,
+            self._host,
             "清空本场数据",
             f"将删除本场的 {count} 条通过记录、问题判读、校时和试录画面，不能恢复。\n"
             "终点线、认车模型、摄像头和保存位置设置保留；CycleRace 正式成绩不受影响。\n\n"
@@ -331,45 +332,45 @@ class FinishReviewSettingsMixin:
         if answer != QMessageBox.Yes:
             return
         # The question ran an event loop, and a reading may have started recording.
-        if self._recording_any_active():
-            QMessageBox.warning(self, "无法清空数据", "请先停止普通录像，再清空本场测试数据。")
+        if self._host._recording_any_active():
+            QMessageBox.warning(self._host, "无法清空数据", "请先停止普通录像，再清空本场测试数据。")
             return
         # Another window recording into this folder would lose its race; holding
         # the folder also keeps one from starting while the files go.
         try:
-            self._recording_lock.acquire(self.output_dir)
+            self._host._recording_lock.acquire(self._host.output_dir)
         except FolderInUseError as error:
             QMessageBox.warning(
-                self, "无法清空数据",
+                self._host, "无法清空数据",
                 f"另一个 FinishReview{error.owner}正在向这个赛事文件夹录像，未做任何改动。"
                 "请先在那个窗口停止录像，再清空本场测试数据。",
             )
             return
         try:
-            self._invalidate_capture_refresh()
-            self._clear_selection_details()
-            self._filmstrip_prefetch_timer.stop()
-            self.playback_coordinator.shutdown()
-            for pane in self.all_evidence_panes:
+            self._host._invalidate_capture_refresh()
+            self._host._clear_selection_details()
+            self._host._filmstrip_prefetch_timer.stop()
+            self._host.playback_coordinator.shutdown()
+            for pane in self._host.all_evidence_panes:
                 pane.shutdown(wait=True)
-            self.video_filmstrip.clear()
-            self.video_filmstrip.full_race.clear()
+            self._host.video_filmstrip.clear()
+            self._host.video_filmstrip.full_race.clear()
             if panel is not None:
                 panel.reset_data()
             # Retired decoders still own file handles until their reads finish.
             from .thread_lifecycle import wait_for_retired_threads
             wait_for_retired_threads(timeout_ms=5000)
-            failures = self._remove_event_data(event_dir, root)
-            for store, label in ((self.passage_store, "通过记录"), (self._receiver_passage_store, "收件箱")):
+            failures = self._host._remove_event_data(event_dir, root)
+            for store, label in ((self._host.passage_store, "通过记录"), (self._host._receiver_passage_store, "收件箱")):
                 try:
                     store.clear()
                 except Exception as error:  # noqa: BLE001 - report what could not be removed.
                     failures.append(f"{label}：{error}")
         finally:
             # Hand the folder back before anything below may start recording.
-            self._recording_lock.release()
-        applied = self._apply_settings(
-            self._current_settings(output_dir=self.output_dir),
+            self._host._recording_lock.release()
+        applied = self._host._apply_settings(
+            self._host._current_settings(output_dir=self._host.output_dir),
             persist_settings=False,
             update_workspace_root=False,
             preserve_cyclerace_receiver=True,
@@ -378,21 +379,21 @@ class FinishReviewSettingsMixin:
         if not applied:
             return
         keep_marker = any(
-            (self.output_dir / name).is_file()
+            (self._host.output_dir / name).is_file()
             for name in ("cyclerace_race_metadata.json", "cyclerace_passage_events.jsonl")
         )
         try:
-            save_workspace_mode(self.workspace_root, self.output_dir,
+            save_workspace_mode(self._host.workspace_root, self._host.output_dir,
                                 "live" if keep_marker else "live_ready")
         except (OSError, ValueError) as error:
             failures.append(f"赛事状态：{error}")
-        self._workspace_notice = "本场数据已清空；可开始正式录像，测试读数不会保留。"
-        self._refresh_problem_list()
-        self.refresh()
-        self._update_runtime_status()
+        self._host._workspace_notice = "本场数据已清空；可开始正式录像，测试读数不会保留。"
+        self._host._refresh_problem_list()
+        self._host.refresh()
+        self._host._update_runtime_status()
         if failures:
             QMessageBox.warning(
-                self, "部分文件未能删除",
+                self._host, "部分文件未能删除",
                 "以下文件仍留在磁盘上，请关闭占用它们的程序后重试：\n" + "\n".join(failures[:8]),
             )
 
@@ -452,22 +453,22 @@ class FinishReviewSettingsMixin:
         preserve_cyclerace_receiver: bool = False,
         reload_data_source: bool = False,
     ) -> bool:
-        self._runtime_error = ""
-        self._auto_recording_error = ""
+        self._host._runtime_error = ""
+        self._host._auto_recording_error = ""
         requested_output_dir = Path(settings.output_dir).expanduser().resolve()
         workspace_root_changed = bool(
-            update_workspace_root and requested_output_dir != self.workspace_root
+            update_workspace_root and requested_output_dir != self._host.workspace_root
         )
         output_dir = (
             requested_output_dir
             if not update_workspace_root or workspace_root_changed
-            else self.output_dir
+            else self._host.output_dir
         )
-        output_changed = output_dir != self.output_dir
+        output_changed = output_dir != self._host.output_dir
         next_timing_provider = str(settings.timing_provider or "cyclerace").strip().lower()
         if next_timing_provider not in {"cyclerace", "racetiger"}:
             next_timing_provider = "cyclerace"
-        timing_changed = next_timing_provider != self.timing_provider
+        timing_changed = next_timing_provider != self._host.timing_provider
         next_racetiger_values = (
             str(settings.racetiger_base_url or "").strip(),
             str(settings.racetiger_pc or "").strip(),
@@ -476,11 +477,11 @@ class FinishReviewSettingsMixin:
             max(0.5, float(settings.racetiger_poll_interval_seconds or 2.0)),
         )
         racetiger_changed = next_racetiger_values != (
-            self.racetiger_base_url,
-            self.racetiger_pc,
-            self.racetiger_rid,
-            self.racetiger_token,
-            self.racetiger_poll_interval_seconds,
+            self._host.racetiger_base_url,
+            self._host.racetiger_pc,
+            self._host.racetiger_rid,
+            self._host.racetiger_token,
+            self._host.racetiger_poll_interval_seconds,
         )
         data_source_changed = bool(
             reload_data_source
@@ -490,15 +491,15 @@ class FinishReviewSettingsMixin:
         )
         preserve_running_receiver = bool(
             preserve_cyclerace_receiver
-            and self.timing_provider == "cyclerace"
+            and self._host.timing_provider == "cyclerace"
             and next_timing_provider == "cyclerace"
             and not workspace_root_changed
-            and self._receiver is not None
-            and self._receiver.is_running
+            and self._host._receiver is not None
+            and self._host._receiver.is_running
         )
         receiver_restart_needed = (
             data_source_changed
-            or (self.timing_provider == "racetiger" and racetiger_changed)
+            or (self._host.timing_provider == "racetiger" and racetiger_changed)
         ) and not preserve_running_receiver
         prepared_data_source = None
         if data_source_changed:
@@ -540,12 +541,12 @@ class FinishReviewSettingsMixin:
                 carried_metadata = None
                 if (workspace_root_changed and not timing_changed
                         and next_timing_provider == "cyclerace"
-                        and self._workspace_mode == "live"
+                        and self._host._workspace_mode == "live"
                         and metadata_store.current() is None):
-                    carried_metadata = self.metadata_store.current()
+                    carried_metadata = self._host.metadata_store.current()
                     if carried_metadata is not None:
                         metadata_store.store(carried_metadata)
-                        for event in self.passage_store.events(include_inactive=True):
+                        for event in self._host.passage_store.events(include_inactive=True):
                             if (event.race_id, event.stage_id) == (
                                 carried_metadata.race_id, carried_metadata.stage_id
                             ):
@@ -560,8 +561,8 @@ class FinishReviewSettingsMixin:
                     ArchiveTimelinePublisher(session, timeline_store)
                     for session in load_archive_recording_sessions(output_dir)
                 ]
-                receiver_passage_store = self._receiver_passage_store
-                receiver_metadata_store = self._receiver_metadata_store
+                receiver_passage_store = self._host._receiver_passage_store
+                receiver_metadata_store = self._host._receiver_metadata_store
                 if workspace_root_changed:
                     inbox_dir = requested_output_dir / CYCLERACE_INBOX_DIRNAME
                     receiver_passage_store = PassageEventStore(
@@ -572,10 +573,10 @@ class FinishReviewSettingsMixin:
                     )
                     # Changing storage roots must not discard already received
                     # races merely because the destination contains an archive.
-                    for event in self._receiver_passage_store.events(include_inactive=True):
+                    for event in self._host._receiver_passage_store.events(include_inactive=True):
                         receiver_passage_store.append(event)
-                    live_metadata = self._receiver_metadata_store.current()
-                    if (live_metadata is not None and self._live_metadata_scope ==
+                    live_metadata = self._host._receiver_metadata_store.current()
+                    if (live_metadata is not None and self._host._live_metadata_scope ==
                             (live_metadata.race_id, live_metadata.stage_id)):
                         receiver_metadata_store.store(live_metadata)
                     if carried_metadata is not None:
@@ -598,65 +599,65 @@ class FinishReviewSettingsMixin:
                     receiver_metadata_store,
                 )
             except Exception as exc:  # noqa: BLE001 - validate before runtime mutation.
-                self._runtime_error = sanitize_recording_message(exc)
-                QMessageBox.warning(self, "设置无法应用", self._runtime_error)
-                self._update_runtime_status()
+                self._host._runtime_error = sanitize_recording_message(exc)
+                QMessageBox.warning(self._host, "设置无法应用", self._host._runtime_error)
+                self._host._update_runtime_status()
                 return False
-        previous_runtime_settings = self._current_settings()
+        previous_runtime_settings = self._host._current_settings()
         if data_source_changed:
-            self._capture_refresh_generation += 1
-            if not self._capture_refresh_worker.invalidate_and_wait(
-                self._capture_refresh_generation,
+            self._host._capture_refresh_generation += 1
+            if not self._host._capture_refresh_worker.invalidate_and_wait(
+                self._host._capture_refresh_generation,
                 timeout=5.0,
             ):
                 QMessageBox.warning(
-                    self,
+                    self._host,
                     "设置无法应用",
                     "后台录像刷新仍在运行，设置未切换。",
                 )
                 return False
-        if persist_settings and self._settings_saver is not None:
+        if persist_settings and self._host._settings_saver is not None:
             try:
-                self._settings_saver(settings)
+                self._host._settings_saver(settings)
             except Exception as exc:  # noqa: BLE001 - keep current runtime unchanged.
-                QMessageBox.warning(self, "设置未保存", str(exc))
+                QMessageBox.warning(self._host, "设置未保存", str(exc))
                 return False
         if stop_recording:
-            failures = self.stop_recording()
+            failures = self._host.stop_recording()
             if any(failure.still_running for failure in failures):
-                if persist_settings and self._settings_saver is not None:
+                if persist_settings and self._host._settings_saver is not None:
                     try:
-                        self._settings_saver(previous_runtime_settings)
+                        self._host._settings_saver(previous_runtime_settings)
                     except Exception:
                         logger.exception("Failed to roll back settings after stop failure")
                 QMessageBox.warning(
-                    self,
+                    self._host,
                     "设置无法应用",
                     "仍有录像进程未停止，设置未切换。",
                 )
                 return False
         if receiver_restart_needed:
-            self.stop_receiver()
+            self._host.stop_receiver()
         if data_source_changed:
-            self._stop_archive_video_scan_workers()
-            self._passage_batch_timer.stop()
-            self._pending_passages.clear()
-        self.source = str(settings.source).strip()
-        self.secondary_source = str(settings.secondary_source).strip()
-        self.passage_host = str(settings.passage_host).strip()
-        self.passage_port = int(settings.passage_port)
-        self.camera_index = max(1, int(settings.camera_index))
-        self.finishreview_ip = str(settings.finishreview_ip).strip()
-        self.cyclerace_ip = str(settings.cyclerace_ip).strip()
-        self.high_speed_pc_ip = str(settings.high_speed_pc_ip).strip()
-        self.switch_ip = str(settings.switch_ip).strip()
-        self.timing_provider = next_timing_provider
+            self._host._stop_archive_video_scan_workers()
+            self._host._passage_batch_timer.stop()
+            self._host._pending_passages.clear()
+        self._host.source = str(settings.source).strip()
+        self._host.secondary_source = str(settings.secondary_source).strip()
+        self._host.passage_host = str(settings.passage_host).strip()
+        self._host.passage_port = int(settings.passage_port)
+        self._host.camera_index = max(1, int(settings.camera_index))
+        self._host.finishreview_ip = str(settings.finishreview_ip).strip()
+        self._host.cyclerace_ip = str(settings.cyclerace_ip).strip()
+        self._host.high_speed_pc_ip = str(settings.high_speed_pc_ip).strip()
+        self._host.switch_ip = str(settings.switch_ip).strip()
+        self._host.timing_provider = next_timing_provider
         (
-            self.racetiger_base_url,
-            self.racetiger_pc,
-            self.racetiger_rid,
-            self.racetiger_token,
-            self.racetiger_poll_interval_seconds,
+            self._host.racetiger_base_url,
+            self._host.racetiger_pc,
+            self._host.racetiger_rid,
+            self._host.racetiger_token,
+            self._host.racetiger_poll_interval_seconds,
         ) = next_racetiger_values
         next_visual_values = (
             bool(settings.visual_detection_enabled),
@@ -668,22 +669,22 @@ class FinishReviewSettingsMixin:
             float(settings.visual_roi_bottom),
         )
         visual_changed = next_visual_values != (
-            self._visual_detection_enabled,
-            self._visual_camera_index,
-            self._visual_finish_line,
-            self._visual_gate_width,
-            self._visual_forward_direction,
-            self._visual_roi_top,
-            self._visual_roi_bottom,
+            self._host._visual_detection_enabled,
+            self._host._visual_camera_index,
+            self._host._visual_finish_line,
+            self._host._visual_gate_width,
+            self._host._visual_forward_direction,
+            self._host._visual_roi_top,
+            self._host._visual_roi_bottom,
         )
         (
-            self._visual_detection_enabled,
-            self._visual_camera_index,
-            self._visual_finish_line,
-            self._visual_gate_width,
-            self._visual_forward_direction,
-            self._visual_roi_top,
-            self._visual_roi_bottom,
+            self._host._visual_detection_enabled,
+            self._host._visual_camera_index,
+            self._host._visual_finish_line,
+            self._host._visual_gate_width,
+            self._host._visual_forward_direction,
+            self._host._visual_roi_top,
+            self._host._visual_roi_bottom,
         ) = next_visual_values
         next_high_speed_dir = (
             Path(settings.high_speed_dir).expanduser().absolute()
@@ -691,23 +692,23 @@ class FinishReviewSettingsMixin:
             and str(settings.high_speed_dir).strip()
             else None
         )
-        high_speed_changed = next_high_speed_dir != self.high_speed_dir
+        high_speed_changed = next_high_speed_dir != self._host.high_speed_dir
         if high_speed_changed:
-            self.high_speed_dir = next_high_speed_dir
-            self._high_speed_catalog.set_root(next_high_speed_dir)
+            self._host.high_speed_dir = next_high_speed_dir
+            self._host._high_speed_catalog.set_root(next_high_speed_dir)
         configured_camera_indexes = tuple(
             camera_index
-            for camera_index, _source in self._configured_recording_sources()
-        ) or (self.camera_index,)
+            for camera_index, _source in self._host._configured_recording_sources()
+        ) or (self._host.camera_index,)
         evidence_layout_changed = bool(
-            configured_camera_indexes != self._configured_regular_camera_indexes
-            or (self.high_speed_dir is not None) != self._show_high_speed_pane
+            configured_camera_indexes != self._host._configured_regular_camera_indexes
+            or (self._host.high_speed_dir is not None) != self._host._show_high_speed_pane
         )
         if evidence_layout_changed:
-            self._sync_evidence_pane_layout(include_recorded=False)
+            self._host._sync_evidence_pane_layout(include_recorded=False)
         if data_source_changed:
             assert prepared_data_source is not None
-            self.video_filmstrip.full_race.set_recording_start(None)
+            self._host.video_filmstrip.full_race.set_recording_start(None)
             (
                 passage_store,
                 metadata_store,
@@ -724,122 +725,122 @@ class FinishReviewSettingsMixin:
                 receiver_metadata_store,
             ) = prepared_data_source
             if workspace_root_changed:
-                self.workspace_root = requested_output_dir
-                self._receiver_passage_store = receiver_passage_store
-                self._receiver_metadata_store = receiver_metadata_store
-                self._workspace_mode = "live"
-                self._archive_background_passage_count = 0
-            self.output_dir = output_dir
-            self._finish_line_store = FinishLineStore(
-                self.output_dir / "motion_finish_lines.json", legacy_path=self.output_dir / "finish_lines.json"
+                self._host.workspace_root = requested_output_dir
+                self._host._receiver_passage_store = receiver_passage_store
+                self._host._receiver_metadata_store = receiver_metadata_store
+                self._host._workspace_mode = "live"
+                self._host._archive_background_passage_count = 0
+            self._host.output_dir = output_dir
+            self._host._finish_line_store = FinishLineStore(
+                self._host.output_dir / "motion_finish_lines.json", legacy_path=self._host.output_dir / "finish_lines.json"
             )
-            self._finish_line_rois = self._finish_line_store.rois()
-            self._video_review_journal = VideoReviewJournal(
-                self.output_dir / "video_review.jsonl"
+            self._host._finish_line_rois = self._host._finish_line_store.rois()
+            self._host._video_review_journal = VideoReviewJournal(
+                self._host.output_dir / "video_review.jsonl"
             )
-            self.video_arrival_store = VideoArrivalCandidateStore(
-                self.output_dir / "video_arrival_candidates.jsonl",
-                metrics=self.runtime_metrics,
+            self._host.video_arrival_store = VideoArrivalCandidateStore(
+                self._host.output_dir / "video_arrival_candidates.jsonl",
+                metrics=self._host.runtime_metrics,
             )
-            self._video_reconciliation_by_id.clear()
-            self._video_candidate_cache = {
+            self._host._video_reconciliation_by_id.clear()
+            self._host._video_candidate_cache = {
                 str(candidate.candidate_id): candidate
-                for candidate in self.video_arrival_store.candidates()
+                for candidate in self._host.video_arrival_store.candidates()
             }
-            self.set_video_navigation_candidates(
-                tuple(self._video_candidate_cache.values())
+            self._host.set_video_navigation_candidates(
+                tuple(self._host._video_candidate_cache.values())
             )
-            self._video_review_statuses.clear()
-            self._video_review_bibs.clear()
-            for record in self._video_review_journal.records():
-                self.restore_video_review_record(
+            self._host._video_review_statuses.clear()
+            self._host._video_review_bibs.clear()
+            for record in self._host._video_review_journal.records():
+                self._host.restore_video_review_record(
                     record.candidate_id,
                     status=record.status,
                     bib=record.bib,
                 )
-            self._video_reconciliation = ()
-            self._active_video_anomaly_id = ""
-            self._video_anomaly_cursor = -1
-            self.passage_store = passage_store
-            self.metadata_store = metadata_store
-            self.timeline_store = timeline_store
-            self.review_binding_store = review_binding_store
-            self.association_store = association_store
-            self.calibration_store = calibration_store
-            self.video_discovery_store = video_discovery_store
-            self._reload_video_discoveries()
-            self._lookup_cache.clear()
-            self._timeline_signature = ()
-            self._selected_event_id = ""
-            self._capture_windows_by_camera = {self.camera_index: {}}
-            self._capture_windows = self._capture_windows_by_camera[
-                self.camera_index
+            self._host._video_reconciliation = ()
+            self._host._active_video_anomaly_id = ""
+            self._host._video_anomaly_cursor = -1
+            self._host.passage_store = passage_store
+            self._host.metadata_store = metadata_store
+            self._host.timeline_store = timeline_store
+            self._host.review_binding_store = review_binding_store
+            self._host.association_store = association_store
+            self._host.calibration_store = calibration_store
+            self._host.video_discovery_store = video_discovery_store
+            self._host._reload_video_discoveries()
+            self._host._lookup_cache.clear()
+            self._host._timeline_signature = ()
+            self._host._selected_event_id = ""
+            self._host._capture_windows_by_camera = {self._host.camera_index: {}}
+            self._host._capture_windows = self._host._capture_windows_by_camera[
+                self._host.camera_index
             ]
-            self._archive_publishers = archive_publishers
-            self._unsupported_event_ids.clear()
-            self._preflight_journal = preflight_journal
-            self._preflight_event_keys = set(preflight_journal.event_keys())
-            self._evidence_timestamp_overrides = evidence_timestamp_overrides
-            self._historical_passage_count = len(self._events_for_current_metadata(self.passage_store.events()))
-            self._received_passage_count = 0
-            self._received_passage_sequence = 0
-            self._received_event_order.clear()
-            self._capture_error = ""
-            self.refresh()
-            self._refresh_problem_list()
-            if self._video_candidate_cache:
-                self._reconcile_video_candidates(
-                    tuple(self._video_candidate_cache.values())
+            self._host._archive_publishers = archive_publishers
+            self._host._unsupported_event_ids.clear()
+            self._host._preflight_journal = preflight_journal
+            self._host._preflight_event_keys = set(preflight_journal.event_keys())
+            self._host._evidence_timestamp_overrides = evidence_timestamp_overrides
+            self._host._historical_passage_count = len(self._host._events_for_current_metadata(self._host.passage_store.events()))
+            self._host._received_passage_count = 0
+            self._host._received_passage_sequence = 0
+            self._host._received_event_order.clear()
+            self._host._capture_error = ""
+            self._host.refresh()
+            self._host._refresh_problem_list()
+            if self._host._video_candidate_cache:
+                self._host._reconcile_video_candidates(
+                    tuple(self._host._video_candidate_cache.values())
                 )
             if not preserve_running_receiver:
                 try:
-                    self.start_receiver()
+                    self._host.start_receiver()
                 except Exception as exc:  # noqa: BLE001 - settings remain applied.
-                    self._runtime_error = sanitize_recording_message(exc)
+                    self._host._runtime_error = sanitize_recording_message(exc)
                     QMessageBox.warning(
-                        self,
+                        self._host,
                         (
                             "赛虎读取未启动"
-                            if self.timing_provider == "racetiger"
+                            if self._host.timing_provider == "racetiger"
                             else "CycleRace监听未启动"
                         ),
-                        self._runtime_error,
+                        self._host._runtime_error,
                     )
-            self._high_speed_catalog.set_cache_path(
+            self._host._high_speed_catalog.set_cache_path(
                 output_dir / HIGH_SPEED_INDEX_FILENAME
             )
-            self._high_speed_catalog.set_target_dates(
+            self._host._high_speed_catalog.set_target_dates(
                 _high_speed_target_dates(
                     historical_events,
-                    self._evidence_timestamp_overrides,
+                    self._host._evidence_timestamp_overrides,
                 )
             )
         if high_speed_changed or data_source_changed:
-            self.invalidate_external_locations()
-            self._request_high_speed_scan()
+            self._host.invalidate_external_locations()
+            self._host._request_high_speed_scan()
         elif evidence_layout_changed:
-            self.refresh()
+            self._host.refresh()
         if receiver_restart_needed and not data_source_changed:
             try:
-                self.start_receiver()
+                self._host.start_receiver()
             except Exception as exc:  # noqa: BLE001 - settings remain applied.
-                self._runtime_error = sanitize_recording_message(exc)
+                self._host._runtime_error = sanitize_recording_message(exc)
                 QMessageBox.warning(
-                    self,
+                    self._host,
                     "Timing source not started",
-                    self._runtime_error,
+                    self._host._runtime_error,
                 )
-        if visual_changed and self._recording_any_active():
-            self._start_visual_workers()
-        self._update_runtime_status()
+        if visual_changed and self._host._recording_any_active():
+            self._host._start_visual_workers()
+        self._host._update_runtime_status()
         return True
 
     def _clean_old_folders(self) -> None:
         """Folders left by earlier tests: the operator ticks which go (see workspace_cleanup)."""
         from .workspace_cleanup import clean_old_folders
-        done = clean_old_folders(self, self.workspace_root, self.output_dir)
+        done = clean_old_folders(self._host, self._host.workspace_root, self._host.output_dir)
         if done:
-            self.problem_panel.hint.setText(done)
+            self._host.problem_panel.hint.setText(done)
 
 
     def _activate_cyclerace_workspace(
@@ -849,21 +850,21 @@ class FinishReviewSettingsMixin:
         force: bool = False,
         preserve_cyclerace_receiver: bool = False,
     ) -> bool:
-        if self.timing_provider != "cyclerace" or self.metadata_store is None:
+        if self._host.timing_provider != "cyclerace" or self._host.metadata_store is None:
             return False
-        current_metadata = self.metadata_store.current()
+        current_metadata = self._host.metadata_store.current()
         if (
             not force
             and current_metadata is not None
             and current_metadata.race_id == metadata.race_id
         ):
-            self.metadata_store.store(metadata)
-            self._merge_cyclerace_events(self.passage_store, metadata.race_id)
-            self.refresh()
+            self._host.metadata_store.store(metadata)
+            self._host._merge_cyclerace_events(self._host.passage_store, metadata.race_id)
+            self._host.refresh()
             return False
 
-        self._export_review_summary()
-        target_dir = _event_workspace_dir(self.workspace_root, metadata)
+        self._host._export_review_summary()
+        target_dir = _event_workspace_dir(self._host.workspace_root, metadata)
         target_dir.mkdir(parents=True, exist_ok=True)
         target_metadata_store = RaceMetadataStore(
             target_dir / "cyclerace_race_metadata.json"
@@ -872,11 +873,11 @@ class FinishReviewSettingsMixin:
         target_passage_store = PassageEventStore(
             target_dir / "cyclerace_passage_events.jsonl"
         )
-        self._merge_cyclerace_events(target_passage_store, metadata.race_id)
+        self._host._merge_cyclerace_events(target_passage_store, metadata.race_id)
 
-        recording_was_active = self._recording_any_active()
-        applied = self._apply_settings(
-            self._current_settings(output_dir=target_dir),
+        recording_was_active = self._host._recording_any_active()
+        applied = self._host._apply_settings(
+            self._host._current_settings(output_dir=target_dir),
             stop_recording=recording_was_active,
             persist_settings=False,
             update_workspace_root=False,
@@ -884,12 +885,12 @@ class FinishReviewSettingsMixin:
             reload_data_source=force,
         )
         if applied:
-            self._workspace_mode = "live"
-            save_workspace_mode(self.workspace_root, self.output_dir, "live")
-            self._archive_background_passage_count = 0
-            self._workspace_notice = ""
+            self._host._workspace_mode = "live"
+            save_workspace_mode(self._host.workspace_root, self._host.output_dir, "live")
+            self._host._archive_background_passage_count = 0
+            self._host._workspace_notice = ""
         if applied and recording_was_active:
-            self._workspace_notice = "已切换新赛事，录像待重新开始"
+            self._host._workspace_notice = "已切换新赛事，录像待重新开始"
         return applied
 
     def _merge_cyclerace_events(
@@ -905,10 +906,10 @@ class FinishReviewSettingsMixin:
         switching back from an archive or restarting the application.
         """
         events_by_id: dict[str, PassageEvent] = {}
-        stores = [target_store, self._receiver_passage_store]
+        stores = [target_store, self._host._receiver_passage_store]
         # During ``__init__`` the Qt base class has not been initialised yet,
         # so attribute lookup through QObject can raise RuntimeError.
-        existing_store = self.__dict__.get("passage_store")
+        existing_store = self._host.__dict__.get("passage_store")
         if existing_store is not None and existing_store is not target_store:
             stores.append(existing_store)
         for store in stores:
@@ -933,43 +934,43 @@ class FinishReviewSettingsMixin:
         11-05: every race opened in CycleRace used to get a folder the moment its
         details arrived, so a morning of tests left dozens behind.
         """
-        if self._workspace_mode != "live" or self.timing_provider != "cyclerace":
+        if self._host._workspace_mode != "live" or self._host.timing_provider != "cyclerace":
             return
-        opened = self._receiver_metadata_store.current()
-        if opened is None or self._live_metadata_scope != (opened.race_id, opened.stage_id):
+        opened = self._host._receiver_metadata_store.current()
+        if opened is None or self._host._live_metadata_scope != (opened.race_id, opened.stage_id):
             return
-        current = self.metadata_store.current() if self.metadata_store is not None else None
+        current = self._host.metadata_store.current() if self._host.metadata_store is not None else None
         if current is not None and current.race_id == opened.race_id:
             return
         if opened.groups and all(_is_test_group_name(group.name) or _is_test_group_name(group.group_id)
                                  for group in opened.groups):
             return
-        self._activate_cyclerace_workspace(opened)
+        self._host._activate_cyclerace_workspace(opened)
 
     def _current_archive_race_id(self) -> str:
-        metadata = self._current_metadata()
+        metadata = self._host._current_metadata()
         if metadata is not None:
             return metadata.race_id
-        return race_id_from_passage_store(self.passage_store)
+        return race_id_from_passage_store(self._host.passage_store)
 
     def _export_review_summary(self, *, show_warning: bool = False) -> Path | None:
-        metadata = self._current_metadata()
-        if self.timing_provider == "cyclerace" and metadata is None:
+        metadata = self._host._current_metadata()
+        if self._host.timing_provider == "cyclerace" and metadata is None:
             return None
-        if self.timing_provider == "racetiger" and not self.racetiger_rid:
+        if self._host.timing_provider == "racetiger" and not self._host.racetiger_rid:
             return None
         try:
             return export_review_summary(
-                self.output_dir,
-                self._events_for_current_metadata(self.passage_store.events()),
-                self.association_store,
+                self._host.output_dir,
+                self._host._events_for_current_metadata(self._host.passage_store.events()),
+                self._host.association_store,
                 metadata,
             )
         except Exception as error:  # noqa: BLE001 - review operation must not be blocked.
             logger.exception("Failed to export the event review summary")
             if show_warning:
                 QMessageBox.warning(
-                    self,
+                    self._host,
                     "复核清单未更新",
                     f"无法更新终点复核清单：{error}",
                 )

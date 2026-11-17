@@ -20,36 +20,37 @@ from .quick_review_common import (
     UNVERIFIED_SPAN_MS,
     WAVE_VIEW_MARGIN_MS,
 )
+from .ui_parts import UiPart
 
 
-class QuickReviewRowsMixin:
+class QuickReviewRowsPart(UiPart):
     """Store and events, laps, repeats, folded unverified rows and fragments, row state and lookup."""
 
     def _ensure_store(self):
-        if self.problem_dir is None:
+        if self._host.problem_dir is None:
             return
-        path = self.problem_dir / ARRIVAL_REVIEWS_FILENAME
-        if self._arrival_store is None or self._arrival_store.path != path:
-            self._arrival_store = ArrivalReviewStore(path)
+        path = self._host.problem_dir / ARRIVAL_REVIEWS_FILENAME
+        if self._host._arrival_store is None or self._host._arrival_store.path != path:
+            self._host._arrival_store = ArrivalReviewStore(path)
         else:
-            self._arrival_store.refresh()
+            self._host._arrival_store.refresh()
 
     def _locally_excluded(self, event):
-        entry = (self._arrival_store.latest(self._arrival_scope, "event:" + event.event_id,
-                                            event_binding(event)) if self._arrival_store is not None else None)
+        entry = (self._host._arrival_store.latest(self._host._arrival_scope, "event:" + event.event_id,
+                                            event_binding(event)) if self._host._arrival_store is not None else None)
         return bool(entry and entry["action"] == "held" and entry.get("reason") == LOCAL_CHIP_EXCLUSION)
 
     def _events(self):
         """Every chip passage of this race; lap k/N is a label, never a visibility filter."""
-        events = tuple(self._events_provider())
+        events = tuple(self._host._events_provider())
         scopes = {(event.race_id, event.stage_id) for event in events}
-        self._arrival_scope = self._scope if self._scope[0] else next(iter(scopes)) if len(scopes) == 1 else self._scope
-        scoped = [event for event in events if (event.race_id, event.stage_id) == self._arrival_scope]
-        metadata = self._metadata_provider()
-        self._target_laps = ({group.group_id: group.target_laps for group in metadata.groups}
-                             if metadata is not None and (metadata.race_id, metadata.stage_id) == self._arrival_scope
+        self._host._arrival_scope = self._host._scope if self._host._scope[0] else next(iter(scopes)) if len(scopes) == 1 else self._host._scope
+        scoped = [event for event in events if (event.race_id, event.stage_id) == self._host._arrival_scope]
+        metadata = self._host._metadata_provider()
+        self._host._target_laps = ({group.group_id: group.target_laps for group in metadata.groups}
+                             if metadata is not None and (metadata.race_id, metadata.stage_id) == self._host._arrival_scope
                              else {})
-        self._short_bibs = self._short_of_laps([event for event in scoped if not self._locally_excluded(event)])
+        self._host._short_bibs = self._host._short_of_laps([event for event in scoped if not self._host._locally_excluded(event)])
         return {event.event_id: event for event in scoped}
 
     def _short_of_laps(self, events):
@@ -59,7 +60,7 @@ class QuickReviewRowsMixin:
         hint only (圈数异常只提示): the rider may not have finished, or a lap
         may have gone unread.
         """
-        laps = self._target_laps
+        laps = self._host._target_laps
         active = [event for event in events if event.is_active and laps.get(event.group_id, 0) > 1]
         finished = {event.group_id for event in active if event.lap >= laps[event.group_id]}
         passages = [Passage(event.event_id, event.athlete_id or event.bib, int(event.timeline_timestamp_ms),
@@ -70,10 +71,10 @@ class QuickReviewRowsMixin:
         return tuple(sorted((bibs[rider] or rider for rider in short), key=lambda bib: (len(bib), bib)))
 
     def _category(self, item=None):
-        item = item or self._candidate_item()
-        return (self._arrival_store.latest(self._arrival_scope, "candidate:" + item.item_id,
+        item = item or self._host._candidate_item()
+        return (self._host._arrival_store.latest(self._host._arrival_scope, "candidate:" + item.item_id,
                                            candidate_binding(item))
-                if self._arrival_store is not None and item is not None else None)
+                if self._host._arrival_store is not None and item is not None else None)
 
     def _without_repeats(self, rows):
         """One row per person without a chip: the same person flagged twice on a wave is listed once.
@@ -84,7 +85,7 @@ class QuickReviewRowsMixin:
         """
         kept, seen = [], []
         for row in rows:
-            marks = self._marks.get(row.item.item_id, ()) if row.event is None else ()
+            marks = self._host._marks.get(row.item.item_id, ()) if row.event is None else ()
             parent = row.item.evidence.get("wave_parent")
             if parent and len(marks) == 1:
                 mark = marks[0]
@@ -106,15 +107,15 @@ class QuickReviewRowsMixin:
         folded, leads = set(), {}
         for row in sorted(rows, key=lambda row: (row.time_ms if row.time_ms is not None else 2**62, row.key)):
             item = row.item
-            category = self._category(item) or {}
+            category = self._host._category(item) or {}
             check = item.evidence.get("crossing_check") or {}
-            is_unverified = self._unverified_picture(item)
+            is_unverified = self._host._unverified_picture(item)
             if row.event is not None or not is_unverified:
                 leads.clear()  # A chip or known person separates review clips.
                 continue
             frame = item.evidence.get("frame") or {}
             if (row.time_ms is None or row.mark is not None or row.decision is not None or row.entered
-                    or item.item_id in counting or assigned[item.item_id] or self._marks.get(item.item_id)
+                    or item.item_id in counting or assigned[item.item_id] or self._host._marks.get(item.item_id)
                     or not frame.get("video_path") or not frame.get("segment_id")):
                 leads.clear()
                 continue
@@ -142,11 +143,11 @@ class QuickReviewRowsMixin:
             return (row.event is None and row.mark is None and row.decision is None and row.time_ms is not None
                     and item.kind == KIND_NO_CHIP_CROSSING and not item.evidence.get("wave_parent")
                     and ((item.evidence.get("crossing_check") or {}).get("state") == "confirmed"
-                         or (self._category(item) or {}).get("action") == "bicycle")
-                    and not self._marks.get(item.item_id) and not row.fragments and not assigned[item.item_id])
+                         or (self._host._category(item) or {}).get("action") == "bicycle")
+                    and not self._host._marks.get(item.item_id) and not row.fragments and not assigned[item.item_id])
         folded, leads = set(), {}
         for row in sorted((row for row in rows if foldable(row)), key=lambda row: (row.time_ms, row.key)):
-            state = (self._row_state(row), (self._category(row.item) or {}).get("action"),
+            state = (self._host._row_state(row), (self._host._category(row.item) or {}).get("action"),
                      int((row.item.evidence.get("frame") or {}).get("camera_index") or 1))
             lead = leads.get(state)
             if lead is not None and row.time_ms - lead.time_ms <= FRAGMENT_REACH_MS:
@@ -165,9 +166,9 @@ class QuickReviewRowsMixin:
         if row is None or row.time_ms is None or not (row.fragments or whole):
             return []
         camera = str(int((row.item.evidence.get("frame") or {}).get("camera_index") or 1))
-        seen = self._arrival_drafts.get("seen", {}).get(camera, [])
+        seen = self._host._arrival_drafts.get("seen", {}).get(camera, [])
         last = (row.fragments[-1] if row.fragments else row).time_ms
-        return uncovered_intervals(row.time_ms - self._passage_lead(row), last + PASSAGE_VIEW_MARGIN_MS,
+        return uncovered_intervals(row.time_ms - self._host._passage_lead(row), last + PASSAGE_VIEW_MARGIN_MS,
                                    seen, tolerance=100)
 
     def _passage_lead(self, row):
@@ -180,7 +181,7 @@ class QuickReviewRowsMixin:
         """
         if row is None or row.event is not None:
             return WAVE_VIEW_MARGIN_MS
-        arrival = self._earlier_arrival(row, read=False)
+        arrival = self._host._earlier_arrival(row, read=False)
         if arrival is None:
             return PASSAGE_VIEW_MARGIN_MS
         return max(PASSAGE_VIEW_MARGIN_MS, -(-int(row.time_ms - arrival) // 100) * 100)
@@ -188,17 +189,17 @@ class QuickReviewRowsMixin:
     def _read_earlier(self):
         """A few crossings at a time; the table shows 可能多人 once they are read."""
         read = 0
-        for row in self._arrival_rows:
+        for row in self._host._arrival_rows:
             if read == EARLIER_BATCH:
                 break
             key = (row.item.item_id, int(row.time_ms)) if row.time_ms is not None else None
-            if row.event is None and key is not None and key not in self._earlier:
-                self._earlier_arrival(row)
-                read += key in self._earlier
-        if {key for key, arrival in self._earlier.items() if arrival is not None} != self._earlier_shown:
-            self._render()  # and on to the next few
+            if row.event is None and key is not None and key not in self._host._earlier:
+                self._host._earlier_arrival(row)
+                read += key in self._host._earlier
+        if {key for key, arrival in self._host._earlier.items() if arrival is not None} != self._host._earlier_shown:
+            self._host._render()  # and on to the next few
         elif read == EARLIER_BATCH:
-            self._earlier_timer.start()
+            self._host._earlier_timer.start()
 
     def _unverified_picture(self, item):
         """Line motion is evidence to inspect, not a person or an arrival.
@@ -208,9 +209,9 @@ class QuickReviewRowsMixin:
         """
         if item.kind == KIND_MANUAL_REVIEW:
             return False
-        if rider_count(self._marks.get(item.item_id, ())):
+        if rider_count(self._host._marks.get(item.item_id, ())):
             return False
-        category = self._category(item)
+        category = self._host._category(item)
         if category and category["action"] in ("bicycle", "not_rider"):
             return False
         return (item.evidence.get("crossing_check") or {}).get("state") != "confirmed"
@@ -225,9 +226,9 @@ class QuickReviewRowsMixin:
         """
         if item.item_id in counting:
             return False
-        if self._unverified_picture(item) and not self._show_unverified:
+        if self._host._unverified_picture(item) and not self._host._show_unverified:
             return False
-        marks = self._marks.get(item.item_id, ())
+        marks = self._host._marks.get(item.item_id, ())
         if item.evidence.get("wave_parent"):
             return assigned[item.item_id] < rider_count(marks)
         return assigned[item.item_id] < max(1, len(marks))
@@ -238,7 +239,7 @@ class QuickReviewRowsMixin:
         Most likely that person, maybe someone nobody counted: a row, 已点附近
         (COUNTED_REACH_MS).
         """
-        if not moments or self._marks.get(item.item_id) or assigned[item.item_id] or self._category(item) is not None:
+        if not moments or self._host._marks.get(item.item_id) or assigned[item.item_id] or self._host._category(item) is not None:
             return False
         frame = item.evidence.get("frame") or {}
         stamp = item.evidence.get("recorder_ms", frame.get("recorder_ms"))
@@ -248,9 +249,9 @@ class QuickReviewRowsMixin:
     def _counted_moments(self, counting):
         """Camera -> recorder moments of everyone counted on a wave's picture, those without a chip too."""
         moments = {}
-        for item in self.items:
+        for item in self._host.items:
             if item.item_id in counting or item.evidence.get("wave_parent") in counting:
-                for mark in self._marks.get(item.item_id, ()):
+                for mark in self._host._marks.get(item.item_id, ()):
                     camera = int((mark.get("frame") or {}).get("camera_index") or 1)
                     moments.setdefault(camera, []).append(int(mark["recorder_ms"]))
         return moments
@@ -258,7 +259,7 @@ class QuickReviewRowsMixin:
     def _row_state(self, row):
         if row.event is not None and not row.event.is_active:
             return "已排除"
-        if row.event is None and self._unverified_picture(row.item):
+        if row.event is None and self._host._unverified_picture(row.item):
             return "画面待核"
         if row.stale:
             return "待定"
@@ -270,7 +271,7 @@ class QuickReviewRowsMixin:
             return "已点" if (row.decision.get("frame") or {}).get("marker_x_normalized") is not None else "已确认"
         if row.note:
             return row.note
-        category = self._category(row.item)
+        category = self._host._category(row.item)
         if category and category["action"] == "not_rider":
             return "已排除"
         if (row.item.status == STATUS_WAITING or row.item.evidence.get("configuration_stale")
@@ -290,30 +291,30 @@ class QuickReviewRowsMixin:
 
     def _find(self):
         """Jump to the next row whose bib is the text, or whose bib or name holds it."""
-        text = self.search.text().strip()
+        text = self._host.search.text().strip()
         if not text:
             return
-        rows = self._arrival_rows
+        rows = self._host._arrival_rows
         exact = [i for i, row in enumerate(rows) if row.bib == text]
         found = exact or [i for i, row in enumerate(rows)
                           if text in row.bib or text in (getattr(row.event, "athlete_name", "") or "")]
         if not found:
-            self.hint.setText(f"没有找到 {text}")
+            self._host.hint.setText(f"没有找到 {text}")
             return
-        if any(self._row_state(rows[i]) == "已排除" for i in found):
-            self.show_excluded_action.setChecked(True)
-        current = self.table.currentRow()
+        if any(self._host._row_state(rows[i]) == "已排除" for i in found):
+            self._host.show_excluded_action.setChecked(True)
+        current = self._host.table.currentRow()
         index = next((i for i in found if i > current), found[0])
-        self._arrival_clicked(index)
-        self.table.scrollToItem(self.table.item(index, 0))
+        self._host._arrival_clicked(index)
+        self._host.table.scrollToItem(self._host.table.item(index, 0))
         # Back on the table, so Enter / Backspace work at once.
-        self.table.setFocus()
+        self._host.table.setFocus()
 
     def _row_category(self, row):
         if row.note == "已排除":
             return "非运动员"
         if row.decision:
             return "运动员"
-        category = self._category(row.item)
+        category = self._host._category(row.item)
         return ({"bicycle": "运动员", "not_rider": "非运动员"}.get(category["action"], "待判定")
                 if category and not row.stale else "待判定")

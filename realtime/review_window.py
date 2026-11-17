@@ -112,24 +112,19 @@ from PyQt5.QtWidgets import QFrame  # noqa: F401
 from .event_workspace import discover_event_workspaces  # noqa: F401
 from .review_window_widgets import _CompactStatusIndicator  # noqa: F401
 from .review_window_common import BEIJING_TIMEZONE, _align_live_evidence_timestamp  # noqa: F401
-from .review_window_settings import FinishReviewSettingsMixin
-from .review_window_status import FinishReviewStatusMixin
-from .review_window_problems import FinishReviewProblemsMixin
-from .review_window_recording import FinishReviewRecordingMixin
-from .review_window_receiving import FinishReviewReceivingMixin
-from .review_window_capture import FinishReviewCaptureMixin
+from .review_window_settings import FinishReviewSettingsPart
+from .review_window_status import FinishReviewStatusPart
+from .review_window_problems import FinishReviewProblemsPart
+from .review_window_recording import FinishReviewRecordingPart
+from .review_window_receiving import FinishReviewReceivingPart
+from .review_window_capture import FinishReviewCapturePart
+from .ui_parts import install_parts
 
 
 logger = logging.getLogger("FinishReview")
 
 
 class FinishReviewWindow(
-    FinishReviewSettingsMixin,
-    FinishReviewStatusMixin,
-    FinishReviewProblemsMixin,
-    FinishReviewRecordingMixin,
-    FinishReviewReceivingMixin,
-    FinishReviewCaptureMixin,
     PassageReviewSurface,
 ):
     """Production console for recording, CycleRace intake, and evidence review."""
@@ -1016,6 +1011,19 @@ class FinishReviewWindow(
             return
         self._export_review_summary()
         super().closeEvent(event)
+
+
+install_parts(
+    FinishReviewWindow,
+    (
+        FinishReviewSettingsPart,
+        FinishReviewStatusPart,
+        FinishReviewProblemsPart,
+        FinishReviewRecordingPart,
+        FinishReviewReceivingPart,
+        FinishReviewCapturePart,
+    ),
+)
 
 
 __all__ = [

@@ -17,29 +17,30 @@ from .passage_review_common import (
     source_location,
 )
 from .passage_evidence_pane import PassageEvidencePane
+from .ui_parts import UiPart
 
 
-class PassageReviewLookupMixin:
+class PassageReviewLookupPart(UiPart):
     """Find where a passage is in the recordings, with cache and saved associations."""
 
     def _association_for_event(
         self, event_id: str, source_kind: str,
     ) -> Optional[PassageEvidenceAssociation]:
-        return self.association_store.get_for_event(
-            self.passage_store.get(event_id), source_kind,
+        return self._host.association_store.get_for_event(
+            self._host.passage_store.get(event_id), source_kind,
         )
 
     def _current_associations(self) -> tuple[PassageEvidenceAssociation, ...]:
         return tuple(
-            association for association in self.association_store.associations()
-            if association.matches_event(self.passage_store.get(association.passage_event_id))
+            association for association in self._host.association_store.associations()
+            if association.matches_event(self._host.passage_store.get(association.passage_event_id))
         )
 
     def _bound_regular_locations(
         self,
         event: PassageEvent,
     ) -> tuple[PassageVideoLocation, ...]:
-        store = self.review_binding_store
+        store = self._host.review_binding_store
         if store is None:
             return ()
         locations = []
@@ -47,11 +48,11 @@ class PassageReviewLookupMixin:
             clip = store.get_clip(binding.clip_id)
             if clip is None:
                 continue
-            segment = self.timeline_store.get_segment(clip.timeline_segment_id)
+            segment = self._host.timeline_store.get_segment(clip.timeline_segment_id)
             if segment is None:
                 continue
-            video_path = self.timeline_store.resolve_video_path(segment)
-            camera_offset = self._clock_offset_for_camera(
+            video_path = self._host.timeline_store.resolve_video_path(segment)
+            camera_offset = self._host._clock_offset_for_camera(
                 segment.camera_index
             )
             passage_position_ms = max(
@@ -65,7 +66,7 @@ class PassageReviewLookupMixin:
                 )
             status = (
                 "located"
-                if self.timeline_store.video_path_is_playable(video_path)
+                if self._host.timeline_store.video_path_is_playable(video_path)
                 else "missing_file"
             )
             locations.append(
@@ -75,7 +76,7 @@ class PassageReviewLookupMixin:
                     passage_position_ms=passage_position_ms,
                     playback_position_ms=max(
                         0,
-                        passage_position_ms - self.pre_roll_ms,
+                        passage_position_ms - self._host.pre_roll_ms,
                     ),
                     clock_offset_ms=camera_offset,
                     timing_error_ms=segment.timing_error_ms,
@@ -90,33 +91,33 @@ class PassageReviewLookupMixin:
         event: PassageEvent,
         camera_index: int,
     ) -> PassageVideoLookup:
-        base_offset = self._clock_offset_for_camera(camera_index)
-        lookup = self.timeline_store.locate_passage(
+        base_offset = self._host._clock_offset_for_camera(camera_index)
+        lookup = self._host.timeline_store.locate_passage(
             event.timeline_timestamp_ms,
             clock_offset_ms=base_offset,
-            pre_roll_ms=self.CONTINUOUS_SKIP_LEAD_MS,
+            pre_roll_ms=self._host.CONTINUOUS_SKIP_LEAD_MS,
             race_id=event.race_id,
             prefer_continuous_media=True,
         )
-        location = self._regular_location_for_camera(lookup, camera_index)
+        location = self._host._regular_location_for_camera(lookup, camera_index)
         if location is None:
             return lookup
-        calibrated_offset = self._continuous_offset_for_location(location)
+        calibrated_offset = self._host._continuous_offset_for_location(location)
         if calibrated_offset == base_offset:
             return lookup
-        return self.timeline_store.locate_passage(
+        return self._host.timeline_store.locate_passage(
             event.timeline_timestamp_ms,
             clock_offset_ms=calibrated_offset,
-            pre_roll_ms=self.CONTINUOUS_SKIP_LEAD_MS,
+            pre_roll_ms=self._host.CONTINUOUS_SKIP_LEAD_MS,
             race_id=event.race_id,
             prefer_continuous_media=True,
         )
 
     def _lookup(self, event: PassageEvent) -> PassageVideoLookup:
         direct_locations = (
-            () if self._batch_mode else self._bound_regular_locations(event)
+            () if self._host._batch_mode else self._host._bound_regular_locations(event)
         )
-        configured = set(self._configured_regular_camera_indexes)
+        configured = set(self._host._configured_regular_camera_indexes)
         direct_camera_indexes = {
             location.segment.camera_index
             for location in direct_locations
@@ -128,14 +129,14 @@ class PassageReviewLookupMixin:
         if needs_fallback:
             fallback_locations = []
             fallback_statuses = []
-            for camera_index in self._configured_regular_camera_indexes:
+            for camera_index in self._host._configured_regular_camera_indexes:
                 fallback = (
-                    self._continuous_lookup_for_camera(event, camera_index)
-                    if self._batch_mode
-                    else self.timeline_store.locate_passage(
+                    self._host._continuous_lookup_for_camera(event, camera_index)
+                    if self._host._batch_mode
+                    else self._host.timeline_store.locate_passage(
                         event.timeline_timestamp_ms,
-                        clock_offset_ms=self._clock_offset_for_camera(camera_index),
-                        pre_roll_ms=self.pre_roll_ms,
+                        clock_offset_ms=self._host._clock_offset_for_camera(camera_index),
+                        pre_roll_ms=self._host.pre_roll_ms,
                         race_id=event.race_id,
                     )
                 )
@@ -150,16 +151,16 @@ class PassageReviewLookupMixin:
             external_camera_indexes = sorted(
                 {
                     segment.camera_index
-                    for segment in self.timeline_store.segments()
+                    for segment in self._host.timeline_store.segments()
                     if segment.camera_index
-                    not in self._configured_regular_camera_indexes
+                    not in self._host._configured_regular_camera_indexes
                 }
             )
             for camera_index in external_camera_indexes:
-                fallback = self.timeline_store.locate_passage(
+                fallback = self._host.timeline_store.locate_passage(
                     event.timeline_timestamp_ms,
-                    clock_offset_ms=self._clock_offset_for_camera(camera_index),
-                    pre_roll_ms=self.pre_roll_ms,
+                    clock_offset_ms=self._host._clock_offset_for_camera(camera_index),
+                    pre_roll_ms=self._host.pre_roll_ms,
                     race_id=event.race_id,
                 )
                 fallback_statuses.append(fallback.status)
@@ -192,24 +193,24 @@ class PassageReviewLookupMixin:
             "located"
             if any(location.status == "located" for location in locations)
             else lookup_status,
-            event.timeline_timestamp_ms + self.clock_offset_ms,
+            event.timeline_timestamp_ms + self._host.clock_offset_ms,
             tuple(sorted(locations, key=lambda item: item.segment.camera_index)),
         )
         locations = list(lookup.locations)
-        if not self._include_recorded_evidence:
+        if not self._host._include_recorded_evidence:
             locations = [
                 location
                 for location in locations
                 if (
                     is_high_speed(location)
-                    and self._show_high_speed_pane
+                    and self._host._show_high_speed_pane
                 )
                 or (
                     not is_high_speed(location)
                     and location.segment.camera_index in configured
                 )
             ]
-        if self._high_speed_locator is None or not self._show_high_speed_pane:
+        if self._host._high_speed_locator is None or not self._host._show_high_speed_pane:
             if tuple(locations) == lookup.locations:
                 return lookup
             status = (
@@ -221,14 +222,14 @@ class PassageReviewLookupMixin:
             )
             return PassageVideoLookup(
                 status,
-                event.timeline_timestamp_ms + self.clock_offset_ms,
+                event.timeline_timestamp_ms + self._host.clock_offset_ms,
                 tuple(locations),
             )
         locations = [location for location in locations if not is_high_speed(location)]
-        high_speed = self._high_speed_locator(
+        high_speed = self._host._high_speed_locator(
             event,
-            self.clock_offset_ms,
-            self.pre_roll_ms,
+            self._host.clock_offset_ms,
+            self._host.pre_roll_ms,
         )
         if high_speed is not None:
             locations.append(high_speed)
@@ -240,17 +241,17 @@ class PassageReviewLookupMixin:
             status = lookup.status
         return PassageVideoLookup(
             status,
-            event.timeline_timestamp_ms + self.clock_offset_ms,
+            event.timeline_timestamp_ms + self._host.clock_offset_ms,
             tuple(locations),
         )
 
     def invalidate_external_locations(self) -> None:
-        self._external_location_revision += 1
-        self._lookup_cache.clear()
-        self.refresh()
+        self._host._external_location_revision += 1
+        self._host._lookup_cache.clear()
+        self._host.refresh()
 
     def _timeline_cache_signature(self) -> tuple:
-        return (self.timeline_store.revision,)
+        return (self._host.timeline_store.revision,)
 
     @staticmethod
     def _cache_survives_timeline_update(lookup: PassageVideoLookup) -> bool:
@@ -263,23 +264,23 @@ class PassageReviewLookupMixin:
             event.revision,
             event.timeline_timestamp_ms,
             event.race_id,
-            self.clock_offset_ms,
-            self.pre_roll_ms,
-            self._external_location_revision,
-            tuple(self._configured_regular_camera_indexes),
-            self._show_high_speed_pane,
-            self._include_recorded_evidence,
-            self._batch_mode,
-            self._continuous_calibration_revision,
-            self.review_binding_store.active_bindings(event.event_id, event.revision)
-            if self.review_binding_store is not None
+            self._host.clock_offset_ms,
+            self._host.pre_roll_ms,
+            self._host._external_location_revision,
+            tuple(self._host._configured_regular_camera_indexes),
+            self._host._show_high_speed_pane,
+            self._host._include_recorded_evidence,
+            self._host._batch_mode,
+            self._host._continuous_calibration_revision,
+            self._host.review_binding_store.active_bindings(event.event_id, event.revision)
+            if self._host.review_binding_store is not None
             else (),
         )
-        cached = self._lookup_cache.get(event.event_id)
+        cached = self._host._lookup_cache.get(event.event_id)
         if cached is not None and cached[0] == key:
             return cached[1]
-        lookup = self._lookup(event)
-        self._lookup_cache[event.event_id] = (key, lookup)
+        lookup = self._host._lookup(event)
+        self._host._lookup_cache[event.event_id] = (key, lookup)
         return lookup
 
     def _source_association(
@@ -288,7 +289,7 @@ class PassageReviewLookupMixin:
         source_kind: str,
         location: Optional[PassageVideoLocation],
     ) -> Optional[PassageEvidenceAssociation]:
-        association = self._association_for_event(event_id, source_kind)
+        association = self._host._association_for_event(event_id, source_kind)
         if not _association_matches_location(association, location):
             return None
         return association
@@ -301,7 +302,7 @@ class PassageReviewLookupMixin:
         high_speed: bool,
     ) -> Optional[PassageVideoLocation]:
         source_kind = HIGH_SPEED_SOURCE if high_speed else REGULAR_SOURCE
-        association = self._association_for_event(event_id, source_kind)
+        association = self._host._association_for_event(event_id, source_kind)
         if association is not None:
             associated = next(
                 (
@@ -315,7 +316,7 @@ class PassageReviewLookupMixin:
             if associated is not None:
                 return associated
             if not high_speed:
-                saved_location = self._saved_regular_location(association)
+                saved_location = self._host._saved_regular_location(association)
                 if saved_location is not None:
                     return saved_location
         return source_location(lookup, high_speed=high_speed)
@@ -326,10 +327,10 @@ class PassageReviewLookupMixin:
     ) -> Optional[PassageVideoLocation]:
         """Resolve the exact recording segment stored by a confirmation."""
 
-        segment = self.timeline_store.get_segment(association.segment_id)
+        segment = self._host.timeline_store.get_segment(association.segment_id)
         if segment is None or segment.clock_source == AUYAT_CLOCK_SOURCE:
             return None
-        video_path = self.timeline_store.resolve_video_path(segment)
+        video_path = self._host.timeline_store.resolve_video_path(segment)
         duration_ms = int(
             segment.media_duration_ms
             if segment.media_duration_ms is not None
@@ -346,12 +347,12 @@ class PassageReviewLookupMixin:
             segment=segment,
             video_path=video_path,
             passage_position_ms=position_ms,
-            playback_position_ms=max(0, position_ms - self.pre_roll_ms),
-            clock_offset_ms=self._clock_offset_for_camera(segment.camera_index),
+            playback_position_ms=max(0, position_ms - self._host.pre_roll_ms),
+            clock_offset_ms=self._host._clock_offset_for_camera(segment.camera_index),
             timing_error_ms=segment.timing_error_ms,
             status=(
                 "located"
-                if self.timeline_store.video_path_is_playable(video_path)
+                if self._host.timeline_store.video_path_is_playable(video_path)
                 else "missing_file"
             ),
         )
@@ -420,8 +421,8 @@ class PassageReviewLookupMixin:
         event_id: str,
         lookup: PassageVideoLookup,
     ) -> Optional[PassageVideoLocation]:
-        locations = self._regular_locations(lookup)
-        association = self._association_for_event(event_id, REGULAR_SOURCE)
+        locations = self._host._regular_locations(lookup)
+        association = self._host._association_for_event(event_id, REGULAR_SOURCE)
         if association is not None:
             associated = next(
                 (
@@ -433,7 +434,7 @@ class PassageReviewLookupMixin:
             )
             if associated is not None:
                 return associated
-        configured = set(self._configured_regular_camera_indexes)
+        configured = set(self._host._configured_regular_camera_indexes)
         return next(
             (
                 location
@@ -451,11 +452,11 @@ class PassageReviewLookupMixin:
         location = pane.location
         if location is None or location.segment.media_started_at_ms is None:
             return None
-        offset_ms = self._continuous_offset_for_location(location)
+        offset_ms = self._host._continuous_offset_for_location(location)
         target_time_ms = int(event.timeline_timestamp_ms) + int(offset_ms)
         # 换号码只换身份；预计过线点可以在当前文件之外，不能截断后改变原帧时间。
         position_ms = target_time_ms - int(location.segment.media_started_at_ms)
-        playback_ms = max(0, position_ms - self.CONTINUOUS_SKIP_LEAD_MS)
+        playback_ms = max(0, position_ms - self._host.CONTINUOUS_SKIP_LEAD_MS)
         if location.segment.media_duration_ms is not None:
             playback_ms = min(playback_ms, location.segment.media_duration_ms)
         return replace(

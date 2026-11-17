@@ -51,23 +51,17 @@ from .quick_review_common import (
     WavePlan,
     row_moment,
 )
-from .quick_review_rows import QuickReviewRowsMixin
-from .quick_review_display import QuickReviewDisplayMixin
-from .quick_review_waves import QuickReviewWavesMixin
-from .quick_review_play import QuickReviewPlayMixin
-from .quick_review_picture import QuickReviewPictureMixin
-from .quick_review_judgments import QuickReviewJudgmentsMixin
-from .quick_review_export import QuickReviewExportMixin
+from .quick_review_rows import QuickReviewRowsPart
+from .quick_review_display import QuickReviewDisplayPart
+from .quick_review_waves import QuickReviewWavesPart
+from .quick_review_play import QuickReviewPlayPart
+from .quick_review_picture import QuickReviewPicturePart
+from .quick_review_judgments import QuickReviewJudgmentsPart
+from .quick_review_export import QuickReviewExportPart
+from .ui_parts import install_parts
 
 
 class QuickReviewPanel(
-    QuickReviewRowsMixin,
-    QuickReviewDisplayMixin,
-    QuickReviewWavesMixin,
-    QuickReviewPlayMixin,
-    QuickReviewPictureMixin,
-    QuickReviewJudgmentsMixin,
-    QuickReviewExportMixin,
     ProblemListPanel,
 ):
     quick_review = True
@@ -1128,3 +1122,17 @@ class QuickReviewPanel(
             self.hint.setText(f"芯片记录已变化（{'、'.join(changed)}），请重新核对本波。{rollback_error}")
             return False
         return True
+
+
+install_parts(
+    QuickReviewPanel,
+    (
+        QuickReviewRowsPart,
+        QuickReviewDisplayPart,
+        QuickReviewWavesPart,
+        QuickReviewPlayPart,
+        QuickReviewPicturePart,
+        QuickReviewJudgmentsPart,
+        QuickReviewExportPart,
+    ),
+)

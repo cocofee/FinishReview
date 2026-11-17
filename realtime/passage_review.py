@@ -100,25 +100,19 @@ from PyQt5.QtGui import QImage  # noqa: F401
 from PyQt5.QtWidgets import QInputDialog, QMessageBox  # noqa: F401
 from .evidence_image_view import PERSON_TAG_FONT_PX  # noqa: F401
 from .passage_review_common import _TABLE_COLUMN_MIN_WIDTHS, _expanded_column_widths  # noqa: F401
-from .passage_review_video_assist import PassageReviewVideoAssistMixin
-from .passage_review_clock import PassageReviewClockMixin
-from .passage_review_lookup import PassageReviewLookupMixin
-from .passage_review_queue import PassageReviewQueueMixin
-from .passage_review_filmstrip import PassageReviewFilmstripMixin
-from .passage_review_selection import PassageReviewSelectionMixin
-from .passage_review_playback import PassageReviewPlaybackMixin
+from .passage_review_video_assist import PassageReviewVideoAssistPart
+from .passage_review_clock import PassageReviewClockPart
+from .passage_review_lookup import PassageReviewLookupPart
+from .passage_review_queue import PassageReviewQueuePart
+from .passage_review_filmstrip import PassageReviewFilmstripPart
+from .passage_review_selection import PassageReviewSelectionPart
+from .passage_review_playback import PassageReviewPlaybackPart
+from .ui_parts import install_parts
 
 logger = logging.getLogger("FinishReview.Review")
 
 
 class PassageReviewSurface(
-    PassageReviewVideoAssistMixin,
-    PassageReviewClockMixin,
-    PassageReviewLookupMixin,
-    PassageReviewQueueMixin,
-    PassageReviewFilmstripMixin,
-    PassageReviewSelectionMixin,
-    PassageReviewPlaybackMixin,
     QDialog,
 ):
     """Shared Qt review surface used by the standalone and formal windows.
@@ -1633,6 +1627,20 @@ class PassageReviewSurface(
         for pane in self.all_evidence_panes:
             pane.shutdown(wait=True)
         event.accept()
+
+
+install_parts(
+    PassageReviewSurface,
+    (
+        PassageReviewVideoAssistPart,
+        PassageReviewClockPart,
+        PassageReviewLookupPart,
+        PassageReviewQueuePart,
+        PassageReviewFilmstripPart,
+        PassageReviewSelectionPart,
+        PassageReviewPlaybackPart,
+    ),
+)
 
 
 class PassageReviewDialog(PassageReviewSurface):
