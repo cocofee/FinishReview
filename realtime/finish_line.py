@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from .atomic_file import atomic_write_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,12 +170,11 @@ class FinishLineStore:
                 for camera_index, roi in sorted(self._rois.items())
             },
         }
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
+        atomic_write_text(
+            self.path,
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        temporary.replace(self.path)
 
 
 __all__ = ["FinishLine", "FinishLineStore"]

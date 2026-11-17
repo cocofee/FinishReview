@@ -41,6 +41,7 @@ from .video_timeline import (
     probe_video_duration_ms,
 )
 from .failure_log import warn_handled_failure
+from .atomic_file import atomic_open, atomic_write_bytes
 
 
 logger = logging.getLogger("FinishReview.ReviewRecorder")
@@ -513,13 +514,7 @@ class FfmpegReviewRecorder:
             "session_started_at_ms": session.session_started_at_ms,
             "archive_pattern": session.archive_pattern.name,
         }
-        temporary_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-        with temporary_path.open("wb") as output:
-            output.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-            output.write(b"\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, manifest_path)
+        atomic_write_bytes(manifest_path, json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
 
     @property
     def is_running(self) -> bool:
@@ -1295,14 +1290,10 @@ class ReviewRingBuffer:
         path = self.playlist_path.with_suffix(".clock.json")
         if path.exists():
             return
-        temporary = path.with_suffix(".json.tmp")
         payload = {"playlist_stem": self.playlist_path.stem,
                    "media_started_at_ms": int(started_at_ms)}
-        with temporary.open("w", encoding="utf-8") as output:
+        with atomic_open(path, "w", encoding="utf-8") as output:
             json.dump(payload, output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
 
     def retain_filmstrip_segment(self, segment: RecordingSegment,
                                  store: VideoTimelineStore, *, end_reason="retained_filmstrip_segment") -> RecordingSegment:
@@ -2234,12 +2225,7 @@ class PassageReviewTimelinePublisher:
                 return
         except FileNotFoundError:
             pass
-        temporary_path = path.with_suffix(path.suffix + ".tmp")
-        with temporary_path.open("wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, path)
+        atomic_write_bytes(path, payload)
 
     @staticmethod
     def _segments_for_preview(

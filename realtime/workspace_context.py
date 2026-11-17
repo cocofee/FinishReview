@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from .passage_evidence import PassageEvidenceAssociationStore
 from .passage_receiver import PassageEventStore
 from .race_metadata import RaceGroupMetadata, RaceMetadata, RaceMetadataStore
 from .video_timeline import VideoTimelineStore
+from .atomic_file import atomic_open
 
 
 SCOPE_FILENAME = "review_event_scope.json"
@@ -26,15 +26,8 @@ def _read_object(path):
 
 def _write_object(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with atomic_open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False)
 
 
 def saved_archive_path(root):

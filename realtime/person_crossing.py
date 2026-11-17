@@ -28,6 +28,7 @@ import numpy as np
 
 from .bike_check import BICYCLE, CAR, MOTORCYCLE, PERSON, TRUCK, YoloxDetector
 from .problem_rules import CrossingRecord
+from .atomic_file import atomic_write_text
 
 
 logger = logging.getLogger("FinishReview.PersonCrossing")
@@ -302,9 +303,8 @@ def extract_people(
         if cancelled():
             break
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(dict(payload, meta=meta), separators=(",", ":")), encoding="utf-8")
-        temporary.replace(target)
+        atomic_write_text(target, json.dumps(dict(payload, meta=meta), separators=(",", ":")),
+                          encoding="utf-8", durable=False)
         logger.info("people %s: %s", item.path.name, payload["stats"])
         done += 1
     progress("找人", len(files), len(files))

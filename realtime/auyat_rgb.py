@@ -21,6 +21,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 
 from .video_timeline import PassageVideoLocation, RecordingSegment
+from .atomic_file import atomic_write_text
 
 
 AUYAT_CLOCK_SOURCE = "auyat_rgb_beijing"
@@ -1216,12 +1217,12 @@ class AuyatRgbCatalog:
         }
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-            temporary_path.write_text(
+            atomic_write_text(
+                cache_path,
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                 encoding="utf-8",
+                durable=False,
             )
-            os.replace(temporary_path, cache_path)
         except OSError:
             return
 

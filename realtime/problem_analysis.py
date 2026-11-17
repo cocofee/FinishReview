@@ -18,7 +18,6 @@ reads the event workspace and writes into its own output folder.
 from __future__ import annotations
 
 import json
-import os
 import hashlib
 import logging
 import time
@@ -107,6 +106,7 @@ from .problem_rules import CrossingRecord, Obstruction, build_video_items, merge
 from .problem_rules import _crossing_evidence as crossing_evidence
 from .target_crossing import TargetCrossingCheck, VERIFICATION_OFFSETS_MS, VERIFICATION_VERSION, check_target_tracks
 from .target_sport import CYCLING, DEFAULT_SPORT, POLICY_VERSION, RUNNING, normalize_sport, policy_for
+from .atomic_file import atomic_write_text
 
 
 logger = logging.getLogger("FinishReview.ProblemAnalysis")
@@ -561,10 +561,9 @@ def detect_session_crossings(
             joined = np.concatenate(parts, axis=1) if len(parts) > 1 else own
             result = detect_crossings(joined, item.pts, params)
             if cache:
-                temporary = cache_path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(dict(signature=signature, crossings=[asdict(c) for c in result.crossings],
-                                                      obstructions=result.obstructions)), encoding="utf-8")
-                temporary.replace(cache_path)
+                atomic_write_text(cache_path, json.dumps(dict(signature=signature, crossings=[asdict(c) for c in result.crossings],
+                                                              obstructions=result.obstructions)),
+                                  encoding="utf-8", durable=False)
         if cache and memory_cache is not None:
             memory_cache[item.path] = (signature, result)
             if len(memory_cache) > 512:
@@ -740,9 +739,7 @@ def _bike_verdicts(
 
 
 def _save_bike_cache(path, payload):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False), encoding="utf-8", durable=False)
 
 
 def _verification_index(files):
@@ -970,9 +967,8 @@ def _write_follow(output_dir: Path, people, camera: int, bibs: dict) -> None:
     target = follow_path(output_dir, camera)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(follow_payload(people, bibs, camera), ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, target)
+        atomic_write_text(target, json.dumps(follow_payload(people, bibs, camera), ensure_ascii=False),
+                          encoding="utf-8", durable=False)
     except OSError as error:  # The picture only loses its moving numbers.
         logger.warning("person tracks for camera %s not saved: %s", camera, error)
 
@@ -2266,9 +2262,7 @@ def write_problem_list(
         "passage_members": members,
     }
     target = output_dir / PROBLEM_LIST_FILENAME
-    temporary = target.with_name(target.name + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
-    temporary.replace(target)
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     return target
 
 

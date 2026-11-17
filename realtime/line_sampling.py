@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +23,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import cv2
 import numpy as np
+from .atomic_file import atomic_open, atomic_write_bytes
 
 
 DEFAULT_SAMPLES = 500
@@ -330,9 +330,7 @@ def _save_geometry_record(path, meta, xs, ys):
     target = path.parent / relative
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".tmp")
-        temporary.write_bytes(encoded)
-        temporary.replace(target)
+        atomic_write_bytes(target, encoded)
     return str(relative)
 
 
@@ -367,8 +365,7 @@ def save_strip(path: str | Path, strip: LineStrip, meta: Mapping[str, Any]) -> N
         except (ValueError, KeyError):
             pass  # An unreadable cache has no recoverable geometry; replace it.
     payload["geometry_file"] = _save_geometry_record(path, payload, strip.geometry.xs, strip.geometry.ys)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("wb") as handle:
+    with atomic_open(path, "wb", durable=False) as handle:
         np.savez_compressed(
             handle,
             strip=strip.strip,
@@ -379,7 +376,6 @@ def save_strip(path: str | Path, strip: LineStrip, meta: Mapping[str, Any]) -> N
             ny=strip.geometry.ny,
             meta=np.frombuffer(json.dumps(payload, ensure_ascii=False).encode("utf-8"), dtype=np.uint8),
         )
-    os.replace(temporary, path)
 
 
 def load_strip(path: str | Path) -> LineStrip:

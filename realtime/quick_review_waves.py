@@ -22,6 +22,7 @@ from .quick_review_common import (
     WAVE_GAP_MS,
     WAVE_VIEW_MARGIN_MS,
 )
+from .atomic_file import atomic_write_text
 
 
 class QuickReviewWavesMixin:
@@ -164,11 +165,9 @@ class QuickReviewWavesMixin:
                     path = self.problem_dir / "manual_problems.json"
                     try:
                         values = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
-                        temporary = path.with_suffix(".tmp")
-                        temporary.write_text(json.dumps([value for value in values
-                                                         if value.get("item_id") != item.item_id], ensure_ascii=False),
-                                             encoding="utf-8")
-                        temporary.replace(path)
+                        atomic_write_text(path, json.dumps([value for value in values
+                                                            if value.get("item_id") != item.item_id], ensure_ascii=False),
+                                          encoding="utf-8")
                     except (OSError, ValueError, TypeError):
                         message += "；自动创建的问题条目未能清理，请稍后手工删除。"
                     self.items = [value for value in self.items if value.item_id != item.item_id]
@@ -615,9 +614,7 @@ class QuickReviewWavesMixin:
                 known.add(child.item_id)
             children.append((child.item_id, mark))
         self.problem_dir.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
-        temporary.replace(path)
+        atomic_write_text(path, json.dumps(existing, ensure_ascii=False), encoding="utf-8")
         owned = self._marks.setdefault(item.item_id, [])
         for child_id, mark in children:
             owned[:] = [value for value in owned if value is not mark]

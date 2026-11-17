@@ -197,7 +197,7 @@ def test_export_is_utf8_bom_unicode_csv_and_atomically_replaced(
         replace_calls.append((source, destination))
         real_replace(source, destination)
 
-    monkeypatch.setattr(review_export.os, "replace", tracked_replace)
+    monkeypatch.setattr(os, "replace", tracked_replace)
 
     exported = review_export.export_review_summary(tmp_path, (_event(),), store)
 

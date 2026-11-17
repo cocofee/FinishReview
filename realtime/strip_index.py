@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from .atomic_file import atomic_open
 
 logger = logging.getLogger("FinishReview.StripIndex")
 
@@ -120,21 +121,15 @@ class StripIndex:
             pts_parts.append(pts)
             pts_total += int(pts.size)
         header = {"version": INDEX_VERSION, "geometries": geometries, "entries": entries}
-        temporary = self.path.with_name(self.path.name + ".tmp")
         try:
-            with temporary.open("wb") as output:
+            with atomic_open(self.path, "wb", durable=False) as output:
                 np.savez(
                     output,
                     header=np.frombuffer(json.dumps(header, ensure_ascii=False).encode("utf-8"), dtype=np.uint8),
                     geometry=np.concatenate(flat) if flat else np.zeros(0),
                     pts=np.concatenate(pts_parts) if pts_parts else np.zeros(0),
                 )
-            os.replace(temporary, self.path)
             self._entries = {name: value for name, value in kept.items()}
             self._dirty = False
         except (OSError, ValueError, TypeError) as error:
             logger.warning("strip index not saved: %s", error)
-            try:
-                temporary.unlink()
-            except OSError:
-                pass

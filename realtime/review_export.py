@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import csv
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
+from .atomic_file import atomic_open
 
 try:
     from .passage_evidence import (
@@ -200,19 +200,11 @@ def export_review_summary(
     output_dir = Path(event_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / REVIEW_SUMMARY_FILENAME
-    temporary_path = output_path.with_name(f".{output_path.name}.tmp")
     rows = build_review_summary_rows(events, association_store, metadata)
-    try:
-        with temporary_path.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(REVIEW_SUMMARY_HEADERS)
-            writer.writerows(row.as_csv_row() for row in rows)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, output_path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+    with atomic_open(output_path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(REVIEW_SUMMARY_HEADERS)
+        writer.writerows(row.as_csv_row() for row in rows)
     return output_path
 
 

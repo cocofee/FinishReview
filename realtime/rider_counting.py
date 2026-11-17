@@ -36,6 +36,7 @@ from .person_crossing import (
     MOTION_HOLD_MS, MOTION_LEVEL, MOTION_SHARE, PATH_REACH_MS, PeopleAtLine, PersonCrossing, _free_record, _iou,
     _line_record, _nearest_frame, _projection, _roi_frames, _side, _strip_line,
 )
+from .atomic_file import atomic_open, atomic_write_text
 
 
 logger = logging.getLogger("FinishReview.RiderCounting")
@@ -263,10 +264,8 @@ def _save_gate(path: Path, gate: _RiderGate, until_ms: float, meta: dict) -> Non
              "recent": [[stamp, [list(map(float, box)) for box in riders]] for stamp, riders in gate.recent]}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        with open(temporary, "wb") as handle:
+        with atomic_open(path, "wb", durable=False) as handle:
             np.savez(handle, background=gate.background, state=np.array(json.dumps(state)))
-        temporary.replace(path)
     except OSError as error:
         logger.warning("rider gate not saved: %s", error)
 
@@ -452,9 +451,8 @@ def extract_riders(output_dir: Path, files: Sequence, model: Path, count_points,
         if cancelled():
             break
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(dict(payload, meta=meta), separators=(",", ":")), encoding="utf-8")
-        temporary.replace(target)
+        atomic_write_text(target, json.dumps(dict(payload, meta=meta), separators=(",", ":")),
+                          encoding="utf-8", durable=False)
         _save_gate(saved_gate, gate, float(item.end_ms), meta)
         logger.info("riders %s: %s", item.path.name, payload["stats"])
         done += 1

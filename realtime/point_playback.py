@@ -16,6 +16,7 @@ from .video_timeline import (
     RecordingSegment,
     VideoTimelineStore,
 )
+from .atomic_file import atomic_write_bytes
 
 
 POINT_PLAYBACK_BEFORE_MS = 45_000
@@ -413,12 +414,7 @@ def _write_manifest(
             )
         lines.append(f"duration {span.duration_ms / 1000.0:.6f}")
     payload = ("\n".join(lines) + "\n").encode("utf-8")
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    with temporary_path.open("wb") as output:
-        output.write(payload)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary_path, path)
+    atomic_write_bytes(path, payload)
 
 
 def prepare_point_playback(

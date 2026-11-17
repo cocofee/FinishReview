@@ -93,6 +93,7 @@ from .problem_resolutions import (
     same_frame_conflicts,
 )
 from .failure_log import warn_handled_failure
+from .atomic_file import atomic_write_text
 
 
 logger = logging.getLogger("FinishReview.ProblemPanel")
@@ -588,13 +589,11 @@ class ProblemListPanel(QFrame):
         try:
             self.problem_dir.mkdir(parents=True, exist_ok=True)
             path = self.problem_dir / "operator_drafts.json"
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"drafts": self._drafts, "held": self._held,
-                                             "marks": self._marks, "viewed": self._viewed,
-                                             "items": self._operator_items,
-                                             "arrivals": self._arrival_drafts}, ensure_ascii=False),
-                                 encoding="utf-8")
-            temporary.replace(path)
+            atomic_write_text(path, json.dumps({"drafts": self._drafts, "held": self._held,
+                                                "marks": self._marks, "viewed": self._viewed,
+                                                "items": self._operator_items,
+                                                "arrivals": self._arrival_drafts}, ensure_ascii=False),
+                              encoding="utf-8")
         except OSError as error:
             self.hint.setText(f"草稿保存失败：{error}")
 
@@ -2018,9 +2017,7 @@ class ProblemListPanel(QFrame):
             existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
             ids = {value["item_id"] for value in existing}
             existing.extend(child.to_payload() for child in children if child.item_id not in ids)
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
-            temporary.replace(path)
+            atomic_write_text(path, json.dumps(existing, ensure_ascii=False), encoding="utf-8")
             self._operator_items[item.item_id] = item.to_payload()
             for child, mark in zip(children, marks):
                 self._marks[child.item_id] = [dict(mark)]
@@ -2575,9 +2572,7 @@ class ProblemListPanel(QFrame):
             self._chip_status_from_payload(payload)
             self.problem_dir.mkdir(parents=True, exist_ok=True)
             path = self.problem_dir / LIVE_CHIP_FILENAME
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            temporary.replace(path)
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             self._chip_signature = payload["input_signature"]
             self._chip_recheck_at = payload.get("recheck_at_ms")
             self.refresh()
@@ -2646,9 +2641,7 @@ class ProblemListPanel(QFrame):
         items = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
         items.append(item.to_payload())
         self.problem_dir.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
-        temporary.replace(path)
+        atomic_write_text(path, json.dumps(items, ensure_ascii=False), encoding="utf-8")
         self._class_filter = ""
         self.queue_filter.blockSignals(True)
         self.queue_filter.setCurrentIndex(0)

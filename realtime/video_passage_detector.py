@@ -22,6 +22,7 @@ import numpy as np
 
 from .finish_line import FinishLine
 from .failure_log import warn_handled_failure
+from .atomic_file import atomic_write_text
 
 
 logger = logging.getLogger("FinishReview.VideoPassageDetector")
@@ -1144,9 +1145,7 @@ class LiveReviewBatchScanWorker:
             lines.append(
                 f"duration {max(1, int(getattr(segment, 'ended_at_ms') - getattr(segment, 'started_at_ms'))) / 1000.0:.6f}"
             )
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        atomic_write_text(path, "\n".join(lines) + "\n", encoding="utf-8", durable=False)
         return path
 
     def _ready_batch(self, segments: Sequence[object]) -> tuple[ReviewBatchRange, ...]:
