@@ -443,7 +443,6 @@ def test_picture_and_number_clicks_only_prepare_explicit_frame_confirmation(qapp
     """Choose the athlete, locate the finish-line frame, then confirm explicitly."""
 
     import json
-    from PyQt5.QtCore import QPoint
     from PyQt5.QtGui import QImage
     from realtime.problem_items import ProblemItem, KIND_NO_CHIP_CROSSING, CATEGORY_VIDEO
     window = _window(tmp_path, workbench=True)

@@ -5,7 +5,7 @@ from PyQt5.QtCore import QRectF
 from PyQt5.QtGui import QColor, QImage, QPainter, QTransform
 
 from realtime.passage_review import PERSON_TAG_FONT_PX, EvidenceImageView
-from tests.realtime.test_quick_review_panel import qapp
+from tests.realtime.test_quick_review_panel import qapp  # noqa: F401 (pytest fixtures)
 
 
 def painted(view, *, scale=1):

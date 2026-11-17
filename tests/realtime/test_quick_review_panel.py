@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtTest import QSignalSpy, QTest
-from PyQt5.QtWidgets import QApplication, QLabel
+from PyQt5.QtWidgets import QApplication
 
 from realtime.problem_items import (
     CATEGORY_VIDEO, KIND_LINE_ACTIVITY, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING,

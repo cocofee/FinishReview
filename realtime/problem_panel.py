@@ -20,7 +20,6 @@ from typing import Callable, Optional
 from PyQt5.QtCore import QEvent, QProcess, QProcessEnvironment, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPixmap
 from PyQt5.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -56,8 +55,6 @@ from .problem_items import (
     ACTION_REASON_PRESETS,
     ACTION_RECORD_BIB,
     ACTION_RIDER,
-    ACTION_RIDE_BACK,
-    ACTION_SAME_CROSSING,
     ACTION_SIDE_BY_SIDE,
     ACTION_SYNCED,
     STATUS_CLOSED_UPSTREAM,
@@ -82,7 +79,6 @@ from .problem_items import (
     TYPE_EVIDENCE,
     TYPE_MISSED,
     TYPE_MULTI_CHIP,
-    TYPE_OTHER,
     ProblemItem,
     auto_passed_item,
     operator_actions,

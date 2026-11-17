@@ -9,8 +9,9 @@ from PyQt5.QtWidgets import QInputDialog
 
 from realtime.quick_review_panel import LOCAL_CHIP_EXCLUSION, QuickReviewPanel
 from tests.realtime.test_quick_review_panel import (
-    T0, auto_people, count_on_picture, event, fragment_panel, menu_labels, qapp, row, three_laps, wave_panel,
+    T0, auto_people, count_on_picture, event, menu_labels, row, three_laps,
 )
+from tests.realtime.test_quick_review_panel import fragment_panel, qapp, wave_panel  # noqa: F401 (pytest fixtures)
 
 
 def exclude(panel, monkeypatch, bib="5"):

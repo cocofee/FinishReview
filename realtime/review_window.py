@@ -3,69 +3,31 @@
 from __future__ import annotations
 
 import logging
-import json
-import importlib
-import os
-import re
-import shutil
 import threading
-import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
-from types import MappingProxyType
 
-from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QPainter, QPen
+from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import (
     QDialog,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QInputDialog,
     QMessageBox,
-    QPushButton,
-    QSizePolicy,
-    QStyle,
-    QVBoxLayout,
-    QWidget,
 )
 
-from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
+from . import APP_WINDOW_TITLE
 from .ui_metrics import UiLatencyProbe
 from .runtime_status import (
-    RuntimeStatusSnapshot as RuntimeStatusSnapshot, RuntimeStatusPresenter, STATUS_WIDGET_NAMES,
+    RuntimeStatusSnapshot as RuntimeStatusSnapshot,
 )
-from .decode_resources import DECODE_RESOURCES
-from .background_wait import wait_for_background
-from .recording_catalog import RecordingCatalog, RecordingCatalogJob
-from .evidence_pipeline import EvidencePassage, EvidencePipeline, EvidenceRefreshJob
-from .evidence_clock import LIVE_DATE_TOLERANCE_MS, align_evidence_timestamp
 from .capture_refresh import (
-    ArchiveRefreshJob,
-    CaptureRefreshRequest,
-    CaptureRefreshResult,
     CaptureRefreshWorker,
 )
 from .auyat_rgb import (
         AuyatRgbCatalog,
         AuyatRgbScanWorker,
-        AuyatScanResult,
-        is_network_share,
     )
-from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
 from .finish_line import FinishLineStore
-from .event_workspace import (
-        EventWorkspaceDescriptor,
-        EventWorkspaceError,
-        EventWorkspaceSummary,
-        discover_event_workspaces,
-        summarize_event_workspace,
-        validate_event_workspace,
-    )
 from .passage_evidence import (
-    PassageEvidenceAssociationStore,
     VideoClockCalibrationStore,
 )
 from .passage_receiver import (
@@ -76,35 +38,26 @@ from .passage_receiver import (
         PassageEventStore,
         RaceFocus,
     )
-from .passage_review import (
-    PassageEvidencePane,
-    PassageReviewSurface,
-    source_location,
-)
+from .passage_review import PassageReviewSurface
+from .passage_evidence_pane import PassageEvidencePane
 from .point_playback import PointPlaybackUnavailable, prepare_point_playback
 from .preflight import (
         PreflightJournal,
-        PreflightRun,
     )
 from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
-from .race_metadata import RaceMetadata, RaceMetadataStore
+from .race_metadata import RaceMetadataStore
 from .workspace_context import (
-    EventWorkspaceMetadataStore, is_event_folder_under, recovered_archive_path, saved_archive_path, saved_live_path,
+    EventWorkspaceMetadataStore, recovered_archive_path, saved_archive_path, saved_live_path,
     saved_received_path, save_workspace_mode,
 )
-from .review_export import export_review_summary
-from .runtime_paths import relocated_video_path
 from .review_clip import PassageReviewBindingStore
 from .receiver_controller import ReceiverController
-from .recording_lock import LOCK_FILENAME, FolderInUseError, RecordingFolderLock
+from .recording_lock import RecordingFolderLock
 from .recording_controller import (
-    PendingRecordingPassage,
     RecordingSessionController,
     RecordingRecoveryState,
-    RecordingStopFailure,
 )
 from .settings import FinishReviewSettings
-from .video_discovery import VideoDiscoveryStore
 from .review_recorder import (
     ArchiveTimelinePublisher,
     FfmpegReviewRecorder,
@@ -117,8 +70,6 @@ from .review_recorder import (
     load_archive_recording_sessions,
     )
 from .stream_recorder import (
-        is_rtsp_source,
-        RecordingError,
         sanitize_recording_message,
     )
 from .video_timeline import (
@@ -126,16 +77,12 @@ from .video_timeline import (
         DEFAULT_TIMING_ERROR_MS,
         PassageVideoLocation,
         PassageVideoLookup,
-        RecordingSegment,
         VideoTimelineStore,
     )
-from .thread_lifecycle import retire_qthread, track_qthread
+from .thread_lifecycle import track_qthread
 from .video_playback import VideoPlaybackDialog
-from .video_arrival import VideoArrivalCandidateStore
 from .video_review import VideoReviewJournal
 from .visual_crossing import (
-    CrossingConfig,
-    VisualCrossingEvent,
     VisualCrossingWorker,
 )
 
@@ -148,34 +95,23 @@ from .launch_dialog import (
     _format_rtsp_probe_error as _format_rtsp_probe_error,
 )
 from .review_window_widgets import (
-    _CompactStatusIndicator,
-    _ElidedLabel,
-    _FinishReviewLogo,
     _PassageSignalBridge,
 )
 from .review_window_common import (
-    BEIJING_TIMEZONE,
     CYCLERACE_INBOX_DIRNAME,
     HIGH_SPEED_INDEX_FILENAME,
-    IS_WINDOWS,
-    LIVE_EVIDENCE_DATE_TOLERANCE_MS,
-    PROBLEM_FRAME_TOLERANCE_MS,
-    _INVALID_EVENT_FOLDER_CHARS,
-    _TEST_GROUP_MARKERS,
-    _TEST_GROUP_NAMES,
-    _VideoCandidateDelivery,
-    _VideoCandidatePersistenceFailure,
-    _WINDOWS_RESERVED_NAMES,
-    _align_live_evidence_timestamp,
     _event_workspace_dir,
     _format_point_playback_time,
     _high_speed_target_dates,
     _historical_evidence_timestamp_overrides,
-    _is_test_group_name,
-    _safe_event_folder_name,
-    _saved_race_folders,
-    _saved_race_id,
 )
+# Not used here any more; re-exported because tests still reach them through this module.
+import shutil  # noqa: F401
+import time  # noqa: F401
+from PyQt5.QtWidgets import QFrame  # noqa: F401
+from .event_workspace import discover_event_workspaces  # noqa: F401
+from .review_window_widgets import _CompactStatusIndicator  # noqa: F401
+from .review_window_common import BEIJING_TIMEZONE, _align_live_evidence_timestamp  # noqa: F401
 from .review_window_settings import FinishReviewSettingsMixin
 from .review_window_status import FinishReviewStatusMixin
 from .review_window_problems import FinishReviewProblemsMixin

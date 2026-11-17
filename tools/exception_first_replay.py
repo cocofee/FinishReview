@@ -26,7 +26,6 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from realtime.analysis_workspace import AnalysisWorkspace
 from realtime.problem_analysis import AnalysisConfig, config_from_workspace, run_offline_analysis
 from realtime.problem_items import ProblemItem
 

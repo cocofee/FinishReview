@@ -1,14 +1,14 @@
 """Correspondence is visible without counting or changing the selected row."""
 
-from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
 from tests.realtime.test_person_marker_style import painted, view_with_frame
 from realtime.race_strip import AUTO_LABELLED, RaceStripView
 from realtime.review_marker_style import AUTO_COLOR, LEGEND, MANUAL_COLOR, PENDING_COLOR, marker_style
 from tests.realtime.test_quick_review_panel import (
-    FRAME, T0, auto_people, count_on_picture, qapp, row, wave_panel,
+    T0, auto_people, count_on_picture, row,
 )
+from tests.realtime.test_quick_review_panel import qapp, wave_panel  # noqa: F401 (pytest fixtures)
 from tests.realtime.test_race_strip import _Strips, piece
 
 

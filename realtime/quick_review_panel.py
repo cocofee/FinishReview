@@ -2,76 +2,48 @@
 
 from __future__ import annotations
 
-import csv
-import json
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
-import uuid
 
 from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QApplication, QAbstractSpinBox, QComboBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QApplication, QAbstractSpinBox, QComboBox, QHBoxLayout, QLabel, QLineEdit,
     QMenu, QPlainTextEdit, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .auto_label import WAVE_REACH_MS, label_wave, people_on_line
 from .arrival_review import (
-    ARRIVAL_REVIEWS_FILENAME, ArrivalReviewStore, candidate_binding, event_binding,
+    candidate_binding, event_binding,
 )
 from .extra_person import fit_wave
-from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count, uncovered_intervals
-from .chip_history import format_chip_time
-from .crossing_time import item_crossing_time, manual_clock_offsets, recorder_crossing_time, workspace_clocks
-from .lap_wave import Passage, short_riders
+from .bunch_review import add_viewed, is_excluded, mark_on_frame, rider_count
+from .crossing_time import item_crossing_time, recorder_crossing_time, workspace_clocks
 from .problem_items import (
-    CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, KIND_MANUAL_REVIEW, KIND_NO_CHIP_CROSSING,
-    STATUS_EXCLUDED,
-    STATUS_WAITING, ProblemItem, stable_item_id,
+    CATEGORY_VIDEO, KIND_CHIP_NO_CROSSING, STATUS_EXCLUDED,
+    ProblemItem,
 )
 from .problem_panel import ProblemListPanel
-from .wave_slots import DONE, ELSEWHERE, EXTRA, NEXT, NO_CHIP, TODO, Slot, WaveSlotRow
-from .problem_resolutions import _frame_text, _passage_number, export_lists
-from .race_strip import (AUTO_LABELLED, RaceStripPanel, earlier_arrival, first_crossing, frame_at, line_next_entry,
+from .wave_slots import WaveSlotRow
+from .race_strip import (RaceStripPanel, earlier_arrival, first_crossing, frame_at, line_next_entry,
                          line_arrivals)
 from .quick_review_common import (
-    AUTO_GO_ON,
-    AUTO_PICTURE_REASON,
-    AUTO_TEXT,
     ArrivalRow,
-    BIB_CHIP_REACH_MS,
     CLOSE_BEHIND_MS,
-    COUNTED_REACH_MS,
-    EARLIER_BATCH,
-    EXCLUSION_RUN_GAP_MS,
     EXTRA_CHIP,
-    FRAGMENT_REACH_MS,
-    GHOST_REACH_MS,
     KEEP,
-    KEY_NAMES,
     LOCAL_CHIP_EXCLUSION,
-    NEAR_COUNTED_TEXT,
-    NUMBER_KEYS,
-    PASSAGE_VIEW_MARGIN_MS,
     RECORD_BIB,
     REVIEW_STALL_MS,
-    REVIEW_STEP_DELAY_MS,
-    REVIEW_STEP_FRAMES,
-    ROW_KEYS,
     RUN_FAST_MIN_MS,
     RUN_FAST_SPEED,
     RUN_NEAR_MS,
     RUN_SLOW_MS,
     RUN_STALE_MS,
-    RUN_STEP_MS,
     RUN_STOP_LEAD_MS,
     RUN_TAIL_MS,
     SAME_BODY_MS,
-    SAME_FRAME_MS,
     SWEEP_REACH_MS,
-    UNVERIFIED_SPAN_MS,
-    WAVE_ALERT_WORDS,
     WAVE_GAP_MS,
     WAVE_NO_PERSON,
     WAVE_VIEW_MARGIN_MS,

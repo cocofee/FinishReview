@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import QApplication
 
 from realtime.race_strip import (RaceStripPanel, RaceStripView, StripPiece, earlier_arrival, first_crossing,
                                  line_arrivals, line_next_entry)
-from tests.realtime.test_quick_review_panel import panel, qapp
+from tests.realtime.test_quick_review_panel import panel, qapp  # noqa: F401 (pytest fixtures)
 
 
 T = 1_789_784_000_000

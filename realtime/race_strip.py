@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import QHBoxLayout, QLabel, QPushButton, QScrollBar, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QHBoxLayout, QLabel, QScrollBar, QVBoxLayout, QWidget
 
 from .chip_history import format_chip_time
 from .crossing_time import recorder_crossing_time, workspace_clocks

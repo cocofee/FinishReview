@@ -2,86 +2,51 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
 import logging
-import math
 from pathlib import Path
-import re
 import time
-from types import SimpleNamespace
 from typing import Callable, Iterable, Mapping, Optional
 
-from PyQt5.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
-    QBrush,
     QColor,
-    QFont,
-    QFontMetrics,
-    QImage,
     QKeySequence,
-    QPainter,
     QPalette,
-    QPen,
-    QPixmap,
-    QTransform,
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
-    QFormLayout,
     QFrame,
-    QGraphicsPixmapItem,
-    QGraphicsScene,
-    QGraphicsView,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QMenu,
-    QMessageBox,
-    QInputDialog,
     QPushButton,
-    QScrollArea,
-    QSlider,
     QSizePolicy,
     QSpinBox,
     QSplitter,
-    QStyledItemDelegate,
     QShortcut,
     QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
-    QWidget,
 )
 
-from . import APP_DISPLAY_NAME, APP_WINDOW_TITLE
-from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
-from .camera_judgments import CameraJudgment
-from .clock_sync import CLOCK_MODEL_FILENAME, MANUAL_ANCHOR_TOLERANCE_MS, ClockModelStore
-from .review_marker_style import marker_style
-from .race_filmstrip import RaceFilmstripFrame, recording_sources
-from .external_clip_import import EXTERNAL_CLOCK_SOURCE
+from . import APP_WINDOW_TITLE
 from .passage_evidence import (
     ContinuousMarkerStore,
     HIGH_SPEED_SOURCE,
     REGULAR_SOURCE,
-    PassageEvidenceAssociation,
     PassageEvidenceAssociationStore,
     VideoClockCalibrationStore,
 )
 from .passage_receiver import PassageEvent, PassageEventStore
-from .person_follow import FOLLOW_AFTER_MS, FOLLOW_BEFORE_MS, FollowTracks, follow_path
-from .person_follow import OUTPUT_DIRNAME as FOLLOW_OUTPUT_DIRNAME
+from .person_follow import FollowTracks
 from .passage_batch import (
     DEFAULT_REVIEW_GAP_MS,
     DEFAULT_SUBWAVE_GAP_MS,
     PassageReviewBatch,
-    build_review_batches,
 )
 from .video_arrival import (
     DEFAULT_ARRIVAL_BATCH_GAP_MS,
@@ -90,70 +55,51 @@ from .video_arrival import (
     VideoArrivalCandidateStore,
     build_video_arrival_batches,
 )
-from .video_discovery import VideoDiscoveryError, VideoDiscoveryStore
+from .video_discovery import VideoDiscoveryStore
 from .playback_coordinator import PlaybackCoordinator
 from .race_metadata import (
     RaceAthleteMetadata,
     RaceMetadata,
     RaceMetadataStore,
 )
-from .review_selection import ReviewSelectionController, ReviewSelectionPlan
+from .review_selection import ReviewSelectionController
 from .review_clip import PassageReviewBindingStore
 from .runtime_metrics import RuntimeMetrics
-from .thread_lifecycle import retire_qthread, track_qthread
-from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
+from .video_playback import TargetTimelineSlider
 from .video_filmstrip import (
-    CONTINUOUS_FILMSTRIP_INTERVAL_MS,
     VideoFilmstripWidget,
 )
 from .video_timeline import (
-    DEFAULT_CLOCK_SOURCE,
     PassageVideoLocation,
     PassageVideoLookup,
     VideoTimelineStore,
 )
 from .passage_review_common import (
-    BEIJING_TIMEZONE,
-    CTRL_FRAME_STEP,
-    SHIFT_FRAME_STEP,
     UI_BASE_FONT_POINT_SIZE,
     UI_FONT_FAMILY,
-    UI_INFO_PANEL_DEFAULT_WIDTH,
     UI_INFO_PANEL_MAX_WIDTH,
     UI_INFO_PANEL_MIN_WIDTH,
-    _ARCHIVE_SEGMENT_SUFFIX_RE,
     _AutoFitTableWidget,
-    _CONFIRMABLE_STATUSES,
     _OPENABLE_STATUSES,
     _ReviewFilterBar,
-    _STATUS_PRIORITY,
-    _STATUS_TEXT,
     _StatusColorDelegate,
-    _TABLE_COLUMN_MIN_WIDTHS,
-    _association_matches_location,
-    _expanded_column_widths,
     _resolve_evidence_layout,
     combined_review_status,
     compact_source_status,
     format_passage_time,
-    is_high_speed,
-    location_clock_text,
-    location_source_text,
-    location_status_text,
     lookup_status_text,
     review_status_text,
-    source_confirmation_status,
     source_location,
 )
 from .evidence_image_view import (
-    COUNT_MODE_HELP,
     EvidenceImageView,
-    HOVER_REACH_PX,
-    PERSON_TAG_FONT_PX,
-    PERSON_TAG_LIFT_PX,
-    SELECTED_RING_PX,
 )
 from .passage_evidence_pane import PassageEvidencePane
+# Not used here any more; re-exported because tests still reach them through this module.
+from PyQt5.QtGui import QImage  # noqa: F401
+from PyQt5.QtWidgets import QInputDialog, QMessageBox  # noqa: F401
+from .evidence_image_view import PERSON_TAG_FONT_PX  # noqa: F401
+from .passage_review_common import _TABLE_COLUMN_MIN_WIDTHS, _expanded_column_widths  # noqa: F401
 from .passage_review_video_assist import PassageReviewVideoAssistMixin
 from .passage_review_clock import PassageReviewClockMixin
 from .passage_review_lookup import PassageReviewLookupMixin

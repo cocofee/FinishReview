@@ -40,7 +40,6 @@ from realtime.settings import FinishReviewSettings
 from realtime.thread_lifecycle import install_qthread_shutdown
 from realtime.stream_recorder import (
     apply_rtsp_credentials,
-    is_rtsp_source,
     sanitize_recording_message,
     split_rtsp_credentials,
 )

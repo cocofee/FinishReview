@@ -11,7 +11,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import QMessageBox
 
 from .passage_receiver import PassageEvent
-from .passage_review import source_location
+from .passage_review_common import source_location
 from .preflight import PreflightRun
 from .recording_controller import PendingRecordingPassage, RecordingStopFailure
 from .review_recorder import PassageReviewState, is_supported_review_source

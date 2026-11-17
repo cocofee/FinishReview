@@ -97,7 +97,6 @@ from .problem_items import (
     STATUS_DISPUTED,
     STATUS_EXCLUDED,
     ProblemItem,
-    sort_items,
 )
 from .person_follow import follow_path, follow_payload
 from .person_crossing import (configured_direction, extract_people, learn_profile, not_athlete_reason,

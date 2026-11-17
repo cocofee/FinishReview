@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
@@ -18,9 +18,9 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QKeySequence
 
-from .recording_catalog import FilmstripSource, RecordingSpan, RaceRecordingIndex, recording_sources
+from .recording_catalog import FilmstripSource, RaceRecordingIndex
+from .recording_catalog import recording_sources  # noqa: F401 (re-exported for callers)
 from .thread_lifecycle import retire_qthread, track_qthread
-from .video_timeline import DEFAULT_CLOCK_SOURCE, PassageVideoLocation
 from .filmstrip_checks import FilmstripCheckStore, merge_ranges, subtract_ranges
 from .decode_resources import DECODE_RESOURCES, FOREGROUND, THUMBNAIL, ImageCache
 

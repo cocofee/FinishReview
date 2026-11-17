@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from realtime.runtime_paths import (
     application_dir,
