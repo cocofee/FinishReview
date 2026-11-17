@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
 )
 
+import realtime.passage_evidence_pane as passage_evidence_pane
 import realtime.passage_review as passage_review
 from realtime.passage_evidence import (
     HIGH_SPEED_SOURCE,
@@ -147,7 +148,7 @@ class _FakePlaybackWorker(QObject):
 @pytest.fixture
 def fake_playback(monkeypatch):
     _FakePlaybackWorker.instances.clear()
-    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", _FakePlaybackWorker)
+    monkeypatch.setattr(passage_evidence_pane, "VideoPlaybackWorker", _FakePlaybackWorker)
     return _FakePlaybackWorker
 
 
@@ -4617,7 +4618,7 @@ def test_single_video_enables_reverse_lookahead_without_idle_prefetch(qapp, tmp_
             super().__init__(path, parent, idle_prefetch=idle_prefetch)
             self.reverse_prefetch = reverse_prefetch
 
-    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", ConfiguredWorker)
+    monkeypatch.setattr(passage_evidence_pane, "VideoPlaybackWorker", ConfiguredWorker)
     passages = PassageEventStore(tmp_path / "passages.jsonl")
     passages.append(_event())
     timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
@@ -6987,7 +6988,7 @@ def test_real_decoder_crosses_seam_and_saves_256_frame(
             reverse_prefetch=False, idle_prefetch=False,
         )
 
-    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", make_worker)
+    monkeypatch.setattr(passage_evidence_pane, "VideoPlaybackWorker", make_worker)
     passages = PassageEventStore(tmp_path / "passages.jsonl")
     passages.append(_event(event_id="passage-204", bib="204", passage_time_ms=10_120))
     passages.append(_event(event_id="passage-256", bib="256", sequence=2, passage_time_ms=10_240))

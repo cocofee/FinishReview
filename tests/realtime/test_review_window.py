@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
 )
 
-from realtime import passage_review
+from realtime import passage_evidence_pane, passage_review
 from realtime import review_window as review_window_module
 from realtime.auyat_rgb import AuyatScanResult
 from realtime.passage_evidence import (
@@ -118,7 +118,7 @@ class _FakePlaybackWorker(QObject):
 
 @pytest.fixture(autouse=True)
 def fake_playback(monkeypatch):
-    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", _FakePlaybackWorker)
+    monkeypatch.setattr(passage_evidence_pane, "VideoPlaybackWorker", _FakePlaybackWorker)
 
 
 class _FakeRecorder:
