@@ -6,6 +6,7 @@ chip passages and never create or modify an official timing record.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -17,6 +18,10 @@ from typing import Iterable
 from .durable_jsonl import append_jsonl_records, locked_jsonl
 from .runtime_metrics import RuntimeMetrics
 from .video_passage_detector import VideoPassageCandidate
+from .failure_log import warn_handled_failure
+
+
+logger = logging.getLogger("FinishReview.VideoArrival")
 
 
 SCHEMA_VERSION = 1
@@ -191,7 +196,15 @@ class VideoArrivalCandidateStore:
                 journal.truncate(int(size))
                 journal.flush()
                 os.fsync(journal.fileno())
-        except OSError:
+        except OSError as error:
+            warn_handled_failure(
+                logger,
+                f"truncate:{self.path}",
+                "Could not cut the torn tail of %s at byte %s: %r",
+                self.path,
+                size,
+                error,
+            )
             return
 
     def candidates(self) -> tuple[VideoPassageCandidate, ...]:

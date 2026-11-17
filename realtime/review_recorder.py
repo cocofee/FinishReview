@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import hashlib
 import fnmatch
 import json
@@ -39,6 +40,10 @@ from .video_timeline import (
     VideoTimelineStore,
     probe_video_duration_ms,
 )
+from .failure_log import warn_handled_failure
+
+
+logger = logging.getLogger("FinishReview.ReviewRecorder")
 
 
 DEFAULT_ARCHIVE_SEGMENT_SECONDS = 300
@@ -1046,7 +1051,15 @@ class ReviewRingBuffer:
                     trash_path.unlink(missing_ok=True)
                 else:
                     os.replace(trash_path, original_path)
-            except OSError:
+            except OSError as error:
+                warn_handled_failure(
+                    logger,
+                    f"cleanup-recovery:{trash_path}",
+                    "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                    original_path,
+                    trash_path,
+                    error,
+                )
                 continue
 
     @staticmethod
@@ -1508,7 +1521,15 @@ class ReviewRingBuffer:
                         self._cleanup_aborted_record(transaction_id),
                         already_locked=True,
                     )
-            except OSError:
+            except OSError as error:
+                warn_handled_failure(
+                    logger,
+                    f"cleanup-recovery:{trash_path}",
+                    "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                    original_path,
+                    trash_path,
+                    error,
+                )
                 continue
             self._sync_pin_journal_locked()
 
@@ -1532,7 +1553,15 @@ class ReviewRingBuffer:
             try:
                 if not path.exists():
                     os.replace(trash_path, path)
-            except OSError:
+            except OSError as error:
+                warn_handled_failure(
+                    logger,
+                    f"cleanup-recovery:{trash_path}",
+                    "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                    path,
+                    trash_path,
+                    error,
+                )
                 continue
             self._cleanup_pending_segments.pop(segment_id, None)
             self._cleanup_pending_paths.pop(segment_id, None)
@@ -1765,7 +1794,15 @@ class ReviewRingBuffer:
                 try:
                     if not path.exists():
                         os.replace(trash_path, path)
-                except OSError:
+                except OSError as error:
+                    warn_handled_failure(
+                        logger,
+                        f"cleanup-recovery:{trash_path}",
+                        "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                        path,
+                        trash_path,
+                        error,
+                    )
                     continue
                 segment = self._cleanup_pending_segments.pop(segment_id, None)
                 self._cleanup_pending_paths.pop(segment_id, None)
@@ -1849,7 +1886,15 @@ class ReviewRingBuffer:
                         try:
                             if not path.exists():
                                 os.replace(trash_path, path)
-                        except OSError:
+                        except OSError as error:
+                            warn_handled_failure(
+                                logger,
+                                f"cleanup-recovery:{trash_path}",
+                                "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                                path,
+                                trash_path,
+                                error,
+                            )
                             continue
                         self._append_pin_record(
                             self._cleanup_aborted_record(transaction_id),
@@ -1868,7 +1913,15 @@ class ReviewRingBuffer:
                         try:
                             if not path.exists():
                                 os.replace(trash_path, path)
-                        except OSError:
+                        except OSError as error:
+                            warn_handled_failure(
+                                logger,
+                                f"cleanup-recovery:{trash_path}",
+                                "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                                path,
+                                trash_path,
+                                error,
+                            )
                             continue
                         self._append_pin_record(
                             self._cleanup_aborted_record(transaction_id),

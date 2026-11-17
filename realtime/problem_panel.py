@@ -9,6 +9,7 @@ lists for CycleRace are exported from them.
 
 from __future__ import annotations
 
+import logging
 import json
 import sys
 import time
@@ -91,6 +92,10 @@ from .problem_resolutions import (
     export_lists,
     same_frame_conflicts,
 )
+from .failure_log import warn_handled_failure
+
+
+logger = logging.getLogger("FinishReview.ProblemPanel")
 
 
 def _progress_group(stage: str) -> str:
@@ -942,7 +947,13 @@ class ProblemListPanel(QFrame):
             return False
         try:
             current = {event.event_id: event for event in self._events_provider()}
-        except Exception:  # noqa: BLE001 - the list must stay usable
+        except Exception as error:  # noqa: BLE001 - the list must stay usable
+            warn_handled_failure(
+                logger,
+                "events-provider",
+                "Chip events unavailable; upstream-closed check skipped: %r",
+                error,
+            )
             return False
         if not current:
             return False
@@ -1704,7 +1715,13 @@ class ProblemListPanel(QFrame):
             return context.chips
         try:
             events = {event.event_id: event for event in self._events_provider()} if item.event_ids else {}
-        except Exception:  # noqa: BLE001 - 对照表不能因为上游掉线就打不开
+        except Exception as error:  # noqa: BLE001 - 对照表不能因为上游掉线就打不开
+            warn_handled_failure(
+                logger,
+                "events-provider",
+                "Chip events unavailable; showing the chip table without them: %r",
+                error,
+            )
             events = {}
         members = {member["event_id"]: member for member in item.evidence.get("batch_members", [])}
         chips = []

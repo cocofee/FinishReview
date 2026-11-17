@@ -66,6 +66,7 @@ from .stream_recorder import (
         split_rtsp_credentials,
     )
 from .thread_lifecycle import track_qthread
+from .failure_log import warn_handled_failure
 
 logger = logging.getLogger("FinishReview")
 IS_WINDOWS = os.name == "nt"
@@ -1586,7 +1587,13 @@ class FinishReviewLaunchDialog(QDialog):
         parsed_secondary_source = parse_directshow_source(self._secondary_source)
         try:
             discovered = tuple(self._device_provider())
-        except Exception:  # noqa: BLE001 - device discovery is best effort.
+        except Exception as error:  # noqa: BLE001 - device discovery is best effort.
+            warn_handled_failure(
+                logger,
+                "device-discovery",
+                "Video device discovery failed; showing no devices: %s",
+                sanitize_recording_message(error),
+            )
             discovered = ()
         devices: list[DirectShowVideoDevice] = []
         seen_inputs: set[str] = set()

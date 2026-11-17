@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,9 @@ from .video_timeline import (
     VideoTimelineStore,
     probe_video_duration_ms,
 )
+
+
+logger = logging.getLogger("FinishReview.StreamRecorder")
 
 
 _RTSP_CREDENTIAL_PATTERN = re.compile(
@@ -540,8 +544,12 @@ class ManualRecordingManager:
             for recorder in started:
                 try:
                     recorder.stop()
-                except Exception:
-                    pass
+                except Exception as stop_error:
+                    logger.warning(
+                        "Camera %s could not be stopped while rolling back a failed start: %s",
+                        getattr(recorder, "camera_index", "?"),
+                        sanitize_recording_message(stop_error),
+                    )
                 self._record_timeline_end(recorder, "start_rollback")
             raise RecordingError(sanitize_recording_message(exc)) from exc
 
