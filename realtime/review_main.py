@@ -44,7 +44,7 @@ from realtime.stream_recorder import (
     split_rtsp_credentials,
 )
 from realtime.target_sport import SPORTS, normalize_sport
-from .atomic_file import atomic_write_bytes
+from realtime.atomic_file import atomic_write_bytes
 
 
 logger = logging.getLogger("FinishReview.Entry")
