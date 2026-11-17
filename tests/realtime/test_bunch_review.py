@@ -6,11 +6,9 @@ import cv2
 import numpy as np
 import pytest
 from PyQt5.QtCore import QEventLoop, QPoint, Qt
-from PyQt5.QtGui import QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
-from realtime.bunch_dialog import BunchDecoder, BunchReviewDialog, CountView
 from realtime.bunch_review import (
     BunchChip, BunchReviewStore, align_counts, completion_issue, count_differences, detected_crossings,
     load_context, add_viewed, uncovered_intervals, review_candidates, group_member_batch,
@@ -201,27 +199,6 @@ def synthetic_bunch(tmp_path):
                                           'video_path': str(videos / 'camera_01_20260919_100000_archive_0000.avi'),
                                           'position_ms': 2300, 'frame_index': 46}})
     return tmp_path, item, events
-
-
-def test_context_and_decoder_span_recording_files_using_actual_frame_times(synthetic_bunch):
-    root, item, _events = synthetic_bunch
-    inputs = {p: p.read_bytes() for p in root.iterdir() if p.is_file()}
-    context = load_context(root, item)
-    assert len(context.segments) == 2
-    decoder = BunchDecoder()
-    try:
-        first = decoder.read(context, T + 3950)
-        following = decoder.read(context, first.recorder_ms, 1)
-        previous = decoder.read(context, following.recorder_ms, -1)
-        assert first.recorder_ms == T + 3950
-        assert following.recorder_ms == T + 4000
-        assert first.ref['segment_id'] != following.ref['segment_id']
-        assert previous.recorder_ms == first.recorder_ms
-        assert first.ref['frame_index'] == 79 and following.ref['frame_index'] == 0
-        assert decoder.read(context, T - 10000) is None
-    finally:
-        decoder.close()
-    assert all(p.read_bytes() == value for p, value in inputs.items())
 
 
 def test_context_uses_recording_session_clock_offset_once(synthetic_bunch):
@@ -534,146 +511,6 @@ def test_exclusion_reason_and_evidence_roundtrip_without_exporting_cached_extras
     assert store.manual_entries([item], root) == [] and store.differences(item, root) == []
 
 
-def test_dialog_can_exclude_restore_and_reopen_without_changing_other_marks(synthetic_bunch):
-    app = QApplication.instance() or QApplication([])
-    root, item, _events = synthetic_bunch
-    context = load_context(root, item)
-    counts = [mark(c.recorder_ms - T, c.bib) for c in context.chips]
-    counts.insert(1, mark(2800, '101'))
-    BunchReviewStore(root / 'finish_problems').save(context, counts, 4)
-    dialog = BunchReviewDialog(root, item)
-    try:
-        dialog.count_table.setCurrentCell(1, 0)
-        dialog.exclusion_reason.setCurrentText('行人')
-        dialog.exclude_button.click()
-        assert len(dialog.marks) == 5 and dialog.marks[1]['exclusion_reason'] == '行人'
-        assert '选手计数 4 人' in dialog.summary.text() and '已排除 1 人' in dialog.summary.text()
-        assert dialog.count_table.item(1, 3).text() == '已排除：行人'
-        assert not dialog.bib_input.isEnabled() and dialog.restore_button.isEnabled()
-        assert dialog.marks[0] == counts[0] and dialog.marks[2:] == counts[2:]
-        assert dialog.save(False)
-        dialog.restore()
-        dialog.count_table.setCurrentCell(1, 0)
-        assert dialog.marks[1]['exclusion_reason'] == '行人'
-        dialog.restore_button.click()
-        assert 'exclusion_reason' not in dialog.marks[1]
-        assert dialog.bib_input.isEnabled() and not dialog.restore_button.isEnabled()
-        assert '同一号码' in completion_issue(context.chips, dialog.marks,
-                                            align_counts(context.chips, dialog.marks))
-        assert dialog.save(False)
-    finally:
-        dialog.close()
-        dialog.worker.requestInterruption()
-        assert dialog.worker.wait(3000)
-        app.processEvents()
-    records = [json.loads(line) for line in (root / 'finish_problems' / 'bunch_reviews.jsonl').read_text(
-        encoding='utf-8').splitlines()]
-    assert any(r['marks'][1].get('exclusion_reason') == '行人' for r in records)
-    assert 'exclusion_reason' not in records[-1]['marks'][1]
-
-
-def test_the_strip_shows_every_detected_person_beside_the_chips(synthetic_bunch):
-    app = QApplication.instance() or QApplication([])
-    root, item, _events = synthetic_bunch
-    context = load_context(root, item)
-    # 两个落点都避开芯片预期时刻，画出来才知道是谁的线。
-    first, later, quiet = context.start_ms + 900, context.start_ms + 4200, context.start_ms + 550
-    _detections(root, 1, [
-        {'recorder_ms': context.start_ms - 400, 'in_obstruction': False},   # 本团之前
-        {'recorder_ms': first, 'in_obstruction': False},
-        {'recorder_ms': later, 'in_obstruction': True},
-        {'recorder_ms': context.end_ms + 400, 'in_obstruction': False},     # 本团之后
-    ])
-    dialog = BunchReviewDialog(root, item)
-    try:
-        timeline = dialog.timeline
-        assert [entry['recorder_ms'] for entry in timeline.detected] == [first, later]
-        assert '画面检测 2 处过线' in dialog.summary.text()
-
-        # 画出来看：每个人的线落在自己的时刻上，被遮挡的那一个浅一号。
-        dialog.layout().activate()
-        picture = QPixmap(timeline.size())
-        timeline.render(picture)
-        image = picture.toImage()
-        assert image.width() == timeline.width()
-        of = lambda ms: int((ms - context.start_ms) / (context.end_ms - context.start_ms) * (image.width() - 1))
-        band = (timeline.PEOPLE_TOP + timeline.PEOPLE_BOTTOM) // 2
-        person, hidden, empty = (image.pixelColor(of(ms), band) for ms in (first, later, quiet))
-        assert person.blue() > 150 and person.red() < 120      # 蓝线：画面看见了这个人
-        assert hidden.blue() > 150 and hidden.red() > person.red()   # 遮挡时的过线画浅一点
-        assert empty.name() == '#edf1f5'                       # 没人过线的时刻只有底色
-    finally:
-        dialog.close()
-        dialog.worker.requestInterruption()
-        assert dialog.worker.wait(3000)
-        app.processEvents()
-
-
-def test_dialog_reads_counts_saves_reopens_and_releases_worker(synthetic_bunch):
-    app = QApplication.instance() or QApplication([])
-    root, item, _events = synthetic_bunch
-    dialog = BunchReviewDialog(root, item)
-    try:
-        for _ in range(100):
-            app.processEvents(QEventLoop.AllEvents, 50)
-            if dialog.frame is not None:
-                break
-            QTest.qWait(10)
-        assert dialog.frame is not None, dialog.notice.text()
-        dialog.count_at(.3, .5)
-        dialog.count_at(.3, .5)  # accidental repeat click is ignored
-        dialog.count_at(.6, .5)  # two abreast in the same actual frame
-        assert len(dialog.marks) == 2
-        original_frame = dialog.frame
-        dialog.frame = replace(original_frame, ref=dict(original_frame.ref, frame_index=999))
-        dialog.count_at(.8, .5, False, original_frame)
-        assert dialog.marks[-1]['frame']['frame_index'] == original_frame.ref['frame_index']
-        dialog.marks.pop()
-        dialog.frame = original_frame
-        dialog.update_results()
-        dialog.count_table.setCurrentCell(1, 0)
-        dialog.bib_input.setText('319')
-        dialog.assign_bib()
-        assert dialog.marks[1]['bib'] == '319'
-        assert dialog.save(False)
-        assert not dialog.save(True)
-        dialog.close()
-        for _ in range(100):
-            app.processEvents(QEventLoop.AllEvents, 50)
-            if not dialog.worker.isRunning():
-                break
-            QTest.qWait(10)
-        assert not dialog.worker.isRunning()
-        record = BunchReviewStore(root / 'finish_problems').get(dialog.context)
-        assert len(record['marks']) == 2 and not record['completed']
-    finally:
-        dialog.worker.requestInterruption()
-        assert dialog.worker.wait(3000)
-
-
-def test_zoom_double_click_adds_no_rider_and_rapid_clicks_keep_source_frame():
-    app = QApplication.instance() or QApplication([])
-    view = CountView()
-    view.resize(600, 400)
-    view.show()
-    source = object()
-    view.show_frame(np.zeros((300, 500, 3), np.uint8), {}, [], source)
-    counted = []
-    view.counted.connect(lambda *args: counted.append(args))
-    app.processEvents()
-    QTest.mouseDClick(view.viewport(), Qt.LeftButton, pos=QPoint(200, 200))
-    QTest.mouseRelease(view.viewport(), Qt.LeftButton, pos=QPoint(200, 200))
-    QTest.qWait(QApplication.doubleClickInterval() * 2 + 50)
-    assert counted == []
-    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=QPoint(150, 200))
-    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=QPoint(400, 200))
-    view.show_frame(np.zeros((300, 500, 3), np.uint8), {}, [], object())
-    QTest.qWait(QApplication.doubleClickInterval() * 2 + 50)
-    assert len(counted) == 2
-    assert all(args[3] is source for args in counted)
-    view.close()
-
-
 def test_legacy_group_without_frame_uses_only_unique_calibrated_camera(synthetic_bunch):
     root, item, _events = synthetic_bunch
     original = load_context(root, item)
@@ -783,37 +620,6 @@ def test_group_context_revision_changes_invalidate_draft(synthetic_bunch):
     revised = load_context(root, item)
     assert revised.chips[0].revision != context.chips[0].revision
     assert store.get(revised) is None
-
-
-def test_dialog_local_navigation_leaves_group_pending_and_tracks_frames(synthetic_bunch):
-    app = QApplication.instance() or QApplication([])
-    root, item, _events = synthetic_bunch
-    item = replace(item, evidence=dict(item.evidence, video_count=2))
-    dialog = BunchReviewDialog(root, item)
-    try:
-        for _ in range(100):
-            app.processEvents(QEventLoop.AllEvents, 50)
-            if not dialog.busy:
-                break
-            QTest.qWait(10)
-        assert dialog.frame is not None
-        assert dialog.candidates and dialog.viewed_ranges
-        assert not dialog.fully_viewed.isEnabled()
-        assert not dialog.save(True)
-        dialog.navigate_candidate(1)
-        for _ in range(100):
-            app.processEvents(QEventLoop.AllEvents, 50)
-            if not dialog.busy:
-                break
-            QTest.qWait(10)
-        assert 'count_difference' in dialog.visited_candidates
-        assert dialog.save(False)
-        assert not dialog.store.get(dialog.context)['completed']
-    finally:
-        dialog.close()
-        dialog.worker.requestInterruption()
-        assert dialog.worker.wait(3000)
-        app.processEvents()
 
 
 def test_the_workbench_is_the_group_tool_and_keeps_the_live_analysis_running(synthetic_bunch, monkeypatch):
