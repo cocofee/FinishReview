@@ -240,6 +240,7 @@ CycleRace计时优先，其次录像、当前回放，再是后台分析。延�
 ### 步骤4：接通集团 Demo 的完整作用，而不是恢复逐人确认
 
 主要范围：`bunch_dialog.py`、`bunch_review.py`、集团生成规则和问题入口。
+（2026-11-17 注：`bunch_dialog.py` 已删除，集团核对现在在 `problem_panel.py` 的问题工作台里。）
 
 工作内容：
 
