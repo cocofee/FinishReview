@@ -303,3 +303,10 @@ def test_while_the_recording_plays_the_strip_scrolls_under_a_cursor_that_stays_p
     start = view.view_ms
     view.set_cursor(stamp + 58_960)
     assert view.view_ms == start
+
+
+def test_hover_help_is_one_short_line_of_keys(panel):
+    """11-18 "这个描述能不能去掉": three lines of explanation covered the picture."""
+    tip = panel.race_strip.view.toolTip()
+    assert tip == "单击跳转；←/→ 移动，+/− 缩放，Home/End 到首尾"
+    assert panel.race_strip.toolTip() == ""

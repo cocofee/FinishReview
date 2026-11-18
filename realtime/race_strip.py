@@ -550,9 +550,8 @@ class RaceStripView(QWidget):
         self._press = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
-        self.setToolTip("全程过线图：横向是时间。灰蓝/绿色同号线来自已有绑定，待核号码只作芯片时间参考；不识别号码。"
-                        "单击跳转；点过图后 ←/→ 移动，+/− 缩放，Home/End 到首尾。"
-                        "滚轮移动，Ctrl+滚轮缩放；回到视频后 ←/→ 仍逐帧。灰色为无过线图，不代表无人。")
+        # 11-18: the long explanation covered the picture; one line of keys is enough.
+        self.setToolTip("单击跳转；←/→ 移动，+/− 缩放，Home/End 到首尾")
 
     @property
     def ms_per_px(self) -> float:
@@ -837,11 +836,7 @@ class RaceStripPanel(QWidget):
         self.legend = QLabel(LEGEND, self)
         self.legend.setWordWrap(True)
         self.legend.setStyleSheet("color:#374151;font-size:11px;")
-        self.view.setToolTip(self.view.toolTip() + "\n" + LEGEND + "\n"
-                             "加粗并带边框的号码是左表当前选中记录；灰色状态为已排除。"
-                             "上方时间线和下方同号标签表示已有对应；待核芯片只有时间参考，不强贴到人。"
-                             "视频标记只在绑定帧附近显示，不跟踪移动；灰色图像缺口不代表无人。")
-        self.legend.hide()  # Keep the source legend in hover help, not a permanent extra row.
+        self.legend.hide()  # not a permanent extra row; nor in the hover help any more (11-18)
         column.addWidget(self.view)
         column.addWidget(self.scroll)
         layout.addLayout(column, 1)
