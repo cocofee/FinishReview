@@ -270,6 +270,24 @@ def test_manual_anchors_accept_a_legacy_record_on_its_current_event(tmp_path):
     assert anchor.chip_ms == t and anchor.reference == SESSION
 
 
+def test_manual_anchors_keep_only_the_newest_click_on_a_recording_also_after_a_folder_move(tmp_path):
+    """11-18: recalibrating never reached Space because the earliest chip's anchor kept the model."""
+    root = tmp_path / "race"
+    root.mkdir()
+    t = DAY + 10 * 3_600_000
+    early, late = _event("main", 1, t), _event("main", 2, t + 60_000)
+    _write_events(root, [early, late])
+    store = VideoClockCalibrationStore(root / "video_clock_calibrations.jsonl")
+    store.record(camera_index=1, session_key=f"camera_01_review|{tmp_path / 'moved_from'}|{SESSION}",
+                 offset_ms=149, anchor_event_id=early.event_id, anchor_bib=early.bib, calibrated_at_ms=DAY)
+    store.record(camera_index=1, session_key=f"camera_01_review|{root / 'videos'}|{SESSION}",
+                 offset_ms=2_699, anchor_event_id=late.event_id, anchor_bib=late.bib, calibrated_at_ms=DAY + 5)
+
+    anchor, = AnalysisWorkspace(root).manual_anchors(1)
+
+    assert anchor.offset_ms == 2_699 and anchor.label == late.bib and anchor.reference == SESSION
+
+
 @pytest.mark.parametrize("change", ["revision", "time", "race", "stage", "inactive"])
 def test_manual_anchors_reject_an_anchor_that_no_longer_stands(tmp_path, change):
     root = tmp_path / change

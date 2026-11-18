@@ -17,13 +17,29 @@ def _clock_snapshot(path, modified, size):
     return ClockModelStore(path)
 
 
+@dataclass(frozen=True)
+class ManualCalibration:
+    """The newest first-rider calibration of one recording (camera, session stem)."""
+
+    offset_ms: int
+    calibrated_at_ms: int
+    bib: str
+
+
 @lru_cache(maxsize=4)
-def _manual_offsets(path, modified, size):
+def _manual_calibrations(path, modified, size):
+    # Keyed by the recording's own name, not its folder: moving a race folder
+    # (11-05) must not lose the calibration, and recalibrating must win over
+    # every earlier click on the same recording (11-18).
     store = VideoClockCalibrationStore(path, recover_incomplete_tail=False)
-    return {
-        (int(calibration.camera_index), str(calibration.session_key).rsplit("|", 1)[-1]): int(calibration.offset_ms)
-        for calibration in store.calibrations()
-    }
+    result = {}
+    for calibration in store.calibrations():
+        key = (int(calibration.camera_index), str(calibration.session_key).rsplit("|", 1)[-1])
+        current = result.get(key)
+        if current is None or int(calibration.calibrated_at_ms) >= current.calibrated_at_ms:
+            result[key] = ManualCalibration(int(calibration.offset_ms), int(calibration.calibrated_at_ms),
+                                            str(calibration.anchor_bib))
+    return result
 
 
 def workspace_clocks(workspace):
@@ -35,15 +51,21 @@ def workspace_clocks(workspace):
         return None
 
 
-def manual_clock_offsets(workspace):
-    """First-rider offsets published by the live calibration journal."""
+def manual_calibrations(workspace):
+    """Newest first-rider calibration per (camera, session stem)."""
 
     path = Path(workspace) / MANUAL_CALIBRATION_FILENAME
     try:
         stamp = path.stat()
-        return _manual_offsets(str(path), stamp.st_mtime_ns, stamp.st_size)
+        return _manual_calibrations(str(path), stamp.st_mtime_ns, stamp.st_size)
     except (OSError, ValueError, PassageEvidenceError):
         return {}
+
+
+def manual_clock_offsets(workspace):
+    """First-rider offsets published by the live calibration journal."""
+
+    return {key: value.offset_ms for key, value in manual_calibrations(workspace).items()}
 
 
 @dataclass(frozen=True)
@@ -81,15 +103,21 @@ def recorder_crossing_time(recorder_ms, frame, workspace=None, *, context=None, 
         from .runtime_paths import recording_session_path
         session = re.sub(r"_review_\d+$", "", re.sub(
             r"_archive_\d+$", "", recording_session_path(Path(str(frame["video_path"]))).stem, flags=re.I))
-    if model and not (model.source == MANUAL_ANCHOR_SOURCE and session not in model.session_ids):
+    manual = (manual_calibrations(workspace).get((camera, session))
+              if workspace is not None and camera and session else None)
+    usable = model and not (model.source == MANUAL_ANCHOR_SOURCE and session not in model.session_ids)
+    # A click made after the model was fitted is the operator correcting it:
+    # it rules at once instead of waiting for the next analysis (11-18 "校完
+    # 立刻全部生效"); a model fitted later takes over again.  Models saved
+    # without a creation time keep their old precedence.
+    if usable and not (manual is not None and model.created_at_ms
+                       and manual.calibrated_at_ms > int(model.created_at_ms)):
         return CrossingTime(int(model.to_chip(int(recorder_ms), session)), "aligned")
     # The live first-rider calibration is written before offline analysis
     # publishes an automatic model; without this fallback the table shows raw
     # recorder time (about two seconds ahead of the camera OSD) until then.
-    if workspace is not None and camera and session:
-        offset = manual_clock_offsets(workspace).get((camera, session))
-        if offset is not None:
-            return CrossingTime(int(recorder_ms) - int(offset), "aligned")
+    if manual is not None:
+        return CrossingTime(int(recorder_ms) - int(manual.offset_ms), "aligned")
     return CrossingTime(int(recorder_ms), "video")
 
 

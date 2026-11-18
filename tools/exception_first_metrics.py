@@ -43,12 +43,9 @@ from realtime.problem_items import (
     KIND_OBSTRUCTION,
     KIND_STANDING,
     ProblemItem,
-    TYPE_BUNCH,
     TYPE_EVIDENCE,
     TYPE_MISSED,
-    TYPE_MULTI_CHIP,
     TYPE_ORDER,
-    TYPE_RECORD,
     TYPE_TITLES,
 )
 

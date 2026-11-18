@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finish-review"
-version = "0.25.12"
+version = "0.25.13"
 description = "Standalone multi-source finish review console"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,7 +37,7 @@ addopts = "-p no:cacheprovider"
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E9", "F63", "F7", "F82"]
+select = ["E9", "F63", "F7", "F82", "F401"]
 
 [tool.coverage.run]
 branch = true

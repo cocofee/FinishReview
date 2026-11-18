@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import socket
-import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
@@ -28,6 +27,7 @@ from .race_metadata import (
     RaceMetadataStore,
 )
 from .time_domain import WallClockMs
+from .atomic_file import atomic_open
 
 
 logger = logging.getLogger("FinishReview.PassageReceiver")
@@ -546,25 +546,14 @@ class PassageEventStore:
                 reason=str(reason).strip(),
                 deleted_at_ms=int(time.time() * 1000),
             )
-            temporary_path = None
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=self.deletions_path.parent,
-                    prefix=self.deletions_path.name + ".", suffix=".tmp", delete=False,
-                ) as handle:
-                    temporary_path = Path(handle.name)
+                with atomic_open(self.deletions_path, "w", encoding="utf-8") as handle:
                     json.dump(
                         {"schema_version": 2, "deletions": [deletions[key] for key in sorted(deletions)]},
                         handle, ensure_ascii=False,
                     )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary_path, self.deletions_path)
             except OSError as error:
                 raise PassageJournalError("failed to save passage deletion") from error
-            finally:
-                if temporary_path is not None and temporary_path.exists():
-                    temporary_path.unlink()
             self._deletions = deletions
             return True
 

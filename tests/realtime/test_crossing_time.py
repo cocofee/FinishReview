@@ -109,3 +109,28 @@ def test_a_group_starts_at_first_observed_rider_and_fallbacks_are_labelled():
     assert item_crossing_time(official, clocks=clocks).value_ms == T + 99
     assert item_crossing_time(official, clocks=clocks).source == "chip"
     assert item_crossing_time(item("untimed"), clocks=clocks) is None
+
+
+def test_a_click_after_the_fit_rules_at_once_and_a_later_fit_takes_over(tmp_path):
+    """11-18 "校完立刻全部生效": table and Space must not wait for the next analysis."""
+    from realtime.clock_sync import MANUAL_ANCHOR_SOURCE
+    from realtime.passage_evidence import VideoClockCalibrationStore
+
+    session = "camera_01_20261104_112206_629703"
+    store = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl")
+    # An older click under the folder the race was in before it was moved (11-05) ...
+    store.record(camera_index=1, session_key=f"camera_01_review|D:\\old\\videos|{session}", offset_ms=1738,
+                 anchor_event_id="e20", anchor_bib="20", calibrated_at_ms=T + 10)
+    # ... then the operator's new click on the same recording.
+    store.record(camera_index=1, session_key=f"camera_01_review|D:\\new\\videos|{session}", offset_ms=2699,
+                 anchor_event_id="e1", anchor_bib="1", calibrated_at_ms=T + 50)
+    frame = {"camera_index": 1, "session_id": session}
+    fitted = model(offset=1738, source=MANUAL_ANCHOR_SOURCE, session_ids=(session,), created_at_ms=T + 20)
+    value = recorder_crossing_time(T + 10_000, frame, tmp_path, clocks=Clocks(fitted))
+    assert value.value_ms == T + 10_000 - 2699 and value.source == "aligned"
+
+    refitted = model(offset=2600, version=2, created_at_ms=T + 60)
+    assert recorder_crossing_time(T + 10_000, frame, tmp_path, clocks=Clocks(refitted)).value_ms == T + 10_000 - 2600
+    # A model saved without a creation time keeps its old precedence.
+    legacy = model(offset=2600, version=3)
+    assert recorder_crossing_time(T + 10_000, frame, tmp_path, clocks=Clocks(legacy)).value_ms == T + 10_000 - 2600

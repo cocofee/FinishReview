@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from .atomic_file import atomic_write_text
 
 
 SCHEMA_VERSION = 1
@@ -249,18 +249,7 @@ class RaceMetadataStore:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            temporary = self.snapshot_path.with_suffix(
-                self.snapshot_path.suffix + ".tmp"
-            )
-            try:
-                with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(encoded)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self.snapshot_path)
-            finally:
-                if temporary.exists():
-                    temporary.unlink()
+            atomic_write_text(self.snapshot_path, encoded, encoding="utf-8", newline="\n")
             self._current = metadata
             return RaceMetadataIngestResult.ACCEPTED
 

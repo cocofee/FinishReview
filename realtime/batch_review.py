@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +13,7 @@ from .problem_items import (CATEGORY_CHIP, CATEGORY_VIDEO, KIND_BATCH_READS, KIN
                             KIND_OBSTRUCTION, KIND_TWO_CHIPS_ONE_CROSSING, STATUS_CLOSED_UPSTREAM,
                             STATUS_OPEN, ProblemItem, sort_items, stable_item_id)
 from .problem_rules import BUNCH_MARGIN_MS
+from .atomic_file import atomic_write_text
 
 MAX_BATCH_SPAN_MS = 1000
 BATCH_DECISIONS = "batch_member_decisions.jsonl"
@@ -313,7 +313,5 @@ def save_identity(path, scope, parents, history=()):
     items = [item.to_payload() for item in parents]
     items += [item.to_payload() for item in history if item.item_id not in current]
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(dict(race_id=scope[0], stage_id=scope[1], items=items),
-                                    ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_text(path, json.dumps(dict(race_id=scope[0], stage_id=scope[1], items=items),
+                                       ensure_ascii=False), encoding="utf-8")

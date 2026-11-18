@@ -8,8 +8,9 @@ from PyQt5.QtTest import QSignalSpy
 
 from realtime import quick_review_panel as module
 from tests.realtime.test_quick_review_panel import (
-    FRAME, T0, auto_people, qapp, row, wave_panel,
+    FRAME, T0, auto_people, row,
 )
+from tests.realtime.test_quick_review_panel import qapp, wave_panel  # noqa: F401 (pytest fixtures)
 
 
 def test_auto_wave_opens_bound_frame_even_before_strip_is_ready(wave_panel, monkeypatch, tmp_path):

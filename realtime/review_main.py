@@ -40,11 +40,11 @@ from realtime.settings import FinishReviewSettings
 from realtime.thread_lifecycle import install_qthread_shutdown
 from realtime.stream_recorder import (
     apply_rtsp_credentials,
-    is_rtsp_source,
     sanitize_recording_message,
     split_rtsp_credentials,
 )
 from realtime.target_sport import SPORTS, normalize_sport
+from realtime.atomic_file import atomic_write_bytes
 
 
 logger = logging.getLogger("FinishReview.Entry")
@@ -603,17 +603,10 @@ def save_review_settings(
     payload.pop("rtsp_password", None)
     payload.pop("secondary_rtsp_password", None)
     payload.pop("racetiger_token", None)
-    temporary_path = config_path.with_suffix(config_path.suffix + ".tmp")
-    with temporary_path.open("wb") as output:
-        output.write(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        )
-        output.write(b"\n")
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary_path, config_path)
+    atomic_write_bytes(
+        config_path,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n",
+    )
 
 
 def configure_application_font(app: QApplication) -> None:

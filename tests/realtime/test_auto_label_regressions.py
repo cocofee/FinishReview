@@ -16,8 +16,9 @@ from tests.realtime.test_arrival_review import SCOPE
 from tests.realtime.test_auto_label import START, workspace
 from tests.realtime.test_passage_receiver import metadata_payload
 from tests.realtime.test_quick_review_panel import (
-    auto_people, look_through, qapp, row, saved, states, wave_panel,
+    auto_people, look_through, row, saved, states,
 )
+from tests.realtime.test_quick_review_panel import qapp, wave_panel  # noqa: F401 (pytest fixtures)
 
 
 def test_enriched_metadata_is_delivered_and_callback_can_retry(tmp_path):

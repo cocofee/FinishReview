@@ -9,6 +9,7 @@ lists for CycleRace are exported from them.
 
 from __future__ import annotations
 
+import logging
 import json
 import sys
 import time
@@ -20,7 +21,6 @@ from typing import Callable, Optional
 from PyQt5.QtCore import QEvent, QProcess, QProcessEnvironment, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPixmap
 from PyQt5.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -56,8 +56,6 @@ from .problem_items import (
     ACTION_REASON_PRESETS,
     ACTION_RECORD_BIB,
     ACTION_RIDER,
-    ACTION_RIDE_BACK,
-    ACTION_SAME_CROSSING,
     ACTION_SIDE_BY_SIDE,
     ACTION_SYNCED,
     STATUS_CLOSED_UPSTREAM,
@@ -82,7 +80,6 @@ from .problem_items import (
     TYPE_EVIDENCE,
     TYPE_MISSED,
     TYPE_MULTI_CHIP,
-    TYPE_OTHER,
     ProblemItem,
     auto_passed_item,
     operator_actions,
@@ -95,6 +92,11 @@ from .problem_resolutions import (
     export_lists,
     same_frame_conflicts,
 )
+from .failure_log import warn_handled_failure
+from .atomic_file import atomic_write_text
+
+
+logger = logging.getLogger("FinishReview.ProblemPanel")
 
 
 def _progress_group(stage: str) -> str:
@@ -587,13 +589,11 @@ class ProblemListPanel(QFrame):
         try:
             self.problem_dir.mkdir(parents=True, exist_ok=True)
             path = self.problem_dir / "operator_drafts.json"
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"drafts": self._drafts, "held": self._held,
-                                             "marks": self._marks, "viewed": self._viewed,
-                                             "items": self._operator_items,
-                                             "arrivals": self._arrival_drafts}, ensure_ascii=False),
-                                 encoding="utf-8")
-            temporary.replace(path)
+            atomic_write_text(path, json.dumps({"drafts": self._drafts, "held": self._held,
+                                                "marks": self._marks, "viewed": self._viewed,
+                                                "items": self._operator_items,
+                                                "arrivals": self._arrival_drafts}, ensure_ascii=False),
+                              encoding="utf-8")
         except OSError as error:
             self.hint.setText(f"草稿保存失败：{error}")
 
@@ -946,7 +946,13 @@ class ProblemListPanel(QFrame):
             return False
         try:
             current = {event.event_id: event for event in self._events_provider()}
-        except Exception:  # noqa: BLE001 - the list must stay usable
+        except Exception as error:  # noqa: BLE001 - the list must stay usable
+            warn_handled_failure(
+                logger,
+                "events-provider",
+                "Chip events unavailable; upstream-closed check skipped: %r",
+                error,
+            )
             return False
         if not current:
             return False
@@ -1708,7 +1714,13 @@ class ProblemListPanel(QFrame):
             return context.chips
         try:
             events = {event.event_id: event for event in self._events_provider()} if item.event_ids else {}
-        except Exception:  # noqa: BLE001 - 对照表不能因为上游掉线就打不开
+        except Exception as error:  # noqa: BLE001 - 对照表不能因为上游掉线就打不开
+            warn_handled_failure(
+                logger,
+                "events-provider",
+                "Chip events unavailable; showing the chip table without them: %r",
+                error,
+            )
             events = {}
         members = {member["event_id"]: member for member in item.evidence.get("batch_members", [])}
         chips = []
@@ -2005,9 +2017,7 @@ class ProblemListPanel(QFrame):
             existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
             ids = {value["item_id"] for value in existing}
             existing.extend(child.to_payload() for child in children if child.item_id not in ids)
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
-            temporary.replace(path)
+            atomic_write_text(path, json.dumps(existing, ensure_ascii=False), encoding="utf-8")
             self._operator_items[item.item_id] = item.to_payload()
             for child, mark in zip(children, marks):
                 self._marks[child.item_id] = [dict(mark)]
@@ -2562,9 +2572,7 @@ class ProblemListPanel(QFrame):
             self._chip_status_from_payload(payload)
             self.problem_dir.mkdir(parents=True, exist_ok=True)
             path = self.problem_dir / LIVE_CHIP_FILENAME
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            temporary.replace(path)
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             self._chip_signature = payload["input_signature"]
             self._chip_recheck_at = payload.get("recheck_at_ms")
             self.refresh()
@@ -2633,9 +2641,7 @@ class ProblemListPanel(QFrame):
         items = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
         items.append(item.to_payload())
         self.problem_dir.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
-        temporary.replace(path)
+        atomic_write_text(path, json.dumps(items, ensure_ascii=False), encoding="utf-8")
         self._class_filter = ""
         self.queue_filter.blockSignals(True)
         self.queue_filter.setCurrentIndex(0)

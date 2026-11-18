@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtTest import QSignalSpy, QTest
-from PyQt5.QtWidgets import QApplication, QLabel
+from PyQt5.QtWidgets import QApplication
 
 from realtime.problem_items import (
     CATEGORY_VIDEO, KIND_LINE_ACTIVITY, KIND_NO_CHIP_CROSSING, KIND_TWO_CHIPS_ONE_CROSSING,
@@ -1781,7 +1781,8 @@ def test_four_takes_the_pairing_back_for_good_and_leaves_the_wave_to_hand(wave_p
     assert not any(entry.decision for entry in wave_panel._arrival_rows)
 
 
-def test_calibration_is_a_front_button_that_turns_red_until_the_recording_is_calibrated(panel, tmp_path):
+def test_calibration_is_a_front_button_that_says_whether_the_recording_is_calibrated(panel, tmp_path):
+    """11-18 "目前我不知道是否校时了": the button always says it; a click on it arms 重新校时."""
     from realtime.passage_evidence import VideoClockCalibrationStore
 
     spy = QSignalSpy(panel.calibration_requested)
@@ -1791,18 +1792,24 @@ def test_calibration_is_a_front_button_that_turns_red_until_the_recording_is_cal
     assert bar.indexOf(button) == bar.indexOf(panel.status_widget) + 1
     assert bar.indexOf(button) < bar.indexOf(panel.row_action_buttons[Qt.Key_1])
     panel.refresh_calibration_state()
-    assert button.text() == "先校时" and "c2410c" in button.styleSheet()
+    assert button.text() == "未校时：点下一位压线的人" and "c2410c" in button.styleSheet()
     assert "没校时" in button.toolTip()
-    QTest.mouseClick(button, Qt.LeftButton)
-    assert len(spy) == 1
 
     VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl").record(
         camera_index=1, session_key="camera_01|camera_01_20261103_125112_396991", offset_ms=3248,
         anchor_event_id="one", anchor_bib="321", calibrated_at_ms=1)
     panel.refresh_calibration_state()
-    assert button.text() == "已校时" and "c2410c" not in button.styleSheet()
-    QTest.mouseClick(button, Qt.LeftButton)  # still there to redo it
-    assert len(spy) == 2
+    assert button.text().startswith("已校时") and "c2410c" not in button.styleSheet()
+
+    QTest.mouseClick(button, Qt.LeftButton)  # arms 重新校时 for the next picture click
+    assert panel._recalibrate_armed and button.text() == "重新校时：点压线的人"
+    assert "重新校时" in panel.hint.text() and len(spy) == 0
+    QTest.keyClick(panel.table, Qt.Key_Escape)
+    assert not panel._recalibrate_armed and button.text().startswith("已校时")
+    # The list of chips is still there, under 更多.
+    action = next(action for action in panel.more_button.menu().actions() if action.text() == "按列表选人校时…")
+    action.trigger()
+    assert len(spy) == 1
 
 
 def run_signals(panel):

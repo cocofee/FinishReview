@@ -176,7 +176,7 @@ def test_partial_receive_snapshot_is_not_proof_of_upstream_deletion(qapp, tmp_pa
 
 
 def test_publication_failure_keeps_last_snapshot_and_retries(qapp, tmp_path, monkeypatch):
-    from pathlib import Path
+    import os
 
     journal(tmp_path, [event(), event("b", offset=100)])
     payload = live_chip_payload(tmp_path, race_id="race", stage_id="stage")
@@ -193,7 +193,7 @@ def test_publication_failure_keeps_last_snapshot_and_retries(qapp, tmp_path, mon
     process = SimpleNamespace(readAllStandardOutput=lambda: json.dumps(updated).encode(), deleteLater=lambda: None)
     panel._chip_process = process
     with monkeypatch.context() as patch:
-        patch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk failure")))
+        patch.setattr(os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk failure")))
         panel._chip_done(process, panel._chip_generation, 0)
     assert path.read_bytes() == before
     assert panel.payload["chip_checks"]["counts"]["effective_passages"] == 2

@@ -33,7 +33,6 @@ from realtime.problem_items import (
     KIND_TWO_CHIPS_ONE_CROSSING,
     STATUS_CLOSED_UPSTREAM,
     STATUS_DISPUTED,
-    STATUS_EXCLUDED,
     row_label,
 )
 from realtime.problem_rules import CrossingRecord, Obstruction, build_video_items

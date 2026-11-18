@@ -1,6 +1,6 @@
 # FinishReview 系统详细说明
 
-> 适用版本：v0.25.12（代码位于 `realtime` 包，入口 `python -m realtime.review_main`）。
+> 适用版本：v0.25.13（代码位于 `realtime` 包，入口 `python -m realtime.review_main`）。
 > 本文按“现场怎么用 → 数据怎么流 → 每层怎么实现 → 文件放在哪 → 哪些事不做”的顺序说明。
 
 ## 0. 一句话定位
@@ -428,7 +428,8 @@ CycleRace ──HTTP JSONL──┐
 
 ## 9. 集团逐帧核对
 
-实现：`realtime/bunch_dialog.py`、`realtime/bunch_review.py`、`realtime/bunch_timeline.py`。
+实现：`realtime/problem_panel.py`（问题工作台内嵌集团时间尺 `BunchTimeline`）、`realtime/bunch_review.py`、`realtime/bunch_timeline.py`。
+原独立集团窗口 `realtime/bunch_dialog.py` 没有任何产品入口，已于 2026-11-17 删除。
 
 - 入口是集团条目上的“打开集团逐帧核对”，在独立的集团窗口里完成，不需要另开一套流程。
 - 上方是集团自己的时间尺：原始过线图片带、芯片刻度、检测到的每个人。
@@ -616,7 +617,7 @@ CycleRace 计时 > 录像写盘 > 当前处理画面 > 线取样 > 认车 > 其�
 | --- | --- |
 | 入口/主窗口 | `review_main.py`、`review_window.py`、`launch_dialog.py` |
 | 问题清单 UI | `problem_panel.py`、`problem_items.py`、`crossing_widgets.py`、`crossing_cards.py` |
-| 集团核对 | `bunch_dialog.py`、`bunch_review.py`、`bunch_timeline.py` |
+| 集团核对 | `problem_panel.py`、`bunch_review.py`、`bunch_timeline.py` |
 | 人工判读/回放 | `passage_review.py`、`passage_evidence.py`、`race_filmstrip.py`、`video_playback.py`、`point_playback.py`、`playback_coordinator.py` |
 | 计时接入 | `passage_receiver.py`、`racetiger_source.py`、`receiver_controller.py`、`race_metadata.py`、`sync_check.py`、`chip_history.py` |
 | 录像 | `review_recorder.py`、`stream_recorder.py`、`recording_controller.py`、`video_timeline.py`、`review_buffer_journal.py`、`review_clip.py` |

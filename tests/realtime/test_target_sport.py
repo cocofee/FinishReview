@@ -22,7 +22,7 @@ from realtime.clock_sync import ClockModel
 from realtime.problem_analysis import config_from_workspace
 from realtime.problem_rules import CrossingRecord, build_video_items
 from realtime.target_crossing import check_target_tracks
-from realtime.target_sport import DEFAULT_SPORT, RUNNING, normalize_sport, policy_for
+from realtime.target_sport import DEFAULT_SPORT, normalize_sport, policy_for
 
 
 T0 = 1_789_784_000_000

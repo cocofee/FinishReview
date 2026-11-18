@@ -5,6 +5,7 @@ from dataclasses import replace
 from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 
+from realtime.problem_panel import ProblemListPanel
 from realtime.quick_review_panel import QuickReviewPanel
 from tests.realtime.test_quick_review_panel import (  # noqa: F401
     FRAME, count_on_picture, panel, qapp, row, three_laps, wave_panel,
@@ -14,7 +15,7 @@ from tests.realtime.test_quick_review_panel import (  # noqa: F401
 def test_finish_line_menu_and_missing_line_button_use_same_entry(panel, monkeypatch):
     calls = []
     # Both paths must emit the existing preparation signal and open the same editor.
-    monkeypatch.setattr(type(panel).__mro__[1], "_configure_sampling", lambda self: calls.append(self))
+    monkeypatch.setattr(ProblemListPanel, "_configure_sampling", lambda self: calls.append(self))
     action = next(action for action in panel.more_button.menu().actions() if action.text() == "终点线 / 模型")
     panel.set_finish_line_status(True)
     assert panel.finish_line_button.isHidden()

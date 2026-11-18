@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 from copy import deepcopy
 from pathlib import Path
 
 from .target_sport import normalize_sport
+from .atomic_file import atomic_write_bytes
 
 
 CONFIG_PATH = Path("finish_problems/analysis_config.json")
@@ -205,11 +205,6 @@ class AnalysisSettingsStore:
         if self.original is not None:
             backup = self.path.with_name(self.path.name + ".bak")
             backup.write_bytes(self.original)
-        temporary = self.path.with_suffix(".tmp")
-        with temporary.open("wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, self.path)
+        atomic_write_bytes(self.path, data)
         self.original, self.payload = data, payload
         return profile

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import hashlib
 import fnmatch
 import json
@@ -39,6 +40,11 @@ from .video_timeline import (
     VideoTimelineStore,
     probe_video_duration_ms,
 )
+from .failure_log import warn_handled_failure
+from .atomic_file import atomic_open, atomic_write_bytes
+
+
+logger = logging.getLogger("FinishReview.ReviewRecorder")
 
 
 DEFAULT_ARCHIVE_SEGMENT_SECONDS = 300
@@ -508,13 +514,7 @@ class FfmpegReviewRecorder:
             "session_started_at_ms": session.session_started_at_ms,
             "archive_pattern": session.archive_pattern.name,
         }
-        temporary_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-        with temporary_path.open("wb") as output:
-            output.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-            output.write(b"\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, manifest_path)
+        atomic_write_bytes(manifest_path, json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
 
     @property
     def is_running(self) -> bool:
@@ -1046,7 +1046,15 @@ class ReviewRingBuffer:
                     trash_path.unlink(missing_ok=True)
                 else:
                     os.replace(trash_path, original_path)
-            except OSError:
+            except OSError as error:
+                warn_handled_failure(
+                    logger,
+                    f"cleanup-recovery:{trash_path}",
+                    "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                    original_path,
+                    trash_path,
+                    error,
+                )
                 continue
 
     @staticmethod
@@ -1282,14 +1290,10 @@ class ReviewRingBuffer:
         path = self.playlist_path.with_suffix(".clock.json")
         if path.exists():
             return
-        temporary = path.with_suffix(".json.tmp")
         payload = {"playlist_stem": self.playlist_path.stem,
                    "media_started_at_ms": int(started_at_ms)}
-        with temporary.open("w", encoding="utf-8") as output:
+        with atomic_open(path, "w", encoding="utf-8") as output:
             json.dump(payload, output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
 
     def retain_filmstrip_segment(self, segment: RecordingSegment,
                                  store: VideoTimelineStore, *, end_reason="retained_filmstrip_segment") -> RecordingSegment:
@@ -1508,7 +1512,15 @@ class ReviewRingBuffer:
                         self._cleanup_aborted_record(transaction_id),
                         already_locked=True,
                     )
-            except OSError:
+            except OSError as error:
+                warn_handled_failure(
+                    logger,
+                    f"cleanup-recovery:{trash_path}",
+                    "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                    original_path,
+                    trash_path,
+                    error,
+                )
                 continue
             self._sync_pin_journal_locked()
 
@@ -1532,7 +1544,15 @@ class ReviewRingBuffer:
             try:
                 if not path.exists():
                     os.replace(trash_path, path)
-            except OSError:
+            except OSError as error:
+                warn_handled_failure(
+                    logger,
+                    f"cleanup-recovery:{trash_path}",
+                    "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                    path,
+                    trash_path,
+                    error,
+                )
                 continue
             self._cleanup_pending_segments.pop(segment_id, None)
             self._cleanup_pending_paths.pop(segment_id, None)
@@ -1765,7 +1785,15 @@ class ReviewRingBuffer:
                 try:
                     if not path.exists():
                         os.replace(trash_path, path)
-                except OSError:
+                except OSError as error:
+                    warn_handled_failure(
+                        logger,
+                        f"cleanup-recovery:{trash_path}",
+                        "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                        path,
+                        trash_path,
+                        error,
+                    )
                     continue
                 segment = self._cleanup_pending_segments.pop(segment_id, None)
                 self._cleanup_pending_paths.pop(segment_id, None)
@@ -1849,7 +1877,15 @@ class ReviewRingBuffer:
                         try:
                             if not path.exists():
                                 os.replace(trash_path, path)
-                        except OSError:
+                        except OSError as error:
+                            warn_handled_failure(
+                                logger,
+                                f"cleanup-recovery:{trash_path}",
+                                "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                                path,
+                                trash_path,
+                                error,
+                            )
                             continue
                         self._append_pin_record(
                             self._cleanup_aborted_record(transaction_id),
@@ -1868,7 +1904,15 @@ class ReviewRingBuffer:
                         try:
                             if not path.exists():
                                 os.replace(trash_path, path)
-                        except OSError:
+                        except OSError as error:
+                            warn_handled_failure(
+                                logger,
+                                f"cleanup-recovery:{trash_path}",
+                                "Recording cleanup recovery failed for %s (moved-aside copy %s): %r",
+                                path,
+                                trash_path,
+                                error,
+                            )
                             continue
                         self._append_pin_record(
                             self._cleanup_aborted_record(transaction_id),
@@ -2181,12 +2225,7 @@ class PassageReviewTimelinePublisher:
                 return
         except FileNotFoundError:
             pass
-        temporary_path = path.with_suffix(path.suffix + ".tmp")
-        with temporary_path.open("wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, path)
+        atomic_write_bytes(path, payload)
 
     @staticmethod
     def _segments_for_preview(

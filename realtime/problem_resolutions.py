@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -38,6 +37,7 @@ from .problem_items import (
     KIND_TITLES,
     ProblemItem,
 )
+from .atomic_file import atomic_open
 
 
 SCHEMA_VERSION = 1
@@ -403,12 +403,10 @@ def export_lists(
     counts = {}
     for name, header, rows in tables:
         path = output_dir / name
-        temporary = path.with_name(path.name + ".tmp")
-        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+        with atomic_open(path, "w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(header)
             writer.writerows(rows)
-        os.replace(temporary, path)
         counts[name] = len(rows)
     return counts
 

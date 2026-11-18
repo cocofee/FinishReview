@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import json
 import math
 import os
@@ -20,6 +21,10 @@ from .time_domain import (
     MediaPositionMs,
     WallClockMs,
 )
+from .failure_log import warn_handled_failure
+
+
+logger = logging.getLogger("FinishReview.VideoTimeline")
 
 
 SCHEMA_VERSION = 1
@@ -237,7 +242,14 @@ def probe_video_duration_ms(video_path: str | Path, *, cancelled=lambda: False) 
             return None
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
-    except Exception:
+    except Exception as error:
+        warn_handled_failure(
+            logger,
+            f"probe:{path}",
+            "Could not read video duration for %s: %r",
+            path,
+            error,
+        )
         return None
     finally:
         if capture is not None:

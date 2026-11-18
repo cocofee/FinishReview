@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
 from .thread_lifecycle import retire_qthread, track_qthread
 from .time_domain import ClockOffsetMs, MediaPositionMs
 from .decode_resources import DECODE_RESOURCES, PREFETCH, ImageCache
+from .failure_log import warn_handled_failure
 
 logger = logging.getLogger("FinishReview.Playback")
 
@@ -1098,6 +1099,12 @@ class VideoPlaybackWorker(QThread):
                     self._condition.notify_all()
                 decoded.clear()
         except Exception:
+            warn_handled_failure(
+                logger,
+                "reverse-prefetch",
+                "Reverse prefetch failed and is disabled for this video",
+                exc_info=True,
+            )
             with self._condition:
                 self._reverse_prefetch_active = None
                 self._reverse_prefetch_task = None

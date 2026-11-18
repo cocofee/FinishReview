@@ -16,8 +16,9 @@ from .review_recorder import (
     PassageReviewWindow,
     ReviewRingBuffer,
 )
-from .stream_recorder import RecordingError
+from .stream_recorder import RecordingError, sanitize_recording_message
 from .video_timeline import VideoTimelineStore
+from .failure_log import warn_handled_failure
 
 
 logger = logging.getLogger("FinishReview")
@@ -488,7 +489,16 @@ class RecordingSessionController:
     ) -> bool:
         try:
             return bool(recorder.is_running)
-        except Exception:  # noqa: BLE001 - callers choose the conservative default.
+        except Exception as error:  # noqa: BLE001 - callers choose the conservative default.
+            camera_index = getattr(recorder, "camera_index", "?")
+            warn_handled_failure(
+                logger,
+                f"recorder-state-{camera_index}",
+                "Camera %s recorder state unknown; assuming running=%s: %s",
+                camera_index,
+                bool(uncertain),
+                sanitize_recording_message(error),
+            )
             return bool(uncertain)
 
     def _reset_sources_from_state(self) -> None:

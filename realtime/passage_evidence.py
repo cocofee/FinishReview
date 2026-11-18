@@ -365,6 +365,8 @@ class VideoClockCalibrationStore:
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._latest: dict[tuple[int, str], VideoClockCalibration] = {}
+        # Goes up with every calibration saved, so lookups built on them know to start again.
+        self.revision = 0
         self._recovered_incomplete_tail = False
         self._recover_incomplete_tail = bool(recover_incomplete_tail)
         self._load_existing()
@@ -462,6 +464,7 @@ class VideoClockCalibrationStore:
                 f"failed to append video clock calibration journal: {self.journal_path}"
             ) from error
         self._latest[(calibration.camera_index, calibration.session_key)] = calibration
+        self.revision += 1
 
     def record(
         self,

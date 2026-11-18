@@ -2,7 +2,6 @@ import json
 import os
 import time
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 
 import cv2

@@ -8,6 +8,7 @@ on low-resource field computers.
 
 from __future__ import annotations
 
+import logging
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 import os
@@ -20,6 +21,11 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 import numpy as np
 
 from .finish_line import FinishLine
+from .failure_log import warn_handled_failure
+from .atomic_file import atomic_write_text
+
+
+logger = logging.getLogger("FinishReview.VideoPassageDetector")
 
 
 # Python's subprocess module does not expose this Windows creation flag on
@@ -1066,7 +1072,12 @@ class LiveReviewBatchScanWorker:
             try:
                 callback(value)
             except Exception:  # noqa: BLE001 - progress must not stop scanning.
-                pass
+                warn_handled_failure(
+                    logger,
+                    "progress-callback",
+                    "Scan progress callback failed; scanning continues",
+                    exc_info=True,
+                )
 
     def _segments_are_contiguous(self, segments: Sequence[object]) -> bool:
         previous_end: int | None = None
@@ -1134,9 +1145,7 @@ class LiveReviewBatchScanWorker:
             lines.append(
                 f"duration {max(1, int(getattr(segment, 'ended_at_ms') - getattr(segment, 'started_at_ms'))) / 1000.0:.6f}"
             )
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        atomic_write_text(path, "\n".join(lines) + "\n", encoding="utf-8", durable=False)
         return path
 
     def _ready_batch(self, segments: Sequence[object]) -> tuple[ReviewBatchRange, ...]:

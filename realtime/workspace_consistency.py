@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
@@ -20,6 +18,7 @@ from .passage_evidence import (
 from .passage_receiver import PassageEventStore
 from .review_clip import PassageReviewBindingStore
 from .video_timeline import VideoTimelineStore
+from .atomic_file import atomic_open
 
 
 PROJECTION_SCHEMA_VERSION = 1
@@ -388,28 +387,14 @@ class WorkspaceConsistencyService:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=f".{target.name}.",
-                suffix=".tmp",
-                dir=target.parent,
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                temporary.write(data)
-                temporary.flush()
-                os.fsync(temporary.fileno())
+        with atomic_open(target, "wb") as temporary:
+            temporary.write(data)
+            # Publish only if no journal changed while the projection was built.
             if (
                 expected_sources is not None
                 and self._source_fingerprints() != expected_sources
             ):
                 raise _WorkspaceSourcesChanged
-            os.replace(temporary_path, target)
-        finally:
-            if temporary_path is not None and temporary_path.exists():
-                temporary_path.unlink()
         return target
 
     @staticmethod
