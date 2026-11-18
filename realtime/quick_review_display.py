@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import QLabel, QMenu
 from .arrival_review import candidate_binding
 from .bunch_review import is_excluded
 from .chip_history import format_chip_time
-from .crossing_time import manual_clock_offsets, workspace_clocks
+from .crossing_time import manual_calibrations, workspace_clocks
 from .race_strip import AUTO_LABELLED
 from .quick_review_common import (
     AUTO_GO_ON,
@@ -607,37 +607,87 @@ class QuickReviewDisplayPart(UiPart):
         self._host.status_widget.setVisible(any(label.text() for label in labels))
 
     def refresh_calibration_state(self):
-        """Red 先校时 until the latest recording has a clock; 已校时 after (still clickable to redo).
+        """Always say whether the current recording is calibrated, from whom and by how much.
 
+        11-18 "目前我不知道是否校时了": red 未校时 until the latest recording
+        has a clock (the next left click on the person at the line then
+        calibrates from that person's chip); green 已校时 with the bib and the
+        delay after.  Clicking it arms 重新校时 for the next picture click.
         The latest strip piece is the current recording: an earlier, short
         session left uncalibrated only keeps its grey on the strip.  Without a
         strip yet, any saved first-rider offset or fitted clock counts.
         """
         pieces = self._host.race_strip.view.pieces
-        if pieces:
+        workspace = self._host.workspace_dir
+        camera, offset = None, None
+        viewed = getattr(self._host, "_viewed_clock", None)
+        if viewed is not None:
+            camera, aligned, shown_offset = viewed
+            needed, offset = not aligned, (shown_offset if aligned else None)
+        elif pieces:
             latest = max(pieces, key=lambda piece: (piece.start_ms, piece.archive))
             needed = not latest.aligned
-            offset = latest.offset_ms if latest.aligned else None
+            camera, offset = latest.camera, (latest.offset_ms if latest.aligned else None)
         else:
-            workspace = self._host.workspace_dir
-            needed = workspace is None or not (manual_clock_offsets(workspace) or workspace_clocks(workspace))
-            offset = None
-        if needed == self._host._calibration_needed and offset == getattr(self._host, "_calibration_offset", None):
+            saved = manual_calibrations(workspace) if workspace is not None else {}
+            needed = workspace is None or not (saved or workspace_clocks(workspace))
+            if saved:
+                newest = max(saved.values(), key=lambda click: click.calibrated_at_ms)
+                offset = newest.offset_ms
+                camera = next(key[0] for key, click in saved.items() if click is newest)
+        bib = ""
+        if offset is not None and workspace is not None:
+            clicks = [saved for (saved_camera, _session), saved in manual_calibrations(workspace).items()
+                      if saved_camera == camera and abs(saved.offset_ms - offset) <= 1]
+            bib = max(clicks, key=lambda saved: saved.calibrated_at_ms).bib if clicks else ""
+        armed = bool(getattr(self._host, "_recalibrate_armed", False))
+        # Compared at the 0.1 s shown: a fitted clock's drift must not restyle it every frame.
+        state = (needed, None if offset is None else round(offset / 100), bib, armed)
+        if state == getattr(self._host, "_calibration_state", None):
             return
+        self._host._calibration_state = state
         self._host._calibration_needed, self._host._calibration_offset = needed, offset
-        steps = ("每次开始录像后第一步：在左表选一条芯片记录，把画面停在这位选手压线的那一帧，"
-                 "点这里并确认是哪位选手。不改芯片时间，只让芯片标记对上画面。")
-        if needed:
-            self._host.calibrate_button.setText("先校时")
-            self._host.calibrate_button.setStyleSheet(
-                "QPushButton{color:white; background:#c2410c; font-weight:700; padding:2px 10px;"
+        button = self._host.calibrate_button
+        how = ("左键点下一位压线的人，就按他的芯片时间校时（芯片时间不变，只让画面对上芯片）。"
+               "\n也可在「更多」里按列表选人校时。")
+        if armed:
+            button.setText("重新校时：点压线的人")
+            button.setStyleSheet(
+                "QPushButton{color:white; background:#b45309; font-weight:700; padding:2px 8px;"
+                " border:1px solid #92400e; border-radius:3px;}")
+            button.setToolTip("下一次左键点人会重新校时。再点这里或按 Esc 取消。\n" + how)
+        elif needed:
+            button.setText("未校时：点下一位压线的人")
+            button.setStyleSheet(
+                "QPushButton{color:white; background:#c2410c; font-weight:700; padding:2px 8px;"
                 " border:1px solid #9a3412; border-radius:3px;}")
-            self._host.calibrate_button.setToolTip("本次录像还没校时：芯片标记和画面可能差几秒。\n" + steps)
+            button.setToolTip("本次录像还没校时：芯片标记和画面可能差几秒。\n" + how)
         else:
-            self._host.calibrate_button.setText("已校时")
-            self._host.calibrate_button.setStyleSheet("color:#17675b; font-weight:600;")
-            detail = f"当前录像比芯片晚 {offset / 1000:+.1f} 秒，已扣除。" if offset is not None else "本次录像已校时。"
-            self._host.calibrate_button.setToolTip(detail + "\n需要重校时：" + steps)
+            words = ["已校时"]
+            if bib:
+                words.append(f"{bib} 号")
+            if offset is not None:
+                words.append(f"录像{'晚' if offset >= 0 else '早'} {abs(offset) / 1000:.1f} 秒")
+            button.setText(" · ".join(words))
+            button.setStyleSheet("color:#17675b; font-weight:600;")
+            button.setToolTip("当前录像已校时，时间已扣除。不对就点这里，再左键点压线的人重新校时。\n" + how)
+
+    def toggle_recalibration(self):
+        """The calibrate button arms (or disarms) 重新校时 for the next picture click."""
+
+        self._host._recalibrate_armed = not getattr(self._host, "_recalibrate_armed", False)
+        self._host.refresh_calibration_state()
+        self._host.hint.setText(
+            "重新校时：把画面停在下一位压线的那一帧，左键点他。再点按钮或按 Esc 取消。"
+            if self._host._recalibrate_armed else "已取消重新校时，校时不变。")
+
+    def calibration_done(self):
+        """A click just calibrated: disarm 重新校时 and show the new state at once."""
+
+        self._host._recalibrate_armed = False
+        self._host._quick_render_signature = None
+        self._host.race_strip.load(self._host.workspace_dir, self._host.race_strip.camera)
+        self._host.refresh_calibration_state()
 
     def set_finish_line_status(self, configured):
         self._host.finish_line_status.setText("" if configured else "未设终点线")

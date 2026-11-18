@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import os
 import re
+import time
 from typing import Optional
 
 from .clock_sync import CLOCK_MODEL_FILENAME, MANUAL_ANCHOR_TOLERANCE_MS, ClockModelStore
@@ -16,6 +18,15 @@ from .passage_evidence_pane import PassageEvidencePane
 from .ui_parts import UiPart
 
 logger = logging.getLogger("FinishReview.Review")
+
+# Which recording a piece belongs to never changes for a .ts/.mkv path and only
+# with the playlist's contents for a .m3u8: worked out once, not on every
+# refresh (11-17: twice a second for ~590 pieces held playback 80-190 ms).
+_SESSION_KEY_CACHE: dict = {}
+_SESSION_KEY_CACHE_LIMIT = 50_000
+# Old calibrations found under another name: looked up again only when a
+# calibration is saved, or after this long (their playlists can be cleaned up).
+CALIBRATION_ALIAS_CACHE_SECONDS = 30.0
 
 
 class PassageReviewClockPart(UiPart):
@@ -72,20 +83,9 @@ class PassageReviewClockPart(UiPart):
 
     def _calibrated_clock_offset(self, camera_index: int, session_key: str) -> int:
         calibration = self._host.calibration_store.get(camera_index, session_key)
-        if calibration is None:
-            # Older versions keyed HLS calibrations by the generated window name.
-            aliases = []
-            for saved in self._host.calibration_store.calibrations():
-                if saved.camera_index != camera_index:
-                    continue
-                parts = saved.session_key.split("|", 2)
-                if len(parts) != 3:
-                    continue
-                path = Path(parts[1]) / (parts[2] + ".m3u8")
-                if path.is_file() and self._host._recording_session_key_from_path(parts[0], path) == session_key:
-                    aliases.append(saved)
-            if aliases:
-                calibration = max(aliases, key=lambda saved: saved.calibrated_at_ms)
+        alias = self._host._calibration_alias(camera_index, session_key)
+        if alias is not None and (calibration is None or alias.calibrated_at_ms > calibration.calibrated_at_ms):
+            calibration = alias
         return int(
             self._host._continuous_clock_offsets.get(
                 (camera_index, session_key),
@@ -93,8 +93,70 @@ class PassageReviewClockPart(UiPart):
             )
         )
 
+    def _calibration_alias(self, camera_index: int, session_key: str):
+        """The newest calibration saved under another name of this recording, or None.
+
+        Older versions keyed HLS calibrations by the generated window name, and
+        a moved race folder (11-05) changes the folder part of the key: the
+        recording's own name (the key's last part) still identifies it.
+        """
+        store = self._host.calibration_store
+        revision = getattr(store, "revision", None)
+        now = time.monotonic()
+        state = getattr(self._host, "_calibration_alias_state", None)
+        if (state is None or state[0] is not store or state[1] != revision
+                or now - state[2] >= CALIBRATION_ALIAS_CACHE_SECONDS):
+            self._host._calibration_alias_state = (store, revision, now)
+            self._host._calibration_alias_cache = {}
+        cache = self._host._calibration_alias_cache
+        key = (int(camera_index), str(session_key))
+        if revision is not None and key in cache:
+            return cache[key]
+        aliases = []
+        stem = str(session_key).rsplit("|", 1)[-1]
+        for saved in store.calibrations():
+            if saved.camera_index != camera_index or saved.session_key == session_key:
+                continue
+            if saved.session_key.rsplit("|", 1)[-1] == stem:
+                aliases.append(saved)
+                continue
+            parts = saved.session_key.split("|", 2)
+            if len(parts) != 3:
+                continue
+            path = Path(parts[1]) / (parts[2] + ".m3u8")
+            if path.is_file() and self._host._recording_session_key_from_path(parts[0], path) == session_key:
+                aliases.append(saved)
+        calibration = max(aliases, key=lambda saved: saved.calibrated_at_ms) if aliases else None
+        if revision is not None:  # a store without a revision is looked through every time
+            cache[key] = calibration
+        return calibration
+
     @staticmethod
     def _recording_session_key_from_path(source_id: str, video_path: Path) -> str:
+        path = Path(video_path)
+        cache_key = None
+        if path.is_absolute():
+            stamp = None
+            if path.suffix.lower() == ".m3u8":
+                try:
+                    status = os.stat(path)
+                except OSError:
+                    status = None
+                stamp = None if status is None else (status.st_mtime_ns, status.st_size)
+            if stamp is not None or path.suffix.lower() != ".m3u8":
+                cache_key = (str(source_id), path, stamp)
+                cached = _SESSION_KEY_CACHE.get(cache_key)
+                if cached is not None:
+                    return cached
+        result = PassageReviewClockPart._session_key_uncached(source_id, path)
+        if cache_key is not None:
+            if len(_SESSION_KEY_CACHE) >= _SESSION_KEY_CACHE_LIMIT:
+                _SESSION_KEY_CACHE.clear()
+            _SESSION_KEY_CACHE[cache_key] = result
+        return result
+
+    @staticmethod
+    def _session_key_uncached(source_id: str, video_path: Path) -> str:
         from .runtime_paths import recording_session_path
         path = recording_session_path(Path(video_path).absolute())
         stem = _ARCHIVE_SEGMENT_SUFFIX_RE.sub("", path.stem)
@@ -124,7 +186,9 @@ class PassageReviewClockPart(UiPart):
             )
         }
         changed = False
-        for calibration in self._host.calibration_store.calibrations():
+        # Newest first: a recalibration must win over older clicks (11-18).
+        for calibration in sorted(self._host.calibration_store.calibrations(),
+                                  key=lambda saved: -int(saved.calibrated_at_ms)):
             parts = calibration.session_key.split("|", 2)
             session_key = (
                 self._host._recording_session_key_from_path(parts[0], Path(parts[1]) / parts[2])
@@ -300,7 +364,8 @@ class PassageReviewClockPart(UiPart):
             location.segment.camera_index,
             self._host._recording_session_key(location),
         )
-        if key in self._host._continuous_clock_offsets or self._host.calibration_store.get(*key) is not None:
+        if (key in self._host._continuous_clock_offsets or self._host.calibration_store.get(*key) is not None
+                or self._host._calibration_alias(*key) is not None):
             return False
         offset_ms = (
             int(location.segment.media_started_at_ms)

@@ -630,6 +630,68 @@ def test_a_lone_chip_row_is_saved_by_a_click_on_its_picture_and_never_by_a_numbe
         window.close()
 
 
+def test_one_click_on_the_rider_calibrates_an_uncalibrated_recording_and_counts_him(qapp, tmp_path):
+    """11-18 "我只需要在运动员过线那里点一下，就可以校时": no dialog, no event ids."""
+    from PyQt5.QtGui import QImage
+    from realtime.passage_evidence import VideoClockCalibrationStore
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.show()
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        target = _event(event_id="click-321", bib="21", passage_timestamp_ms=start + 1900)
+        window.passage_store.append(target)
+        panel = window.problem_panel
+        panel._live_paused = True  # calibrating must not spawn the analysis worker
+        panel.refresh()
+        panel._arrival_clicked(next(i for i, row in enumerate(panel._arrival_rows) if row.bib == "21"))
+        frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                     position_ms=2000, frame_index=50)
+        window._open_problem_frame(frame)
+        pane = window.regular_pane
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
+        qapp.processEvents()
+
+        def journal():
+            return VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl",
+                                              recover_incomplete_tail=False).calibrations()
+
+        # The button speaks of the recording in the picture.
+        assert panel.calibrate_button.text() == "未校时：点下一位压线的人"
+        window._problem_count_clicked(0.55, 0.62, pane)
+        qapp.processEvents()
+        calibration, = journal()
+        assert calibration.anchor_bib == "21" and calibration.offset_ms == 100
+        # The button says it from now on (the hint line moves on with the recording).
+        assert panel.calibrate_button.text() == "已校时 · 21 号 · 录像晚 0.1 秒"
+        saved = next(row.decision for row in panel._arrival_rows if row.bib == "21")
+        assert saved is not None  # the same click counted him
+        assert window.passage_store.get(target.event_id).timeline_timestamp_ms == target.timeline_timestamp_ms
+
+        # Calibrated: a click only counts (左键只有一个意思).
+        window._problem_count_clicked(0.56, 0.62, pane)
+        qapp.processEvents()
+        assert len(journal()) == 1
+
+        # 重新校时 arms the next click; it then recalibrates once.
+        panel.toggle_recalibration()
+        assert panel._recalibrate_armed
+        pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2300, 56)
+        window._problem_count_clicked(0.57, 0.62, pane)
+        qapp.processEvents()
+        assert [saved.offset_ms for saved in journal()] == [400]
+        assert not panel._recalibrate_armed
+        assert panel.calibrate_button.text() == "已校时 · 21 号 · 录像晚 0.4 秒"
+    finally:
+        window.close()
+
+
 def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path):
     from PyQt5.QtGui import QImage
 
@@ -982,11 +1044,14 @@ def test_the_first_rider_calibration_keeps_the_original_chip_record(qapp, tmp_pa
         assert window._seek_retained_camera_frame(location, 2000, 50, 1)
         pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), 2000, 50)
         stored = window.passage_store.get(event.event_id)
-        label = (f"{stored.bib} · "
-                 f"{datetime.fromtimestamp(stored.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]}"
-                 f" · {stored.event_id}")
-        monkeypatch.setattr(QInputDialog, "getItem", lambda *args, **kwargs: (label, True))
+        # 11-18 "这一堆，根本看不懂": the list shows the bib and the chip time only.
+        label = (f"{stored.bib} 号 · "
+                 f"{datetime.fromtimestamp(stored.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]}")
+        shown = []
+        monkeypatch.setattr(QInputDialog, "getItem",
+                            lambda _parent, _title, _text, labels, *args: shown.extend(labels) or (label, True))
         window._calibrate_crossing_frame()
+        assert shown == [label] and stored.event_id not in shown[0]
 
         journal = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl",
                                              recover_incomplete_tail=False)
@@ -1094,6 +1159,55 @@ def test_hls_windows_share_first_rider_calibration_including_legacy_key(qapp, tm
         assert window._calibrated_clock_offset(1, key) == 2525
         window._continuous_clock_offsets[(1, key)] = 2714
         assert window._calibrated_clock_offset(1, key) == 2714
+    finally:
+        window.close()
+
+
+def test_recording_and_legacy_calibration_lookups_are_remembered_until_they_change(qapp, tmp_path, monkeypatch):
+    """11-17: the filmstrip refresh worked these out for every piece twice a second
+    and held playback 80-190 ms; they are remembered, but never past a change."""
+    import realtime.passage_review_clock as clock
+    window = _window(tmp_path, workbench=True)
+    try:
+        folder = tmp_path / "review_buffer" / "camera_01"
+        folder.mkdir(parents=True)
+        first, second = "camera_01_20261018_104528_433517", "camera_01_20261018_110000_000001"
+        playlist = folder / "evidence_window.m3u8"
+        playlist.write_text(f"#EXTM3U\n{first}_review_{0:016d}.ts\n#EXT-X-ENDLIST\n", encoding="utf-8")
+        assert first in window._recording_session_key_from_path("camera_01_review", playlist)
+        # The playlist now holds another recording: it is read again.
+        playlist.write_text(f"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n{second}_review_{7:016d}.ts\n#EXT-X-ENDLIST\n",
+                            encoding="utf-8")
+        key = window._recording_session_key_from_path("camera_01_review", playlist)
+        assert second in key and first not in key
+        default = window._calibrated_clock_offset(1, key)
+        window.calibration_store.record(
+            camera_index=1, session_key=f"camera_01_review|{folder}|{playlist.stem}",
+            offset_ms=default + 3100, anchor_event_id="first", anchor_bib="901", calibrated_at_ms=1000)
+        assert window._calibrated_clock_offset(1, key) == default + 3100  # a new calibration is seen at once
+        playlist.unlink()  # the old window cleaned up: remembered for a while, then gone
+        assert window._calibrated_clock_offset(1, key) == default + 3100
+        monkeypatch.setattr(clock, "CALIBRATION_ALIAS_CACHE_SECONDS", 0.0)
+        assert window._calibrated_clock_offset(1, key) == default
+    finally:
+        window.close()
+
+
+def test_a_moved_race_folder_keeps_its_calibration_and_the_newest_click_wins(qapp, tmp_path):
+    """11-18: the 11-05 folder move left every calibration under the old folder's name."""
+    window = _window(tmp_path, workbench=True)
+    try:
+        session = "camera_01_20261104_112206_629703"
+        key = f"camera_01_review|{tmp_path / 'videos'}|{session}"
+        default = window._calibrated_clock_offset(1, key)
+        window.calibration_store.record(
+            camera_index=1, session_key=f"camera_01_review|D:\\old race\\videos|{session}",
+            offset_ms=default + 1738, anchor_event_id="e20", anchor_bib="20", calibrated_at_ms=1000)
+        assert window._calibrated_clock_offset(1, key) == default + 1738
+        window.calibration_store.record(
+            camera_index=1, session_key=key, offset_ms=default + 2699,
+            anchor_event_id="e1", anchor_bib="1", calibrated_at_ms=2000)
+        assert window._calibrated_clock_offset(1, key) == default + 2699
     finally:
         window.close()
 

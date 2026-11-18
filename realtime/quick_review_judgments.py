@@ -602,6 +602,9 @@ class QuickReviewJudgmentsPart(UiPart):
             return False
         # The picture is already as large as the workbench allows: F does nothing.
         # Esc still leaves an enlarged view, however it was entered.
+        if event.key() == Qt.Key_Escape and getattr(self._host, "_recalibrate_armed", False):
+            self._host.toggle_recalibration()
+            return True
         if event.key() == Qt.Key_Escape and self._host._big_view:
             self._host.toggle_big_view()
             return True

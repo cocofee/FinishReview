@@ -212,10 +212,13 @@ class QuickReviewPanel(
         # 校时 is the first thing done at every recording: until it is done every
         # chip mark sits seconds away from its rider (11-03: 3.2 s).  It used to
         # hide under the picture, behind 查找原录像.
-        self.calibrate_button = QPushButton("先校时", self.quick_toolbar)
-        self.calibrate_button.clicked.connect(self.calibration_requested.emit)
+        # 11-18: a left click on the person at the line calibrates; this button
+        # says whether it is done and arms 重新校时 (the list is under 更多).
+        self.calibrate_button = QPushButton("未校时：点下一位压线的人", self.quick_toolbar)
+        self.calibrate_button.clicked.connect(self.toggle_recalibration)
         bar.addWidget(self.calibrate_button)
         self._calibration_needed = None
+        self._recalibrate_armed = False
         self.row_action_buttons = {}
         for key, label in ((Qt.Key_1, "1 非运动员"), (Qt.Key_2, "2 双芯片"), (Qt.Key_3, "3 补录")):
             button = QPushButton(label, self.quick_toolbar)
@@ -240,6 +243,7 @@ class QuickReviewPanel(
         more = self.more_button = QPushButton("更多", self.quick_toolbar)
         menu = QMenu(more)
         menu.addAction("终点线 / 模型", self._configure_sampling)
+        menu.addAction("按列表选人校时…", self.calibration_requested.emit)
         self.show_excluded_action = menu.addAction("显示已排除")
         self.show_excluded_action.setCheckable(True)
         self.show_excluded_action.toggled.connect(self._set_show_excluded)
@@ -308,6 +312,7 @@ class QuickReviewPanel(
         if self._quick_ready:
             self.race_strip.load(workspace_dir)
         if Path(workspace_dir) != self.workspace_dir:
+            self._viewed_clock = None
             self._active_item = None
             self._selected_key = None
             self._last_saved_key = None
@@ -772,6 +777,12 @@ class QuickReviewPanel(
             return None
         stamp = crossing.value_ms
         self._shown_ms = stamp
+        # 11-18: the calibrate button speaks of the recording in the picture,
+        # not of the newest one in the folder (a later uncalibrated race kept
+        # it red while the one being judged was calibrated).
+        self._viewed_clock = (int(frame.get("camera_index") or 1), crossing.source != "video",
+                              int(recorder_ms) - int(stamp))
+        self.refresh_calibration_state()
         self.race_strip.set_cursor(stamp, frame.get("camera_index") or 1)
         camera = str(int(frame.get("camera_index") or 1))
         seen = self._arrival_drafts.setdefault("seen", {})

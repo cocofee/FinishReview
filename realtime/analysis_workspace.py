@@ -404,7 +404,7 @@ class AnalysisWorkspace:
                 if calibration.anchor_chip_time_ms is not None
                 else int(event.timeline_timestamp_ms)
             )
-            anchors.append(
+            anchors.append((int(calibration.calibrated_at_ms),
                 ClockAnchor(
                     camera_index=int(camera_index),
                     chip_ms=chip_ms,
@@ -415,8 +415,16 @@ class AnalysisWorkspace:
                                                   (calibration.session_key.rsplit("|", 1)[-1] + ".m3u8"))
                     if calibration.session_key.count("|") == 2 else calibration.session_key.rsplit("|", 1)[-1],
                 )
-            )
-        return tuple(anchors)
+            ))
+        # One recording, one calibration: the newest click that still stands.
+        # Older clicks on the same recording (also under a moved folder's key)
+        # were corrections the operator already overrode (11-18).
+        newest = {}
+        for calibrated_at, anchor in anchors:
+            current = newest.get(anchor.reference)
+            if current is None or calibrated_at >= current[0]:
+                newest[anchor.reference] = (calibrated_at, anchor)
+        return tuple(anchor for _calibrated_at, anchor in newest.values())
 
     def operator_anchors(self, camera_index: int, *, archive_only: bool = True) -> tuple[ClockAnchor, ...]:
         """Offsets implied by operator-confirmed frames (one per confirmation)."""

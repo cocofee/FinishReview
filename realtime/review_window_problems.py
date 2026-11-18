@@ -447,10 +447,13 @@ class FinishReviewProblemsPart(UiPart):
         """Use the operator's picture click as the bicycle cue, not a final ruling."""
 
         panel = self._host.problem_panel
+        calibrated, go_on = self._click_calibration(pane, frame)
+        if not go_on:
+            return
         row = panel._selected_arrival()
         item, refusal = panel.picture_candidate(frame)
         if refusal:
-            panel.hint.setText(refusal)
+            panel.hint.setText("；".join(part for part in (calibrated, refusal) if part))
             return
         frame = dict(frame, marker_x_normalized=float(x_normalized),
                      marker_y_normalized=float(y_normalized))
@@ -510,11 +513,10 @@ class FinishReviewProblemsPart(UiPart):
             panel._render()
         self._host._problem_count_mode_changed(True)
         self._host._problem_marks_changed(())
-        panel.hint.setText(
-            panel.picture_mark_hint()
-            or (f"已标记 {row.bib} 的压线位置。"
-                if selected_key else "已圈出压线位置；请在左边选对应的芯片记录。")
-        )
+        counted = (panel.picture_mark_hint()
+                   or (f"已标记 {row.bib} 的压线位置。"
+                       if selected_key else "已圈出压线位置；请在左边选对应的芯片记录。"))
+        panel.hint.setText(f"{calibrated}。{counted}" if calibrated else counted)
 
     def _problem_marks_changed(self, _marks) -> None:
         """Redraw the counted people on the frame that is being judged."""
@@ -711,13 +713,9 @@ class FinishReviewProblemsPart(UiPart):
         self._host._open_problem_frame({"camera_index": context.camera, "segment_id": segment.segment.segment_id,
                                   "video_path": str(segment.path), "position_ms": position})
 
-    def _calibrate_crossing_frame(self):
-        pane = self._host._active_playback_pane()
-        frame = self._host._frame_for_problem_count(pane)
-        if frame is None:
-            self._host.problem_panel.hint.setText("先在左表选这位选手的芯片记录，把画面停在他压线的那一帧，再点「先校时」。")
-            self._host.recording_rail_button.setChecked(True)
-            return
+    def _calibration_events(self):
+        """(events that can anchor a calibration, by chip time; or a reason there are none)."""
+
         from .analysis_workspace import AnalysisWorkspace
         metadata = self._host._current_metadata()
         try:
@@ -725,8 +723,7 @@ class FinishReviewProblemsPart(UiPart):
                                           race_id=metadata.race_id if metadata else "",
                                           stage_id=metadata.stage_id if metadata else "")
         except (OSError, ValueError) as error:
-            self._host.problem_panel.hint.setText(f"等待本场有效芯片记录：{error}")
-            return
+            return [], f"等待本场有效芯片记录：{error}"
         eligible = {read.event_id for read in workspace.reads
                     if read.active_now and not read.excluded and not read.manual_entry
                     and read.bib and read.chip_ms == read.latest_chip_ms}
@@ -734,25 +731,19 @@ class FinishReviewProblemsPart(UiPart):
                   and event.is_active and event.bib and event.timeline_timestamp_ms > 0
                   and (event.race_id, event.stage_id) == (workspace.race_id, workspace.stage_id)]
         events.sort(key=lambda event: event.timeline_timestamp_ms)
-        if not events:
-            self._host.problem_panel.hint.setText("等待本场有效芯片记录；画面可以先补记过线。")
-            return
-        labels = [f"{event.bib} · {datetime.fromtimestamp(event.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]} · {event.event_id}"
-                  for event in events]
-        selected = self._host.problem_panel._selected_arrival()
-        default = next((i for i, candidate in enumerate(events)
-                        if selected and selected.event and candidate.event_id == selected.event.event_id), 0)
-        label, ok = QInputDialog.getItem(self._host, "以当前帧校时", "当前画面压线的是哪位选手？", labels, default, False)
-        if not ok or label not in labels:
-            return
-        event = events[labels.index(label)]
+        return events, "" if events else "等待本场有效芯片记录；画面可以先补记过线。"
+
+    def _save_calibration(self, pane, frame, event):
+        """Calibrate the shown recording from ``event``'s chip; the offset, or None (hint says why)."""
+
         current = self._host.passage_store.get(event.event_id)
         if current != event or not current.is_active:
-            self._host.problem_panel.hint.setText("所选芯片记录已变化，请重新选择压线选手校时。")
-            return
+            self._host.problem_panel.hint.setText("这条芯片记录已变化，请重新选择压线选手校时。")
+            return None
         try:
             location = self._host._persist_filmstrip_location(pane.location)
-            frame["segment_id"], frame["video_path"] = location.segment.segment_id, str(location.video_path)
+            pane._location = location
+            frame = dict(frame, segment_id=location.segment.segment_id, video_path=str(location.video_path))
             session_key = self._host._recording_session_key(location)
             offset = frame["recorder_ms"] - int(event.timeline_timestamp_ms)
             self._host.calibration_store.record(camera_index=pane.camera_index, session_key=session_key,
@@ -767,12 +758,79 @@ class FinishReviewProblemsPart(UiPart):
             self._host._lookup_cache.clear()
         except (OSError, ValueError, RuntimeError) as error:
             self._host.problem_panel.hint.setText(f"校时未保存：{error}")
+            return None
+        panel = self._host.problem_panel
+        panel._viewed_clock = (int(pane.camera_index), True, int(offset))  # green at once, on this recording
+        panel._last_live_signature = None
+        panel._next_analysis = 0
+        if not panel._live_paused and panel._process is None:
+            panel._start_analysis()
+        panel.calibration_done()
+        return offset
+
+    @staticmethod
+    def _calibration_words(event, offset):
+        late = "晚" if offset >= 0 else "早"
+        return (f"已按 {event.bib} 号校时：录像比芯片{late} {abs(offset) / 1000:.1f} 秒，"
+                "表格和空格停点已按新校时；不对就点「已校时」按钮再点一次")
+
+    def _click_calibration(self, pane, frame):
+        """Calibrate on this click when the recording has no clock yet or 重新校时 is armed.
+
+        11-18 "我只需要在运动员过线那里点一下，就可以校时": the person clicked
+        is the one due next (下一位 X 号 on a wave, else the selected row).
+        Returns (calibration words or "", go on counting).
+        """
+        panel = self._host.problem_panel
+        armed = bool(getattr(panel, "_recalibrate_armed", False))
+        if not armed:
+            from .crossing_time import recorder_crossing_time
+            shown = recorder_crossing_time(frame["recorder_ms"], frame, self._host.output_dir)
+            if shown is None or shown.source != "video":
+                return "", True
+        plan = panel._run_plan()
+        row = plan.unmatched[0] if plan is not None and plan.unmatched else panel._selected_arrival()
+        target = getattr(row, "event", None)
+        events, reason = self._calibration_events()
+        event = next((event for event in events if target is not None and event.event_id == target.event_id), None)
+        if event is None:
+            if armed:
+                panel.hint.setText(reason or "重新校时：先在左表选这位压线选手的芯片记录，再左键点他。")
+                return "", False
+            return "", True   # nothing to calibrate from: count as before, the button stays red
+        offset = self._save_calibration(pane, frame, event)
+        if offset is None:
+            return "", not armed
+        return self._calibration_words(event, offset), True
+
+    def _calibrate_crossing_frame(self):
+        """更多 → 按列表选人校时: pick the person on the shown frame from a short list."""
+
+        pane = self._host._active_playback_pane()
+        frame = self._host._frame_for_problem_count(pane)
+        if frame is None:
+            self._host.problem_panel.hint.setText("先把画面停在这位选手压线的那一帧，再按列表选人校时。")
+            self._host.recording_rail_button.setChecked(True)
             return
-        self._host.problem_panel._last_live_signature = None
-        self._host.problem_panel._next_analysis = 0
-        if not self._host.problem_panel._live_paused and self._host.problem_panel._process is None:
-            self._host.problem_panel._start_analysis()
-        self._host.problem_panel.hint.setText(f"已按 {event.bib} 建立初始校时 {offset:+d} ms；后续独立过线继续检查漂移。")
+        events, reason = self._calibration_events()
+        if not events:
+            self._host.problem_panel.hint.setText(reason)
+            return
+        # 11-18 "这一堆，根本看不懂": the bib and the chip time are all one needs.
+        labels = [f"{event.bib} 号 · "
+                  f"{datetime.fromtimestamp(event.timeline_timestamp_ms / 1000).strftime('%H:%M:%S.%f')[:-3]}"
+                  for event in events]
+        selected = self._host.problem_panel._selected_arrival()
+        default = next((i for i, candidate in enumerate(events)
+                        if selected and selected.event and candidate.event_id == selected.event.event_id), 0)
+        label, ok = QInputDialog.getItem(self._host, "按列表选人校时", "当前画面压线的是哪位选手？",
+                                         labels, default, False)
+        if not ok or label not in labels:
+            return
+        event = events[labels.index(label)]
+        offset = self._save_calibration(pane, frame, event)
+        if offset is not None:
+            self._host.problem_panel.hint.setText(self._calibration_words(event, offset) + "。")
 
     def _set_recording_rail_visible(self, visible):
         workbench = getattr(self._host, "_problem_workbench_active", False)
