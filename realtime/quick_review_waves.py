@@ -215,7 +215,11 @@ class QuickReviewWavesPart(UiPart):
         """The picture this wave's people are counted on, if one is still usable."""
         mapping = self._host._wave_candidates()
         wanted = [mapping[row.event.event_id] for row in wave or () if mapping.get(row.event.event_id)]
+        wave_index = self._host._wave_of.get(wave[0].key) if wave else None
         for item_id in dict.fromkeys(wanted):
+            # 一条波次证据只能供其所属波次使用，不能在波次拆分后被后一圈借用。
+            if wave_index is None or self._host._candidate_wave.get(item_id) != wave_index:
+                continue
             item = next((item for item in self._host.items if item.item_id == item_id), None)
             if (item is not None and item.kind == KIND_MANUAL_REVIEW and item.status != STATUS_WAITING
                     and not item.evidence.get("superseded") and not item.evidence.get("configuration_stale")):

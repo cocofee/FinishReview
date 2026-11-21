@@ -79,6 +79,23 @@ def row_moment(row):
     return int(row.event.timeline_timestamp_ms) if row.event is not None else row.time_ms
 
 
+def arrival_order(row, unverified=False):
+    # 未校时的待核画面单独排在末尾，不能拿录像时钟与芯片时钟直接比较。
+    moment = row_moment(row)
+    section = (2 if moment is None or (unverified and row.time_source not in ("aligned", "video"))
+               else int(unverified and row.time_source == "video"))
+    if row.event is not None:
+        return section, moment, 0, row.event.sequence, row.key
+    return section, moment if moment is not None else 0, 2 if row.mark is not None else 1, 0, row.key
+
+
+def wave_contains_time(wave, stamp):
+    if not wave or stamp is None:
+        return False
+    times = [int(row.event.timeline_timestamp_ms) for row in wave]
+    return min(times) - WAVE_GAP_MS / 2 <= stamp <= max(times) + WAVE_GAP_MS / 2
+
+
 # Within this of the frame shown a clicked person is the one on screen (one
 # frame at 25 fps is 40 ms): Space goes on to the next one, not to them.
 SAME_FRAME_MS = 20
@@ -146,6 +163,7 @@ class ArrivalRow:
     fragments: tuple = ()  # later pieces of the same passage shown on this row (rows of their own before)
     entered: dict | None = None  # the bib read for a 疑似漏读 row (see RECORD_BIB)
     carrier: str = ""  # a 双芯片 row: the bib of the rider who carries this chip too
+    time_source: str = ""  # 待核画面用来区分校时后的画面时间与录像原时刻
 
 
 @dataclass
