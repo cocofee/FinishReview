@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import QLabel, QMenu
 from .arrival_review import candidate_binding
 from .bunch_review import is_excluded
 from .chip_history import format_chip_time
-from .crossing_time import manual_calibrations, workspace_clocks
+from .crossing_time import manual_calibrations, recorder_crossing_time, workspace_clocks
 from .race_strip import AUTO_LABELLED
 from .quick_review_common import (
     AUTO_GO_ON,
@@ -22,6 +22,7 @@ from .quick_review_common import (
     PASSAGE_VIEW_MARGIN_MS,
     ROW_KEYS,
     row_moment,
+    wave_contains_time,
 )
 from .ui_parts import UiPart
 
@@ -99,7 +100,7 @@ class QuickReviewDisplayPart(UiPart):
                      tuple(sorted((index, reasons) for index, reasons in self._host._auto_reasons.items())),
                      tuple(sorted((key, person.key) for key, person in self._host._auto_labels.items())),
                      tuple((row.key, row.bib, row.time_ms, row.reference, self._host._row_state(row), self._host._row_category(row),
-                            candidate_binding(row.item), self._host._wave_of.get(row.key), group, row.carrier,
+                            candidate_binding(row.item), self._host._wave_of.get(row.key), group, row.carrier, row.time_source,
                             row.event.lap if row.event is not None else None,
                             tuple(piece.key for piece in row.fragments))
                            for row, group in zip(rows, groups)))
@@ -133,7 +134,12 @@ class QuickReviewDisplayPart(UiPart):
             # A chip row shows its chip time, so the column reads in the table's
             # order; the frame its rider was clicked on is in the tooltip.
             moment = row_moment(row)
-            time = format_chip_time(moment) if moment is not None and state != "画面待核" else "—"
+            time = format_chip_time(moment) if moment is not None else "—"
+            if state == "画面待核":
+                if moment is not None and row.time_source in ("aligned", "video"):
+                    time += " 画面" if row.time_source == "aligned" else " 未校时"
+                else:
+                    time = "时间未知"
             category = self._host._row_category(row)
             number = ""
             if row.event is not None:
@@ -232,7 +238,10 @@ class QuickReviewDisplayPart(UiPart):
                                + (f"录像原时刻：{format_chip_time(row.recorder_ms)}\n"
                                   if row.recorder_ms is not None else "") + tooltip)
                 if state == "画面待核":
-                    tooltip = ("仅检测到画面变化，尚未确认目标穿越；不计到达，不生成过线时间。\n"
+                    basis = {"aligned": "画面时间已校时，按时间插入到达表。",
+                             "video": "录像原时刻未校时，单独排在表尾。"}.get(
+                                 row.time_source, "没有可用的画面时间，单独排在表尾。")
+                    tooltip = ("仅检测到画面变化，尚未确认目标穿越；不计到达。\n" + basis + "\n"
                                + (f"录像变化时刻：{format_chip_time(row.recorder_ms)}\n"
                                   if row.recorder_ms is not None else "")
                                + "点击回看；确实有人时在原帧点人，疑点和原始证据均保留。")
@@ -300,8 +309,10 @@ class QuickReviewDisplayPart(UiPart):
                 fresh = next((item for item in self._host.items if item.item_id == self._host._active_item.item_id), None)
             if fresh is None:
                 self._host._active_item = None
-                if first_visible is not None:
-                    self._host._open_row(first_visible)
+                # 证据刷新不应把仍存在的过线选中项换成表首或上一圈。
+                target = selected if selected >= 0 and not self._host.table.isRowHidden(selected) else first_visible
+                if target is not None:
+                    self._host._open_row(target, keep=False)
                 else:
                     self._host.current_changed.emit(None)
             else:
@@ -321,7 +332,7 @@ class QuickReviewDisplayPart(UiPart):
         self._host._shown_id = row.item.item_id
         self._host.table.setCurrentCell(index, 0)
         self._host._sync_timeline()
-        self._host._present(row.item, self._host._landing(row, keep))
+        self._host._present(row.item, self._host._landing(row, keep), chip_row=row.event is not None)
         self._host._sync_arrival_confirmation()
         self._host.marks_changed.emit(tuple(self._host.current_marks()))
 
@@ -334,16 +345,24 @@ class QuickReviewDisplayPart(UiPart):
         if key is not None and row is not None and row.key == key:
             landing = self._host._landing(row, keep=False)
             if isinstance(landing, dict):
-                self._host.jump_requested.emit(landing)
+                self._host._jump_to_row(landing, chip_row=True)
 
-    def _present(self, item, landing):
+    def _jump_to_row(self, landing, *, chip_row):
+        previous = self._host.opening_chip_row
+        self._host.opening_chip_row = chip_row
+        try:
+            self._host.jump_requested.emit(landing)
+        finally:
+            self._host.opening_chip_row = previous
+
+    def _present(self, item, landing, *, chip_row=False):
         self._host.holds_picture = landing is not None
         try:
             self._host.current_changed.emit(item)
         finally:
             self._host.holds_picture = False
         if isinstance(landing, dict):
-            self._host.jump_requested.emit(landing)
+            self._host._jump_to_row(landing, chip_row=chip_row)
 
     def open_wave_start(self):
         """回到团首: the selected row's wave, from its first rider at the line."""
@@ -386,6 +405,15 @@ class QuickReviewDisplayPart(UiPart):
         if index is not None:
             self._host._arrival_clicked(index)
 
+    def _picture_time(self):
+        frame = self._host._frame_provider()
+        if frame is None:
+            return None
+        if self._host._shown_ms is not None:
+            return self._host._shown_ms
+        crossing = recorder_crossing_time(frame.get("recorder_ms"), frame, self._host.workspace_dir)
+        return crossing.value_ms if crossing is not None else None
+
     def _arrival_clicked(self, index, _column=0):
         if not 0 <= index < len(self._host._arrival_rows):
             return
@@ -400,18 +428,20 @@ class QuickReviewDisplayPart(UiPart):
             self._host._editing_mark = next((i for i, mark in enumerate(self._host.current_marks())
                                        if self._host._decision_holds(row.decision, mark)), -1)
             return
-        candidate = self._host._wave_candidate(self._host._row_wave(row))
+        wave = self._host._row_wave(row)
+        candidate = self._host._wave_candidate(wave)
         if candidate is not None:
             # A wave is judged as a whole on its one picture.
             self._host._selected_key = row.key
             self._host.table.setCurrentCell(index, 0)
             landing = self._host._landing(row)
-            if self._host._active_item is None or self._host._active_item.item_id != candidate.item_id:
+            if (self._host._active_item is None or self._host._active_item.item_id != candidate.item_id
+                    or (landing is None and not wave_contains_time(wave, self._host._picture_time()))):
                 self._host._active_item = candidate
                 self._host._shown_id = candidate.item_id
-                self._host._present(candidate, landing)
+                self._host._present(candidate, landing, chip_row=row.event is not None)
             elif isinstance(landing, dict):
-                self._host.jump_requested.emit(landing)
+                self._host._jump_to_row(landing, chip_row=row.event is not None)
             if row.mark is not None:
                 self._host._editing_mark = next((i for i, mark in enumerate(self._host.current_marks()) if mark is row.mark), -1)
                 self._host.hint.setText(self._host.picture_mark_hint())
@@ -430,8 +460,9 @@ class QuickReviewDisplayPart(UiPart):
             category = self._host._category()
             frame = self._host._frame_provider()
             circle = item.evidence.get("frame", {}).get("marker_x_normalized") is not None
+            # 仅在目标过线所在波次的画面里保留点位；不能借用上一圈的画面。
             if ((circle or category and category.get("action") == "bicycle") and frame
-                    and frame.get("frame_index", -1) >= 0):
+                    and frame.get("frame_index", -1) >= 0 and wave_contains_time(wave, self._host._picture_time())):
                 self._host._selected_key = row.key
                 self._host.table.setCurrentCell(index, 0)
                 self._host._sync_arrival_confirmation()

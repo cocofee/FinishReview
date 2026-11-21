@@ -99,7 +99,7 @@ class FinishReviewProblemsPart(UiPart):
         self._host.problem_panel.set_metadata_provider(
             lambda: self._host.metadata_store.current() if getattr(self._host, "metadata_store", None) is not None else None
         )
-        self._host.problem_panel.jump_requested.connect(self._host._open_problem_frame)
+        self._host.problem_panel.jump_requested.connect(self._host._open_requested_problem_frame)
         self._host.problem_panel.current_changed.connect(self._host._problem_selection_changed)
         self._host.problem_panel.big_view_changed.connect(self._host._problem_big_view_changed)
         self._host.problem_panel.marks_changed.connect(self._host._problem_marks_changed)
@@ -588,8 +588,15 @@ class FinishReviewProblemsPart(UiPart):
         self._host._opened_normal_crossing = ""
         item = self._host.problem_panel.current_item()
         self._host.video_filmstrip.full_race.follow_button.setChecked(False)
-        if item is not None and item.evidence.get("frame"):
-            self._host.problem_panel.set_browsing(True)
+        panel = self._host.problem_panel
+        row = panel._selected_arrival() if getattr(panel, "quick_review", False) else None
+        if row is not None and row.event is not None and item is not None:
+            saved = (row.decision or {}).get("frame")
+            if saved and self._host._open_problem_frame(dict(saved)):
+                return
+            self._host._open_selected_chip_reference(row)
+        elif item is not None and item.evidence.get("frame"):
+            panel.set_browsing(True)
             self._host._open_problem_frame(dict(item.evidence["frame"]))
         elif item is not None:
             self._host._set_sync_playing(False, seek_final=False)
@@ -609,15 +616,41 @@ class FinishReviewProblemsPart(UiPart):
                     for pane in self._host.evidence_panes:
                         pane.clear_passage(self._host.problem_panel.queue_text() + "；可从原录像打开画面校时或补记")
 
-    def _open_chip_reference(self, item) -> bool:
+    def _open_requested_problem_frame(self, frame):
+        if self._host._open_problem_frame(frame):
+            return
+        panel = self._host.problem_panel
+        if panel.opening_chip_row:
+            row = panel._selected_arrival()
+            if row is not None and row.event is not None:
+                self._host._open_selected_chip_reference(row)
+
+    def _open_selected_chip_reference(self, row):
+        # 带圈次的行只能回退到这条过线自己的参考录像，不能用共用证据里的第一条芯片。
+        event = self._host.passage_store.get(row.event.event_id)
+        if (event is not None and event.is_active
+                and self._host._open_chip_reference(row.item, event=event)):
+            return
+        panel = self._host.problem_panel
+        panel._shown_ms = None
+        panel.set_browsing(True)
+        lap = f"第 {row.event.lap} 圈" if row.event.lap else "本次过线"
+        message = f"{row.bib} 号{lap}暂无可回看录像；未打开其他过线。"
+        self._host._set_sync_playing(False, seek_final=False)
+        for pane in self._host.evidence_panes:
+            pane.clear_passage(message)
+        panel.hint.setText(message)
+
+    def _open_chip_reference(self, item, *, event=None) -> bool:
         """Raw playback must not depend on detection, line setup or calibration."""
-        events = [self._host.passage_store.get(event_id) for event_id in item.event_ids]
-        event = next((event for event in events if event is not None and event.is_active), None)
         if event is None:
-            reference = item.evidence.get("reference_frame")
-            if reference:
-                return self._host._open_problem_frame(dict(reference, reference_only=True))
-            return False
+            events = [self._host.passage_store.get(event_id) for event_id in item.event_ids]
+            event = next((event for event in events if event is not None and event.is_active), None)
+            if event is None:
+                reference = item.evidence.get("reference_frame")
+                if reference:
+                    return self._host._open_problem_frame(dict(reference, reference_only=True))
+                return False
         timestamp = self._host._evidence_timestamp(event)
         if timestamp is None:
             return False
@@ -713,10 +746,11 @@ class FinishReviewProblemsPart(UiPart):
         self._host._open_problem_frame({"camera_index": context.camera, "segment_id": segment.segment.segment_id,
                                   "video_path": str(segment.path), "position_ms": position})
 
-    def _calibration_events(self):
+    def _calibration_events(self, *, selected_test_event_id=""):
         """(events that can anchor a calibration, by chip time; or a reason there are none)."""
 
         from .analysis_workspace import AnalysisWorkspace
+        from .chip_history import EXCLUDED_TEST
         metadata = self._host._current_metadata()
         try:
             workspace = AnalysisWorkspace(self._host.output_dir,
@@ -724,9 +758,12 @@ class FinishReviewProblemsPart(UiPart):
                                           stage_id=metadata.stage_id if metadata else "")
         except (OSError, ValueError) as error:
             return [], f"等待本场有效芯片记录：{error}"
+        # 测试组只允许用操作员本次点选的具体过线校时，不加入默认校时名单。
         eligible = {read.event_id for read in workspace.reads
-                    if read.active_now and not read.excluded and not read.manual_entry
-                    and read.bib and read.chip_ms == read.latest_chip_ms}
+                    if read.active_now and not read.manual_entry and read.bib
+                    and read.chip_ms == read.latest_chip_ms
+                    and (not read.excluded or (read.excluded == EXCLUDED_TEST
+                                               and read.event_id == selected_test_event_id))}
         events = [event for event in self._host.passage_store.events() if event.event_id in eligible
                   and event.is_active and event.bib and event.timeline_timestamp_ms > 0
                   and (event.race_id, event.stage_id) == (workspace.race_id, workspace.stage_id)]
@@ -788,14 +825,21 @@ class FinishReviewProblemsPart(UiPart):
             shown = recorder_crossing_time(frame["recorder_ms"], frame, self._host.output_dir)
             if shown is None or shown.source != "video":
                 return "", True
+        selected = panel._selected_arrival()
         plan = panel._run_plan()
-        row = plan.unmatched[0] if plan is not None and plan.unmatched else panel._selected_arrival()
+        row = plan.unmatched[0] if plan is not None and plan.unmatched else selected
         target = getattr(row, "event", None)
-        events, reason = self._calibration_events()
-        event = next((event for event in events if target is not None and event.event_id == target.event_id), None)
+        selected_test_event_id = (target.event_id if armed and target is not None and row is selected
+                                  and row.note not in ("已排除", "多余芯片") else "")
+        events, reason = self._calibration_events(selected_test_event_id=selected_test_event_id)
+        event = next((event for event in events if target is not None and event.event_id == target.event_id
+                      and row.note not in ("已排除", "多余芯片")), None)
         if event is None:
             if armed:
-                panel.hint.setText(reason or "重新校时：先在左表选这位压线选手的芯片记录，再左键点他。")
+                if target is not None:
+                    panel.hint.setText("这次过线不能用于重新校时；请选可校时的过线，或取消重新校时后再点人。")
+                else:
+                    panel.hint.setText(reason or "重新校时：先在左表选这位压线选手的芯片记录，再左键点人。")
                 return "", False
             return "", True   # nothing to calibrate from: count as before, the button stays red
         offset = self._save_calibration(pane, frame, event)

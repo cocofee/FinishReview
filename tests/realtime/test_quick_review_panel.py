@@ -97,13 +97,57 @@ def test_unverified_video_never_becomes_an_arrival_even_from_old_cache(panel, ki
     panel.show_unverified_action.setChecked(True)
     assert not panel.table.isRowHidden(0)
     assert panel.table.rowCount() == 1
-    assert panel.table.item(0, 2).text() == "—"
+    assert panel.table.item(0, 2).text() == format_chip_time(FRAME["recorder_ms"]) + " 未校时"
     assert panel.table.item(0, 3).text() == "画面待核"
     assert "到达 0" in panel.quick_title.text()
     assert not panel._auto_labels
     assert panel._arrival_exports() == ([], [], 0)
     panel.show_unverified_action.setChecked(False)
     assert panel.table.rowCount() == 0
+
+
+def test_pending_picture_times_are_only_mixed_with_chips_when_aligned(panel, monkeypatch):
+    from realtime import quick_review_panel as module
+    from realtime.crossing_time import CrossingTime
+
+    start = FRAME["recorder_ms"]
+    def picture(key, delta, source):
+        stamp = start + delta if delta is not None else None
+        return ProblemItem(key, KIND_LINE_ACTIVITY, CATEGORY_VIDEO, "",
+                           evidence={"frame": dict(FRAME, recorder_ms=stamp, session_id=key),
+                                     "recorder_ms": stamp, "test_source": source})
+
+    def crossing(item, *_args, **_kwargs):
+        stamp = item.evidence.get("recorder_ms")
+        return CrossingTime(stamp, item.evidence["test_source"]) if stamp is not None else None
+
+    monkeypatch.setattr(module, "item_crossing_time", crossing)
+    panel.events = [event("902", "lap-1", start), event("902", "lap-2", start + 60_000)]
+    panel.items = [picture("late", 75_000, "aligned"), picture("unknown", None, ""),
+                   picture("raw-later", -5_000, "video"), picture("middle", 30_000, "aligned"),
+                   picture("raw-earlier", -8_000, "video")]
+    panel.show_unverified_action.setChecked(True)
+    assert [entry.key for entry in panel._arrival_rows] == [
+        "event:lap-1", "candidate:middle", "event:lap-2", "candidate:late",
+        "candidate:raw-earlier", "candidate:raw-later", "candidate:unknown",
+    ]
+    assert panel.table.item(1, 2).text() == format_chip_time(start + 30_000) + " 画面"
+    assert panel.table.item(4, 2).text() == format_chip_time(start - 8_000) + " 未校时"
+    assert panel.table.item(6, 2).text() == "时间未知"
+    assert "到达 2" in panel.quick_title.text()
+
+
+def test_clicking_later_lap_does_not_keep_an_older_classified_picture(panel):
+    start = FRAME["recorder_ms"]
+    panel.events += [replace(event("321", "next-lap", start + 60_000), lap=2)]
+    panel._render()
+    panel._classify("bicycle")
+    changes = QSignalSpy(panel.current_changed)
+    late = next(i for i, entry in enumerate(panel._arrival_rows) if entry.key == "event:next-lap")
+    panel.table.cellClicked.emit(late, 1)
+    assert panel._selected_arrival().key == "event:next-lap"
+    assert changes and panel.current_item().event_ids == ("next-lap",)
+    assert not any(entry.decision for entry in panel._arrival_rows)
 
 
 def test_unverified_line_changes_are_one_display_group_but_keep_all_source_items(panel):

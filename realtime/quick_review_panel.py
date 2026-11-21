@@ -44,12 +44,12 @@ from .quick_review_common import (
     RUN_TAIL_MS,
     SAME_BODY_MS,
     SWEEP_REACH_MS,
-    WAVE_GAP_MS,
     WAVE_NO_PERSON,
     WAVE_VIEW_MARGIN_MS,
     WAVE_VIEW_REACH_MS,
     WavePlan,
-    row_moment,
+    arrival_order,
+    wave_contains_time,
 )
 from .quick_review_rows import QuickReviewRowsPart
 from .quick_review_display import QuickReviewDisplayPart
@@ -125,6 +125,7 @@ class QuickReviewPanel(
         # True while a row is opened whose picture the panel itself places (or
         # keeps): the window must not reopen the item's stored frame over it.
         self.holds_picture = False
+        self.opening_chip_row = False  # 仅左表定位请求允许安全回退到本条芯片参考录像
         super().__init__(parent)
         self.jump_requested.connect(self._forget_run)  # a jump elsewhere ends any run
         self.header.hide()
@@ -162,7 +163,7 @@ class QuickReviewPanel(
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["顺序", "号码", "时间", "状态", "组别", "圈数"])
         self.table.horizontalHeaderItem(2).setToolTip(
-            "校时后的芯片域时间；悬浮单元格可看录像原时刻"
+            "到达按芯片时间；已校时的待核画面按画面时间插入，未校时的录像原时刻另排在末尾"
         )
         for column, width in enumerate((42, 66, 137, 72)):
             self.table.setColumnWidth(column, width)
@@ -378,7 +379,8 @@ class QuickReviewPanel(
                 rows.append(ArrivalRow("candidate:" + item.item_id, item,
                                        time_ms=crossing.value_ms if crossing else None,
                                        recorder_ms=raw_recorder_ms,
-                                       reference=crossing is None or crossing.source in ("expected", "chip")))
+                                       reference=crossing is None or crossing.source in ("expected", "chip"),
+                                       time_source=crossing.source if crossing else ""))
             for event_id, bib in pairs:
                 # Every lap keeps its chip row, without duplicating the bound picture.
                 if not event_id or event_id in represented:
@@ -468,21 +470,11 @@ class QuickReviewPanel(
         # it instead of standing as rows of their own beside the counted rider.
         rows = self._fold_fragments(rows, assigned)
         rows = [row for row in rows if row.item.item_id not in near or row.event is not None]
-        # Arrival order is chip time.  Not the order the records came in: a chip
-        # added later (古浪 6 号) sat after the whole wave and gave its rider's
-        # click to the next bib.  A corrected video time never moves a chip.
-        chips = sorted((row for row in rows if row.event is not None), key=lambda row: (
-            int(row.event.timeline_timestamp_ms), row.event.sequence, row.key))
-        # A crossing without a chip is read in arrival order too: it sits at its
-        # own time between the chips, never collected after the last finisher.
-        others = sorted((row for row in rows if row.event is None), key=lambda row: (
-            row.time_ms if row.time_ms is not None else 2**62, row.key))
-        merged = []
-        for chip in chips:
-            while others and others[0].time_ms is not None and others[0].time_ms < chip.event.timeline_timestamp_ms:
-                merged.append(others.pop(0))
-            merged.append(chip)
-        return merged + others
+        # 芯片始终按正式时间排序；未校时的待核画面不混入到达顺序。
+        return sorted(rows, key=self._arrival_order)
+
+    def _arrival_order(self, row):
+        return arrival_order(row, row.event is None and self._unverified_picture(row.item))
 
     def _earlier_arrival(self, row, read=True):
         """When someone else came onto the line up to 2 s before this crossing without a chip (可能多人).
@@ -570,16 +562,7 @@ class QuickReviewPanel(
                     f"extra:{plan.item.item_id}:{mark['recorder_ms']}:{mark['x']}:{mark['y']}", plan.item,
                     time_ms=crossing.value_ms if crossing else int(mark["recorder_ms"]),
                     recorder_ms=int(mark["recorder_ms"]), note="多出", mark=mark))
-        if not extra:
-            return rows
-        extra.sort(key=lambda row: row.time_ms)
-        merged = []
-        for row in rows:
-            moment = row_moment(row)
-            while extra and moment is not None and extra[0].time_ms < moment:
-                merged.append(extra.pop(0))
-            merged.append(row)
-        return merged + extra
+        return sorted([*rows, *extra], key=self._arrival_order) if extra else rows
 
     def queue_text(self):
         if self._unverified_items and not any(row.event is not None or not self._unverified_picture(row.item)
@@ -608,10 +591,10 @@ class QuickReviewPanel(
             return self._passage_start(row)
         if not self._quick_ready:
             return None
-        first, last = min(stamps), max(stamps)
+        first = min(stamps)
         wave = self._row_wave(row) or ()
         paired = [self._auto_labels[chip.key] for chip in wave if chip.key in self._auto_labels]
-        visible = self._shown_ms is not None and first - WAVE_GAP_MS / 2 <= self._shown_ms <= last + WAVE_GAP_MS / 2
+        visible = self._frame_provider() is not None and wave_contains_time(wave, self._shown_ms)
         if paired and len(paired) == len(wave):
             binding = (str(self.workspace_dir), self._arrival_scope,
                        tuple((chip.key, self._auto_labels[chip.key].key) for chip in wave))
@@ -810,7 +793,9 @@ class QuickReviewPanel(
                 tail, self._run_to = self._run_tail, None
                 self._run_slow()
                 self.run_requested.emit(False)
-                QTimer.singleShot(0, lambda: self._run_arrived(tail))  # rule outside the frame callback
+                # 下一波动作延迟执行；期间若点了左表，不得让旧播放任务抢走新选中行。
+                selected_key = self._selected_key
+                QTimer.singleShot(0, lambda: self._run_arrived(tail) if self._selected_key == selected_key else None)
             elif stamp >= self._run_to - RUN_SLOW_MS:
                 self._run_slow()  # the last stretch at normal speed, to stop on the frame
         return stamp

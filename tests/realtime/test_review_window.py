@@ -692,6 +692,61 @@ def test_one_click_on_the_rider_calibrates_an_uncalibrated_recording_and_counts_
         window.close()
 
 
+def test_recalibration_with_selected_test_group_second_lap_counts_it(qapp, tmp_path):
+    from PyQt5.QtGui import QImage
+    from realtime.passage_evidence import VideoClockCalibrationStore
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        window.show()
+        start = 1_789_600_000_000
+        video = tmp_path / "camera_01_test_archive_000.mkv"
+        video.write_bytes(b"video")
+        segment = window.timeline_store.add_completed_segment(
+            source_id="camera_01", camera_index=1, video_path=video,
+            media_started_at_ms=start, media_duration_ms=6000,
+            clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+        first = _event(event_id="lap-1", bib="902", lap=1, group_name="测试组",
+                       passage_timestamp_ms=start + 1000, received_at_ms=start + 1050)
+        second = replace(first, event_id="lap-2", sequence=first.sequence + 1, lap=2,
+                         passage_timestamp_ms=start + 4000, received_at_ms=start + 4050)
+        for event in (first, second):
+            window.passage_store.append(event)
+        panel = window.problem_panel
+        panel._live_paused = True
+        panel.refresh()
+        assert not window._calibration_events()[0]  # 测试组没有进入默认校时名单
+        pane = window.regular_pane
+        first_decision = None
+        for event, position in ((first, 1050), (second, 4300)):
+            index = next(i for i, row in enumerate(panel._arrival_rows) if row.key == "event:" + event.event_id)
+            panel.table.cellClicked.emit(index, 1)
+            frame = dict(camera_index=1, segment_id=segment.segment_id, video_path=str(video),
+                         position_ms=position, frame_index=position // 40)
+            window._open_problem_frame(frame)
+            pane._worker.frame_ready.emit(QImage(640, 480, QImage.Format_RGB32), position, position // 40)
+            qapp.processEvents()
+            if event == second:
+                panel.toggle_recalibration()
+            window._problem_count_clicked(.55, .62, pane)
+            qapp.processEvents()
+            assert panel._selected_arrival().event.event_id == event.event_id
+            assert panel.table.item(panel.table.currentRow(), 3).text() == "已点"
+            row = panel._selected_arrival()
+            assert row.decision["frame"]["position_ms"] == position
+            if event == first:
+                first_decision = dict(row.decision)
+                assert not (tmp_path / "video_clock_calibrations.jsonl").exists()
+        assert panel._row_by_key("event:lap-1").decision == first_decision
+        assert not panel._recalibrate_armed
+        calibration, = VideoClockCalibrationStore(tmp_path / "video_clock_calibrations.jsonl",
+                                                   recover_incomplete_tail=False).calibrations()
+        assert calibration.anchor_event_id == second.event_id and calibration.offset_ms == 300
+        assert window.passage_store.get(second.event_id).timeline_timestamp_ms == start + 4000
+    finally:
+        window.close()
+
+
 def test_quick_review_picture_click_marks_bicycle_and_keeps_the_chip_row(qapp, tmp_path):
     from PyQt5.QtGui import QImage
 
@@ -1134,6 +1189,53 @@ def test_chip_reference_does_not_borrow_unrelated_or_missing_video(qapp, tmp_pat
         window.problem_panel._arrival_clicked(index)
         assert window.regular_pane.location is None
         assert not window.problem_panel.confirm_arrival_button.isEnabled()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("has_second_video", [True, False])
+def test_clicking_second_lap_never_reuses_the_shared_first_lap_frame(qapp, tmp_path, has_second_video):
+    from realtime.problem_items import CATEGORY_VIDEO, KIND_TWO_CHIPS_ONE_CROSSING, ProblemItem
+
+    window = _window(tmp_path, workbench=True)
+    try:
+        start = 1_789_600_000_000
+        segments = []
+        for index in range(1 + int(has_second_video)):
+            video = tmp_path / f"lap-{index + 1}.mkv"
+            video.write_bytes(b"video")
+            segment = window.timeline_store.add_completed_segment(
+                source_id="camera_01", camera_index=1, video_path=video,
+                media_started_at_ms=start + index * 60_000, media_duration_ms=6000,
+                clock_source=DEFAULT_CLOCK_SOURCE, timing_error_ms=0, end_reason="test", race_id="race-1")
+            segments.append(segment)
+        first = replace(_event(event_id="lap-1", passage_timestamp_ms=start + 2000,
+                               received_at_ms=start + 2200), bib="902", lap=1)
+        second = replace(first, event_id="lap-2", sequence=first.sequence + 1, lap=2,
+                         passage_timestamp_ms=start + 62_000, received_at_ms=start + 62_200)
+        for event in (first, second):
+            window.passage_store.append(event)
+        panel = window.problem_panel
+        # 模拟分析结果为两条过线附了同一帧；不能拿这组第一条芯片/画面回退。
+        pane = window.regular_pane
+        panel.items = [ProblemItem("shared", KIND_TWO_CHIPS_ONE_CROSSING, CATEGORY_VIDEO, "",
+                     bibs=("902", "902"), event_ids=(first.event_id, second.event_id),
+                     evidence={"frame": dict(camera_index=1, segment_id=segments[0].segment_id,
+                                             video_path=str(tmp_path / "lap-1.mkv"),
+                                             position_ms=2000, frame_index=50)})]
+        panel._render()
+        for event_id in (first.event_id, second.event_id):
+            index = next(i for i, row in enumerate(panel._arrival_rows) if row.event.event_id == event_id)
+            panel.table.cellClicked.emit(index, 1)
+            assert panel._selected_arrival().event.event_id == event_id
+            if event_id == first.event_id or has_second_video:
+                expected = segments[0 if event_id == first.event_id else 1]
+                assert pane.location.segment.segment_id == expected.segment_id
+                assert pane.location.playback_position_ms == 2000
+            else:
+                assert pane.location is None
+                assert "第 2 圈暂无可回看录像" in panel.hint.text()
+                assert not panel.confirm_arrival_button.isEnabled()
     finally:
         window.close()
 
